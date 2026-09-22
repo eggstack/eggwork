@@ -21,12 +21,7 @@ This subsystem owns:
 - Artifact records/retrieval;
 - storage quotas, leases/references, and garbage collection.
 
-It does not own:
-
-- Git repository/worktree semantics;
-- CodeGG branch integration;
-- scheduler placement;
-- artifact interpretation by downstream applications.
+It does not own Git repository/worktree semantics, CodeGG branch integration, scheduler placement, or artifact interpretation by downstream applications.
 
 ## 2. Durable invariants
 
@@ -47,6 +42,10 @@ Class: infrastructure/capability
 
 Status: blocked on Control Plane M002 closure
 
+Implementation plan:
+
+- `plans/implementation/workspace-artifact-transport/001-blob-store-and-digest-protocol.md`
+
 Objective:
 
 Implement SHA-256 blob identity, find-missing, streamed verified upload/download, authorization hooks, storage layout, quotas, and deterministic corruption handling.
@@ -66,6 +65,10 @@ Class: capability/invariant
 
 Status: blocked on M001 closure
 
+Implementation plan:
+
+- `plans/implementation/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md`
+
 Objective:
 
 Materialize a bounded portable tree into a node-owned workspace without traversal/symlink/special-file escape.
@@ -83,6 +86,10 @@ Exit conditions:
 Class: capability/infrastructure
 
 Status: blocked on M002 closure
+
+Implementation plan:
+
+- `plans/implementation/workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md`
 
 Objective:
 
