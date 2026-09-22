@@ -8,6 +8,25 @@ license.workspace = true
 [dependencies]
 eggwork-core = { path = "../eggwork-core" }
 eggwork-runner = { path = "../eggwork-runner" }
+eggserve-core.workspace = true
+tokio = { workspace = true, features = ["net"] }
+bytes.workspace = true
+futures-util.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13"
+tempfile = "3"
+rustls = "0.23"
+base64.workspace = true
+eggwork-client = { path = "../eggwork-client" }
+eggfetch-core.workspace = true
 
 [lints]
 workspace = true

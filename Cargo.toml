@@ -24,6 +24,13 @@ tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 nix = { version = "0.29", features = ["signal", "process"] }
 libc = "0.2"
+bytes = "1"
+futures-util = { version = "0.3", features = ["sink"] }
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+base64 = "0.22"
+eggserve-core = { version = "0.2.0", default-features = false, features = ["tls"] }
+eggfetch-core = { version = "0.2.0", default-features = false, features = ["standard-http1", "tls-rustls"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

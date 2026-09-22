@@ -574,6 +574,35 @@ pub struct Versioned<T> {
     pub value: T,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteRequest {
+    pub schema_version: u16,
+    pub spec: ExecutionSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionAccepted {
+    pub schema_version: u16,
+    pub execution_id: ExecutionId,
+    pub state: ExecutionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionSnapshot {
+    pub schema_version: u16,
+    pub execution_id: ExecutionId,
+    pub generation: ExecutionGeneration,
+    pub state: ExecutionState,
+    pub result: Option<ExecutionResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiError {
+    pub schema_version: u16,
+    pub code: String,
+    pub message: String,
+}
+
 /// Stable canonical digest input: version prefix and serde_json output with struct field order.
 pub fn request_digest(spec: &ExecutionSpec) -> Result<BlobDigest, serde_json::Error> {
     let mut bytes = b"eggwork-execution-spec\0v1\0".to_vec();
