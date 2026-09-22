@@ -844,6 +844,19 @@ mod tests {
             .build()
     }
 
+    async fn post_raw(endpoint: &str, tls: TlsConfig, body: Vec<u8>) -> u16 {
+        let http = eggfetch_core::Client::builder().tls_config(tls).build();
+        http.post(endpoint)
+            .unwrap()
+            .header("content-type", "application/json")
+            .bytes(body)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
     fn pem(label: &str, der: &[u8]) -> String {
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(der);
@@ -1022,6 +1035,38 @@ mod tests {
             write_client_config(&client_temp, root.as_ref(), &client_identity),
         )
         .unwrap();
+        assert_eq!(
+            post_raw(
+                &format!("{address}/v1/executions"),
+                write_client_config(&client_temp, root.as_ref(), &client_identity),
+                b"{".to_vec(),
+            )
+            .await,
+            400
+        );
+        assert_eq!(
+            post_raw(
+                &format!("{address}/v1/executions"),
+                write_client_config(&client_temp, root.as_ref(), &client_identity),
+                vec![b'x'; MAX_REQUEST_BYTES + 1],
+            )
+            .await,
+            413
+        );
+        let unsupported_schema = serde_json::to_vec(&ExecuteRequest {
+            schema_version: API_SCHEMA_VERSION + 1,
+            spec: execution_spec(vec!["/bin/true".into()]),
+        })
+        .unwrap();
+        assert_eq!(
+            post_raw(
+                &format!("{address}/v1/executions"),
+                write_client_config(&client_temp, root.as_ref(), &client_identity),
+                unsupported_schema,
+            )
+            .await,
+            426
+        );
         let execution = client
             .execute(&execution_spec(vec![
                 "/bin/echo".into(),
