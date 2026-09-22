@@ -1,6 +1,6 @@
 # Foundation and Execution Core M002 — Canonical Local Runner
 
-Status: active
+Status: closed
 
 Source roadmap:
 

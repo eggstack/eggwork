@@ -44,8 +44,8 @@ Planning content is intentionally ahead of implementation. There is currently no
 
 | Workstream | Status | Current dependency-ready work | Authority |
 |---|---|---|---|
-| Foundation / execution core | active | M002 canonical local runner | `plans/subsystems/foundation-execution-core-roadmap.md` |
-| Control-plane protocol | blocked | M001 waits on Foundation M002 | `plans/subsystems/control-plane-protocol-roadmap.md` |
+| Foundation / execution core | closed | M002 canonical local runner | `plans/subsystems/foundation-execution-core-roadmap.md` |
+| Control-plane protocol | ready | M001 authenticated fixed-target execution | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | blocked | M001 waits on Control Plane M002 | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | blocked | M001 waits on Foundation M001 + Control Plane M001 interface; later M002/M003 have stronger dependencies | `plans/subsystems/security-isolation-resource-roadmap.md` |
 | Operations / distribution | blocked | M001 waits on Control Plane M002 + Workspace M003 + Security M003 | `plans/subsystems/operations-distribution-roadmap.md` |
@@ -55,14 +55,14 @@ Planning content is intentionally ahead of implementation. There is currently no
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Foundation | M002 canonical local runner | **active** | `plans/implementation/foundation-execution-core/002-canonical-local-runner.md` | M001 closed; CodeGG lifecycle reference re-checked at `28b4695661d463dd1675d045ac6299c5fbc9ea31`. |
+| Control plane | M001 authenticated fixed-target execution | **ready** | `plans/implementation/control-plane-protocol/001-authenticated-fixed-target-execution.md` | Foundation M002 closed; EggServe/Eggfetch/Eggress interfaces re-checked in `plans/closure/foundation-execution-core/002-status.md`. |
 
 ## Registered blocked implementation plans
 
 | Workstream | Milestone | Status | Implementation plan | Blocker |
 |---|---|---|---|---|
 | Foundation | M001 repository bootstrap + domain contract | closed | `plans/implementation/foundation-execution-core/001-repository-bootstrap-and-domain-contract.md` | Closure: `plans/closure/foundation-execution-core/001-status.md`. |
-| Control plane | M001 authenticated fixed-target execution | blocked | `plans/implementation/control-plane-protocol/001-authenticated-fixed-target-execution.md` | Foundation M002 closure |
+| Foundation | M002 canonical local runner | closed | `plans/implementation/foundation-execution-core/002-canonical-local-runner.md` | Closure: `plans/closure/foundation-execution-core/002-status.md`. |
 | Control plane | M002 idempotency/leases/events/recovery | blocked | `plans/implementation/control-plane-protocol/002-idempotency-leases-events-and-recovery.md` | Control Plane M001 closure |
 | Workspace | M001 blob store/digest protocol | blocked | `plans/implementation/workspace-artifact-transport/001-blob-store-and-digest-protocol.md` | Control Plane M002 closure |
 | Workspace | M002 safe workspace materialization | blocked | `plans/implementation/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md` | Workspace M001 closure |
@@ -80,7 +80,7 @@ These are intentionally not implementation-ready:
 
 | Work | Status | Reason |
 |---|---|---|
-| Foundation M003 ownership guards/API hardening | roadmap-level | derive exact guard from M002 implementation surface |
+| Foundation M003 ownership guards/API hardening | roadmap-level | M002 made the runner surface concrete; create the focused static-guard handoff when this roadmap-level item is scheduled |
 | Control Plane M003 Eggress route/protocol hardening | roadmap-level | re-check current Eggfetch custom-dial/Eggress integration after M002 |
 | Security M004 adversarial closure | roadmap-level | exact corpus depends on M001-M003 implementation |
 | Operations M003 operational qualification | roadmap-level | exact release/service surface not implemented |
@@ -94,18 +94,15 @@ Do not create implementation plans for these merely to increase plan count. Writ
 
 ## Current execution order
 
-1. **Foundation M002** — canonical bounded local runner (active).
-2. Close Foundation M002; promote **Control Plane M001**.
-4. After Control Plane M001 interface is stable:
-   - promote **Control Plane M002**;
-   - Security M001 may proceed in parallel if the authorization hook surface is concrete.
-5. Close Control Plane M002; execute **Workspace M001 -> M002 -> M003**.
-6. Once Workspace M002 exists, execute **Security M002**, then **Security M003**. Security M001 must also be closed before the security subsystem is considered qualified.
-7. After Control Plane M002 + Workspace M003 + Security M003:
+1. **Control Plane M001** — authenticated fixed-target execution (ready).
+2. Close Control Plane M001; promote **Control Plane M002**. Security M001 may start once its authorization hook interface is concrete.
+3. Close Control Plane M002; execute **Workspace M001 -> M002 -> M003**.
+4. Once Workspace M002 exists, execute **Security M002**, then **Security M003**. Security M001 must also be closed before the security subsystem is considered qualified.
+5. After Control Plane M002 + Workspace M003 + Security M003:
    - **Operations M001** may begin;
    - **CodeGG M001** may begin independently.
-8. Operations M002 waits on Operations M001 and the required stable Eggup interface.
-9. Generate later roadmap-level handoffs only after their concrete dependencies exist.
+6. Operations M002 waits on Operations M001 and the required stable Eggup interface.
+7. Generate later roadmap-level handoffs only after their concrete dependencies exist.
 
 ## External interface research baselines
 

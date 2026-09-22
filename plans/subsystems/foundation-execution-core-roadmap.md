@@ -71,7 +71,7 @@ Exit conditions:
 
 Class: capability/invariant
 
-Status: ready
+Status: closed
 
 Implementation plan:
 

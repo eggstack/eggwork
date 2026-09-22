@@ -53,7 +53,7 @@ It does not own:
 
 Class: capability/infrastructure/invariant
 
-Status: blocked on Foundation M002 closure
+Status: ready
 
 Implementation plan:
 

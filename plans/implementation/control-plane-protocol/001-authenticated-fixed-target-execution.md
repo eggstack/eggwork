@@ -1,6 +1,6 @@
 # Control Plane M001 — Authenticated Fixed-Target Execution
 
-Status: blocked on Foundation M002 closure
+Status: ready
 
 Source roadmap:
 
