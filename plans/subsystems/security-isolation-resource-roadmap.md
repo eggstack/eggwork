@@ -43,6 +43,10 @@ Class: invariant/infrastructure
 
 Status: blocked on Foundation M001 and Control Plane M001 interface availability
 
+Implementation plan:
+
+- `plans/implementation/security-isolation-resource/001-authorization-redaction-and-threat-model.md`
+
 Objective:
 
 Define principal-to-capability policy, operation descriptors, secret-safe serialization/debugging, threat model, and adversarial request corpus.
@@ -60,6 +64,10 @@ Exit conditions:
 Class: invariant/capability
 
 Status: blocked on Foundation M002 and Workspace M002 closure
+
+Implementation plan:
+
+- `plans/implementation/security-isolation-resource/002-trusted-landlock-sandbox-path.md`
 
 Objective:
 
@@ -81,7 +89,7 @@ Status: blocked on M002 closure
 
 Implementation plan:
 
-- `plans/implementation/security-isolation-resource/001-enforced-isolation-and-resource-controls.md`
+- `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md`
 
 Objective:
 
