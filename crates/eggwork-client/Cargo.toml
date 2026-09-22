@@ -1,0 +1,12 @@
+[package]
+name = "eggwork-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eggwork-core = { path = "../eggwork-core" }
+
+[lints]
+workspace = true
