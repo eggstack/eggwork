@@ -45,7 +45,7 @@ Planning content is intentionally ahead of implementation. There is currently no
 | Workstream | Status | Current dependency-ready work | Authority |
 |---|---|---|---|
 | Foundation / execution core | closed | M002 canonical local runner | `plans/subsystems/foundation-execution-core-roadmap.md` |
-| Control-plane protocol | ready | M001 authenticated fixed-target execution | `plans/subsystems/control-plane-protocol-roadmap.md` |
+| Control-plane protocol | active | M001 authenticated fixed-target execution | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | blocked | M001 waits on Control Plane M002 | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | blocked | M001 waits on Foundation M001 + Control Plane M001 interface; later M002/M003 have stronger dependencies | `plans/subsystems/security-isolation-resource-roadmap.md` |
 | Operations / distribution | blocked | M001 waits on Control Plane M002 + Workspace M003 + Security M003 | `plans/subsystems/operations-distribution-roadmap.md` |
@@ -55,7 +55,7 @@ Planning content is intentionally ahead of implementation. There is currently no
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Control plane | M001 authenticated fixed-target execution | **ready** | `plans/implementation/control-plane-protocol/001-authenticated-fixed-target-execution.md` | Foundation M002 closed; EggServe/Eggfetch/Eggress interfaces re-checked in `plans/closure/foundation-execution-core/002-status.md`. |
+| Control plane | M001 authenticated fixed-target execution | **active** | `plans/implementation/control-plane-protocol/001-authenticated-fixed-target-execution.md` | Foundation M002 closed; EggServe/Eggfetch/Eggress interfaces re-checked in `plans/closure/foundation-execution-core/002-status.md`. |
 
 ## Registered blocked implementation plans
 

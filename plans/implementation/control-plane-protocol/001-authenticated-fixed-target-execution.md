@@ -1,6 +1,6 @@
 # Control Plane M001 — Authenticated Fixed-Target Execution
 
-Status: ready
+Status: active
 
 Source roadmap:
 
