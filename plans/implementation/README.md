@@ -14,13 +14,35 @@ Implementation plans are bounded handoff documents derived from canonical direct
 
 ## Initial implementation sequence
 
+Foundation:
+
 1. `foundation-execution-core/001-repository-bootstrap-and-domain-contract.md`
 2. `foundation-execution-core/002-canonical-local-runner.md`
+
+Control plane:
+
 3. `control-plane-protocol/001-authenticated-fixed-target-execution.md`
 4. `control-plane-protocol/002-idempotency-leases-events-and-recovery.md`
-5. `workspace-artifact-transport/001-content-addressed-workspaces-and-artifacts.md`
-6. `security-isolation-resource/001-enforced-isolation-and-resource-controls.md`
-7. `operations-distribution/001-node-operations-packaging-and-eggup.md`
-8. `codegg-integration/001-codegg-fixed-target-remote-executor.md`
 
-Only the earliest dependency-ready milestone should normally be active at one time unless the registry explicitly allows parallel work.
+Workspace/artifacts:
+
+5. `workspace-artifact-transport/001-blob-store-and-digest-protocol.md`
+6. `workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md`
+7. `workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md`
+
+Security/isolation:
+
+8. `security-isolation-resource/001-authorization-redaction-and-threat-model.md`
+9. `security-isolation-resource/002-trusted-landlock-sandbox-path.md`
+10. `security-isolation-resource/003-enforced-resource-controls.md`
+
+Operations:
+
+11. `operations-distribution/001-node-operations-surface.md`
+12. `operations-distribution/002-packaging-services-and-eggup.md`
+
+Downstream integration:
+
+13. `codegg-integration/001-codegg-fixed-target-remote-executor.md`
+
+Only the earliest dependency-ready milestone should normally be active at one time unless the registry explicitly allows parallel work. Some later plans are intentionally written while blocked so architecture and handoff intent are preserved before implementation reaches them.
