@@ -1,6 +1,6 @@
 # Foundation and Execution Core M001 — Repository Bootstrap and Domain Contract
 
-Status: ready for handoff
+Status: closed
 
 Source roadmap:
 

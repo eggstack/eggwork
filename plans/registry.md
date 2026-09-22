@@ -44,7 +44,7 @@ Planning content is intentionally ahead of implementation. There is currently no
 
 | Workstream | Status | Current dependency-ready work | Authority |
 |---|---|---|---|
-| Foundation / execution core | ready | M001 repository bootstrap + domain contract | `plans/subsystems/foundation-execution-core-roadmap.md` |
+| Foundation / execution core | active | M002 canonical local runner | `plans/subsystems/foundation-execution-core-roadmap.md` |
 | Control-plane protocol | blocked | M001 waits on Foundation M002 | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | blocked | M001 waits on Control Plane M002 | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | blocked | M001 waits on Foundation M001 + Control Plane M001 interface; later M002/M003 have stronger dependencies | `plans/subsystems/security-isolation-resource-roadmap.md` |
@@ -55,13 +55,13 @@ Planning content is intentionally ahead of implementation. There is currently no
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Foundation | M001 repository bootstrap + domain contract | **ready** | `plans/implementation/foundation-execution-core/001-repository-bootstrap-and-domain-contract.md` | First implementation handoff. Do not add networking or process execution. |
+| Foundation | M002 canonical local runner | **active** | `plans/implementation/foundation-execution-core/002-canonical-local-runner.md` | M001 closed; CodeGG lifecycle reference re-checked at `28b4695661d463dd1675d045ac6299c5fbc9ea31`. |
 
 ## Registered blocked implementation plans
 
 | Workstream | Milestone | Status | Implementation plan | Blocker |
 |---|---|---|---|---|
-| Foundation | M002 canonical local runner | blocked | `plans/implementation/foundation-execution-core/002-canonical-local-runner.md` | Foundation M001 closure |
+| Foundation | M001 repository bootstrap + domain contract | closed | `plans/implementation/foundation-execution-core/001-repository-bootstrap-and-domain-contract.md` | Closure: `plans/closure/foundation-execution-core/001-status.md`. |
 | Control plane | M001 authenticated fixed-target execution | blocked | `plans/implementation/control-plane-protocol/001-authenticated-fixed-target-execution.md` | Foundation M002 closure |
 | Control plane | M002 idempotency/leases/events/recovery | blocked | `plans/implementation/control-plane-protocol/002-idempotency-leases-events-and-recovery.md` | Control Plane M001 closure |
 | Workspace | M001 blob store/digest protocol | blocked | `plans/implementation/workspace-artifact-transport/001-blob-store-and-digest-protocol.md` | Control Plane M002 closure |
@@ -94,9 +94,8 @@ Do not create implementation plans for these merely to increase plan count. Writ
 
 ## Current execution order
 
-1. **Foundation M001** — repository/bootstrap/domain contract.
-2. Close Foundation M001; promote **Foundation M002**.
-3. Close Foundation M002; promote **Control Plane M001**.
+1. **Foundation M002** — canonical bounded local runner (active).
+2. Close Foundation M002; promote **Control Plane M001**.
 4. After Control Plane M001 interface is stable:
    - promote **Control Plane M002**;
    - Security M001 may proceed in parallel if the authorization hook surface is concrete.
