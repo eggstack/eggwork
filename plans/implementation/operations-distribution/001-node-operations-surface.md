@@ -1,6 +1,6 @@
 # Operations M001 — Node Operations Surface
 
-Status: blocked on Control Plane M002 and Workspace/Artifact M003 closure
+Status: blocked on Control Plane M002, Workspace/Artifact M003, and Security M003 closure
 
 Source roadmap:
 
