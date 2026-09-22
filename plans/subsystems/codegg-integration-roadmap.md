@@ -58,7 +58,7 @@ Eggwork should align with these seams rather than create a second CodeGG daemon 
 
 Class: capability/invariant
 
-Status: blocked on Eggwork Control Plane M002 and Workspace M003 closure
+Status: blocked on Eggwork Control Plane M002, Workspace M003, and Security M003 closure
 
 Implementation plan:
 
