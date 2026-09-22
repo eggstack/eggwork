@@ -99,7 +99,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "eggwork-core",
- "libc",
  "nix",
  "tempfile",
  "thiserror",

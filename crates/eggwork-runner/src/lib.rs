@@ -621,6 +621,7 @@ fn denied_environment_key(key: &str) -> bool {
         "PERL5OPT",
         "GIT_ASKPASS",
         "SSH_ASKPASS",
+        "GIT_CONFIG",
         "GIT_CONFIG_",
         "AWS_",
         "AZURE_",
@@ -909,5 +910,33 @@ mod tests {
         assert_eq!(c.head, b"abc");
         assert_eq!(c.tail.iter().copied().collect::<Vec<_>>(), b"hij");
         assert_eq!(c.omitted_bytes, 4);
+    }
+
+    #[test]
+    fn cleanup_warning_does_not_rewrite_process_outcome() {
+        let result = RunnerResult {
+            termination: TerminationReason::Exited,
+            exit_code: Some(9),
+            stdout: BoundedCapture::default(),
+            stderr: BoundedCapture::default(),
+            cleanup: CleanupDiagnostics {
+                process_group_signal_error: Some("permission denied".into()),
+                wait_error: None,
+                stdin_error: None,
+            },
+            setup: SetupOutcome {
+                sandbox: SandboxOutcome::NotRequested,
+                resources: ResourceSetupOutcome::NotRequested,
+            },
+            stream_chunks_dropped: 0,
+            provenance: ExecutionProvenance::default(),
+        };
+        let terminal = result.execution_result();
+        assert_eq!(terminal.state, ExecutionState::Failed);
+        assert_eq!(terminal.exit_code, Some(9));
+        assert_eq!(
+            terminal.cleanup_warning.as_deref(),
+            Some("permission denied")
+        );
     }
 }

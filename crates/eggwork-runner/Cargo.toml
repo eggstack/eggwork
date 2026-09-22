@@ -11,11 +11,12 @@ tokio.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
-nix.workspace = true
-libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
 
 [lints]
 workspace = true
