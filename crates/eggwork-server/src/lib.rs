@@ -624,7 +624,7 @@ async fn run_execution(
         } else {
             ExecutionState::Failed
         };
-        let result = failed_result(failure);
+        let result = failed_result(terminal.clone(), failure);
         publish_terminal(
             &record,
             terminal.clone(),
@@ -635,9 +635,9 @@ async fn run_execution(
     }
 }
 
-fn failed_result(failure: ExecutionFailure) -> ExecutionResult {
+fn failed_result(state: ExecutionState, failure: ExecutionFailure) -> ExecutionResult {
     ExecutionResult {
-        state: ExecutionState::Failed,
+        state,
         exit_code: None,
         failure: Some(failure),
         stdout_bytes: 0,
@@ -767,7 +767,7 @@ mod tests {
         CommandSpec, EnvironmentEntry, IsolationRequirement, NetworkRequirement, OutputPolicy,
         ResourceRequirements, StdinPolicy,
     };
-    use futures_util::StreamExt;
+    use futures_util::{StreamExt, TryStreamExt};
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::{fs, sync::Arc};
@@ -929,6 +929,34 @@ mod tests {
             Some((Operation::Observe, _))
         ));
         assert!(operation_for("POST", "/v1/execute-anywhere").is_none());
+    }
+
+    #[tokio::test]
+    async fn slow_event_consumer_is_bounded_and_gets_a_stream_error() {
+        let id = ExecutionId::new("slow-reader").unwrap();
+        let (sender, receiver) = broadcast::channel(EVENT_CAPACITY);
+        let mut response = event_stream_response(id, receiver);
+        let ResponseBody::Stream(mut stream) = response.take_body().unwrap() else {
+            panic!("event response must stream");
+        };
+        for index in 1..=(EVENT_CAPACITY + 1) {
+            let _ = sender.send(ExecutionEvent {
+                sequence: EventSequence::new(index as u64),
+                kind: ExecutionEventKind::Diagnostic("bounded diagnostic".into()),
+                metadata: EventMetadata { fields: vec![] },
+            });
+        }
+        assert!(stream.next().await.unwrap().is_err());
+        // A disconnected slow listener does not block event producers.
+        assert!(
+            sender
+                .send(ExecutionEvent {
+                    sequence: EventSequence::new((EVENT_CAPACITY + 2) as u64),
+                    kind: ExecutionEventKind::Diagnostic("execution continues".into()),
+                    metadata: EventMetadata { fields: vec![] },
+                })
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -1098,11 +1126,17 @@ mod tests {
             .execute(&execution_spec(vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                "sleep 1".into(),
+                "sleep 2".into(),
             ]))
             .await
             .unwrap();
         let running_id = running.execution_id.clone();
+        let events_client = client.clone();
+        let events_id = running_id.clone();
+        let events_task = tokio::spawn(async move {
+            let stream = events_client.events(&events_id).await?;
+            Ok::<_, eggwork_client::ClientError>(stream.try_collect::<Vec<_>>().await?)
+        });
         assert!(matches!(
             client
                 .execute(&execution_spec(vec!["/bin/true".into()]))
@@ -1118,6 +1152,12 @@ mod tests {
         ));
         server.set_draining(false);
         drop(running); // A disconnected live stream does not cancel execution.
+        let attached_events = tokio::time::timeout(std::time::Duration::from_secs(4), events_task)
+            .await
+            .expect("GET events stream should end at terminal state")
+            .unwrap()
+            .unwrap();
+        assert!(!attached_events.is_empty());
         tokio::time::timeout(std::time::Duration::from_secs(4), async {
             loop {
                 if client.observe(&running_id).await.unwrap().state == ExecutionState::Succeeded {
@@ -1151,6 +1191,11 @@ mod tests {
         })
         .await
         .expect("explicit cancellation reaches a terminal state");
+        let cancelled_snapshot = client.observe(&cancellable_id).await.unwrap();
+        assert_eq!(
+            cancelled_snapshot.result.unwrap().state,
+            ExecutionState::Cancelled
+        );
 
         let no_cert = eggfetch_core::TlsConfig::builder()
             .ca_certificate_path({
