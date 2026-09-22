@@ -11,18 +11,7 @@ Canonical authority:
 
 ## 1. Ownership boundary
 
-This subsystem owns:
-
-- configuration;
-- node identity/config administration UX;
-- status/doctor/drain commands;
-- service lifecycle;
-- logs/metrics/operator diagnostics;
-- packaging/release assets;
-- Eggup integration;
-- storage inspection/GC commands;
-- reverse-connect transport broker;
-- later interactive PTY client/daemon surfaces.
+This subsystem owns configuration, node identity/config administration UX, status/doctor/drain commands, service lifecycle, logs/metrics/operator diagnostics, packaging/release assets, Eggup integration, storage inspection/GC commands, reverse-connect transport broker, and later interactive PTY client/daemon surfaces.
 
 It does not own process lifecycle internals, scheduler placement, or CodeGG semantics.
 
@@ -44,6 +33,10 @@ Class: capability/polish
 
 Status: blocked on Control Plane M002 and Workspace M003
 
+Implementation plan:
+
+- `plans/implementation/operations-distribution/001-node-operations-surface.md`
+
 Objective:
 
 Add configuration, status, doctor, drain/undrain, execution/storage inspection, cleanup/GC commands, and stable machine-readable operator output.
@@ -56,7 +49,7 @@ Status: blocked on M001 and stable Eggup consumer interfaces
 
 Implementation plan:
 
-- `plans/implementation/operations-distribution/001-node-operations-packaging-and-eggup.md`
+- `plans/implementation/operations-distribution/002-packaging-services-and-eggup.md`
 
 Objective:
 
