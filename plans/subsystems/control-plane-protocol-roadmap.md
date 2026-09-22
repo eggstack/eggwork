@@ -53,7 +53,7 @@ It does not own:
 
 Class: capability/infrastructure/invariant
 
-Status: ready
+Status: blocked on publication of the EggServe 0.2 crate set
 
 Implementation plan:
 
