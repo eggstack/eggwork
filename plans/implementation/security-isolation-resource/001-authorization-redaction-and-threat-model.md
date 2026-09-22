@@ -1,6 +1,8 @@
 # Security M001 — Authorization, Redaction, and Threat-Model Foundation
 
-Status: blocked on Foundation M001 and Control Plane M001 interface availability
+Status: ready
+
+Dependency evidence: `plans/closure/foundation-execution-core/001-status.md` and `plans/closure/control-plane-protocol/001-status.md`
 
 Source roadmap:
 

@@ -41,7 +41,7 @@ Transport mechanics remain in control-plane protocol; process lifecycle remains 
 
 Class: invariant/infrastructure
 
-Status: blocked on Foundation M001 and Control Plane M001 interface availability
+Status: ready; dependencies closed and interface available
 
 Implementation plan:
 

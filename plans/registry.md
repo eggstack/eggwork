@@ -38,16 +38,16 @@ First repository/planning commit:
 
 - `6661ba12ac3fb8d45cb32394635b71c61d947a72` — planning-system bootstrap.
 
-Planning content is intentionally ahead of implementation. There is currently no Rust workspace or production code. No roadmap capability should be treated as implemented merely because its plan exists.
+At planning bootstrap there was no Rust workspace or production code. That is historical baseline context; use the milestone and closure records below for current implementation status. No roadmap capability should be treated as implemented merely because its plan exists.
 
 ## Active workstreams
 
 | Workstream | Status | Current dependency-ready work | Authority |
 |---|---|---|---|
 | Foundation / execution core | closed | M002 canonical local runner | `plans/subsystems/foundation-execution-core-roadmap.md` |
-| Control-plane protocol | active | M001 authenticated fixed-target execution | `plans/subsystems/control-plane-protocol-roadmap.md` |
+| Control-plane protocol | active | M002 idempotency, leases, resumable events, and recovery | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | blocked | M001 waits on Control Plane M002 | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
-| Security / isolation / resources | blocked | M001 waits on Foundation M001 + Control Plane M001 interface; later M002/M003 have stronger dependencies | `plans/subsystems/security-isolation-resource-roadmap.md` |
+| Security / isolation / resources | ready | M001 authorization/redaction/threat-model foundation is ready; later M002/M003 remain blocked | `plans/subsystems/security-isolation-resource-roadmap.md` |
 | Operations / distribution | blocked | M001 waits on Control Plane M002 + Workspace M003 + Security M003 | `plans/subsystems/operations-distribution-roadmap.md` |
 | CodeGG integration | blocked | M001 waits on Control Plane M002 + Workspace M003 + Security M003 | `plans/subsystems/codegg-integration-roadmap.md` |
 
@@ -55,19 +55,19 @@ Planning content is intentionally ahead of implementation. There is currently no
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Control plane | M001 authenticated fixed-target execution | **active** | `plans/implementation/control-plane-protocol/001-authenticated-fixed-target-execution.md` | EggServe/Eggfetch 0.2 crate set is published; blocker clearance evidence: `plans/closure/foundation-execution-core/002-control-plane-blocker-clearance.md`. |
+| Control plane | M002 idempotency/leases/events/recovery | **active** | `plans/implementation/control-plane-protocol/002-idempotency-leases-events-and-recovery.md` | M001 closure: `plans/closure/control-plane-protocol/001-status.md`. |
+| Security | M001 authorization/redaction/threat model | **ready** | `plans/implementation/security-isolation-resource/001-authorization-redaction-and-threat-model.md` | Foundation M001 and Control Plane M001 interfaces are available; scheduled after the requested dependency sequence reaches it. |
 
-## Registered blocked implementation plans
+## Registered implementation plan statuses
 
 | Workstream | Milestone | Status | Implementation plan | Blocker |
 |---|---|---|---|---|
 | Foundation | M001 repository bootstrap + domain contract | closed | `plans/implementation/foundation-execution-core/001-repository-bootstrap-and-domain-contract.md` | Closure: `plans/closure/foundation-execution-core/001-status.md`. |
 | Foundation | M002 canonical local runner | closed | `plans/implementation/foundation-execution-core/002-canonical-local-runner.md` | Closure: `plans/closure/foundation-execution-core/002-status.md`. |
-| Control plane | M002 idempotency/leases/events/recovery | blocked | `plans/implementation/control-plane-protocol/002-idempotency-leases-events-and-recovery.md` | Control Plane M001 closure |
+| Control plane | M001 authenticated fixed-target execution | closed | `plans/implementation/control-plane-protocol/001-authenticated-fixed-target-execution.md` | Closure: `plans/closure/control-plane-protocol/001-status.md`. |
 | Workspace | M001 blob store/digest protocol | blocked | `plans/implementation/workspace-artifact-transport/001-blob-store-and-digest-protocol.md` | Control Plane M002 closure |
 | Workspace | M002 safe workspace materialization | blocked | `plans/implementation/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md` | Workspace M001 closure |
 | Workspace | M003 declared artifacts/retention/GC | blocked | `plans/implementation/workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md` | Workspace M002 closure |
-| Security | M001 authorization/redaction/threat model | blocked | `plans/implementation/security-isolation-resource/001-authorization-redaction-and-threat-model.md` | Foundation M001 + Control Plane M001 interface availability |
 | Security | M002 trusted Landlock sandbox | blocked | `plans/implementation/security-isolation-resource/002-trusted-landlock-sandbox-path.md` | Foundation M002 + Workspace M002 closure |
 | Security | M003 enforced resource controls | blocked | `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md` | Security M002 closure |
 | Operations | M001 node operations surface | blocked | `plans/implementation/operations-distribution/001-node-operations-surface.md` | Control Plane M002 + Workspace M003 + Security M003 |
@@ -94,10 +94,10 @@ Do not create implementation plans for these merely to increase plan count. Writ
 
 ## Current execution order
 
-1. **Control Plane M001** — authenticated fixed-target execution (active; publication blocker cleared).
-2. Close Control Plane M001; then promote **Control Plane M002** and continue the dependency sequence below.
+1. **Control Plane M001** — authenticated fixed-target execution (closed; closure: `plans/closure/control-plane-protocol/001-status.md`).
+2. **Control Plane M002** — idempotency/leases/events/recovery (active).
 3. Close Control Plane M002; execute **Workspace M001 -> M002 -> M003**.
-4. Once Workspace M002 exists, execute **Security M002**, then **Security M003**. Security M001 must also be closed before the security subsystem is considered qualified.
+4. After Workspace M003, execute **Security M001 -> M002 -> M003**. M001 is ready now because its interface dependencies are closed, but it remains inactive until this sequence reaches it.
 5. After Control Plane M002 + Workspace M003 + Security M003:
    - **Operations M001** may begin;
    - **CodeGG M001** may begin independently.

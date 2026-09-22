@@ -1,6 +1,8 @@
 # Control Plane M001 — Authenticated Fixed-Target Execution
 
-Status: active
+Status: closed
+
+Closure evidence: `plans/closure/control-plane-protocol/001-status.md`
 
 Source roadmap:
 

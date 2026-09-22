@@ -53,7 +53,7 @@ It does not own:
 
 Class: capability/infrastructure/invariant
 
-Status: active
+Status: closed
 
 Implementation plan:
 
@@ -76,7 +76,7 @@ Exit conditions:
 
 Class: invariant/capability
 
-Status: blocked on M001 closure
+Status: active
 
 Implementation plan:
 

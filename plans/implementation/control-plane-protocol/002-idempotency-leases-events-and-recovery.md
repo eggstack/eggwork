@@ -1,6 +1,8 @@
 # Control Plane M002 — Idempotency, Leases, Resumable Events, and Recovery
 
-Status: blocked on Control Plane M001 closure
+Status: active
+
+Dependency evidence: `plans/closure/control-plane-protocol/001-status.md`
 
 Source roadmap:
 
