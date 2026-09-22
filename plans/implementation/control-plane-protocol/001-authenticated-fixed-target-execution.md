@@ -1,6 +1,6 @@
 # Control Plane M001 — Authenticated Fixed-Target Execution
 
-Status: blocked on publication of the EggServe 0.2 crate set
+Status: active
 
 Source roadmap:
 

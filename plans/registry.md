@@ -45,7 +45,7 @@ Planning content is intentionally ahead of implementation. There is currently no
 | Workstream | Status | Current dependency-ready work | Authority |
 |---|---|---|---|
 | Foundation / execution core | closed | M002 canonical local runner | `plans/subsystems/foundation-execution-core-roadmap.md` |
-| Control-plane protocol | blocked | M001 requires published EggServe 0.2 crate set with authenticated peer context | `plans/subsystems/control-plane-protocol-roadmap.md` |
+| Control-plane protocol | active | M001 authenticated fixed-target execution | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | blocked | M001 waits on Control Plane M002 | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | blocked | M001 waits on Foundation M001 + Control Plane M001 interface; later M002/M003 have stronger dependencies | `plans/subsystems/security-isolation-resource-roadmap.md` |
 | Operations / distribution | blocked | M001 waits on Control Plane M002 + Workspace M003 + Security M003 | `plans/subsystems/operations-distribution-roadmap.md` |
@@ -55,6 +55,7 @@ Planning content is intentionally ahead of implementation. There is currently no
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
+| Control plane | M001 authenticated fixed-target execution | **active** | `plans/implementation/control-plane-protocol/001-authenticated-fixed-target-execution.md` | EggServe/Eggfetch 0.2 crate set is published; blocker clearance evidence: `plans/closure/foundation-execution-core/002-control-plane-blocker-clearance.md`. |
 
 ## Registered blocked implementation plans
 
@@ -62,7 +63,6 @@ Planning content is intentionally ahead of implementation. There is currently no
 |---|---|---|---|---|
 | Foundation | M001 repository bootstrap + domain contract | closed | `plans/implementation/foundation-execution-core/001-repository-bootstrap-and-domain-contract.md` | Closure: `plans/closure/foundation-execution-core/001-status.md`. |
 | Foundation | M002 canonical local runner | closed | `plans/implementation/foundation-execution-core/002-canonical-local-runner.md` | Closure: `plans/closure/foundation-execution-core/002-status.md`. |
-| Control plane | M001 authenticated fixed-target execution | blocked | `plans/implementation/control-plane-protocol/001-authenticated-fixed-target-execution.md` | Required EggServe 0.2 crates are not published to crates.io. Evidence: `plans/closure/foundation-execution-core/002-control-plane-blocker-addendum.md`. |
 | Control plane | M002 idempotency/leases/events/recovery | blocked | `plans/implementation/control-plane-protocol/002-idempotency-leases-events-and-recovery.md` | Control Plane M001 closure |
 | Workspace | M001 blob store/digest protocol | blocked | `plans/implementation/workspace-artifact-transport/001-blob-store-and-digest-protocol.md` | Control Plane M002 closure |
 | Workspace | M002 safe workspace materialization | blocked | `plans/implementation/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md` | Workspace M001 closure |
@@ -94,8 +94,8 @@ Do not create implementation plans for these merely to increase plan count. Writ
 
 ## Current execution order
 
-1. **STOP: Control Plane M001 is blocked** pending publication of EggServe 0.2 with the reviewed authenticated peer-context API. Do not begin later listed plans until this dependency is available and re-reviewed.
-2. After the blocker clears, close Control Plane M001; then promote **Control Plane M002** and continue the dependency sequence below.
+1. **Control Plane M001** — authenticated fixed-target execution (active; publication blocker cleared).
+2. Close Control Plane M001; then promote **Control Plane M002** and continue the dependency sequence below.
 3. Close Control Plane M002; execute **Workspace M001 -> M002 -> M003**.
 4. Once Workspace M002 exists, execute **Security M002**, then **Security M003**. Security M001 must also be closed before the security subsystem is considered qualified.
 5. After Control Plane M002 + Workspace M003 + Security M003:
