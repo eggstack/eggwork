@@ -12,7 +12,7 @@ Implementation plans are bounded handoff documents derived from canonical direct
 - Stop and record a blocker if a required upstream interface is absent.
 - Do not silently weaken required authentication, isolation, digest validation, fencing, or bounds to make a milestone pass.
 
-## Initial implementation sequence
+## Closed implementation sequence
 
 Foundation:
 
@@ -34,15 +34,29 @@ Security/isolation:
 
 8. `security-isolation-resource/001-authorization-redaction-and-threat-model.md`
 9. `security-isolation-resource/002-trusted-landlock-sandbox-path.md`
-10. `security-isolation-resource/003-enforced-resource-controls.md`
+10. `security-isolation-resource/002a-landlock-runtime-devnull.md`
+11. `security-isolation-resource/003-enforced-resource-controls.md`
 
 Operations:
 
-11. `operations-distribution/001-node-operations-surface.md`
-12. `operations-distribution/002-packaging-services-and-eggup.md`
+12. `operations-distribution/001-node-operations-surface.md`
 
-Downstream integration:
+## Current parallel-ready wave
 
-13. `codegg-integration/001-codegg-fixed-target-remote-executor.md`
+The registry explicitly authorizes these independent handoffs to proceed in parallel:
 
-Only the earliest dependency-ready milestone should normally be active at one time unless the registry explicitly allows parallel work. Some later plans are intentionally written while blocked so architecture and handoff intent are preserved before implementation reaches them.
+- `foundation-execution-core/003-execution-ownership-guards-and-runner-api-hardening.md`
+- `control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md`
+- `operations-distribution/002-eggup-deployment-and-service-integration.md`
+- `codegg-integration/001-codegg-fixed-target-remote-executor.md` — downstream/external handoff; actual CodeGG changes remain governed by CodeGG's own planning system.
+
+The former `operations-distribution/002-packaging-services-and-eggup.md` is superseded because it mixed Eggup consumer authority with Eggpack producer authority.
+
+## Next blocked work
+
+- Security M004 final adversarial/cross-platform qualification waits on Foundation M003, Control Plane M003, and Operations M002 so it tests the current surfaces.
+- Operations M003 producer packaging waits on Eggpack's concrete ReleaseManifest + build/qualification interfaces.
+- CodeGG M002 waits on CodeGG integration M001.
+- Reverse-connect and PTY work remain deferred.
+
+Parallel execution is allowed only where `plans/registry.md` says so. Shared-file conflicts between parallel agents must be resolved before closure evidence is accepted.
