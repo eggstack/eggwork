@@ -524,6 +524,12 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("blobs");
         let store = BlobStore::open(&root, 5).unwrap();
+        assert!(matches!(
+            store
+                .prepare_upload(&BlobDigest::from_bytes(b"too large"), MAX_BLOB_BYTES + 1)
+                .await,
+            Err(BlobError::TooLarge)
+        ));
         let first = BlobDigest::from_bytes(b"12345");
         store
             .put_stream(
