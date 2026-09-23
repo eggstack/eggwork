@@ -3,7 +3,7 @@
 Source plan: `plans/implementation/workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md`  
 Subsystem roadmap: `plans/subsystems/workspace-artifact-transport-roadmap.md`  
 Reviewed implementation commit: `59028a1`  
-Planning/closure commit: pending
+Planning/closure commit: `07f79b8`
 
 ## Finding
 
