@@ -55,7 +55,8 @@ At planning bootstrap there was no Rust workspace or production code. That is hi
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Security | M003 enforced resource controls | **active** | `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md` | Security M002 closure: `plans/closure/security-isolation-resource/002-status.md`. Host cgroup v2 delegation is unavailable to this session; backend capability must reflect that. |
+| Security | M002a Landlock `/dev/null` runtime correction | **closing** | `plans/implementation/security-isolation-resource/002a-landlock-runtime-devnull.md` | Regression and runtime evidence gathered; closure record being written. |
+| Security | M003 enforced resource controls | **closing** | `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md` | Linux systemd user-scope evidence gathered; closure record being written. |
 
 ## Registered implementation plan statuses
 
@@ -70,7 +71,8 @@ At planning bootstrap there was no Rust workspace or production code. That is hi
 | Workspace | M003 declared artifacts/retention/GC | closed | `plans/implementation/workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md` | Closure: `plans/closure/workspace-artifact-transport/003-status.md`. |
 | Security | M001 authorization/redaction/threat model | closed | `plans/implementation/security-isolation-resource/001-authorization-redaction-and-threat-model.md` | Closure: `plans/closure/security-isolation-resource/001-status.md`. |
 | Security | M002 trusted Landlock sandbox | closed | `plans/implementation/security-isolation-resource/002-trusted-landlock-sandbox-path.md` | Closure: `plans/closure/security-isolation-resource/002-status.md`; implementation `98d13f1`. |
-| Security | M003 enforced resource controls | active | `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md` | Security M002 closure available. Host cgroup delegation is unavailable; do not claim cgroup enforcement here. |
+| Security | M002a Landlock `/dev/null` runtime correction | closing | `plans/implementation/security-isolation-resource/002a-landlock-runtime-devnull.md` | M003 cancellation-under-limits regression exposed a missing runtime read; historical M002 closure remains preserved. |
+| Security | M003 enforced resource controls | closing | `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md` | Direct writes to this session's cgroup are unavailable; the systemd user manager can create scopes, and runtime probes gate claims on those scopes. |
 | Operations | M001 node operations surface | blocked | `plans/implementation/operations-distribution/001-node-operations-surface.md` | Security M003 closure |
 | Operations | M002 packaging/services/Eggup | blocked | `plans/implementation/operations-distribution/002-packaging-services-and-eggup.md` | Operations M001 + stable Eggup consumer interface |
 | CodeGG | M001 fixed-target remote executor | blocked | `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md` | Security M003 closure |

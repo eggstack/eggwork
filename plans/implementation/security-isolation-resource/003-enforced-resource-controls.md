@@ -1,8 +1,10 @@
 # Security M003 — Enforced Resource Controls
 
-Status: active
+Status: closing
 
 Dependency evidence: `plans/closure/security-isolation-resource/002-status.md`
+
+Related correction: `plans/implementation/security-isolation-resource/002a-landlock-runtime-devnull.md`
 
 Source roadmap:
 
@@ -43,7 +45,7 @@ Best effort must report what was actually applied.
 
 ### Linux
 
-Prefer cgroups v2 for memory/PIDs/CPU where available and permitted. Define rootless/user-service requirements and delegation limitations explicitly.
+Use a transient systemd scope backed by cgroups v2 for memory/PIDs/CPU when the trusted helper and system/user manager pass runtime probes. Rootless nodes use the user manager; root services use the system manager. Direct writes to the current session cgroup are not assumed. Required limits fail before target spawn if the manager cannot establish the requested properties.
 
 Use rlimits only for dimensions they truthfully enforce.
 

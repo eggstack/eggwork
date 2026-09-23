@@ -89,7 +89,7 @@ Class: capability/invariant
 
 Status: active
 
-Host note: cgroups v2 controllers are present, but this session has no writable delegation. Probe and report runtime capability; do not claim enforcement without it.
+Host note: direct writes to this session cgroup are unavailable; the systemd user manager can create transient scopes. The backend probes each requested controller and verifies the cgroup properties before target start.
 
 Implementation plan:
 

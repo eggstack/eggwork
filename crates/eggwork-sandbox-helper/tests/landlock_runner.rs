@@ -1,4 +1,4 @@
-use eggwork_core::OverflowPolicy;
+use eggwork_core::{OverflowPolicy, Requirement};
 use eggwork_runner::{
     ExecutionProvenance, ExecutionSetup, LocalProcessRunner, ResourceSetupRequest, RunnerRequest,
     SandboxOutcome, SandboxRequest, StdinPolicy, TrustedLandlockSetup,
@@ -30,10 +30,9 @@ fn request(root: &Path, outside_read: &Path, outside_write: &Path) -> RunnerRequ
             profile: "workspace_rw".into(),
         },
         resources: ResourceSetupRequest {
-            memory_bytes: None,
-            cpu_millis: None,
-            pids: None,
-            required: false,
+            memory_bytes: Requirement::NotRequested,
+            cpu_millis: Requirement::NotRequested,
+            pids: Requirement::NotRequested,
         },
     }
 }
@@ -105,10 +104,9 @@ async fn helper_trust_checks_reject_missing_wrong_and_symlinked_helpers() {
         profile: "workspace_rw".into(),
     };
     let resources = ResourceSetupRequest {
-        memory_bytes: None,
-        cpu_millis: None,
-        pids: None,
-        required: false,
+        memory_bytes: Requirement::NotRequested,
+        cpu_millis: Requirement::NotRequested,
+        pids: Requirement::NotRequested,
     };
 
     for path in [temp.path().join("missing"), wrong, link] {
@@ -244,7 +242,12 @@ async fn sandbox_timeout_and_cancellation_reap_the_helper_process_group() {
     fs::set_permissions(helper_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
     let runner = LocalProcessRunner::new(TrustedLandlockSetup::new(helper));
+    let capabilities = runner.resource_capabilities().await;
+    assert!(capabilities.contains(&"resources.cgroups-v2.memory".into()));
+    assert!(capabilities.contains(&"resources.cgroups-v2.cpu".into()));
+    assert!(capabilities.contains(&"resources.cgroups-v2.pids".into()));
     let mut timed_request = request(&root, &root.join("unused"), &root.join("unused2"));
+    timed_request.resources.cpu_millis = Requirement::Required(1000);
     timed_request.argv = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
     timed_request.timeout = Duration::from_millis(100);
     let (tx, _rx) = mpsc::channel(8);
@@ -258,7 +261,12 @@ async fn sandbox_timeout_and_cancellation_reap_the_helper_process_group() {
     );
 
     let mut cancel_request = request(&root, &root.join("unused"), &root.join("unused2"));
-    cancel_request.argv = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+    cancel_request.resources.cpu_millis = Requirement::Required(1000);
+    cancel_request.argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "sleep 30 & echo $! > child-pid; wait".into(),
+    ];
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
     let task_runner = runner;
@@ -266,7 +274,16 @@ async fn sandbox_timeout_and_cancellation_reap_the_helper_process_group() {
         let (tx, _rx) = mpsc::channel(8);
         task_runner.run(cancel_request, task_cancellation, tx).await
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    for _ in 0..100 {
+        if root.join("child-pid").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        root.join("child-pid").exists(),
+        "target child did not start"
+    );
     cancellation.cancel();
     let cancelled = task
         .await
@@ -274,8 +291,181 @@ async fn sandbox_timeout_and_cancellation_reap_the_helper_process_group() {
         .expect("sandboxed cancellation should complete");
     assert_eq!(
         cancelled.termination,
-        eggwork_runner::TerminationReason::Cancelled
+        eggwork_runner::TerminationReason::Cancelled,
+        "{cancelled:?}; stderr={}",
+        String::from_utf8_lossy(&cancelled.stderr.head)
     );
+    let child_pid = fs::read_to_string(root.join("child-pid"))
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let process_state = fs::read_to_string(format!("/proc/{child_pid}/stat"));
+    assert!(
+        process_state.is_err() || process_state.unwrap().split_whitespace().nth(2) == Some("Z")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn required_memory_limit_is_enforced_and_classified() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    let helper_dir = tempfile::tempdir().unwrap();
+    let helper = helper_dir.path().join("eggwork-sandbox-helper");
+    fs::copy(env!("CARGO_BIN_EXE_eggwork-sandbox-helper"), &helper).unwrap();
+    fs::set_permissions(helper_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut request = request(&root, &root.join("unused"), &root.join("unused2"));
+    request.sandbox = SandboxRequest::None;
+    request.resources.memory_bytes = Requirement::Required(16 * 1024 * 1024);
+    request.argv = vec![
+        "/usr/bin/python3".into(),
+        "-c".into(),
+        "x=bytearray(64*1024*1024); [x.__setitem__(i,1) for i in range(0,len(x),4096)]".into(),
+    ];
+    let runner = LocalProcessRunner::new(TrustedLandlockSetup::new(helper));
+    let (tx, _rx) = mpsc::channel(8);
+    let result = runner
+        .run(request, CancellationToken::new(), tx)
+        .await
+        .expect("required memory limit should run in its cgroup");
+    let execution = result.execution_result();
+    assert_eq!(
+        execution.failure,
+        Some(eggwork_core::ExecutionFailure::ResourceLimit)
+    );
+    assert!(matches!(
+        execution.resources.unwrap().memory_bytes,
+        eggwork_core::ResourceDimensionResult::LimitExceeded { .. }
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn required_pid_limit_is_enforced_and_classified() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    let helper_dir = tempfile::tempdir().unwrap();
+    let helper = helper_dir.path().join("eggwork-sandbox-helper");
+    fs::copy(env!("CARGO_BIN_EXE_eggwork-sandbox-helper"), &helper).unwrap();
+    fs::set_permissions(helper_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut request = request(&root, &root.join("unused"), &root.join("unused2"));
+    request.sandbox = SandboxRequest::None;
+    request.resources.pids = Requirement::Required(12);
+    request.argv = vec![
+        "/usr/bin/python3".into(),
+        "-c".into(),
+        "import os,time; kids=[]\nfor _ in range(64):\n try: pid=os.fork()\n except OSError: break\n if pid==0: time.sleep(0.2); os._exit(0)\n kids.append(pid)\nfor pid in kids: os.waitpid(pid,0)".into(),
+    ];
+    let runner = LocalProcessRunner::new(TrustedLandlockSetup::new(helper));
+    let (tx, _rx) = mpsc::channel(8);
+    let result = runner
+        .run(request, CancellationToken::new(), tx)
+        .await
+        .expect("required PID limit should run in its cgroup");
+    let execution = result.execution_result();
+    assert_eq!(
+        execution.failure,
+        Some(eggwork_core::ExecutionFailure::ResourceLimit)
+    );
+    assert!(matches!(
+        execution.resources.unwrap().pids,
+        eggwork_core::ResourceDimensionResult::LimitExceeded { .. }
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn required_cpu_quota_is_verified_before_target_start() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    let helper_dir = tempfile::tempdir().unwrap();
+    let helper = helper_dir.path().join("eggwork-sandbox-helper");
+    fs::copy(env!("CARGO_BIN_EXE_eggwork-sandbox-helper"), &helper).unwrap();
+    fs::set_permissions(helper_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut request = request(&root, &root.join("unused"), &root.join("unused2"));
+    request.sandbox = SandboxRequest::None;
+    request.resources.cpu_millis = Requirement::Required(500);
+    request.argv = vec!["/bin/sh".into(), "-c".into(), "printf quota-ok".into()];
+    let runner = LocalProcessRunner::new(TrustedLandlockSetup::new(helper));
+    let (tx, _rx) = mpsc::channel(8);
+    let result = runner
+        .run(request, CancellationToken::new(), tx)
+        .await
+        .expect("required CPU quota should be installed in the execution cgroup");
+    assert_eq!(result.stdout.head, b"quota-ok");
+    assert!(matches!(
+        result.execution_result().resources.unwrap().cpu_millis,
+        eggwork_core::ResourceDimensionResult::Applied { backend }
+            if backend == "systemd-cgroup-v2"
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn concurrent_resource_scopes_keep_pid_limits_isolated() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let low_root = temp.path().join("low");
+    let high_root = temp.path().join("high");
+    fs::create_dir(&low_root).unwrap();
+    fs::create_dir(&high_root).unwrap();
+    let helper_dir = tempfile::tempdir().unwrap();
+    let helper = helper_dir.path().join("eggwork-sandbox-helper");
+    fs::copy(env!("CARGO_BIN_EXE_eggwork-sandbox-helper"), &helper).unwrap();
+    fs::set_permissions(helper_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+    let runner = LocalProcessRunner::new(TrustedLandlockSetup::new(helper));
+    let argv = vec![
+        "/usr/bin/python3".into(),
+        "-c".into(),
+        "import os,time; kids=[]\nfor _ in range(8):\n try: pid=os.fork()\n except OSError: break\n if pid==0: time.sleep(0.2); os._exit(0)\n kids.append(pid)\nfor pid in kids: os.waitpid(pid,0)".into(),
+    ];
+    let mut low = request(
+        &low_root,
+        &low_root.join("unused"),
+        &low_root.join("unused2"),
+    );
+    low.sandbox = SandboxRequest::None;
+    low.resources.pids = Requirement::Required(6);
+    low.argv = argv.clone();
+    let mut high = request(
+        &high_root,
+        &high_root.join("unused"),
+        &high_root.join("unused2"),
+    );
+    high.sandbox = SandboxRequest::None;
+    high.resources.pids = Requirement::Required(32);
+    high.argv = argv;
+    let (low_tx, _low_rx) = mpsc::channel(8);
+    let (high_tx, _high_rx) = mpsc::channel(8);
+    let (low_result, high_result) = tokio::join!(
+        runner.run(low, CancellationToken::new(), low_tx),
+        runner.run(high, CancellationToken::new(), high_tx),
+    );
+    let low_resources = low_result.unwrap().execution_result().resources.unwrap();
+    let high_resources = high_result.unwrap().execution_result().resources.unwrap();
+    assert!(matches!(
+        low_resources.pids,
+        eggwork_core::ResourceDimensionResult::LimitExceeded { .. }
+    ));
+    assert!(matches!(
+        high_resources.pids,
+        eggwork_core::ResourceDimensionResult::Applied { .. }
+    ));
 }
 
 #[cfg(target_os = "linux")]

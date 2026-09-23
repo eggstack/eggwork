@@ -23,7 +23,8 @@ use eggwork_core::{
     ProtocolVersionRange,
 };
 use eggwork_runner::{
-    ExecutionProvenance, LocalProcessRunner, RunnerError, RunnerRequest, SandboxRequest,
+    ExecutionProvenance, LocalProcessRunner, ResourceSetupRequest, RunnerError, RunnerRequest,
+    SandboxRequest,
 };
 use futures_util::stream;
 use serde::{Deserialize, Serialize};
@@ -185,6 +186,7 @@ struct NodeState {
     workspaces: workspace::WorkspaceManager,
     artifacts: artifact::ArtifactStore,
     lease_ttl: Duration,
+    resource_capabilities: Vec<String>,
     resolver: Arc<dyn PeerPrincipalResolver>,
     authorizer: Arc<dyn Authorizer>,
     executions: Arc<Mutex<HashMap<ExecutionId, Arc<ExecutionRecord>>>>,
@@ -319,6 +321,7 @@ impl NodeServer {
             )
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
         let draining = Arc::new(AtomicBool::new(false));
+        let resource_capabilities = runner.resource_capabilities().await;
         let mut executions = HashMap::new();
         for snapshot in store
             .load_all()
@@ -356,6 +359,7 @@ impl NodeServer {
             workspaces,
             artifacts,
             lease_ttl: config.lease_ttl,
+            resource_capabilities,
             resolver,
             authorizer,
             executions: Arc::new(Mutex::new(executions)),
@@ -708,7 +712,10 @@ fn node_status(state: &NodeState) -> NodeStatus {
                 "blob.stream.v1".into(),
                 "workspace.manifest.v1".into(),
                 "workspace.materialize.v1".into(),
-            ],
+            ]
+            .into_iter()
+            .chain(state.resource_capabilities.iter().cloned())
+            .collect(),
             max_active_executions: state.max_active,
         },
     }
@@ -1492,7 +1499,7 @@ async fn execute(
                     .workspaces
                     .mark_terminal(workspace_id, expiry, &state.blobs);
             }
-            let record = recovered_record(snapshot, state.store.clone(), lease_hash);
+            let record = recovered_record(*snapshot, state.store.clone(), lease_hash);
             drop(executions);
             return event_response(state, id, generation, 0, record).await;
         }
@@ -2074,6 +2081,7 @@ async fn run_execution(
     let runner = state.runner.clone();
     let cancellation = record.cancellation.clone();
     let sandbox_request = request.sandbox.clone();
+    let resource_request = request.resources.clone();
     let mut runner_task =
         tokio::spawn(async move { runner.run(request, cancellation, output_tx).await });
     let mut result = None;
@@ -2128,7 +2136,7 @@ async fn run_execution(
         } else {
             ExecutionState::Failed
         };
-        failed_result(terminal, failure, sandbox_request)
+        failed_result(terminal, failure, sandbox_request, resource_request)
     };
     if let Some(workspace) = workspace {
         let should_capture = runner_completed
@@ -2187,7 +2195,17 @@ fn failed_result(
     state: ExecutionState,
     failure: ExecutionFailure,
     sandbox_request: SandboxRequest,
+    resource_request: ResourceSetupRequest,
 ) -> ExecutionResult {
+    use eggwork_core::ResourceDimensionResult as Dimension;
+    fn requested<T>(requirement: eggwork_core::Requirement<T>) -> Dimension {
+        match requirement {
+            eggwork_core::Requirement::NotRequested => Dimension::NotRequested,
+            _ => Dimension::NotApplied {
+                reason: "requested resource enforcement failed before execution".into(),
+            },
+        }
+    }
     ExecutionResult {
         state,
         exit_code: None,
@@ -2207,6 +2225,11 @@ fn failed_result(
             SandboxRequest::Required { .. } => eggwork_core::SandboxResult::Failed {
                 reason: "required sandbox setup failed".into(),
             },
+        }),
+        resources: Some(eggwork_core::ResourceResult {
+            memory_bytes: requested(resource_request.memory_bytes),
+            cpu_millis: requested(resource_request.cpu_millis),
+            pids: requested(resource_request.pids),
         }),
     }
 }
@@ -2379,7 +2402,8 @@ mod tests {
     use eggwork_client::NodeClient;
     use eggwork_core::{
         CommandSpec, EnvironmentEntry, EventMetadata, EventSequence, ExecutionHandle,
-        IsolationRequirement, NetworkRequirement, OutputPolicy, ResourceRequirements, StdinPolicy,
+        IsolationRequirement, NetworkRequirement, OutputPolicy, Requirement, ResourceRequirements,
+        StdinPolicy,
     };
     use futures_util::{StreamExt, TryStreamExt, future::join_all};
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
@@ -2512,9 +2536,9 @@ mod tests {
                 output: OutputPolicy::default(),
                 declared_outputs: vec![],
                 resources: ResourceRequirements {
-                    memory_bytes: None,
-                    cpu_millis: None,
-                    pids: None,
+                    memory_bytes: Requirement::NotRequested,
+                    cpu_millis: Requirement::NotRequested,
+                    pids: Requirement::NotRequested,
                 },
                 isolation: IsolationRequirement::None,
                 network: NetworkRequirement::Unrestricted,
@@ -2852,7 +2876,13 @@ mod tests {
             unauthorized.download_blob(&denied_digest).await,
             Err(eggwork_client::ClientError::Api { status: 403, .. })
         ));
-        assert!(unauthorized.capabilities().await.is_ok());
+        let capabilities = unauthorized.capabilities().await.unwrap();
+        assert!(
+            !capabilities
+                .features
+                .iter()
+                .any(|feature| feature.starts_with("resources.cgroups-v2."))
+        );
         assert!(unauthorized.status().await.is_ok());
         let unknown_temp = TempDir::new().unwrap();
         let unknown_client = NodeClient::new(

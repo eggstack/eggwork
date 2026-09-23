@@ -6,7 +6,7 @@ use eggwork_core::{
     CommandSpec, ExecutionFailure, ExecutionGeneration, ExecutionId, ExecutionResult,
     ExecutionSpec, ExecutionState, MAX_CAPTURE_BYTES, MAX_ENV_COUNT, MAX_ENV_NAME_BYTES,
     MAX_ENV_VALUE_BYTES, MAX_EVENT_CHUNK_BYTES, OverflowPolicy as CoreOverflowPolicy, RelativePath,
-    StdinPolicy as CoreStdinPolicy,
+    Requirement, StdinPolicy as CoreStdinPolicy,
 };
 use serde::Serialize;
 use std::{
@@ -120,10 +120,248 @@ pub enum SandboxOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceSetupRequest {
-    pub memory_bytes: Option<u64>,
-    pub cpu_millis: Option<u64>,
-    pub pids: Option<u32>,
-    pub required: bool,
+    pub memory_bytes: Requirement<u64>,
+    pub cpu_millis: Requirement<u64>,
+    pub pids: Requirement<u32>,
+}
+
+impl ResourceSetupRequest {
+    fn is_requested(&self) -> bool {
+        !matches!(self.memory_bytes, Requirement::NotRequested)
+            || !matches!(self.cpu_millis, Requirement::NotRequested)
+            || !matches!(self.pids, Requirement::NotRequested)
+    }
+
+    fn has_required(&self) -> bool {
+        matches!(self.memory_bytes, Requirement::Required(_))
+            || matches!(self.cpu_millis, Requirement::Required(_))
+            || matches!(self.pids, Requirement::Required(_))
+    }
+
+    fn properties(&self) -> Vec<(String, String)> {
+        let mut properties = Vec::new();
+        if let Requirement::BestEffort(value) | Requirement::Required(value) = self.memory_bytes {
+            properties.push(("MemoryMax".into(), value.to_string()));
+            properties.push(("MemorySwapMax".into(), "0".into()));
+        }
+        if let Requirement::BestEffort(value) | Requirement::Required(value) = self.cpu_millis {
+            let whole = value / 10;
+            let fractional = value % 10;
+            properties.push(("CPUQuota".into(), format!("{whole}.{fractional}%")));
+        }
+        if let Requirement::BestEffort(value) | Requirement::Required(value) = self.pids {
+            properties.push(("TasksMax".into(), value.to_string()));
+        }
+        properties
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct SystemdCgroupBackend {
+    systemd_run: PathBuf,
+    user_manager: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl SystemdCgroupBackend {
+    fn discover() -> Result<Self, String> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let systemd_run = ["/usr/bin/systemd-run", "/bin/systemd-run"]
+            .iter()
+            .find_map(|path| Path::new(path).canonicalize().ok())
+            .ok_or_else(|| "systemd transient resource backend is unavailable".to_owned())?;
+        let metadata = std::fs::symlink_metadata(&systemd_run)
+            .map_err(|_| "systemd transient resource backend is unavailable".to_owned())?;
+        if !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o022 != 0
+            || metadata.permissions().mode() & 0o111 == 0
+        {
+            return Err("systemd transient resource backend failed trust checks".into());
+        }
+        Ok(Self {
+            systemd_run,
+            user_manager: nix::unistd::geteuid().as_raw() != 0,
+        })
+    }
+
+    async fn probe(resources: &ResourceSetupRequest) -> Result<(), String> {
+        let backend = Self::discover()?;
+        let mut command = backend.base_command();
+        let unit = resource_unit_name();
+        command
+            .arg("--scope")
+            .arg("--quiet")
+            .arg("--collect")
+            .arg(format!("--unit={unit}"));
+        for (key, value) in resources.properties() {
+            command.arg(format!("--property={key}={value}"));
+        }
+        command
+            .arg("--")
+            .arg("/usr/bin/true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        command.process_group(0);
+        let mut child = command
+            .spawn()
+            .map_err(|_| "systemd transient resource backend is unavailable".to_owned())?;
+        match timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(status)) if status.success() => Ok(()),
+            Ok(_) => Err("systemd could not establish the requested cgroup limits".into()),
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                Err("systemd resource capability probe timed out".into())
+            }
+        }
+    }
+
+    fn base_command(&self) -> Command {
+        let mut command = Command::new(&self.systemd_run);
+        if self.user_manager {
+            command.arg("--user");
+        }
+        command
+    }
+
+    fn wrap(
+        &self,
+        inner: Command,
+        resources: &ResourceSetupRequest,
+    ) -> Result<(Command, String), RunnerError> {
+        let inner_std = inner.as_std();
+        let program = inner_std.get_program().to_owned();
+        let args: Vec<_> = inner_std.get_args().map(|arg| arg.to_owned()).collect();
+        let cwd = inner_std
+            .get_current_dir()
+            .ok_or_else(|| RunnerError::Setup("resource command cwd is unavailable".into()))?
+            .to_path_buf();
+        let environment: Vec<_> = inner_std
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+            .collect();
+        let unit = resource_unit_name();
+        let mut command = self.base_command();
+        command
+            .arg("--scope")
+            .arg("--quiet")
+            .arg(format!("--unit={unit}"))
+            .arg("--working-directory")
+            .arg(&cwd);
+        for (key, value) in resources.properties() {
+            command.arg(format!("--property={key}={value}"));
+        }
+        command.arg("--").arg(program).args(args);
+        command
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        command.env_clear();
+        for key in ["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "HOME"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command.env("PATH", "/usr/bin:/bin");
+        for (key, value) in environment {
+            command.env(key, value);
+        }
+        Ok((command, unit))
+    }
+
+    async fn unit_result(&self, unit: &str) -> Option<String> {
+        let mut command = Command::new(Self::systemctl_path()?);
+        self.add_manager_arg(&mut command);
+        command
+            .arg("show")
+            .arg(unit)
+            .arg("--property=Result")
+            .arg("--value")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let output = timeout(Duration::from_secs(1), command.output())
+            .await
+            .ok()?
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let result = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+        (!result.is_empty()).then_some(result)
+    }
+
+    async fn stop_unit(&self, unit: &str) -> Result<(), String> {
+        let systemctl = Self::systemctl_path()
+            .ok_or_else(|| "systemd cleanup command is unavailable".to_owned())?;
+        let mut command = Command::new(systemctl);
+        self.add_manager_arg(&mut command);
+        command
+            .arg("stop")
+            .arg(unit)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .map_err(|_| "systemd scope cleanup failed".to_owned())?;
+        match timeout(Duration::from_secs(2), child.wait()).await {
+            Ok(Ok(status)) if status.success() => Ok(()),
+            Ok(_) => Err("systemd scope cleanup failed".into()),
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                Err("systemd scope cleanup timed out".into())
+            }
+        }
+    }
+
+    fn add_manager_arg(&self, command: &mut Command) {
+        if self.user_manager {
+            command.arg("--user");
+        }
+    }
+
+    fn systemctl_path() -> Option<PathBuf> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let systemctl = ["/usr/bin/systemctl", "/bin/systemctl"]
+            .iter()
+            .find_map(|path| Path::new(path).canonicalize().ok())?;
+        let metadata = std::fs::symlink_metadata(&systemctl).ok()?;
+        if !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o022 != 0
+            || metadata.permissions().mode() & 0o111 == 0
+        {
+            return None;
+        }
+        Some(systemctl)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resource_unit_name() -> String {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("eggwork-{}-{nonce}.scope", std::process::id())
+}
+
+#[cfg(not(target_os = "linux"))]
+struct SystemdCgroupBackend;
+
+#[cfg(not(target_os = "linux"))]
+impl SystemdCgroupBackend {
+    async fn probe(_resources: &ResourceSetupRequest) -> Result<(), String> {
+        Err("OS resource controls are unsupported on this platform".into())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +382,10 @@ pub trait ExecutionSetup: Send + Sync {
         resources: &ResourceSetupRequest,
         root: &Path,
     ) -> Result<SetupOutcome, RunnerError>;
+
+    async fn resource_capabilities(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Installation-selected wrapper used when a sandbox request is active.
     fn sandbox_helper_path(&self) -> Option<&Path> {
@@ -183,19 +425,27 @@ impl ExecutionSetup for TrustedLandlockSetup {
         resources: &ResourceSetupRequest,
         _root: &Path,
     ) -> Result<SetupOutcome, RunnerError> {
-        if resources.required {
-            return Err(RunnerError::RequiredSetupUnavailable);
-        }
-        let resource_outcome = if resources.memory_bytes.is_some()
-            || resources.cpu_millis.is_some()
-            || resources.pids.is_some()
-        {
-            ResourceSetupOutcome::NotApplied {
-                reason: "no resource-control backend is configured".into(),
+        let mut resource_outcome = if resources.is_requested() {
+            match SystemdCgroupBackend::probe(resources).await {
+                Ok(()) => ResourceSetupOutcome::Applied {
+                    backend: "systemd-cgroup-v2".into(),
+                },
+                Err(reason) if resources.has_required() => {
+                    return Err(RunnerError::Setup(reason));
+                }
+                Err(reason) => ResourceSetupOutcome::NotApplied { reason },
             }
         } else {
             ResourceSetupOutcome::NotRequested
         };
+        if matches!(resource_outcome, ResourceSetupOutcome::Applied { .. })
+            && let Err(reason) = verify_trusted_helper(&self.helper_path)
+        {
+            if resources.has_required() {
+                return Err(RunnerError::Setup(reason));
+            }
+            resource_outcome = ResourceSetupOutcome::NotApplied { reason };
+        }
         let outcome = match sandbox {
             SandboxRequest::None => SandboxOutcome::NotRequested,
             SandboxRequest::BestEffort { profile } | SandboxRequest::Required { profile } => {
@@ -224,6 +474,45 @@ impl ExecutionSetup for TrustedLandlockSetup {
             sandbox: outcome,
             resources: resource_outcome,
         })
+    }
+
+    async fn resource_capabilities(&self) -> Vec<String> {
+        if verify_trusted_helper(&self.helper_path).is_err() {
+            return Vec::new();
+        }
+        let probes = [
+            (
+                "resources.cgroups-v2.memory",
+                ResourceSetupRequest {
+                    memory_bytes: Requirement::BestEffort(32 * 1024 * 1024),
+                    cpu_millis: Requirement::NotRequested,
+                    pids: Requirement::NotRequested,
+                },
+            ),
+            (
+                "resources.cgroups-v2.cpu",
+                ResourceSetupRequest {
+                    memory_bytes: Requirement::NotRequested,
+                    cpu_millis: Requirement::BestEffort(100),
+                    pids: Requirement::NotRequested,
+                },
+            ),
+            (
+                "resources.cgroups-v2.pids",
+                ResourceSetupRequest {
+                    memory_bytes: Requirement::NotRequested,
+                    cpu_millis: Requirement::NotRequested,
+                    pids: Requirement::BestEffort(16),
+                },
+            ),
+        ];
+        let mut capabilities = Vec::new();
+        for (feature, request) in probes {
+            if SystemdCgroupBackend::probe(&request).await.is_ok() {
+                capabilities.push(feature.into());
+            }
+        }
+        capabilities
     }
 
     fn sandbox_helper_path(&self) -> Option<&Path> {
@@ -298,7 +587,7 @@ impl ExecutionSetup for NoExecutionSetup {
         resources: &ResourceSetupRequest,
         _root: &Path,
     ) -> Result<SetupOutcome, RunnerError> {
-        if matches!(sandbox, SandboxRequest::Required { .. }) || resources.required {
+        if matches!(sandbox, SandboxRequest::Required { .. }) || resources.has_required() {
             return Err(RunnerError::RequiredSetupUnavailable);
         }
         Ok(SetupOutcome {
@@ -310,10 +599,7 @@ impl ExecutionSetup for NoExecutionSetup {
                     }
                 }
             },
-            resources: if resources.memory_bytes.is_some()
-                || resources.cpu_millis.is_some()
-                || resources.pids.is_some()
-            {
+            resources: if resources.is_requested() {
                 ResourceSetupOutcome::NotApplied {
                     reason: "no resource-control backend is configured".into(),
                 }
@@ -407,7 +693,6 @@ impl RunnerRequest {
                 memory_bytes: resources.memory_bytes,
                 cpu_millis: resources.cpu_millis,
                 pids: resources.pids,
-                required: false,
             },
         })
     }
@@ -530,27 +815,37 @@ pub struct RunnerResult {
     pub stderr: BoundedCapture,
     pub cleanup: CleanupDiagnostics,
     pub setup: SetupOutcome,
+    pub resource_request: ResourceSetupRequest,
+    pub resource_limits_exceeded: Vec<eggwork_core::ResourceDimension>,
     pub stream_chunks_dropped: u64,
     pub provenance: ExecutionProvenance,
 }
 
 impl RunnerResult {
     pub fn execution_result(&self) -> ExecutionResult {
-        let state = match self.termination {
-            TerminationReason::Exited if self.exit_code == Some(0) => ExecutionState::Succeeded,
-            TerminationReason::Exited => ExecutionState::Failed,
-            TerminationReason::TimedOut => ExecutionState::TimedOut,
-            TerminationReason::Cancelled => ExecutionState::Cancelled,
-            TerminationReason::OutputLimit => ExecutionState::Failed,
-        };
-        let failure = match self.termination {
-            TerminationReason::OutputLimit => Some(ExecutionFailure::OutputLimit),
-            _ if self.exit_code.is_none()
-                && matches!(self.termination, TerminationReason::Exited) =>
-            {
-                Some(ExecutionFailure::Internal)
+        let state = if !self.resource_limits_exceeded.is_empty() {
+            ExecutionState::Failed
+        } else {
+            match self.termination {
+                TerminationReason::Exited if self.exit_code == Some(0) => ExecutionState::Succeeded,
+                TerminationReason::Exited => ExecutionState::Failed,
+                TerminationReason::TimedOut => ExecutionState::TimedOut,
+                TerminationReason::Cancelled => ExecutionState::Cancelled,
+                TerminationReason::OutputLimit => ExecutionState::Failed,
             }
-            _ => None,
+        };
+        let failure = if !self.resource_limits_exceeded.is_empty() {
+            Some(ExecutionFailure::ResourceLimit)
+        } else {
+            match self.termination {
+                TerminationReason::OutputLimit => Some(ExecutionFailure::OutputLimit),
+                _ if self.exit_code.is_none()
+                    && matches!(self.termination, TerminationReason::Exited) =>
+                {
+                    Some(ExecutionFailure::Internal)
+                }
+                _ => None,
+            }
         };
         ExecutionResult {
             state,
@@ -580,7 +875,59 @@ impl RunnerResult {
                     reason: reason.clone(),
                 },
             }),
+            resources: Some(resource_result(
+                &self.setup.resources,
+                &self.resource_request,
+                &self.resource_limits_exceeded,
+            )),
         }
+    }
+}
+
+fn resource_result(
+    outcome: &ResourceSetupOutcome,
+    request: &ResourceSetupRequest,
+    limits_exceeded: &[eggwork_core::ResourceDimension],
+) -> eggwork_core::ResourceResult {
+    use eggwork_core::ResourceDimensionResult as Dimension;
+    let dimension = |requested: bool, kind| match outcome {
+        ResourceSetupOutcome::NotRequested if !requested => Dimension::NotRequested,
+        ResourceSetupOutcome::NotRequested => Dimension::NotApplied {
+            reason: "resource control was not requested".into(),
+        },
+        ResourceSetupOutcome::NotApplied { reason } | ResourceSetupOutcome::Failed { reason }
+            if requested =>
+        {
+            Dimension::NotApplied {
+                reason: reason.clone(),
+            }
+        }
+        ResourceSetupOutcome::Applied { backend } if requested => {
+            if limits_exceeded.contains(&kind) {
+                Dimension::LimitExceeded {
+                    backend: backend.clone(),
+                }
+            } else {
+                Dimension::Applied {
+                    backend: backend.clone(),
+                }
+            }
+        }
+        _ => Dimension::NotRequested,
+    };
+    eggwork_core::ResourceResult {
+        memory_bytes: dimension(
+            !matches!(request.memory_bytes, Requirement::NotRequested),
+            eggwork_core::ResourceDimension::Memory,
+        ),
+        cpu_millis: dimension(
+            !matches!(request.cpu_millis, Requirement::NotRequested),
+            eggwork_core::ResourceDimension::Cpu,
+        ),
+        pids: dimension(
+            !matches!(request.pids, Requirement::NotRequested),
+            eggwork_core::ResourceDimension::Pids,
+        ),
     }
 }
 
@@ -633,6 +980,10 @@ impl LocalProcessRunner {
         }
     }
 
+    pub async fn resource_capabilities(&self) -> Vec<String> {
+        self.setup.resource_capabilities().await
+    }
+
     pub async fn run(
         &self,
         request: RunnerRequest,
@@ -655,8 +1006,9 @@ impl LocalProcessRunner {
                 .prepare(&request.sandbox, &request.resources, &request.root)
                 .await?;
             #[cfg(target_os = "linux")]
-            let use_helper = !matches!(request.sandbox, SandboxRequest::None)
-                && matches!(setup.sandbox, SandboxOutcome::Applied { .. })
+            let use_helper = ((!matches!(request.sandbox, SandboxRequest::None)
+                && matches!(setup.sandbox, SandboxOutcome::Applied { .. }))
+                || matches!(setup.resources, ResourceSetupOutcome::Applied { .. }))
                 && self.setup.sandbox_helper_path().is_some();
             #[cfg(target_os = "linux")]
             let mut channel = if use_helper {
@@ -664,12 +1016,23 @@ impl LocalProcessRunner {
                     self.setup.sandbox_helper_path().expect("checked above"),
                     &request,
                     cwd.clone(),
+                    matches!(setup.resources, ResourceSetupOutcome::Applied { .. }),
                 ) {
                     Ok(channel) => Some(channel),
-                    Err(error) if matches!(request.sandbox, SandboxRequest::BestEffort { .. }) => {
-                        setup.sandbox = SandboxOutcome::NotApplied {
-                            reason: error.to_string(),
-                        };
+                    Err(error)
+                        if !matches!(request.sandbox, SandboxRequest::Required { .. })
+                            && !request.resources.has_required() =>
+                    {
+                        if !matches!(request.sandbox, SandboxRequest::None) {
+                            setup.sandbox = SandboxOutcome::NotApplied {
+                                reason: error.to_string(),
+                            };
+                        }
+                        if matches!(setup.resources, ResourceSetupOutcome::Applied { .. }) {
+                            setup.resources = ResourceSetupOutcome::NotApplied {
+                                reason: error.to_string(),
+                            };
+                        }
                         None
                     }
                     Err(error) => return Err(error),
@@ -680,13 +1043,22 @@ impl LocalProcessRunner {
             #[cfg(not(target_os = "linux"))]
             let channel: Option<()> = None;
             #[cfg(target_os = "linux")]
-            let mut command = if let Some(channel) = channel.as_ref() {
+            let command = if let Some(channel) = channel.as_ref() {
                 channel.command()
             } else {
                 direct_command(&request, cwd.clone())
             };
             #[cfg(not(target_os = "linux"))]
             let mut command = direct_command(&request, cwd.clone());
+            #[cfg(target_os = "linux")]
+            let (mut command, mut resource_unit) =
+                wrap_resource_command(command, &request.resources, &setup.resources)?;
+            #[cfg(target_os = "linux")]
+            let mut sandbox_session = None;
+            #[cfg(not(target_os = "linux"))]
+            let resource_unit = None;
+            #[cfg(not(target_os = "linux"))]
+            let mut command = command;
             command.process_group(0);
             let mut child = command
                 .spawn()
@@ -695,34 +1067,58 @@ impl LocalProcessRunner {
             if let Some(sandbox_channel) = channel.take() {
                 let handshake = sandbox_channel.wait(&mut child, cancellation.clone()).await;
                 match handshake {
-                    Ok(true) => {}
-                    Ok(false) if matches!(request.sandbox, SandboxRequest::BestEffort { .. }) => {
+                    Ok(Some(session)) => sandbox_session = Some(session),
+                    Ok(None)
+                        if !matches!(request.sandbox, SandboxRequest::Required { .. })
+                            && !request.resources.has_required() =>
+                    {
                         let _ = child.wait().await;
-                        setup.sandbox = SandboxOutcome::NotApplied {
-                            reason: "Landlock helper could not enforce the requested profile"
-                                .into(),
-                        };
-                        let mut direct = direct_command(&request, cwd.clone());
+                        if !matches!(request.sandbox, SandboxRequest::None) {
+                            setup.sandbox = SandboxOutcome::NotApplied {
+                                reason: "Landlock helper could not enforce the requested profile"
+                                    .into(),
+                            };
+                        }
+                        if matches!(setup.resources, ResourceSetupOutcome::Applied { .. }) {
+                            setup.resources = ResourceSetupOutcome::NotApplied {
+                                reason: "resource helper could not verify the cgroup limits".into(),
+                            };
+                        }
+                        let direct = direct_command(&request, cwd.clone());
+                        let (mut direct, unit) =
+                            wrap_resource_command(direct, &request.resources, &setup.resources)?;
+                        resource_unit = unit;
                         direct.process_group(0);
                         child = direct
                             .spawn()
                             .map_err(|error| RunnerError::Spawn(error.to_string()))?;
                     }
-                    Ok(false) => {
+                    Ok(None) => {
                         let _ = child.start_kill();
                         let _ = child.wait().await;
                         return Err(RunnerError::RequiredSetupUnavailable);
                     }
                     Err(SandboxWaitError::BeforeTarget(error))
-                        if matches!(request.sandbox, SandboxRequest::BestEffort { .. })
+                        if !matches!(request.sandbox, SandboxRequest::Required { .. })
+                            && !request.resources.has_required()
                             && !matches!(error, RunnerError::CancelledBeforeSpawn) =>
                     {
                         let _ = child.start_kill();
                         let _ = child.wait().await;
-                        setup.sandbox = SandboxOutcome::NotApplied {
-                            reason: error.to_string(),
-                        };
-                        let mut direct = direct_command(&request, cwd.clone());
+                        if !matches!(request.sandbox, SandboxRequest::None) {
+                            setup.sandbox = SandboxOutcome::NotApplied {
+                                reason: error.to_string(),
+                            };
+                        }
+                        if matches!(setup.resources, ResourceSetupOutcome::Applied { .. }) {
+                            setup.resources = ResourceSetupOutcome::NotApplied {
+                                reason: error.to_string(),
+                            };
+                        }
+                        let direct = direct_command(&request, cwd.clone());
+                        let (mut direct, unit) =
+                            wrap_resource_command(direct, &request.resources, &setup.resources)?;
+                        resource_unit = unit;
                         direct.process_group(0);
                         child = direct
                             .spawn()
@@ -795,8 +1191,37 @@ impl LocalProcessRunner {
                     Err(error) => (TerminationReason::Exited, None, Some(error.to_string())),
                 }
             };
+            #[cfg(target_os = "linux")]
+            let mut resource_limits_exceeded = if matches!(&termination, TerminationReason::Exited)
+                && let Some(session) = sandbox_session.take()
+            {
+                session.resource_limits_exceeded().await
+            } else {
+                Vec::new()
+            };
+            #[cfg(target_os = "linux")]
+            if let Some(unit) = resource_unit.as_deref()
+                && let Ok(backend) = SystemdCgroupBackend::discover()
+                && backend.unit_result(unit).await.as_deref() == Some("oom-kill")
+                && !resource_limits_exceeded.contains(&eggwork_core::ResourceDimension::Memory)
+            {
+                resource_limits_exceeded.push(eggwork_core::ResourceDimension::Memory);
+            }
+            #[cfg(not(target_os = "linux"))]
+            let resource_limits_exceeded: Vec<eggwork_core::ResourceDimension> = Vec::new();
+            #[cfg(target_os = "linux")]
+            let resource_cleanup_warning = if let Some(unit) = resource_unit.as_deref() {
+                match SystemdCgroupBackend::discover() {
+                    Ok(backend) => backend.stop_unit(unit).await.err(),
+                    Err(_) => Some("systemd scope cleanup was unavailable".into()),
+                }
+            } else {
+                None
+            };
+            #[cfg(not(target_os = "linux"))]
+            let resource_cleanup_warning: Option<String> = None;
             let mut cleanup = CleanupDiagnostics {
-                process_group_signal_error: None,
+                process_group_signal_error: resource_cleanup_warning,
                 wait_error,
                 stdin_error: None,
             };
@@ -853,6 +1278,8 @@ impl LocalProcessRunner {
                 stderr,
                 cleanup,
                 setup,
+                resource_request: request.resources,
+                resource_limits_exceeded,
                 stream_chunks_dropped: dropped_out + dropped_err,
                 provenance: request.provenance,
             })
@@ -923,14 +1350,33 @@ fn direct_command(request: &RunnerRequest, cwd: PathBuf) -> Command {
 }
 
 #[cfg(target_os = "linux")]
+fn wrap_resource_command(
+    command: Command,
+    resources: &ResourceSetupRequest,
+    outcome: &ResourceSetupOutcome,
+) -> Result<(Command, Option<String>), RunnerError> {
+    match outcome {
+        ResourceSetupOutcome::Applied { backend } if backend == "systemd-cgroup-v2" => {
+            let backend = SystemdCgroupBackend::discover().map_err(RunnerError::Setup)?;
+            let (command, unit) = backend.wrap(command, resources)?;
+            Ok((command, Some(unit)))
+        }
+        _ => Ok((command, None)),
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Serialize)]
 struct SandboxLaunchSpec {
     schema_version: u16,
-    profile: String,
+    profile: Option<String>,
     root: PathBuf,
     cwd: PathBuf,
     argv: Vec<String>,
     environment: Vec<(String, String)>,
+    resource_memory_bytes: Option<u64>,
+    resource_cpu_millis: Option<u64>,
+    resource_pids: Option<u32>,
 }
 
 #[cfg(target_os = "linux")]
@@ -940,6 +1386,32 @@ struct SandboxChannel {
     status_path: PathBuf,
     listener: UnixListener,
     helper_path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+struct SandboxSession {
+    stream: tokio::net::UnixStream,
+}
+
+#[cfg(target_os = "linux")]
+impl SandboxSession {
+    async fn resource_limits_exceeded(mut self) -> Vec<eggwork_core::ResourceDimension> {
+        let mut status = [0u8; 1];
+        if !matches!(
+            timeout(Duration::from_secs(2), self.stream.read_exact(&mut status)).await,
+            Ok(Ok(_))
+        ) {
+            return Vec::new();
+        }
+        let mut exceeded = Vec::new();
+        if status[0] & 1 != 0 {
+            exceeded.push(eggwork_core::ResourceDimension::Memory);
+        }
+        if status[0] & 2 != 0 {
+            exceeded.push(eggwork_core::ResourceDimension::Pids);
+        }
+        exceeded
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -959,13 +1431,19 @@ impl SandboxWaitError {
 
 #[cfg(target_os = "linux")]
 impl SandboxChannel {
-    fn new(helper_path: &Path, request: &RunnerRequest, cwd: PathBuf) -> Result<Self, RunnerError> {
+    fn new(
+        helper_path: &Path,
+        request: &RunnerRequest,
+        cwd: PathBuf,
+        resources_applied: bool,
+    ) -> Result<Self, RunnerError> {
         let profile = match &request.sandbox {
             SandboxRequest::BestEffort { profile } | SandboxRequest::Required { profile }
                 if profile == "workspace_rw" =>
             {
-                profile.clone()
+                Some(profile.clone())
             }
+            SandboxRequest::None if request.resources.is_requested() => None,
             _ => return Err(RunnerError::Setup("unsupported sandbox profile".into())),
         };
         let directory = tempfile::Builder::new()
@@ -1016,6 +1494,24 @@ impl SandboxChannel {
             cwd,
             argv: request.argv.clone(),
             environment,
+            resource_memory_bytes: resources_applied
+                .then_some(match request.resources.memory_bytes {
+                    Requirement::BestEffort(value) | Requirement::Required(value) => Some(value),
+                    Requirement::NotRequested => None,
+                })
+                .flatten(),
+            resource_cpu_millis: resources_applied
+                .then_some(match request.resources.cpu_millis {
+                    Requirement::BestEffort(value) | Requirement::Required(value) => Some(value),
+                    Requirement::NotRequested => None,
+                })
+                .flatten(),
+            resource_pids: resources_applied
+                .then_some(match request.resources.pids {
+                    Requirement::BestEffort(value) | Requirement::Required(value) => Some(value),
+                    Requirement::NotRequested => None,
+                })
+                .flatten(),
         };
         let encoded = serde_json::to_vec(&spec)
             .map_err(|_| RunnerError::Setup("sandbox specification is invalid".into()))?;
@@ -1068,7 +1564,7 @@ impl SandboxChannel {
         self,
         _child: &mut tokio::process::Child,
         cancellation: CancellationToken,
-    ) -> Result<bool, SandboxWaitError> {
+    ) -> Result<Option<SandboxSession>, SandboxWaitError> {
         let (mut stream, _) = tokio::select! {
             _ = cancellation.cancelled() => return Err(SandboxWaitError::BeforeTarget(RunnerError::CancelledBeforeSpawn)),
             accepted = tokio::time::timeout(Duration::from_secs(5), self.listener.accept()) => {
@@ -1085,11 +1581,7 @@ impl SandboxChannel {
                     .map_err(|_| SandboxWaitError::BeforeTarget(RunnerError::Setup("sandbox status timed out".into())))?
                     .map_err(|_| SandboxWaitError::BeforeTarget(RunnerError::Setup("sandbox status channel failed".into())))?;
                 match status[0] {
-                    0 => Ok(false),
-                    2 => Ok(false),
-                    3 => Ok(false),
-                    30 => Ok(false),
-                    31 => Ok(false),
+                    0 | 2 | 3 | 30 | 31 => Ok(None),
                     code if code >= 4 => Err(SandboxWaitError::BeforeTarget(RunnerError::Setup(format!("sandbox helper rejected its launch specification (status {code})")))),
                     1 => {
                         let mut target_spawned = [0u8; 1];
@@ -1102,7 +1594,7 @@ impl SandboxChannel {
                             }
                         }
                         match target_spawned[0] {
-                            1 => Ok(true),
+                            1 => Ok(Some(SandboxSession { stream })),
                             0 => Err(SandboxWaitError::AfterTarget(RunnerError::Spawn("sandbox target could not start".into()))),
                             _ => Err(SandboxWaitError::AfterTarget(RunnerError::Setup("sandbox status was invalid".into()))),
                         }
@@ -1219,12 +1711,39 @@ mod tests {
             provenance: ExecutionProvenance::default(),
             sandbox: SandboxRequest::None,
             resources: ResourceSetupRequest {
-                memory_bytes: None,
-                cpu_millis: None,
-                pids: None,
-                required: false,
+                memory_bytes: Requirement::NotRequested,
+                cpu_millis: Requirement::NotRequested,
+                pids: Requirement::NotRequested,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn unsupported_resource_limits_are_reported_or_rejected_before_spawn() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = LocalProcessRunner::new(NoExecutionSetup);
+        let mut best_effort = request(temp.path(), &["/bin/true"]);
+        best_effort.resources.memory_bytes = Requirement::BestEffort(1024 * 1024);
+        let (tx, _rx) = mpsc::channel(4);
+        let result = runner
+            .run(best_effort, CancellationToken::new(), tx)
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        assert!(matches!(
+            result.execution_result().resources.unwrap().memory_bytes,
+            eggwork_core::ResourceDimensionResult::NotApplied { .. }
+        ));
+
+        let marker = temp.path().join("required-limit-target-ran");
+        let mut required = request(temp.path(), &["/usr/bin/touch", marker.to_str().unwrap()]);
+        required.resources.pids = Requirement::Required(4);
+        let (tx, _rx) = mpsc::channel(4);
+        assert!(matches!(
+            runner.run(required, CancellationToken::new(), tx).await,
+            Err(RunnerError::RequiredSetupUnavailable)
+        ));
+        assert!(!marker.exists());
     }
 
     #[test]
@@ -1424,6 +1943,12 @@ mod tests {
                 sandbox: SandboxOutcome::NotRequested,
                 resources: ResourceSetupOutcome::NotRequested,
             },
+            resource_request: ResourceSetupRequest {
+                memory_bytes: Requirement::NotRequested,
+                cpu_millis: Requirement::NotRequested,
+                pids: Requirement::NotRequested,
+            },
+            resource_limits_exceeded: Vec::new(),
             stream_chunks_dropped: 0,
             provenance: ExecutionProvenance::default(),
         };

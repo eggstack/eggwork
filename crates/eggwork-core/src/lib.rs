@@ -341,16 +341,105 @@ pub struct DeclaredOutput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceRequirements {
-    pub memory_bytes: Option<u64>,
-    pub cpu_millis: Option<u64>,
-    pub pids: Option<u32>,
+    #[serde(default)]
+    pub memory_bytes: Requirement<u64>,
+    #[serde(default)]
+    pub cpu_millis: Requirement<u64>,
+    #[serde(default)]
+    pub pids: Requirement<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Requirement<T> {
     NotRequested,
     BestEffort(T),
     Required(T),
+}
+
+impl<T> Default for Requirement<T> {
+    fn default() -> Self {
+        Self::NotRequested
+    }
+}
+
+impl<T: Serialize> Serialize for Requirement<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::NotRequested => serializer.serialize_none(),
+            Self::BestEffort(value) => value.serialize(serializer),
+            Self::Required(value) => {
+                #[derive(Serialize)]
+                struct Required<'a, T> {
+                    required: &'a T,
+                }
+                Required { required: value }.serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Requirement<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.is_null() {
+            return Ok(Self::NotRequested);
+        }
+        if let Some(object) = value.as_object()
+            && object.len() == 1
+            && let Some(required) = object.get("required")
+        {
+            return T::deserialize(required.clone())
+                .map(Self::Required)
+                .map_err(serde::de::Error::custom);
+        }
+        T::deserialize(value)
+            .map(Self::BestEffort)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl ResourceRequirements {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let memory_valid = matches!(
+            self.memory_bytes,
+            Requirement::NotRequested
+                | Requirement::BestEffort(1..=1_125_899_906_842_624)
+                | Requirement::Required(1..=1_125_899_906_842_624)
+        );
+        let cpu_valid = matches!(
+            self.cpu_millis,
+            Requirement::NotRequested
+                | Requirement::BestEffort(1..=1_000_000)
+                | Requirement::Required(1..=1_000_000)
+        );
+        let pids_valid = matches!(
+            self.pids,
+            Requirement::NotRequested
+                | Requirement::BestEffort(1..=1_000_000)
+                | Requirement::Required(1..=1_000_000)
+        );
+        if memory_valid && cpu_valid && pids_valid {
+            Ok(())
+        } else {
+            Err(ValidationError::OutOfRange {
+                field: "resource requirements",
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceDimension {
+    Memory,
+    Cpu,
+    Pids,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,6 +535,7 @@ impl CommandSpec {
         }
         self.stdin.validate()?;
         self.output.validate()?;
+        self.resources.validate()?;
         Ok(())
     }
 }
@@ -711,6 +801,19 @@ pub enum SandboxResult {
     Failed { reason: String },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceDimensionResult {
+    NotRequested,
+    NotApplied { reason: String },
+    Applied { backend: String },
+    LimitExceeded { backend: String },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceResult {
+    pub memory_bytes: ResourceDimensionResult,
+    pub cpu_millis: ResourceDimensionResult,
+    pub pids: ResourceDimensionResult,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionFinalizationFailure {
     ArtifactCapture,
     Retention,
@@ -731,6 +834,8 @@ pub struct ExecutionResult {
     pub artifact_count: u32,
     #[serde(default)]
     pub sandbox: Option<SandboxResult>,
+    #[serde(default)]
+    pub resources: Option<ResourceResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -997,9 +1102,9 @@ mod tests {
                 output: OutputPolicy::default(),
                 declared_outputs: vec![],
                 resources: ResourceRequirements {
-                    memory_bytes: None,
-                    cpu_millis: None,
-                    pids: None,
+                    memory_bytes: Requirement::NotRequested,
+                    cpu_millis: Requirement::NotRequested,
+                    pids: Requirement::NotRequested,
                 },
                 isolation: IsolationRequirement::None,
                 network: NetworkRequirement::Unrestricted,
@@ -1083,6 +1188,55 @@ mod tests {
         let mut invalid = c;
         invalid.protocol.min = ProtocolVersion { major: 2, minor: 0 };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn resource_requirements_preserve_legacy_best_effort_shape_and_accept_required_values() {
+        let best_effort: Requirement<u64> =
+            serde_json::from_value(serde_json::json!(4096)).unwrap();
+        let required: Requirement<u64> =
+            serde_json::from_value(serde_json::json!({"required": 8192})).unwrap();
+        let missing: Requirement<u64> = serde_json::from_value(serde_json::Value::Null).unwrap();
+        assert_eq!(best_effort, Requirement::BestEffort(4096));
+        assert_eq!(required, Requirement::Required(8192));
+        assert_eq!(missing, Requirement::NotRequested);
+        assert_eq!(
+            serde_json::to_value(best_effort).unwrap(),
+            serde_json::json!(4096)
+        );
+        assert_eq!(
+            serde_json::to_value(required).unwrap(),
+            serde_json::json!({"required": 8192})
+        );
+
+        let requirements = ResourceRequirements {
+            memory_bytes: Requirement::BestEffort(4096),
+            cpu_millis: Requirement::Required(500),
+            pids: Requirement::NotRequested,
+        };
+        assert!(requirements.validate().is_ok());
+        assert!(
+            ResourceRequirements {
+                memory_bytes: Requirement::Required(0),
+                cpu_millis: Requirement::NotRequested,
+                pids: Requirement::NotRequested,
+            }
+            .validate()
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(ResourceRequirements {
+                memory_bytes: Requirement::NotRequested,
+                cpu_millis: Requirement::BestEffort(500),
+                pids: Requirement::NotRequested,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "memory_bytes": null,
+                "cpu_millis": 500,
+                "pids": null
+            })
+        );
     }
 
     #[test]

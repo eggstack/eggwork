@@ -38,7 +38,7 @@ pub struct ExecutionStore {
 #[derive(Debug)]
 pub enum ReserveResult {
     Created,
-    Existing(ExecutionSnapshot),
+    Existing(Box<ExecutionSnapshot>),
     Conflict,
     StaleGeneration,
     StorageFull,
@@ -143,7 +143,7 @@ impl ExecutionStore {
                     && old_principal == principal_id
                     && old_lease_hash == lease_token_hash
                 {
-                    ReserveResult::Existing(serde_json::from_slice(&encoded)?)
+                    ReserveResult::Existing(Box::new(serde_json::from_slice(&encoded)?))
                 } else {
                     ReserveResult::Conflict
                 };
@@ -531,6 +531,7 @@ impl ExecutionStore {
                     finalization_failure: None,
                     artifact_count: 0,
                     sandbox: None,
+                    resources: None,
                 });
                 let generation = snapshot.generation.get() as i64;
                 let sequence: i64 = transaction.query_row(

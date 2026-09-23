@@ -11,7 +11,7 @@ mod linux {
     use std::{
         collections::HashSet,
         fs,
-        io::{Read, Write},
+        io::{Read, Seek, SeekFrom, Write},
         os::unix::{fs::MetadataExt, net::UnixStream, process::ExitStatusExt},
         path::{Path, PathBuf},
         process::{Command, ExitStatus},
@@ -28,11 +28,17 @@ mod linux {
     #[serde(deny_unknown_fields)]
     struct LaunchSpec {
         schema_version: u16,
-        profile: String,
+        profile: Option<String>,
         root: PathBuf,
         cwd: PathBuf,
         argv: Vec<String>,
         environment: Vec<(String, String)>,
+        #[serde(default)]
+        resource_memory_bytes: Option<u64>,
+        #[serde(default)]
+        resource_cpu_millis: Option<u64>,
+        #[serde(default)]
+        resource_pids: Option<u32>,
     }
 
     pub fn entry() {
@@ -61,7 +67,17 @@ mod linux {
             }
         };
         let _ = fs::remove_file(&spec_path);
-        if let Err(code) = restrict(&spec) {
+        if !verify_resource_limits(&spec) {
+            let _ = status.write_all(&[2]);
+            return Err(());
+        }
+        let mut resource_events = ResourceEvents::new(
+            spec.resource_memory_bytes.is_some(),
+            spec.resource_pids.is_some(),
+        );
+        if spec.profile.is_some()
+            && let Err(code) = restrict(&spec)
+        {
             let _ = status.write_all(&[code]);
             return Err(());
         }
@@ -90,6 +106,9 @@ mod linux {
         status.write_all(&[1]).map_err(|_| ())?;
         status.flush().map_err(|_| ())?;
         let result = child.wait().map_err(|_| ())?;
+        let resource_status = resource_events.status_code();
+        status.write_all(&[resource_status]).map_err(|_| ())?;
+        status.flush().map_err(|_| ())?;
         Ok(exit_code(result))
     }
 
@@ -117,7 +136,10 @@ mod linux {
         }
         let spec: LaunchSpec = serde_json::from_slice(&bytes).map_err(|_| 11u8)?;
         if spec.schema_version != 1
-            || spec.profile != "workspace_rw"
+            || spec
+                .profile
+                .as_deref()
+                .is_some_and(|profile| profile != "workspace_rw")
             || spec.argv.is_empty()
             || spec.argv.len() > MAX_ARG_COUNT
             || spec
@@ -168,7 +190,7 @@ mod linux {
             ))
             .map_err(|_| 2u8)?;
 
-        for path in ["/usr", "/etc/ld.so.cache", "/etc/ssl/certs"] {
+        for path in ["/usr", "/etc/ld.so.cache", "/etc/ssl/certs", "/dev/null"] {
             let path = Path::new(path);
             let Ok(canonical) = path.canonicalize() else {
                 continue;
@@ -228,6 +250,122 @@ mod linux {
         ]
         .iter()
         .any(|denied| upper == *denied || upper.starts_with(denied))
+    }
+
+    struct ResourceEvents {
+        memory: Option<EventCounter>,
+        pids: Option<EventCounter>,
+    }
+
+    impl ResourceEvents {
+        fn new(track_memory: bool, track_pids: bool) -> Self {
+            Self {
+                memory: track_memory.then(EventCounter::memory).flatten(),
+                pids: track_pids.then(EventCounter::pids).flatten(),
+            }
+        }
+
+        fn status_code(&mut self) -> u8 {
+            u8::from(self.memory.as_mut().is_some_and(EventCounter::exceeded))
+                | (u8::from(self.pids.as_mut().is_some_and(EventCounter::exceeded)) << 1)
+        }
+    }
+
+    struct EventCounter {
+        file: fs::File,
+        key: &'static str,
+        baseline: u64,
+    }
+
+    impl EventCounter {
+        fn memory() -> Option<Self> {
+            Self::for_events("memory.events", "oom_kill")
+        }
+
+        fn pids() -> Option<Self> {
+            Self::for_events("pids.events", "max")
+        }
+
+        fn for_events(filename: &str, key: &'static str) -> Option<Self> {
+            let membership = fs::read_to_string("/proc/self/cgroup").ok()?;
+            let relative = membership
+                .lines()
+                .find_map(|line| line.strip_prefix("0::"))?;
+            let path = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+            let mut file = fs::File::open(path.join(filename)).ok()?;
+            let baseline = read_counter(&mut file, key)?;
+            Some(Self {
+                file,
+                key,
+                baseline,
+            })
+        }
+
+        fn exceeded(&mut self) -> bool {
+            read_counter(&mut self.file, self.key).is_some_and(|value| value > self.baseline)
+        }
+    }
+
+    fn read_counter(file: &mut fs::File, key: &str) -> Option<u64> {
+        let mut contents = String::new();
+        file.seek(SeekFrom::Start(0)).ok()?;
+        file.read_to_string(&mut contents).ok()?;
+        contents.lines().find_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            (name == key).then(|| value.parse().ok()).flatten()
+        })
+    }
+
+    fn verify_resource_limits(spec: &LaunchSpec) -> bool {
+        if spec.resource_memory_bytes.is_none()
+            && spec.resource_cpu_millis.is_none()
+            && spec.resource_pids.is_none()
+        {
+            return true;
+        }
+        let membership = match fs::read_to_string("/proc/self/cgroup") {
+            Ok(membership) => membership,
+            Err(_) => return false,
+        };
+        let Some(relative) = membership.lines().find_map(|line| line.strip_prefix("0::")) else {
+            return false;
+        };
+        let cgroup = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+        if let Some(memory_bytes) = spec.resource_memory_bytes
+            && (fs::read_to_string(cgroup.join("memory.max"))
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .is_none_or(|actual| actual > memory_bytes)
+                || fs::read_to_string(cgroup.join("memory.swap.max"))
+                    .ok()
+                    .is_none_or(|value| value.trim() != "0"))
+        {
+            return false;
+        }
+        if let Some(pids) = spec.resource_pids
+            && fs::read_to_string(cgroup.join("pids.max"))
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .is_none_or(|actual| actual > pids)
+        {
+            return false;
+        }
+        if let Some(cpu_millis) = spec.resource_cpu_millis {
+            let Ok(value) = fs::read_to_string(cgroup.join("cpu.max")) else {
+                return false;
+            };
+            let mut parts = value.split_whitespace();
+            let (Some(quota), Some(period)) = (parts.next(), parts.next()) else {
+                return false;
+            };
+            let (Ok(quota), Ok(period)) = (quota.parse::<u64>(), period.parse::<u64>()) else {
+                return false;
+            };
+            if period == 0 || quota.saturating_mul(1000) / period > cpu_millis {
+                return false;
+            }
+        }
+        true
     }
 }
 
