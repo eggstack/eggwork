@@ -25,116 +25,140 @@ Founding ADRs:
 - **blocked** — a named dependency/evidence requirement prevents progress.
 - **closing** — implementation landed and closure evidence is being gathered.
 - **closed** — closure record accepted.
+- **qualified** — the implemented baseline is closed for its explicitly stated platform/scope while later expansion/closure work may remain.
 - **conditionally closed** — implementation is substantially complete but named evidence remains.
 - **corrective required** — a later finding must close before the area is treated as currently qualified.
 - **superseded** — replaced by another document.
 - **archived** — retained for traceability and no longer active.
 
-## Repository planning baseline
+## Current Eggwork implementation baseline
 
-Eggwork was an empty Git repository when this planning system was established on 2026-09-22.
+Latest implementation/closure head reviewed before this planning correction:
 
-First repository/planning commit:
+- `86f80d6c0ce5818b11ed272847656a5813f726c2` — Operations M001 closure.
 
-- `6661ba12ac3fb8d45cb32394635b71c61d947a72` — planning-system bootstrap.
+Implemented and closed/qualified at that baseline:
 
-At planning bootstrap there was no Rust workspace or production code. That is historical baseline context; use the milestone and closure records below for current implementation status. No roadmap capability should be treated as implemented merely because its plan exists.
+- Foundation M001-M002;
+- Control Plane M001-M002 plus lease-expiry correction;
+- Workspace/Artifact M001-M003;
+- Security M001-M003 plus Landlock `/dev/null` corrective;
+- Operations M001.
+
+The repository is no longer planning-only.
 
 ## Active workstreams
 
-| Workstream | Status | Current dependency-ready work | Authority |
+| Workstream | Status | Current work | Authority |
 |---|---|---|---|
-| Foundation / execution core | closed | M002 canonical local runner | `plans/subsystems/foundation-execution-core-roadmap.md` |
-| Control-plane protocol | active | M003 Eggress route adapter waits on current public Eggfetch/Eggress dial compatibility | `plans/subsystems/control-plane-protocol-roadmap.md` |
-| Workspace / artifacts | closed | M001-M003 complete; no current implementation plan | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
-| Security / isolation / resources | closed | M001-M003 complete for the qualified Linux user-manager path | `plans/subsystems/security-isolation-resource-roadmap.md` |
-| Operations / distribution | blocked | M002 packaging/services/Eggup; requires upstream platform service-manager adapters | `plans/subsystems/operations-distribution-roadmap.md` |
-| CodeGG integration | ready | M001 fixed-target remote executor | `plans/subsystems/codegg-integration-roadmap.md` |
+| Foundation / execution core | ready | M003 execution-ownership guards + runner API hardening | `plans/subsystems/foundation-execution-core-roadmap.md` |
+| Control-plane protocol | ready | M003 Eggress route adapter + protocol hardening | `plans/subsystems/control-plane-protocol-roadmap.md` |
+| Workspace / artifacts | closed | M001-M003 complete | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
+| Security / isolation / resources | qualified | M004 waits on the new Foundation/Control/Operations surfaces | `plans/subsystems/security-isolation-resource-roadmap.md` |
+| Operations / distribution | ready | M002 Eggup deployment/service integration; producer packaging is separate M003 | `plans/subsystems/operations-distribution-roadmap.md` |
+| CodeGG integration | ready external | M001 fixed-target remote executor; independent of Operations M002 | `plans/subsystems/codegg-integration-roadmap.md` |
 
 ## Dependency-ready implementation plans
 
+These plans are independent enough to execute in parallel. Closure must reconcile any shared-file conflicts.
+
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| CodeGG | M001 fixed-target remote executor | **ready** | `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md` | Control Plane M002, Workspace M003, and Security M003 closure evidence is available. |
+| Foundation | M003 ownership guards/API hardening | **ready** | `plans/implementation/foundation-execution-core/003-execution-ownership-guards-and-runner-api-hardening.md` | M002 is closed; current runner/helper/server surfaces are concrete. |
+| Control plane | M003 Eggress route/protocol hardening | **ready** | `plans/implementation/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md` | Eggfetch public `Dialer` and Eggress listener-free typed connector now satisfy the prior interface blocker. |
+| Operations | M002 Eggup deployment/service integration | **ready** | `plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md` | Eggup current main has Unix manager mechanics and native Windows SCM; exact published-or-pinned dependency disposition is part of implementation. |
+| CodeGG | M001 fixed-target remote executor | **ready external** | `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md` | Eggwork Phases 0-5 prerequisites are closed. Actual downstream code remains governed by CodeGG planning. |
 
-## Registered implementation plan statuses
+## Closed and superseded implementation plans
 
-| Workstream | Milestone | Status | Implementation plan | Blocker |
-|---|---|---|---|---|
-| Foundation | M001 repository bootstrap + domain contract | closed | `plans/implementation/foundation-execution-core/001-repository-bootstrap-and-domain-contract.md` | Closure: `plans/closure/foundation-execution-core/001-status.md`. |
-| Foundation | M002 canonical local runner | closed | `plans/implementation/foundation-execution-core/002-canonical-local-runner.md` | Closure: `plans/closure/foundation-execution-core/002-status.md`. |
-| Control plane | M001 authenticated fixed-target execution | closed | `plans/implementation/control-plane-protocol/001-authenticated-fixed-target-execution.md` | Closure: `plans/closure/control-plane-protocol/001-status.md`. |
-| Control plane | M002 idempotency/leases/events/recovery | closed | `plans/implementation/control-plane-protocol/002-idempotency-leases-events-and-recovery.md` | Closure: `plans/closure/control-plane-protocol/002-status.md`; current qualification: `plans/closure/control-plane-protocol/002-lease-expiry-race-correction.md`. |
-| Workspace | M001 blob store/digest protocol | closed | `plans/implementation/workspace-artifact-transport/001-blob-store-and-digest-protocol.md` | Closure: `plans/closure/workspace-artifact-transport/001-status.md`. |
-| Workspace | M002 safe workspace materialization | closed | `plans/implementation/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md` | Closure: `plans/closure/workspace-artifact-transport/002-status.md`. |
-| Workspace | M003 declared artifacts/retention/GC | closed | `plans/implementation/workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md` | Closure: `plans/closure/workspace-artifact-transport/003-status.md`. |
-| Security | M001 authorization/redaction/threat model | closed | `plans/implementation/security-isolation-resource/001-authorization-redaction-and-threat-model.md` | Closure: `plans/closure/security-isolation-resource/001-status.md`. |
-| Security | M002 trusted Landlock sandbox | closed | `plans/implementation/security-isolation-resource/002-trusted-landlock-sandbox-path.md` | Closure: `plans/closure/security-isolation-resource/002-status.md`; implementation `98d13f1`. |
-| Security | M002a Landlock `/dev/null` runtime correction | closed | `plans/implementation/security-isolation-resource/002a-landlock-runtime-devnull.md` | Closure: `plans/closure/security-isolation-resource/002a-status.md`; historical M002 record preserved. |
-| Security | M003 enforced resource controls | closed | `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md` | Closure: `plans/closure/security-isolation-resource/003-status.md`; Linux systemd user-manager path qualified. |
-| Operations | M001 node operations surface | closed | `plans/implementation/operations-distribution/001-node-operations-surface.md` | Closure: `plans/closure/operations-distribution/001-status.md`. |
-| Operations | M002 packaging/services/Eggup | blocked | `plans/implementation/operations-distribution/002-packaging-services-and-eggup.md` | Eggup 0.1.0 exposes manager-neutral lifecycle types and a test double, but no native platform service-manager adapters. |
-| CodeGG | M001 fixed-target remote executor | ready | `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md` | Control Plane M002, Workspace M003, and Security M003 closures available; held behind Operations M001/M002 in requested execution order. |
+| Workstream | Milestone | Status | Evidence / note |
+|---|---|---|---|
+| Foundation | M001 domain/bootstrap | closed | `plans/closure/foundation-execution-core/001-status.md` |
+| Foundation | M002 local runner | closed | `plans/closure/foundation-execution-core/002-status.md` |
+| Control plane | M001 authenticated execution | closed | `plans/closure/control-plane-protocol/001-status.md` |
+| Control plane | M002 idempotency/leases/events/recovery | closed | `plans/closure/control-plane-protocol/002-status.md` + lease-expiry correction |
+| Workspace | M001 blob store | closed | `plans/closure/workspace-artifact-transport/001-status.md` |
+| Workspace | M002 materialization | closed | `plans/closure/workspace-artifact-transport/002-status.md` |
+| Workspace | M003 artifacts/retention/GC | closed | `plans/closure/workspace-artifact-transport/003-status.md` |
+| Security | M001 authz/redaction/threat model | closed | `plans/closure/security-isolation-resource/001-status.md` |
+| Security | M002 Landlock | closed | `plans/closure/security-isolation-resource/002-status.md` |
+| Security | M002a `/dev/null` corrective | closed | `plans/closure/security-isolation-resource/002a-status.md` |
+| Security | M003 resource enforcement | qualified/closed | `plans/closure/security-isolation-resource/003-status.md` |
+| Operations | M001 node operations | closed | `plans/closure/operations-distribution/001-status.md` |
+| Operations | former combined M002 packaging/services/Eggup | superseded | `plans/implementation/operations-distribution/002-packaging-services-and-eggup.md`; split because Eggpack now owns producer packaging |
 
-## Roadmap-level work without implementation handoff yet
+## Planned / blocked work
 
-These are intentionally not implementation-ready:
-
-| Work | Status | Reason |
+| Work | Status | Blocker / rationale |
 |---|---|---|
-| Foundation M003 ownership guards/API hardening | roadmap-level | M002 made the runner surface concrete; create the focused static-guard handoff when this roadmap-level item is scheduled |
-| Control Plane M003 Eggress route/protocol hardening | roadmap-level | re-check current Eggfetch custom-dial/Eggress integration after M002 |
-| Security M004 adversarial closure | roadmap-level | exact corpus depends on M001-M003 implementation |
-| Operations M003 operational qualification | roadmap-level | exact release/service surface not implemented |
-| Operations M004 reverse-connect relay | deferred | needs stable identity/lease/event semantics |
-| Operations M005 PTY extension | deferred | needs stable leases/event resume + separate PTY design |
-| CodeGG M002 target policy/capability projection | roadmap-level | depends on first adapter |
-| CodeGG M003 Git-aware materializer | deferred | needs neutral workspace integration first |
-| CodeGG M004 remote AgentRun worker | deferred | needs finite-job integration and current CodeGG worker contract |
+| Security M004 adversarial + cross-platform closure | blocked | wait for Foundation M003 + Control Plane M003 + Operations M002 so final security evidence includes those surfaces |
+| Operations M003 Eggpack producer packaging | blocked | Eggpack ReleaseManifest M001 and build/qualification interfaces are not yet closed/concrete |
+| Operations M004 operational/release qualification | blocked | Operations M002 + M003 |
+| Operations M005 reverse-connect relay | deferred | no immediate product need; stable identity/lease semantics already exist |
+| Operations M006 PTY extension | deferred | requires a separate interactive ownership/attach design |
+| CodeGG M002 capability/target projection | blocked | CodeGG M001 |
+| CodeGG M003 Git-aware materializer | deferred | first remote executor + optimized Eggwork materializer contract |
+| CodeGG M004 remote AgentRun worker | deferred | CodeGG M001-M003 + stable worker-entry contract |
 
-Do not create implementation plans for these merely to increase plan count. Write them when the prerequisite interfaces are concrete enough for a bounded handoff.
+Do not author Operations M003 merely to increase plan count. Its producer inputs are still moving in Eggpack.
 
-## Current execution order
+## Corrected execution graph
 
-1. **Control Plane M001** — authenticated fixed-target execution (closed; closure: `plans/closure/control-plane-protocol/001-status.md`).
-2. **Control Plane M002** — idempotency/leases/events/recovery (closed; lease-expiry race correction recorded).
-3. Control Plane M002 is closed with a recorded lease-expiry race correction; **Workspace M001 -> M002 -> M003** are now closed.
-4. **Security M001-M003 are closed** for the Linux systemd user-manager path qualified in `plans/closure/security-isolation-resource/003-status.md`.
-5. Operations M001 is closed. Operations M002 is the next requested milestone but remains blocked on Eggup platform service-manager adapters.
-6. CodeGG M001 is dependency-ready and remains sequenced after Operations M002; do not begin it before the blocked milestone is resolved.
-7. Generate later roadmap-level handoffs only after their concrete dependencies exist.
+```text
+Foundation M002 [closed] ------------------> Foundation M003 [READY]
+Control Plane M002 [closed] ---------------> Control Plane M003 [READY]
+Operations M001 [closed] + Eggup adapters --> Operations M002 [READY]
 
-## External interface research baselines
+Eggwork Phases 0-5 [closed/qualified] ------> CodeGG M001 [READY EXTERNAL]
 
-These baselines were inspected while creating the planning set. They are not dependency pins.
+Foundation M003 --+
+Control M003 -----+--> Security M004 [blocked until all three close]
+Operations M002 --+
 
-| Project | Reviewed baseline | Relevant interface |
+Eggpack ReleaseManifest/build interfaces ---> Operations M003 [blocked]
+Operations M002 + Operations M003 ----------> Operations M004
+```
+
+Operations M002 is not a dependency of CodeGG M001. The canonical long-term roadmap already defines CodeGG Phase 7 as depending on Eggwork Phases 0-5, not completion of Phase 6 packaging.
+
+## Current upstream interface baselines
+
+These are reviewed research baselines, not permanent dependency pins.
+
+| Project | Reviewed baseline | Current relevant state |
 |---|---|---|
-| CodeGG | `2f7d84f88070eee2a4fb9f70b6d7d5d10b01048d` | JobScheduler/JobExecutor, ManagedProcessService, WorktreeService, interactive sequence/resync, identity/audit |
-| Eggfetch | `8959ca890ee34f4cf456aed648315322f1e83ef7` / 0.2.0 line | async HTTP/TLS client, streaming, mTLS, advanced routing/custom dial surface |
-| Eggress | `93fafff8ec8f601b509bb347bdfa136d51998c7d` / 1.0.8 | listener-free OutboundConnector, proxy/SSH/multi-hop, typed route failures |
-| EggServe | `7e52ecec0b336ef1755b3e1654ddb1438b38bcdb` / 0.2.0 line | application service, streaming/backpressure, RequestLifecycle, TLS/mTLS, eggnet-tls |
-| Eggup | `892d6cc4b13a5241b179cbf5e9c7d57c16e329b2`; crates.io `eggup-core`, `eggup-acquisition`, `eggup-eggfetch`, `eggup-service` 0.1.0 reviewed on 2026-09-23 | Update transaction, acquisition contract/adapter, and service ownership contract are published; service package has no native systemd/launchd/SCM adapters |
-| Gregg | `5b2c7e8c67616f872070e2acdcce90790f750fbf` / 1.0.x line | versioned capability/telemetry protocol patterns |
+| CodeGG | `7ee0a5c6abcf59370877cfb4368bc5d28eed28f9` | typed `JobExecutor`/`JobExecutionContext` and scheduler ownership remain available |
+| Eggfetch | `b90b32541bd5dac6c5256feed141cadfd124debe` / `eggfetch-core 0.2.0` | public advanced-routing `Dialer` and `ClientBuilder::dialer` preserve Eggfetch-owned HTTP/TLS |
+| Eggress | `e141d4082d211cc5f122414c74617fde846ffbae` / 1.0.8 line | listener-free `OutboundConnector::connect_tcp_detailed` returns a Tokio stream and typed route failure facts |
+| EggServe | `dc8ce30e2c9f0a95f73682cea07163e8076995bd` / 0.2.x line | server/TLS service baseline; re-check exact published patch before dependency changes |
+| Eggup | `66acd739f792437cb9fa1701b8fa456c4ba4c403` | consumer update/service authority; Unix manager mechanics and Windows SCM work are closed on main |
+| Eggpack | `c5fd88f5a44a17104f00f93c9888b568272a01ea` | producer authority; ReleaseManifest M001 is current ready work, build/qualification still blocked |
+| Gregg | `5b2c7e8c67616f872070e2acdcce90790f750fbf` | telemetry/protocol patterns only; not an execution control plane |
 
-Implementation agents MUST re-check current published/repository interfaces at their execution baseline.
+Implementation agents MUST re-check current APIs at execution time.
 
-## Known upstream integration questions
+## Resolved planning defects
 
-These are not current blockers for Foundation M001, but must be resolved before the named milestone closes:
+1. **False Operations → CodeGG dependency:** removed. CodeGG M001 is independently ready.
+2. **Foundation M003 stale blocker:** M002 is closed; M003 now has a concrete ready handoff.
+3. **Control Plane M003 stale dial-interface blocker:** Eggfetch/Eggress now expose a compatible public raw-stream boundary; M003 is ready.
+4. **Operations M002 stale Eggup blocker:** Eggup main now includes platform manager mechanics; consumer deployment integration is ready.
+5. **Eggup/Eggpack authority mix:** corrected. Eggup owns local deployment/service lifecycle; Eggpack owns producer packaging/release construction/evidence.
+6. **Final security sweep ordering:** M004 now waits for the newly ready route/ownership/deployment surfaces instead of incorrectly claiming only M001-M003 prerequisites.
+7. **Stale CodeGG baseline:** M001 planning rebaselined to current reviewed CodeGG head.
 
-1. **Eggfetch <-> Eggress dial composition:** confirm the currently published Eggfetch custom Dialer/advanced-routing surface can consume the listener-free Eggress stream cleanly without a loopback listener before Control Plane M003.
-2. **eggnet-tls crate consumption:** verify whether Eggwork should depend directly on the neutral crate from EggServe's workspace or through an EggServe re-export at the then-current release.
-3. **Eggup service adapters:** current published crates provide stable consumer contracts but no native systemd, launchd, or Windows SCM adapter. Keep Operations M002 blocked until Eggup publishes the platform service layer; do not duplicate it in Eggwork.
-4. **CodeGG extraction vs adaptation:** Foundation M002 must determine whether useful ManagedProcessService code should be copied/generalized into Eggwork first or later consumed back by CodeGG. Do not create a circular repository dependency.
-5. **Windows process-tree details:** actual Job Object lifecycle must be host-qualified before Eggwork claims Windows descendant cleanup/resource enforcement.
-6. **Linux cgroup delegation:** rootless/user-service capability must be probed truthfully; no assumption that cgroups v2 write access exists on every Linux node.
+## Remaining interface gates
+
+1. **Eggup publication:** if current service adapters are not in a published crate at implementation time, use an exact immutable Git revision for qualification or remain blocked for release publication; never use a floating branch.
+2. **Eggpack producer contract:** Operations M003 remains blocked until ReleaseManifest and build/qualification interfaces close.
+3. **Platform qualification:** Linux is the currently exercised execution/security platform. Windows/macOS claims require hosted runtime evidence; cross-compilation is not qualification.
+4. **Eggress feature scope:** SOCKS5 and HTTP CONNECT should be the required deterministic route fixtures. SSH is advertised only if its feature/runtime path is actually exercised.
 
 ## Planning hygiene
 
 - Register before handoff.
-- Historical closure evidence is immutable; use corrective plans for later findings.
-- A blocked external interface is a real blocker.
-- Do not copy Eggfetch/Eggress/EggServe/Eggup functionality into Eggwork to avoid an upstream boundary.
-- Do not treat a roadmap or implementation plan as evidence that a feature exists.
-- Keep scheduler/placement policy outside Eggwork.
+- Historical closure evidence is immutable; use corrective records for later findings.
+- Do not copy Eggfetch/Eggress/EggServe/Eggup/Eggpack functionality into Eggwork to avoid an upstream boundary.
+- Do not treat a plan as implementation evidence.
+- Keep scheduling/placement outside Eggwork.
+- Parallel-ready work may proceed independently, but each closure must verify the actual merged head before unblocking downstream milestones.
