@@ -241,6 +241,44 @@ impl ExecutionStore {
         .map_err(|_| StoreError::Worker)?
     }
 
+    /// Load a snapshot only when the authenticated principal owns that
+    /// execution generation. A foreign execution is indistinguishable from a
+    /// missing one at the observe boundary.
+    pub async fn load_snapshot_for_principal(
+        &self,
+        id: ExecutionId,
+        generation: Option<ExecutionGeneration>,
+        principal_id: String,
+    ) -> Result<Option<ExecutionSnapshot>, StoreError> {
+        let connection = self.connection.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = connection.lock().map_err(|_| StoreError::Worker)?;
+            let row: Option<Vec<u8>> = match generation {
+                Some(generation) => connection
+                    .query_row(
+                        "SELECT snapshot_json FROM executions
+                         WHERE execution_id = ?1 AND generation = ?2 AND principal_id = ?3",
+                        params![id.as_str(), generation.get() as i64, principal_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?,
+                None => connection
+                    .query_row(
+                        "SELECT snapshot_json FROM executions
+                         WHERE execution_id = ?1 AND principal_id = ?2
+                         ORDER BY generation DESC LIMIT 1",
+                        params![id.as_str(), principal_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?,
+            };
+            row.map(|encoded| serde_json::from_slice(&encoded).map_err(StoreError::from))
+                .transpose()
+        })
+        .await
+        .map_err(|_| StoreError::Worker)?
+    }
+
     pub async fn commit_event(
         &self,
         snapshot: ExecutionSnapshot,
@@ -624,6 +662,36 @@ mod tests {
                 .unwrap(),
             ReserveResult::Created
         ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_lookup_is_principal_fenced_and_hides_foreign_execution() {
+        let temp = TempDir::new().unwrap();
+        let store = ExecutionStore::open(temp.path().join("state.sqlite")).unwrap();
+        let accepted = snapshot("private-execution", 1, ExecutionState::Accepted);
+        reserve(&store, accepted.clone()).await;
+        assert_eq!(
+            store
+                .load_snapshot_for_principal(
+                    accepted.execution_id.clone(),
+                    Some(accepted.generation),
+                    "principal-b".into(),
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .load_snapshot_for_principal(
+                    accepted.execution_id.clone(),
+                    None,
+                    "principal-a".into(),
+                )
+                .await
+                .unwrap(),
+            Some(accepted)
+        );
     }
 
     #[tokio::test]

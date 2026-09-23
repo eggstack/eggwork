@@ -35,19 +35,38 @@ pub struct ExecutionProvenance {
 }
 
 /// A bounded output chunk. Consumers must treat bytes as arbitrary binary data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OutputChunk {
     pub stderr: bool,
     pub bytes: Vec<u8>,
 }
+impl std::fmt::Debug for OutputChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputChunk")
+            .field("stderr", &self.stderr)
+            .field("length", &self.bytes.len())
+            .field("bytes", &"[REDACTED]")
+            .finish()
+    }
+}
 
 /// Head and tail retention with accurate byte accounting.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct BoundedCapture {
     pub head: Vec<u8>,
     pub tail: VecDeque<u8>,
     pub total_bytes: u64,
     pub omitted_bytes: u64,
+}
+impl std::fmt::Debug for BoundedCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundedCapture")
+            .field("total_bytes", &self.total_bytes)
+            .field("omitted_bytes", &self.omitted_bytes)
+            .field("captured_bytes", &(self.head.len() + self.tail.len()))
+            .field("content", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl BoundedCapture {
@@ -166,7 +185,7 @@ impl ExecutionSetup for NoExecutionSetup {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunnerRequest {
     pub argv: Vec<String>,
     pub root: PathBuf,
@@ -180,6 +199,25 @@ pub struct RunnerRequest {
     pub provenance: ExecutionProvenance,
     pub sandbox: SandboxRequest,
     pub resources: ResourceSetupRequest,
+}
+
+impl std::fmt::Debug for RunnerRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunnerRequest")
+            .field("argv", &"[REDACTED]")
+            .field("root", &self.root)
+            .field("cwd", &self.cwd)
+            .field("environment_count", &self.environment.len())
+            .field("stdin", &self.stdin)
+            .field("timeout", &self.timeout)
+            .field("capture_limit", &self.capture_limit)
+            .field("event_chunk_bytes", &self.event_chunk_bytes)
+            .field("overflow", &self.overflow)
+            .field("provenance", &self.provenance)
+            .field("sandbox", &self.sandbox)
+            .field("resources", &self.resources)
+            .finish()
+    }
 }
 
 impl RunnerRequest {
@@ -304,10 +342,22 @@ impl RunnerRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum StdinPolicy {
     Null,
     Bytes(Vec<u8>),
+}
+impl std::fmt::Debug for StdinPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Null => f.write_str("Null"),
+            Self::Bytes(bytes) => f
+                .debug_struct("Bytes")
+                .field("length", &bytes.len())
+                .field("value", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 impl StdinPolicy {
     fn validate(&self) -> Result<(), RunnerError> {
@@ -744,6 +794,20 @@ mod tests {
                 pids: None,
                 required: false,
             },
+        }
+    }
+
+    #[test]
+    fn runner_request_debug_redacts_command_and_inputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut request = request(temp.path(), &["tool", "--token=argv-secret"]);
+        request
+            .environment
+            .push(("API_TOKEN".into(), "env-secret".into()));
+        request.stdin = StdinPolicy::Bytes(b"stdin-secret".to_vec());
+        let debug = format!("{request:?}");
+        for secret in ["argv-secret", "env-secret", "stdin-secret"] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}");
         }
     }
     async fn run(req: RunnerRequest) -> Result<RunnerResult, RunnerError> {

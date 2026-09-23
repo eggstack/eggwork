@@ -226,10 +226,18 @@ impl From<RelativePath> for String {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentEntry {
     pub name: String,
     pub value: String,
+}
+impl fmt::Debug for EnvironmentEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EnvironmentEntry")
+            .field("name", &self.name)
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
 }
 impl EnvironmentEntry {
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Result<Self, ValidationError> {
@@ -259,10 +267,22 @@ impl EnvironmentEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StdinPolicy {
     Null,
     Bytes(Vec<u8>),
+}
+impl fmt::Debug for StdinPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null => f.write_str("Null"),
+            Self::Bytes(bytes) => f
+                .debug_struct("Bytes")
+                .field("length", &bytes.len())
+                .field("value", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 impl StdinPolicy {
     pub fn validate(&self) -> Result<(), ValidationError> {
@@ -346,7 +366,7 @@ pub enum NetworkRequirement {
     AllowListed(Vec<String>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandSpec {
     pub argv: Vec<String>,
     pub cwd: Option<RelativePath>,
@@ -358,6 +378,22 @@ pub struct CommandSpec {
     pub resources: ResourceRequirements,
     pub isolation: IsolationRequirement,
     pub network: NetworkRequirement,
+}
+impl fmt::Debug for CommandSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CommandSpec")
+            .field("argv", &"[REDACTED]")
+            .field("cwd", &self.cwd)
+            .field("environment", &self.environment)
+            .field("stdin", &self.stdin)
+            .field("timeout_millis", &self.timeout_millis)
+            .field("output", &self.output)
+            .field("declared_outputs", &self.declared_outputs)
+            .field("resources", &self.resources)
+            .field("isolation", &self.isolation)
+            .field("network", &self.network)
+            .finish()
+    }
 }
 impl CommandSpec {
     pub fn validate(&self) -> Result<(), ValidationError> {
@@ -414,11 +450,20 @@ impl CommandSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionSpec {
     pub schema_version: u16,
     pub command: CommandSpec,
     pub metadata: Vec<(String, String)>,
+}
+impl fmt::Debug for ExecutionSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutionSpec")
+            .field("schema_version", &self.schema_version)
+            .field("command", &self.command)
+            .field("metadata_count", &self.metadata.len())
+            .finish()
+    }
 }
 impl ExecutionSpec {
     pub fn validate(&self) -> Result<(), ValidationError> {
@@ -697,9 +742,17 @@ pub struct ArtifactRecord {
 pub enum ArtifactType {
     File,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventMetadata {
     pub fields: Vec<(String, String)>,
+}
+impl fmt::Debug for EventMetadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EventMetadata")
+            .field("field_count", &self.fields.len())
+            .field("values", &"[REDACTED]")
+            .finish()
+    }
 }
 impl EventMetadata {
     pub fn validate(&self) -> Result<(), ValidationError> {
@@ -721,12 +774,34 @@ impl EventMetadata {
         Ok(())
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionEventKind {
     State(ExecutionState),
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     Diagnostic(String),
+}
+impl fmt::Debug for ExecutionEventKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::State(state) => f.debug_tuple("State").field(state).finish(),
+            Self::Stdout(bytes) => f
+                .debug_struct("Stdout")
+                .field("length", &bytes.len())
+                .field("bytes", &"[REDACTED]")
+                .finish(),
+            Self::Stderr(bytes) => f
+                .debug_struct("Stderr")
+                .field("length", &bytes.len())
+                .field("bytes", &"[REDACTED]")
+                .finish(),
+            Self::Diagnostic(value) => f
+                .debug_struct("Diagnostic")
+                .field("length", &value.len())
+                .field("value", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionEvent {
@@ -953,6 +1028,35 @@ mod tests {
         let s = spec();
         let j = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<ExecutionSpec>(&j).unwrap(), s);
+    }
+
+    #[test]
+    fn execution_spec_debug_redacts_credentials_and_command_arguments() {
+        let mut spec = spec();
+        spec.command.argv = vec!["tool".into(), "--token=argv-secret".into()];
+        spec.command.environment = vec![EnvironmentEntry::new("API_TOKEN", "env-secret").unwrap()];
+        spec.command.stdin = StdinPolicy::Bytes(b"stdin-secret".to_vec());
+        spec.metadata = vec![("authorization".into(), "metadata-secret".into())];
+        let debug = format!("{spec:?}");
+        for secret in [
+            "argv-secret",
+            "env-secret",
+            "stdin-secret",
+            "metadata-secret",
+        ] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}");
+        }
+        assert!(debug.contains("[REDACTED]"));
+        let event = ExecutionEvent {
+            sequence: EventSequence::new(1),
+            kind: ExecutionEventKind::Stdout(b"output-secret".to_vec()),
+            metadata: EventMetadata {
+                fields: vec![("credential".into(), "event-metadata-secret".into())],
+            },
+        };
+        let debug = format!("{event:?}");
+        assert!(!debug.contains("output-secret"));
+        assert!(!debug.contains("event-metadata-secret"));
     }
 
     #[test]

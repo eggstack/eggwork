@@ -63,6 +63,20 @@ pub enum Operation {
     ArtifactRead,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceId {
+    Execution(ExecutionId),
+    Blob(eggwork_core::BlobDigest),
+    Workspace(eggwork_core::WorkspaceId),
+    Artifact(eggwork_core::ArtifactId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationRequest {
+    pub operation: Operation,
+    pub resource: Option<ResourceId>,
+}
+
 pub trait PeerPrincipalResolver: Send + Sync + 'static {
     fn resolve_verified_leaf(&self, leaf_der: &[u8]) -> Option<NodePrincipal>;
 }
@@ -101,6 +115,12 @@ impl PeerPrincipalResolver for FingerprintPrincipalResolver {
 
 pub trait Authorizer: Send + Sync + 'static {
     fn authorize(&self, principal: &NodePrincipal, operation: Operation) -> bool;
+
+    /// Resource-aware hook. Existing operation-wide policies remain valid;
+    /// scoped policies can override this method to inspect authenticated IDs.
+    fn authorize_request(&self, principal: &NodePrincipal, request: &OperationRequest) -> bool {
+        self.authorize(principal, request.operation)
+    }
 }
 
 impl<F> Authorizer for F
@@ -112,16 +132,27 @@ where
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum NodeStartError {
     #[error("remote execution requires a valid server identity and required client authentication")]
     TlsPolicy,
-    #[error("invalid EggServe configuration: {0}")]
+    #[error("node service configuration is invalid")]
     EggServe(String),
     #[error("maximum active execution count must be positive")]
     InvalidLimit,
     #[error("execution lease duration must be positive")]
     InvalidLease,
+}
+
+impl std::fmt::Debug for NodeStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TlsPolicy => f.write_str("NodeStartError::TlsPolicy"),
+            Self::EggServe(_) => f.write_str("NodeStartError::EggServe([REDACTED])"),
+            Self::InvalidLimit => f.write_str("NodeStartError::InvalidLimit"),
+            Self::InvalidLease => f.write_str("NodeStartError::InvalidLease"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -547,7 +578,14 @@ async fn dispatch(
             "verified client identity required",
         ));
     };
-    if !state.authorizer.authorize(&principal, operation) {
+    let authorization = OperationRequest {
+        operation,
+        resource: resource_for_path(operation, &path),
+    };
+    if !state
+        .authorizer
+        .authorize_request(&principal, &authorization)
+    {
         return Ok(error_response(
             403,
             "forbidden",
@@ -579,12 +617,12 @@ async fn dispatch(
         )),
         Route::Status => Ok(json_response(200, &node_status(&state))),
         Route::Execute => execute(state, request, principal).await,
-        Route::Observe(id) => observe(state, id, query.as_deref()).await,
+        Route::Observe(id) => observe(state, id, query.as_deref(), principal).await,
         Route::Cancel(id) => control(state, id, request, principal, false).await,
         Route::Renew(id) => control(state, id, request, principal, true).await,
         Route::Events(id) => events_route(state, id, query.as_deref(), principal).await,
-        Route::BlobMissing => blob_missing(state, request).await,
-        Route::BlobPrepare => blob_prepare(state, request).await,
+        Route::BlobMissing => blob_missing(state, request, principal).await,
+        Route::BlobPrepare => blob_prepare(state, request, principal).await,
         Route::BlobUpload(digest) => blob_upload(state, request, digest).await,
         Route::BlobDownload(digest) => blob_download(state, digest).await,
         Route::BlobInvalidDigest => Ok(error_response(
@@ -596,6 +634,46 @@ async fn dispatch(
         Route::ArtifactList(id) => artifact_list(state, id, query.as_deref(), principal).await,
         Route::ArtifactDownload(id) => artifact_download(state, id, principal).await,
     }
+}
+
+fn resource_for_path(operation: Operation, path: &str) -> Option<ResourceId> {
+    let parts: Vec<_> = path.split('/').collect();
+    match operation {
+        Operation::Observe | Operation::Cancel | Operation::Renew | Operation::Events => {
+            ExecutionId::new(parts.get(3)?.to_string())
+                .ok()
+                .map(ResourceId::Execution)
+        }
+        Operation::BlobRead | Operation::BlobWrite => {
+            eggwork_core::BlobDigest::parse(parts.get(3)?.to_string())
+                .ok()
+                .map(ResourceId::Blob)
+        }
+        Operation::ArtifactRead if parts.get(2) == Some(&"artifacts") => {
+            eggwork_core::ArtifactId::new(parts.get(3)?.to_string())
+                .ok()
+                .map(ResourceId::Artifact)
+        }
+        Operation::ArtifactRead => ExecutionId::new(parts.get(3)?.to_string())
+            .ok()
+            .map(ResourceId::Execution),
+        _ => None,
+    }
+}
+
+fn authorize_resource(
+    state: &NodeState,
+    principal: &NodePrincipal,
+    operation: Operation,
+    resource: ResourceId,
+) -> bool {
+    state.authorizer.authorize_request(
+        principal,
+        &OperationRequest {
+            operation,
+            resource: Some(resource),
+        },
+    )
 }
 
 fn authenticated_principal(state: &NodeState, request: &Request) -> Option<NodePrincipal> {
@@ -650,6 +728,7 @@ async fn read_limited_body(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FindMissingRequest {
     digests: Vec<eggwork_core::BlobDigest>,
 }
@@ -660,6 +739,7 @@ struct FindMissingResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PrepareBlobRequest {
     digest: eggwork_core::BlobDigest,
     size_bytes: u64,
@@ -671,6 +751,7 @@ struct PrepareBlobResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkspaceCreateRequest {
     schema_version: u16,
     workspace_id: eggwork_core::WorkspaceId,
@@ -691,6 +772,7 @@ struct WorkspaceReadyResponse {
 async fn blob_missing(
     state: NodeState,
     request: Request,
+    principal: NodePrincipal,
 ) -> Result<Response, eggserve_core::server::ServiceError> {
     let (_head, body, _context) = request.into_parts_with_context();
     let bytes = match read_limited_body(body, MAX_BLOB_FIND_REQUEST_BYTES).await {
@@ -713,6 +795,20 @@ async fn blob_missing(
             ));
         }
     };
+    for digest in &query.digests {
+        if !authorize_resource(
+            &state,
+            &principal,
+            Operation::BlobRead,
+            ResourceId::Blob(digest.clone()),
+        ) {
+            return Ok(error_response(
+                403,
+                "forbidden",
+                "operation is not authorized",
+            ));
+        }
+    }
     match state.blobs.find_missing(&query.digests) {
         Ok(missing) => Ok(json_response(200, &FindMissingResponse { missing })),
         Err(blob::BlobError::TooManyDigests) => Ok(error_response(
@@ -731,6 +827,7 @@ async fn blob_missing(
 async fn blob_prepare(
     state: NodeState,
     request: Request,
+    principal: NodePrincipal,
 ) -> Result<Response, eggserve_core::server::ServiceError> {
     let (_head, body, _context) = request.into_parts_with_context();
     let bytes = match read_limited_body(body, MAX_BLOB_FIND_REQUEST_BYTES).await {
@@ -753,6 +850,18 @@ async fn blob_prepare(
             ));
         }
     };
+    if !authorize_resource(
+        &state,
+        &principal,
+        Operation::BlobWrite,
+        ResourceId::Blob(prepare.digest.clone()),
+    ) {
+        return Ok(error_response(
+            403,
+            "forbidden",
+            "operation is not authorized",
+        ));
+    }
     match state
         .blobs
         .prepare_upload(&prepare.digest, prepare.size_bytes)
@@ -794,6 +903,18 @@ async fn workspace_create(
             426,
             "protocol_version",
             "unsupported schema version",
+        ));
+    }
+    if !authorize_resource(
+        &state,
+        &principal,
+        Operation::WorkspaceCreate,
+        ResourceId::Workspace(wire.workspace_id.clone()),
+    ) {
+        return Ok(error_response(
+            403,
+            "forbidden",
+            "operation is not authorized",
         ));
     }
     if ExecutionGeneration::new(wire.handle.generation.get()).is_err() {
@@ -1111,6 +1232,25 @@ async fn execute(
             426,
             "protocol_version",
             "unsupported schema version",
+        ));
+    }
+    if !authorize_resource(
+        &state,
+        &principal,
+        Operation::Execute,
+        ResourceId::Execution(wire.handle.execution_id.clone()),
+    ) || wire.workspace_id.as_ref().is_some_and(|workspace_id| {
+        !authorize_resource(
+            &state,
+            &principal,
+            Operation::Execute,
+            ResourceId::Workspace(workspace_id.clone()),
+        )
+    }) {
+        return Ok(error_response(
+            403,
+            "forbidden",
+            "operation is not authorized",
         ));
     }
     if ExecutionGeneration::new(wire.handle.generation.get()).is_err() {
@@ -1505,6 +1645,7 @@ async fn observe(
     state: NodeState,
     id: ExecutionId,
     query: Option<&str>,
+    principal: NodePrincipal,
 ) -> Result<Response, eggserve_core::server::ServiceError> {
     let generation = match query_parameter(query, "generation") {
         Ok(Some(value)) => match value
@@ -1526,7 +1667,7 @@ async fn observe(
     };
     match state
         .store
-        .load_snapshot(id, generation)
+        .load_snapshot_for_principal(id, generation, principal.id.as_str().to_owned())
         .await
         .map_err(|_| eggserve_core::server::ServiceError::internal("execution store unavailable"))?
     {
@@ -2198,6 +2339,7 @@ fn error_response(status: u16, code: &str, message: &str) -> Response {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExecuteRequest {
     schema_version: u16,
     handle: ExecutionHandle,
@@ -2207,6 +2349,7 @@ struct ExecuteRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ControlRequest {
     schema_version: u16,
     handle: ExecutionHandle,
@@ -2401,6 +2544,126 @@ mod tests {
             Some((Operation::ArtifactRead, Route::ArtifactDownload(_)))
         ));
         assert!(operation_for("POST", "/v1/execute-anywhere").is_none());
+        for (method, path, expected) in [
+            ("GET", "/v1/capabilities", Operation::Capabilities),
+            ("GET", "/v1/status", Operation::Status),
+            ("POST", "/v1/executions", Operation::Execute),
+            ("GET", "/v1/executions/exec-1", Operation::Observe),
+            ("POST", "/v1/executions/exec-1/cancel", Operation::Cancel),
+            ("POST", "/v1/executions/exec-1/renew", Operation::Renew),
+            ("GET", "/v1/executions/exec-1/events", Operation::Events),
+            ("POST", "/v1/blobs/missing", Operation::BlobRead),
+            ("POST", "/v1/blobs/prepare", Operation::BlobWrite),
+            (
+                "PUT",
+                "/v1/blobs/0000000000000000000000000000000000000000000000000000000000000000",
+                Operation::BlobWrite,
+            ),
+            (
+                "GET",
+                "/v1/blobs/0000000000000000000000000000000000000000000000000000000000000000",
+                Operation::BlobRead,
+            ),
+            ("POST", "/v1/workspaces", Operation::WorkspaceCreate),
+            (
+                "GET",
+                "/v1/executions/exec-1/artifacts",
+                Operation::ArtifactRead,
+            ),
+            ("GET", "/v1/artifacts/artifact-1", Operation::ArtifactRead),
+        ] {
+            assert_eq!(
+                operation_for(method, path).map(|entry| entry.0),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            resource_for_path(Operation::Observe, "/v1/executions/exec-1"),
+            Some(ResourceId::Execution(ExecutionId::new("exec-1").unwrap()))
+        );
+    }
+
+    #[test]
+    fn request_payload_cannot_supply_authoritative_principal() {
+        let mut execute = serde_json::to_value(ExecuteRequest {
+            schema_version: API_SCHEMA_VERSION,
+            handle: execution_handle("forged-principal"),
+            workspace_id: None,
+            spec: execution_spec(vec!["/bin/true".into()]),
+        })
+        .unwrap();
+        execute["principal_id"] = serde_json::json!("victim");
+        assert!(serde_json::from_value::<ExecuteRequest>(execute).is_err());
+
+        let mut workspace = serde_json::json!({
+            "schema_version": API_SCHEMA_VERSION,
+            "workspace_id": "forged-workspace",
+            "handle": execution_handle("forged-workspace-execution"),
+            "manifest": {"schema_version": 1, "entries": []},
+            "principal_id": "victim"
+        });
+        workspace["principal_id"] = serde_json::json!("victim");
+        assert!(serde_json::from_value::<WorkspaceCreateRequest>(workspace).is_err());
+
+        let mut control = serde_json::to_value(ControlRequest {
+            schema_version: API_SCHEMA_VERSION,
+            handle: execution_handle("forged-control-principal"),
+            renewal_id: None,
+        })
+        .unwrap();
+        control["principal_id"] = serde_json::json!("victim");
+        assert!(serde_json::from_value::<ControlRequest>(control).is_err());
+    }
+
+    #[test]
+    fn resource_aware_authorizer_can_scope_blob_capability() {
+        struct OneBlob;
+        impl Authorizer for OneBlob {
+            fn authorize(&self, _principal: &NodePrincipal, _operation: Operation) -> bool {
+                true
+            }
+
+            fn authorize_request(
+                &self,
+                _principal: &NodePrincipal,
+                request: &OperationRequest,
+            ) -> bool {
+                request.operation != Operation::BlobRead
+                    || request.resource
+                        == Some(ResourceId::Blob(eggwork_core::BlobDigest::from_bytes(
+                            b"allowed",
+                        )))
+            }
+        }
+        let principal = NodePrincipal {
+            id: eggwork_core::PrincipalId::new("controller-a").unwrap(),
+        };
+        let authorizer = OneBlob;
+        assert!(authorizer.authorize_request(
+            &principal,
+            &OperationRequest {
+                operation: Operation::BlobRead,
+                resource: Some(ResourceId::Blob(eggwork_core::BlobDigest::from_bytes(
+                    b"allowed"
+                ))),
+            }
+        ));
+        assert!(!authorizer.authorize_request(
+            &principal,
+            &OperationRequest {
+                operation: Operation::BlobRead,
+                resource: Some(ResourceId::Blob(eggwork_core::BlobDigest::from_bytes(
+                    b"denied"
+                ))),
+            }
+        ));
+    }
+
+    #[test]
+    fn tls_configuration_diagnostics_redact_certificate_paths() {
+        let error = NodeStartError::EggServe("/private/client-key.pem".into());
+        assert!(!format!("{error:?}").contains("client-key.pem"));
+        assert!(!error.to_string().contains("client-key.pem"));
     }
 
     #[test]
@@ -2482,6 +2745,10 @@ mod tests {
                 !matches!(
                     operation,
                     Operation::Execute
+                        | Operation::Observe
+                        | Operation::Cancel
+                        | Operation::Renew
+                        | Operation::Events
                         | Operation::BlobRead
                         | Operation::BlobWrite
                         | Operation::WorkspaceCreate
@@ -2549,6 +2816,27 @@ mod tests {
                 .await,
             Err(eggwork_client::ClientError::Api { status: 403, .. })
         ));
+        assert!(matches!(
+            unauthorized.observe(&denied_handle.execution_id).await,
+            Err(eggwork_client::ClientError::Api { status: 403, .. })
+        ));
+        assert!(matches!(
+            unauthorized.cancel(&denied_handle).await,
+            Err(eggwork_client::ClientError::Api { status: 403, .. })
+        ));
+        assert!(matches!(
+            unauthorized.renew(&denied_handle, "renew-1").await,
+            Err(eggwork_client::ClientError::Api { status: 403, .. })
+        ));
+        assert!(matches!(
+            unauthorized.events(&denied_handle, 0).await,
+            Err(eggwork_client::ClientError::Api { status: 403, .. })
+        ));
+        assert!(matches!(
+            unauthorized.download_blob(&denied_digest).await,
+            Err(eggwork_client::ClientError::Api { status: 403, .. })
+        ));
+        assert!(unauthorized.capabilities().await.is_ok());
         assert!(unauthorized.status().await.is_ok());
         let unknown_temp = TempDir::new().unwrap();
         let unknown_client = NodeClient::new(

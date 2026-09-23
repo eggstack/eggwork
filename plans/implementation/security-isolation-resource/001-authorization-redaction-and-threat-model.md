@@ -1,8 +1,10 @@
 # Security M001 — Authorization, Redaction, and Threat-Model Foundation
 
-Status: active
+Status: closed
 
 Dependency evidence: `plans/closure/foundation-execution-core/001-status.md` and `plans/closure/control-plane-protocol/001-status.md`
+
+Closure evidence: `plans/closure/security-isolation-resource/001-status.md`
 
 Source roadmap:
 

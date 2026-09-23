@@ -17,13 +17,13 @@ use thiserror::Error;
 
 const API_SCHEMA_VERSION: u16 = 1;
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum ClientError {
     #[error("node endpoint must be an https URL without query, fragment, or credentials")]
     InvalidEndpoint,
-    #[error("Eggfetch request failed: {0}")]
-    Transport(#[from] HttpError),
-    #[error("node returned HTTP {status}: {code}: {message}")]
+    #[error("node transport failed")]
+    Transport(HttpError),
+    #[error("node returned HTTP {status}: {code}")]
     Api {
         status: u16,
         code: String,
@@ -31,6 +31,28 @@ pub enum ClientError {
     },
     #[error("node response was malformed")]
     InvalidResponse,
+}
+
+impl From<HttpError> for ClientError {
+    fn from(error: HttpError) -> Self {
+        Self::Transport(error)
+    }
+}
+
+impl fmt::Debug for ClientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidEndpoint => f.write_str("ClientError::InvalidEndpoint"),
+            Self::Transport(_) => f.write_str("ClientError::Transport([REDACTED])"),
+            Self::Api { status, code, .. } => f
+                .debug_struct("ClientError::Api")
+                .field("status", status)
+                .field("code", code)
+                .field("message", &"[REDACTED]")
+                .finish(),
+            Self::InvalidResponse => f.write_str("ClientError::InvalidResponse"),
+        }
+    }
 }
 
 /// A connection to exactly one caller-selected Eggwork node.
@@ -42,10 +64,17 @@ pub struct NodeClient {
 
 impl fmt::Debug for NodeClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let origin = safe_target_origin(&self.endpoint);
         f.debug_struct("NodeClient")
-            .field("endpoint", &self.endpoint)
+            .field("target_origin", &origin)
             .finish_non_exhaustive()
     }
+}
+
+fn safe_target_origin(endpoint: &str) -> String {
+    url::Url::parse(endpoint)
+        .map(|endpoint| endpoint.origin().ascii_serialization())
+        .unwrap_or_else(|_| "[INVALID]".into())
 }
 
 impl NodeClient {
@@ -65,17 +94,7 @@ impl NodeClient {
 
     /// Build a fixed-target client with a caller-configured Eggfetch TLS policy.
     pub fn new(endpoint: impl AsRef<str>, tls: TlsConfig) -> Result<Self, ClientError> {
-        let endpoint = endpoint.as_ref().trim_end_matches('/').to_owned();
-        let parsed = url::Url::parse(&endpoint).map_err(|_| ClientError::InvalidEndpoint)?;
-        if parsed.scheme() != "https"
-            || parsed.host_str().is_none()
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-        {
-            return Err(ClientError::InvalidEndpoint);
-        }
+        let endpoint = normalize_endpoint(endpoint.as_ref())?;
         let http = HttpClient::builder().tls_config(tls).build();
         Ok(Self { endpoint, http })
     }
@@ -394,6 +413,21 @@ impl NodeClient {
     }
 }
 
+fn normalize_endpoint(endpoint: &str) -> Result<String, ClientError> {
+    let endpoint = endpoint.trim_end_matches('/').to_owned();
+    let parsed = url::Url::parse(&endpoint).map_err(|_| ClientError::InvalidEndpoint)?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(ClientError::InvalidEndpoint);
+    }
+    Ok(endpoint)
+}
+
 pub struct ExecutionStream {
     pub handle: ExecutionHandle,
     pub execution_id: ExecutionId,
@@ -518,5 +552,36 @@ async fn api_error(status: u16, response: &mut eggfetch_core::Response) -> Clien
             code: "http_error".into(),
             message: "node returned an error response".into(),
         },
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_rejects_credentials_and_non_tls_schemes() {
+        assert!(normalize_endpoint("https://controller.example/").is_ok());
+        let credential_url =
+            normalize_endpoint("https://user:password@controller.example").unwrap_err();
+        assert!(!format!("{credential_url:?}").contains("password"));
+        assert!(!credential_url.to_string().contains("password"));
+        assert!(normalize_endpoint("http://controller.example").is_err());
+        assert!(normalize_endpoint("https://controller.example/?token=secret").is_err());
+        assert_eq!(
+            safe_target_origin("https://controller.example/prefix/path-token"),
+            "https://controller.example"
+        );
+    }
+
+    #[test]
+    fn client_error_debug_redacts_remote_message() {
+        let error = ClientError::Api {
+            status: 500,
+            code: "internal".into(),
+            message: "private-key-material".into(),
+        };
+        assert!(!format!("{error:?}").contains("private-key-material"));
+        assert!(!error.to_string().contains("private-key-material"));
     }
 }

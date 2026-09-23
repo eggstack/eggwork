@@ -41,7 +41,7 @@ Transport mechanics remain in control-plane protocol; process lifecycle remains 
 
 Class: invariant/infrastructure
 
-Status: active
+Status: closed
 
 Implementation plan:
 
@@ -63,7 +63,7 @@ Exit conditions:
 
 Class: invariant/capability
 
-Status: ready; Foundation M002 and Workspace M002 dependencies are closed
+Status: active; Foundation M002 and Workspace M002 dependencies are closed
 
 Implementation plan:
 
