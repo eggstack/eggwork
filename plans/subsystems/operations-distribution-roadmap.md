@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: blocked on Eggup platform service-manager adapters for M002
+Status: active roadmap; M002 ready, producer packaging waits on Eggpack
 
 Canonical authority:
 
@@ -43,35 +43,53 @@ Objective:
 
 Add configuration, status, doctor, drain/undrain, execution/storage inspection, cleanup/GC commands, and stable machine-readable operator output.
 
-### M002 — Packaging, services, and Eggup
+### M002 — Eggup deployment and service integration
 
 Class: infrastructure/capability
 
-Status: blocked on Eggup platform service-manager adapters
+Status: ready
 
 Implementation plan:
+
+- `plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md`
+
+Supersedes:
 
 - `plans/implementation/operations-distribution/002-packaging-services-and-eggup.md`
 
 Objective:
 
-Ship prebuilt binaries for qualified targets, integrate verified install/update/service management through Eggup where available, and avoid copying lifecycle machinery.
+Use Eggup for consumer-side verified multi-artifact deployment, rollback, install ownership, and native service lifecycle while keeping Eggwork's drain/restart policy application-owned.
 
-### M003 — Metrics and operational qualification
+Current interface review confirms Eggup main contains Unix manager mechanics and a native Windows SCM adapter. A published version is preferred; an exact immutable Git revision may be used for integration qualification when publication lags, with that disposition recorded at closure.
 
-Class: polish/invariant
+### M003 — Eggpack producer packaging integration
 
-Status: blocked on M002
+Class: infrastructure/capability
+
+Status: blocked on Eggpack ReleaseManifest and build/qualification interfaces
 
 Objective:
 
-Add bounded metrics, resource/storage diagnostics, service restart/upgrade fixtures, and hosted release evidence.
+Map Eggwork's release target/artifact policy into Eggpack's producer-side contracts, manifests, build/qualification plan, bootstrap installer, and generated release-CI surfaces without recreating producer distribution logic in Eggwork.
 
-### M004 — Reverse-connect relay
+Do not write the implementation handoff until Eggpack closes the concrete ReleaseManifest and build/qualification interfaces needed by a consumer repository.
+
+### M004 — Operational and release qualification
+
+Class: polish/invariant
+
+Status: blocked on M002 and M003
+
+Objective:
+
+Run hosted target/service/update/recovery qualification, verify checksums/provenance and installed-version coherence, exercise drain/update/restart boundaries, and close release-operational findings.
+
+### M005 — Reverse-connect relay
 
 Class: capability
 
-Status: deferred; blocked on stable Control Plane M002 semantics
+Status: deferred; stable identity/lease/event semantics are available, but no immediate handoff is authorized
 
 Objective:
 
@@ -79,15 +97,16 @@ Permit nodes behind NAT/firewalls to maintain an authenticated outbound link thr
 
 Non-goal: any worker selection, global queue, or retry routing in the relay.
 
-### M005 — Interactive PTY extension
+### M006 — Interactive PTY extension
 
 Class: capability
 
-Status: deferred; blocked on stable leases/event resume and explicit platform PTY design
+Status: deferred; requires a separate PTY ownership/attach design
 
 Objective:
 
 Add create/attach/detach/input/resize/terminate/resume with bounded scrollback and transport-owned attachments. This must not change noninteractive runner ownership.
+
 
 ## 4. Target matrix
 
