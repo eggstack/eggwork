@@ -3,10 +3,12 @@
 //! Explicit, single-node Eggwork client using Eggfetch for all HTTP transport.
 
 use bytes::BytesMut;
-use eggfetch_core::{BoxBytesStream, Client as HttpClient, Error as HttpError, TlsConfig};
+use eggfetch_core::{
+    BoxBytesStream, Client as HttpClient, Error as HttpError, RequestBody, TlsConfig,
+};
 use eggwork_core::{
-    ApiError, ExecutionEvent, ExecutionHandle, ExecutionId, ExecutionSnapshot, ExecutionSpec,
-    NodeCapabilities, NodeStatus,
+    ApiError, BlobDigest, ExecutionEvent, ExecutionHandle, ExecutionId, ExecutionSnapshot,
+    ExecutionSpec, NodeCapabilities, NodeStatus,
 };
 use futures_util::{StreamExt, stream};
 use serde::{Serialize, de::DeserializeOwned};
@@ -205,6 +207,72 @@ impl NodeClient {
         Ok(response.bytes_stream()?)
     }
 
+    pub async fn find_missing_blobs(
+        &self,
+        digests: &[BlobDigest],
+    ) -> Result<Vec<BlobDigest>, ClientError> {
+        let mut response = self
+            .http
+            .post(&self.url("/v1/blobs/missing"))?
+            .header("content-type", "application/json")
+            .bytes(
+                serde_json::to_vec(&FindMissingRequest { digests })
+                    .map_err(|_| ClientError::InvalidResponse)?,
+            )
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(api_error(response.status().as_u16(), &mut response).await);
+        }
+        let missing: FindMissingResponse = decode_json(&mut response).await?;
+        Ok(missing.missing)
+    }
+
+    /// Upload one content-addressed blob as a bounded HTTP byte stream.
+    pub async fn upload_blob(
+        &self,
+        digest: &BlobDigest,
+        declared_length: u64,
+        stream: BoxBytesStream,
+    ) -> Result<(), ClientError> {
+        let length = usize::try_from(declared_length).map_err(|_| ClientError::InvalidResponse)?;
+        let mut response = self
+            .http
+            .put(&self.url(&format!(
+                "/v1/blobs/{}?size={declared_length}",
+                digest.as_str()
+            )))?
+            .header("content-type", "application/octet-stream")
+            .body(RequestBody::from_stream(stream, Some(length)))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(api_error(response.status().as_u16(), &mut response).await);
+        }
+        Ok(())
+    }
+
+    /// Open a streamed download for a digest from this fixed node.
+    pub async fn download_blob(&self, digest: &BlobDigest) -> Result<BoxBytesStream, ClientError> {
+        let mut response = self
+            .http
+            .get(&self.url(&format!("/v1/blobs/{}", digest.as_str())))?
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(api_error(response.status().as_u16(), &mut response).await);
+        }
+        let returned_digest = response
+            .headers()
+            .get("eggwork-blob-digest")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| BlobDigest::parse(value.to_owned()).ok());
+        if returned_digest.as_ref() != Some(digest) {
+            return Err(ClientError::InvalidResponse);
+        }
+        Ok(response.bytes_stream()?)
+    }
+
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
         let mut response = self.http.get(&self.url(path))?.send().await?;
         if !response.status().is_success() {
@@ -276,6 +344,16 @@ struct ControlRequest {
     schema_version: u16,
     handle: ExecutionHandle,
     renewal_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FindMissingRequest<'a> {
+    digests: &'a [BlobDigest],
+}
+
+#[derive(serde::Deserialize)]
+struct FindMissingResponse {
+    missing: Vec<BlobDigest>,
 }
 
 async fn decode_json<T: DeserializeOwned>(

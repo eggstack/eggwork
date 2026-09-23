@@ -2,6 +2,7 @@
 
 //! Authenticated fixed-target Eggwork node service, built on EggServe.
 
+mod blob;
 mod store;
 
 use bytes::Bytes;
@@ -9,9 +10,8 @@ use eggserve_core::{
     primitives::{
         canonical::{Response, ResponseBody, ResponseStream, ResponseStreamError, StatusCode},
         request::Request,
-        request_body_policy::RequestBodyPolicy,
     },
-    server::{RuntimeConfig, Server, ServerHandle, service_fn_with_policy},
+    server::{RuntimeConfig, Server, ServerHandle, Service, ServiceFuture},
     tls::{ClientAuthMode, TlsServerConfig},
 };
 use eggwork_core::{
@@ -43,6 +43,7 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const EVENT_CAPACITY: usize = 32;
 const RUNNER_CHANNEL_CAPACITY: usize = 32;
 const MAX_RECENT_EXECUTIONS: usize = 1024;
+const MAX_BLOB_FIND_REQUEST_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
@@ -53,6 +54,8 @@ pub enum Operation {
     Cancel,
     Renew,
     Events,
+    BlobRead,
+    BlobWrite,
 }
 
 pub trait PeerPrincipalResolver: Send + Sync + 'static {
@@ -122,6 +125,8 @@ pub struct NodeConfig {
     pub bind: SocketAddr,
     pub execution_root: PathBuf,
     pub database_path: PathBuf,
+    pub blob_root: PathBuf,
+    pub blob_quota_bytes: u64,
     pub max_active_executions: u32,
     pub lease_ttl: Duration,
     pub tls: TlsServerConfig,
@@ -136,6 +141,7 @@ struct NodeState {
     draining: Arc<AtomicBool>,
     runner: Arc<LocalProcessRunner>,
     store: store::ExecutionStore,
+    blobs: blob::BlobStore,
     lease_ttl: Duration,
     resolver: Arc<dyn PeerPrincipalResolver>,
     authorizer: Arc<dyn Authorizer>,
@@ -164,6 +170,46 @@ pub struct NodeServer {
     state: NodeState,
 }
 
+struct NodeHttpService(NodeState);
+
+impl Service for NodeHttpService {
+    fn request_body_policy(
+        &self,
+        head: &eggserve_core::primitives::request_head::RequestHead,
+    ) -> eggserve_core::primitives::request_body_policy::RequestBodyPolicy {
+        use eggserve_core::primitives::request_body_policy::RequestBodyPolicy;
+        let path = head.target().path();
+        match (head.method().as_str(), path) {
+            ("POST", "/v1/blobs/missing") => RequestBodyPolicy::Buffer {
+                max_bytes: MAX_BLOB_FIND_REQUEST_BYTES as u64,
+            },
+            ("PUT", path)
+                if path.strip_prefix("/v1/blobs/").is_some_and(|digest| {
+                    eggwork_core::BlobDigest::parse(digest.to_owned()).is_ok()
+                }) =>
+            {
+                RequestBodyPolicy::Stream {
+                    max_bytes: blob::MAX_BLOB_BYTES,
+                }
+            }
+            ("POST", "/v1/executions") => RequestBodyPolicy::Buffer {
+                max_bytes: MAX_REQUEST_BYTES as u64,
+            },
+            ("POST", path) if path.ends_with("/cancel") || path.ends_with("/renew") => {
+                RequestBodyPolicy::Buffer {
+                    max_bytes: MAX_REQUEST_BYTES as u64,
+                }
+            }
+            _ => RequestBodyPolicy::Reject,
+        }
+    }
+
+    fn call(&self, request: Request) -> ServiceFuture<'_> {
+        let state = self.0.clone();
+        Box::pin(async move { dispatch(state, request).await })
+    }
+}
+
 impl NodeServer {
     pub async fn start(
         config: NodeConfig,
@@ -185,6 +231,8 @@ impl NodeServer {
             return Err(NodeStartError::InvalidLease);
         }
         let store = store::ExecutionStore::open(&config.database_path)
+            .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
+        let blobs = blob::BlobStore::open(&config.blob_root, config.blob_quota_bytes)
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
         store
             .recover()
@@ -224,6 +272,7 @@ impl NodeServer {
             draining,
             runner,
             store,
+            blobs,
             lease_ttl: config.lease_ttl,
             resolver,
             authorizer,
@@ -231,21 +280,12 @@ impl NodeServer {
         };
         let runtime = RuntimeConfig::builder()
             .bind(config.bind)
-            .max_request_body_bytes(MAX_REQUEST_BYTES as u64)
+            .max_request_body_bytes(blob::MAX_BLOB_BYTES)
             .tls_config(config.tls.into_server_config())
             .tls_expose_peer_chain(true)
             .build()
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
-        let service_state = state.clone();
-        let service = service_fn_with_policy(
-            move |request| {
-                let state = service_state.clone();
-                async move { dispatch(state, request).await }
-            },
-            RequestBodyPolicy::Buffer {
-                max_bytes: MAX_REQUEST_BYTES as u64,
-            },
-        );
+        let service = NodeHttpService(state.clone());
         let server = Server::builder()
             .runtime(runtime)
             .bind(config.bind)
@@ -326,6 +366,7 @@ fn operation_for(method: &str, path: &str) -> Option<(Operation, Route)> {
         ("GET", "/v1/capabilities") => Some((Operation::Capabilities, Route::Capabilities)),
         ("GET", "/v1/status") => Some((Operation::Status, Route::Status)),
         ("POST", "/v1/executions") => Some((Operation::Execute, Route::Execute)),
+        ("POST", "/v1/blobs/missing") => Some((Operation::BlobRead, Route::BlobMissing)),
         _ => {
             let parts: Vec<_> = path.split('/').collect();
             if parts.len() == 4 && parts[..3] == ["", "v1", "executions"] {
@@ -344,6 +385,26 @@ fn operation_for(method: &str, path: &str) -> Option<(Operation, Route)> {
                     _ => None,
                 };
             }
+            if parts.len() == 4 && parts[..2] == ["", "v1"] && parts[2] == "blobs" {
+                if !matches!(method, "PUT" | "GET") {
+                    return None;
+                }
+                let Ok(digest) = eggwork_core::BlobDigest::parse(parts[3].to_owned()) else {
+                    return Some((
+                        if method == "PUT" {
+                            Operation::BlobWrite
+                        } else {
+                            Operation::BlobRead
+                        },
+                        Route::BlobInvalidDigest,
+                    ));
+                };
+                return match method {
+                    "PUT" => Some((Operation::BlobWrite, Route::BlobUpload(digest))),
+                    "GET" => Some((Operation::BlobRead, Route::BlobDownload(digest))),
+                    _ => None,
+                };
+            }
             None
         }
     }
@@ -357,6 +418,10 @@ enum Route {
     Cancel(ExecutionId),
     Renew(ExecutionId),
     Events(ExecutionId),
+    BlobMissing,
+    BlobUpload(eggwork_core::BlobDigest),
+    BlobDownload(eggwork_core::BlobDigest),
+    BlobInvalidDigest,
 }
 
 async fn dispatch(
@@ -395,6 +460,8 @@ async fn dispatch(
                     "exec.argv.v1".into(),
                     "events.live.v1".into(),
                     "auth.mtls.v1".into(),
+                    "blob.sha256.v1".into(),
+                    "blob.stream.v1".into(),
                 ],
                 max_active_executions: state.max_active,
             },
@@ -405,6 +472,14 @@ async fn dispatch(
         Route::Cancel(id) => control(state, id, request, principal, false).await,
         Route::Renew(id) => control(state, id, request, principal, true).await,
         Route::Events(id) => events_route(state, id, query.as_deref(), principal).await,
+        Route::BlobMissing => blob_missing(state, request).await,
+        Route::BlobUpload(digest) => blob_upload(state, request, digest).await,
+        Route::BlobDownload(digest) => blob_download(state, digest).await,
+        Route::BlobInvalidDigest => Ok(error_response(
+            400,
+            "invalid_digest",
+            "blob digest is invalid",
+        )),
     }
 }
 
@@ -434,9 +509,175 @@ fn node_status(state: &NodeState) -> NodeStatus {
                 "exec.argv.v1".into(),
                 "events.live.v1".into(),
                 "auth.mtls.v1".into(),
+                "blob.sha256.v1".into(),
+                "blob.stream.v1".into(),
             ],
             max_active_executions: state.max_active,
         },
+    }
+}
+
+async fn read_limited_body(
+    mut body: eggserve_core::primitives::RequestBody,
+    limit: usize,
+) -> Result<Vec<u8>, ()> {
+    let mut bytes =
+        Vec::with_capacity(body.declared_length().unwrap_or(0).min(limit as u64) as usize);
+    while let Some(chunk) = body.next_chunk().await.map_err(|_| ())? {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+#[derive(Deserialize)]
+struct FindMissingRequest {
+    digests: Vec<eggwork_core::BlobDigest>,
+}
+
+#[derive(Serialize)]
+struct FindMissingResponse {
+    missing: Vec<eggwork_core::BlobDigest>,
+}
+
+async fn blob_missing(
+    state: NodeState,
+    request: Request,
+) -> Result<Response, eggserve_core::server::ServiceError> {
+    let (_head, body, _context) = request.into_parts_with_context();
+    let bytes = match read_limited_body(body, MAX_BLOB_FIND_REQUEST_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(()) => {
+            return Ok(error_response(
+                413,
+                "request_too_large",
+                "request body exceeds limit",
+            ));
+        }
+    };
+    let query: FindMissingRequest = match serde_json::from_slice(&bytes) {
+        Ok(query) => query,
+        Err(_) => {
+            return Ok(error_response(
+                400,
+                "invalid_request",
+                "request body is invalid",
+            ));
+        }
+    };
+    match state.blobs.find_missing(&query.digests) {
+        Ok(missing) => Ok(json_response(200, &FindMissingResponse { missing })),
+        Err(blob::BlobError::TooManyDigests) => Ok(error_response(
+            413,
+            "too_many_digests",
+            "digest batch exceeds limit",
+        )),
+        Err(_) => Ok(error_response(
+            500,
+            "storage_error",
+            "blob metadata is unavailable",
+        )),
+    }
+}
+
+async fn blob_upload(
+    state: NodeState,
+    request: Request,
+    digest: eggwork_core::BlobDigest,
+) -> Result<Response, eggserve_core::server::ServiceError> {
+    let query = request.head().target().query();
+    let declared = query
+        .and_then(|query| query.strip_prefix("size="))
+        .and_then(|size| size.parse::<u64>().ok());
+    let Some(declared) = declared else {
+        return Ok(error_response(
+            400,
+            "invalid_request",
+            "blob size is required",
+        ));
+    };
+    if declared > blob::MAX_BLOB_BYTES {
+        return Ok(error_response(
+            413,
+            "blob_too_large",
+            "blob exceeds size limit",
+        ));
+    }
+    let (_head, body, _context) = request.into_parts_with_context();
+    if body
+        .declared_length()
+        .is_some_and(|length| length != declared)
+    {
+        return Ok(error_response(
+            400,
+            "length_mismatch",
+            "declared blob length does not match request",
+        ));
+    }
+    let input = stream::unfold(body, |mut body| async move {
+        match body.next_chunk().await {
+            Ok(Some(chunk)) => Some((Ok::<_, blob::BlobError>(chunk), body)),
+            Ok(None) => None,
+            Err(_) => Some((Err(blob::BlobError::Body), body)),
+        }
+    });
+    match state.blobs.put_stream(digest, declared, input).await {
+        Ok(()) => Ok(Response::builder()
+            .status(StatusCode::new(201).expect("valid HTTP status"))
+            .body(ResponseBody::Empty)
+            .unwrap_or_else(|_| error_response(500, "internal", "internal error"))),
+        Err(error) => Ok(blob_error_response(error)),
+    }
+}
+
+async fn blob_download(
+    state: NodeState,
+    digest: eggwork_core::BlobDigest,
+) -> Result<Response, eggserve_core::server::ServiceError> {
+    let file = match state.blobs.open_verified(&digest).await {
+        Ok(file) => file,
+        Err(error) => return Ok(blob_error_response(error)),
+    };
+    let stream = stream::try_unfold(file, |mut file| async move {
+        let mut chunk = vec![0u8; 64 * 1024];
+        match tokio::io::AsyncReadExt::read(&mut file, &mut chunk).await {
+            Ok(0) => Ok(None),
+            Ok(size) => {
+                chunk.truncate(size);
+                Ok(Some((Bytes::from(chunk), file)))
+            }
+            Err(_) => Err(ResponseStreamError::new("blob read failed")),
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .and_then(|builder| builder.header("eggwork-blob-digest", digest.as_str()))
+        .and_then(|builder| builder.body(ResponseBody::Stream(ResponseStream::new(stream))))
+        .map_err(|e| eggserve_core::server::ServiceError::internal(e.to_string()))
+}
+
+fn blob_error_response(error: blob::BlobError) -> Response {
+    match error {
+        blob::BlobError::TooLarge => {
+            error_response(413, "blob_too_large", "blob exceeds size limit")
+        }
+        blob::BlobError::QuotaExceeded => {
+            error_response(507, "quota_exceeded", "blob storage quota exceeded")
+        }
+        blob::BlobError::LengthMismatch => {
+            error_response(422, "length_mismatch", "blob length does not match")
+        }
+        blob::BlobError::DigestMismatch => {
+            error_response(422, "digest_mismatch", "blob digest does not match")
+        }
+        blob::BlobError::NotFound => error_response(404, "blob_not_found", "blob not found"),
+        blob::BlobError::CorruptExisting => {
+            error_response(500, "corrupt_blob", "stored blob was quarantined")
+        }
+        _ => error_response(500, "storage_error", "blob storage operation failed"),
     }
 }
 
@@ -446,9 +687,9 @@ async fn execute(
     principal: NodePrincipal,
 ) -> Result<Response, eggserve_core::server::ServiceError> {
     let (_head, body, _context) = request.into_parts_with_context();
-    let body = match body.read_all().await {
-        Ok(body) if body.len() <= MAX_REQUEST_BYTES => body,
-        _ => {
+    let body = match read_limited_body(body, MAX_REQUEST_BYTES).await {
+        Ok(body) => body,
+        Err(()) => {
             return Ok(error_response(
                 413,
                 "request_too_large",
@@ -803,9 +1044,9 @@ async fn control(
     renew: bool,
 ) -> Result<Response, eggserve_core::server::ServiceError> {
     let (_head, body, _context) = request.into_parts_with_context();
-    let bytes = match body.read_all().await {
-        Ok(bytes) if bytes.len() <= MAX_REQUEST_BYTES => bytes,
-        _ => {
+    let bytes = match read_limited_body(body, MAX_REQUEST_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(()) => {
             return Ok(error_response(
                 413,
                 "request_too_large",
@@ -1655,13 +1896,20 @@ mod tests {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
                 database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024 * 1024,
                 max_active_executions: 2,
                 lease_ttl: std::time::Duration::from_secs(3),
                 tls: tls_server_config(root.clone(), &server_identity),
             },
             Arc::new(LocalProcessRunner::default()),
             resolver,
-            Arc::new(|_: &NodePrincipal, operation| operation != Operation::Execute),
+            Arc::new(|_: &NodePrincipal, operation| {
+                !matches!(
+                    operation,
+                    Operation::Execute | Operation::BlobRead | Operation::BlobWrite
+                )
+            }),
         )
         .await
         .unwrap();
@@ -1691,6 +1939,19 @@ mod tests {
             !marker.exists(),
             "authorization denial must precede admission and spawn"
         );
+        let denied_digest = eggwork_core::BlobDigest::from_bytes(b"denied");
+        assert!(matches!(
+            unauthorized
+                .find_missing_blobs(std::slice::from_ref(&denied_digest))
+                .await,
+            Err(eggwork_client::ClientError::Api { status: 403, .. })
+        ));
+        assert!(matches!(
+            unauthorized
+                .upload_blob(&denied_digest, 0, Box::pin(stream::empty()),)
+                .await,
+            Err(eggwork_client::ClientError::Api { status: 403, .. })
+        ));
         assert!(unauthorized.status().await.is_ok());
         let unknown_temp = TempDir::new().unwrap();
         let unknown_client = NodeClient::new(
@@ -1714,6 +1975,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blob_protocol_streams_verifies_deduplicates_and_enforces_quota() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("blob-controller").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("blob-node").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blobs"),
+                blob_quota_bytes: 3 * 1024 * 1024,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(5),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+
+        assert_eq!(
+            eggwork_core::BlobDigest::from_bytes(b"abc").as_str(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let payload = vec![0x5a; 2 * 1024 * 1024];
+        let digest = eggwork_core::BlobDigest::from_bytes(&payload);
+        assert_eq!(
+            client
+                .find_missing_blobs(std::slice::from_ref(&digest))
+                .await
+                .unwrap(),
+            vec![digest.clone()]
+        );
+        let chunks = payload
+            .chunks(32 * 1024)
+            .map(|chunk| Ok::<_, eggfetch_core::Error>(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        client
+            .upload_blob(
+                &digest,
+                payload.len() as u64,
+                Box::pin(stream::iter(chunks)),
+            )
+            .await
+            .unwrap();
+        assert!(
+            client
+                .find_missing_blobs(std::slice::from_ref(&digest))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Same-digest upload is a verified no-op even when the quota is full.
+        let chunks = payload
+            .chunks(64 * 1024)
+            .map(|chunk| Ok::<_, eggfetch_core::Error>(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        client
+            .upload_blob(
+                &digest,
+                payload.len() as u64,
+                Box::pin(stream::iter(chunks)),
+            )
+            .await
+            .unwrap();
+        let downloaded = client
+            .download_blob(&digest)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let downloaded: Vec<u8> = downloaded.into_iter().flatten().collect();
+        assert_eq!(downloaded, payload);
+
+        let other = vec![0x33; 2 * 1024 * 1024];
+        let other_digest = eggwork_core::BlobDigest::from_bytes(&other);
+        let chunks = other
+            .chunks(32 * 1024)
+            .map(|chunk| Ok::<_, eggfetch_core::Error>(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            client
+                .upload_blob(
+                    &other_digest,
+                    other.len() as u64,
+                    Box::pin(stream::iter(chunks))
+                )
+                .await,
+            Err(eggwork_client::ClientError::Api { status: 507, .. })
+        ));
+        let wrong_digest = eggwork_core::BlobDigest::from_bytes(b"wrong");
+        let chunks = vec![Ok::<_, eggfetch_core::Error>(Bytes::from_static(b"abc"))];
+        assert!(matches!(
+            client
+                .upload_blob(&wrong_digest, 3, Box::pin(stream::iter(chunks)))
+                .await,
+            Err(eggwork_client::ClientError::Api { status: 422, .. })
+        ));
+
+        fs::write(server.state.blobs.path_for(&digest), b"corruption").unwrap();
+        assert!(matches!(
+            client.download_blob(&digest).await,
+            Err(eggwork_client::ClientError::Api { status: 500, .. })
+        ));
+        assert!(!server.state.blobs.path_for(&digest).exists());
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn mtls_execution_streams_output_and_missing_certificate_is_rejected() {
         init_tls();
         let (root, server_identity, client_identity, _) = tls_material();
@@ -1731,6 +2119,8 @@ mod tests {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
                 database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024 * 1024,
                 max_active_executions: 1,
                 lease_ttl: std::time::Duration::from_secs(5),
                 tls: tls_server_config(root.clone(), &server_identity),
@@ -2063,6 +2453,8 @@ mod tests {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
                 database_path: temp.path().join("lease.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024 * 1024,
                 max_active_executions: 1,
                 lease_ttl: std::time::Duration::from_millis(150),
                 tls: tls_server_config(root.clone(), &server_identity),
@@ -2172,6 +2564,8 @@ mod tests {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
                 database_path,
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024 * 1024,
                 max_active_executions: 1,
                 lease_ttl: std::time::Duration::from_secs(30),
                 tls: tls_server_config(root.clone(), &server_identity),
