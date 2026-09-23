@@ -3,7 +3,7 @@
 Historical closure: `plans/closure/control-plane-protocol/002-status.md`  
 Source plan: `plans/implementation/control-plane-protocol/002-idempotency-leases-events-and-recovery.md`  
 Reviewed corrective commit: `428e2ce`  
-Planning/corrective closure commit: pending
+Planning/corrective closure commit: `03da005`
 
 ## Historical claim requiring qualification
 
