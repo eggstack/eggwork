@@ -3008,6 +3008,78 @@ mod tests {
         server.wait().await.unwrap();
     }
 
+    async fn routed_mtls_execution(route: &str, execution_id: &str) {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("routed-work");
+        fs::create_dir_all(&work_root).unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            eggwork_core::PrincipalId::new("routed-controller").unwrap(),
+        )]));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("routed-node").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 2,
+                lease_ttl: std::time::Duration::from_secs(5),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::with_eggress_route(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+            route,
+        )
+        .unwrap();
+        let handle = execution_handle(execution_id);
+        let stream = client
+            .execute(
+                &execution_spec(vec!["/bin/sh".into(), "-c".into(), "printf routed".into()]),
+                &handle,
+            )
+            .await
+            .unwrap();
+        let events = stream.into_events().try_collect::<Vec<_>>().await.unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            ExecutionEventKind::Stdout(bytes) if bytes == b"routed"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            ExecutionEventKind::State(ExecutionState::Succeeded)
+        )));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_route_preserves_mtls_execution_semantics() {
+        let proxy = eggress_testkit::fixtures::Socks5Upstream::start().await;
+        routed_mtls_execution(&format!("socks5://{}", proxy.addr()), "socks-routed").await;
+        assert!(proxy.connection_count().load(Ordering::SeqCst) > 0);
+    }
+
+    #[tokio::test]
+    async fn http_connect_route_preserves_mtls_execution_semantics() {
+        let proxy = eggress_testkit::fixtures::HttpConnectUpstream::start().await;
+        routed_mtls_execution(&format!("http://{}", proxy.addr()), "connect-routed").await;
+        assert!(proxy.connection_count().load(Ordering::SeqCst) > 0);
+    }
+
     #[tokio::test]
     async fn blob_protocol_streams_verifies_deduplicates_and_enforces_quota() {
         init_tls();

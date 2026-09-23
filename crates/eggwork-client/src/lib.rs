@@ -12,6 +12,8 @@ use eggwork_core::{
 };
 use futures_util::{StreamExt, stream};
 use serde::{Serialize, de::DeserializeOwned};
+#[cfg(feature = "eggress-route")]
+use std::sync::Arc;
 use std::{fmt, path::Path};
 use thiserror::Error;
 
@@ -21,6 +23,8 @@ const API_SCHEMA_VERSION: u16 = 1;
 pub enum ClientError {
     #[error("node endpoint must be an https URL without query, fragment, or credentials")]
     InvalidEndpoint,
+    #[error("Eggress route configuration is invalid")]
+    InvalidRoute,
     #[error("node transport failed")]
     Transport(HttpError),
     #[error("node returned HTTP {status}: {code}")]
@@ -31,6 +35,10 @@ pub enum ClientError {
     },
     #[error("node response was malformed")]
     InvalidResponse,
+    #[error("node protocol is incompatible")]
+    ProtocolIncompatible,
+    #[error("node does not support a required protocol capability")]
+    UnsupportedCapability,
 }
 
 impl From<HttpError> for ClientError {
@@ -39,10 +47,28 @@ impl From<HttpError> for ClientError {
     }
 }
 
+#[cfg(feature = "eggress-route")]
+impl ClientError {
+    /// Recover Eggress' typed route failure without parsing display text.
+    pub fn eggress_error(&self) -> Option<&eggress_outbound::OutboundConnectError> {
+        let mut source: &(dyn std::error::Error + 'static) = match self {
+            Self::Transport(error) => error,
+            _ => return None,
+        };
+        loop {
+            if let Some(route) = source.downcast_ref() {
+                return Some(route);
+            }
+            source = source.source()?;
+        }
+    }
+}
+
 impl fmt::Debug for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidEndpoint => f.write_str("ClientError::InvalidEndpoint"),
+            Self::InvalidRoute => f.write_str("ClientError::InvalidRoute"),
             Self::Transport(_) => f.write_str("ClientError::Transport([REDACTED])"),
             Self::Api { status, code, .. } => f
                 .debug_struct("ClientError::Api")
@@ -51,6 +77,8 @@ impl fmt::Debug for ClientError {
                 .field("message", &"[REDACTED]")
                 .finish(),
             Self::InvalidResponse => f.write_str("ClientError::InvalidResponse"),
+            Self::ProtocolIncompatible => f.write_str("ClientError::ProtocolIncompatible"),
+            Self::UnsupportedCapability => f.write_str("ClientError::UnsupportedCapability"),
         }
     }
 }
@@ -99,6 +127,37 @@ impl NodeClient {
         Ok(Self { endpoint, http })
     }
 
+    /// Build a fixed-target client over an explicit Eggress connector.
+    /// Eggfetch retains ownership of HTTP and destination TLS. A route error
+    /// is propagated without retrying or constructing a direct client.
+    #[cfg(feature = "eggress-route")]
+    pub fn with_eggress(
+        endpoint: impl AsRef<str>,
+        tls: TlsConfig,
+        connector: eggress_outbound::OutboundConnector,
+    ) -> Result<Self, ClientError> {
+        let endpoint = normalize_endpoint(endpoint.as_ref())?;
+        let http = HttpClient::builder()
+            .tls_config(tls)
+            .dialer(EggressDialer {
+                connector: Arc::new(connector),
+            })
+            .build();
+        Ok(Self { endpoint, http })
+    }
+
+    /// Construct an opt-in Eggress route from a pproxy-compatible expression.
+    #[cfg(feature = "eggress-route")]
+    pub fn with_eggress_route(
+        endpoint: impl AsRef<str>,
+        tls: TlsConfig,
+        route: &str,
+    ) -> Result<Self, ClientError> {
+        let connector = eggress_outbound::OutboundConnector::from_pproxy_uri(route)
+            .map_err(|_| ClientError::InvalidRoute)?;
+        Self::with_eggress(endpoint, tls, connector)
+    }
+
     pub async fn capabilities(&self) -> Result<NodeCapabilities, ClientError> {
         self.get_json("/v1/capabilities").await
     }
@@ -133,6 +192,7 @@ impl NodeClient {
         handle: &ExecutionHandle,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<ExecutionStream, ClientError> {
+        self.ensure_protocol_compatible().await?;
         let payload = ExecuteRequest {
             schema_version: API_SCHEMA_VERSION,
             handle: handle.clone(),
@@ -164,6 +224,24 @@ impl NodeClient {
             execution_id: id,
             events,
         })
+    }
+
+    async fn ensure_protocol_compatible(&self) -> Result<(), ClientError> {
+        let capabilities = self.capabilities().await?;
+        let required = eggwork_core::ProtocolVersion { major: 1, minor: 0 };
+        let supported =
+            capabilities.protocol.min <= required && capabilities.protocol.max >= required;
+        if !supported {
+            return Err(ClientError::ProtocolIncompatible);
+        }
+        if !capabilities
+            .features
+            .iter()
+            .any(|feature| feature == "exec.argv.v1")
+        {
+            return Err(ClientError::UnsupportedCapability);
+        }
+        Ok(())
     }
 
     pub async fn create_workspace(
@@ -257,6 +335,7 @@ impl NodeClient {
         handle: &ExecutionHandle,
         after_sequence: u64,
     ) -> Result<BoxBytesStream, ClientError> {
+        self.ensure_protocol_compatible().await?;
         let mut response = self
             .http
             .get(&self.url(&format!(
@@ -434,6 +513,87 @@ pub struct ExecutionStream {
     events: BoxBytesStream,
 }
 
+#[cfg(feature = "eggress-route")]
+struct EggressDialer {
+    connector: Arc<eggress_outbound::OutboundConnector>,
+}
+
+#[cfg(feature = "eggress-route")]
+struct EggressIo<S>(S);
+
+#[cfg(feature = "eggress-route")]
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for EggressIo<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "eggress-route")]
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for EggressIo<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+#[cfg(feature = "eggress-route")]
+impl eggfetch_core::Dialer for EggressDialer {
+    fn dial(&self, target: eggfetch_core::DialTarget) -> eggfetch_core::DialFuture<'_> {
+        Box::pin(async move {
+            let (stream, _) = self
+                .connector
+                .connect_tcp_timeout_detailed(
+                    target.host(),
+                    target.port(),
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .map_err(|error| {
+                    use eggfetch_core::DialErrorKind;
+                    use eggress_outbound::OutboundConnectErrorKind as RouteKind;
+                    let kind = match error.kind() {
+                        RouteKind::Timeout => DialErrorKind::Timeout,
+                        RouteKind::Authentication => DialErrorKind::Authentication,
+                        RouteKind::Policy => DialErrorKind::Rejected,
+                        RouteKind::Dns
+                        | RouteKind::ConnectionRefused
+                        | RouteKind::NetworkUnreachable
+                        | RouteKind::HostUnreachable => DialErrorKind::Connection,
+                        _ => DialErrorKind::Other,
+                    };
+                    eggfetch_core::DialError::with_source(
+                        kind,
+                        "Eggress route connection failed",
+                        error,
+                    )
+                })?;
+            let routed: eggfetch_core::DialStream = Box::new(EggressIo(stream));
+            Ok(routed)
+        })
+    }
+}
+
 impl ExecutionStream {
     /// Consume newline-delimited JSON events from the live response.
     pub fn into_events(
@@ -449,17 +609,24 @@ impl ExecutionStream {
                         if line.is_empty() {
                             continue;
                         }
-                        let event = serde_json::from_slice(&line)
+                        let event: ExecutionEvent = serde_json::from_slice(&line)
                             .map_err(|_| ClientError::InvalidResponse)?;
+                        event.validate().map_err(|_| ClientError::InvalidResponse)?;
                         return Ok(Some((event, (events, pending))));
                     }
                     match events.next().await {
-                        Some(Ok(bytes)) => pending.extend_from_slice(&bytes),
+                        Some(Ok(bytes)) => {
+                            if pending.len().saturating_add(bytes.len()) > 128 * 1024 {
+                                return Err(ClientError::InvalidResponse);
+                            }
+                            pending.extend_from_slice(&bytes)
+                        }
                         Some(Err(error)) => return Err(ClientError::Transport(error)),
                         None if pending.is_empty() => return Ok(None),
                         None => {
-                            let event = serde_json::from_slice(&pending)
+                            let event: ExecutionEvent = serde_json::from_slice(&pending)
                                 .map_err(|_| ClientError::InvalidResponse)?;
+                            event.validate().map_err(|_| ClientError::InvalidResponse)?;
                             return Ok(Some((event, (events, BytesMut::new()))));
                         }
                     }
@@ -583,5 +750,86 @@ mod security_tests {
         };
         assert!(!format!("{error:?}").contains("private-key-material"));
         assert!(!error.to_string().contains("private-key-material"));
+    }
+}
+
+#[cfg(all(test, feature = "eggress-route"))]
+mod eggress_route_tests {
+    use super::*;
+    use eggfetch_core::Dialer;
+    use eggress_testkit::fixtures::{HttpConnectUpstream, Socks5Upstream};
+    use std::error::Error;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn init_crypto_provider() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    async fn round_trip(route: String) {
+        init_crypto_provider();
+        let (target, server) = eggress_testkit::start_echo_server().await;
+        let connector = eggress_outbound::OutboundConnector::from_pproxy_uri(&route).unwrap();
+        let dialer = EggressDialer {
+            connector: Arc::new(connector),
+        };
+        let mut stream = dialer
+            .dial(eggfetch_core::DialTarget::new("127.0.0.1", target.port()))
+            .await
+            .unwrap();
+        stream.write_all(b"eggwork route").await.unwrap();
+        let mut response = [0u8; 13];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"eggwork route");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn socks5_route_round_trips() {
+        let proxy = Socks5Upstream::start().await;
+        round_trip(format!("socks5://{}", proxy.addr())).await;
+    }
+
+    #[tokio::test]
+    async fn http_connect_route_round_trips() {
+        let proxy = HttpConnectUpstream::start().await;
+        round_trip(format!("http://{}", proxy.addr())).await;
+    }
+
+    #[tokio::test]
+    async fn route_failure_does_not_connect_direct_and_preserves_typed_error() {
+        init_crypto_provider();
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_task = accepted.clone();
+        let server = tokio::spawn(async move {
+            if target.accept().await.is_ok() {
+                accepted_task.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let connector =
+            eggress_outbound::OutboundConnector::from_pproxy_uri("socks5://127.0.0.1:1").unwrap();
+        let dialer = EggressDialer {
+            connector: Arc::new(connector),
+        };
+        let result = dialer
+            .dial(eggfetch_core::DialTarget::new(
+                target_addr.ip().to_string(),
+                target_addr.port(),
+            ))
+            .await;
+        let error = match result {
+            Ok(_) => panic!("configured proxy unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert!(error.source().is_some());
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 }

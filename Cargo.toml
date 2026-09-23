@@ -33,6 +33,7 @@ base64 = "0.22"
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 eggserve-core = { version = "0.2.0", default-features = false, features = ["tls"] }
 eggfetch-core = { version = "0.2.0", default-features = false, features = ["standard-http1", "tls-rustls"] }
+eggress-outbound = { version = "1.0.8", default-features = false, features = ["pproxy-compat"] }
 landlock = "=0.4.7"
 tempfile = "3"
 
