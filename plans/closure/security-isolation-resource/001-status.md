@@ -3,7 +3,7 @@
 Source plan: `plans/implementation/security-isolation-resource/001-authorization-redaction-and-threat-model.md`  
 Subsystem roadmap: `plans/subsystems/security-isolation-resource-roadmap.md`  
 Threat model: `plans/security/threat-model.md`  
-Reviewed implementation commit: pending  
+Reviewed implementation commit: `f629f9b`  
 Planning/closure commit: pending
 
 ## Finding
