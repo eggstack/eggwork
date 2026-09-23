@@ -41,7 +41,7 @@ Transport mechanics remain in control-plane protocol; process lifecycle remains 
 
 Class: invariant/infrastructure
 
-Status: ready; dependencies closed and interface available
+Status: active
 
 Implementation plan:
 

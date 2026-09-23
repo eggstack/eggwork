@@ -85,7 +85,7 @@ Exit conditions:
 
 Class: capability/infrastructure
 
-Status: active
+Status: closed
 
 Implementation plan:
 
