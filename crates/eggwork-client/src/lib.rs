@@ -8,7 +8,7 @@ use eggfetch_core::{
 };
 use eggwork_core::{
     ApiError, BlobDigest, ExecutionEvent, ExecutionHandle, ExecutionId, ExecutionSnapshot,
-    ExecutionSpec, NodeCapabilities, NodeStatus,
+    ExecutionSpec, NodeCapabilities, NodeStatus, WorkspaceId, WorkspaceManifest,
 };
 use futures_util::{StreamExt, stream};
 use serde::{Serialize, de::DeserializeOwned};
@@ -95,9 +95,29 @@ impl NodeClient {
         spec: &ExecutionSpec,
         handle: &ExecutionHandle,
     ) -> Result<ExecutionStream, ClientError> {
+        self.execute_with_workspace(spec, handle, None).await
+    }
+
+    pub async fn execute_in_workspace(
+        &self,
+        spec: &ExecutionSpec,
+        handle: &ExecutionHandle,
+        workspace_id: &WorkspaceId,
+    ) -> Result<ExecutionStream, ClientError> {
+        self.execute_with_workspace(spec, handle, Some(workspace_id.clone()))
+            .await
+    }
+
+    async fn execute_with_workspace(
+        &self,
+        spec: &ExecutionSpec,
+        handle: &ExecutionHandle,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<ExecutionStream, ClientError> {
         let payload = ExecuteRequest {
             schema_version: API_SCHEMA_VERSION,
             handle: handle.clone(),
+            workspace_id,
             spec,
         };
         let mut response = self
@@ -125,6 +145,33 @@ impl NodeClient {
             execution_id: id,
             events,
         })
+    }
+
+    pub async fn create_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        handle: &ExecutionHandle,
+        manifest: &WorkspaceManifest,
+    ) -> Result<WorkspaceReady, ClientError> {
+        let mut response = self
+            .http
+            .post(&self.url("/v1/workspaces"))?
+            .header("content-type", "application/json")
+            .bytes(
+                serde_json::to_vec(&CreateWorkspaceRequest {
+                    schema_version: API_SCHEMA_VERSION,
+                    workspace_id,
+                    handle,
+                    manifest,
+                })
+                .map_err(|_| ClientError::InvalidResponse)?,
+            )
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(api_error(response.status().as_u16(), &mut response).await);
+        }
+        decode_json(&mut response).await
     }
 
     pub async fn observe(&self, id: &ExecutionId) -> Result<ExecutionSnapshot, ClientError> {
@@ -356,7 +403,26 @@ impl ExecutionStream {
 struct ExecuteRequest<'a> {
     schema_version: u16,
     handle: ExecutionHandle,
+    workspace_id: Option<WorkspaceId>,
     spec: &'a ExecutionSpec,
+}
+
+#[derive(Serialize)]
+struct CreateWorkspaceRequest<'a> {
+    schema_version: u16,
+    workspace_id: &'a WorkspaceId,
+    handle: &'a ExecutionHandle,
+    manifest: &'a WorkspaceManifest,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WorkspaceReady {
+    pub schema_version: u16,
+    pub workspace_id: WorkspaceId,
+    pub execution_id: ExecutionId,
+    pub generation: eggwork_core::ExecutionGeneration,
+    pub manifest_digest: BlobDigest,
+    pub logical_bytes: u64,
 }
 
 #[derive(Serialize)]

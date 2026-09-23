@@ -4,6 +4,7 @@
 
 mod blob;
 mod store;
+mod workspace;
 
 use bytes::Bytes;
 use eggserve_core::{
@@ -44,6 +45,7 @@ const EVENT_CAPACITY: usize = 32;
 const RUNNER_CHANNEL_CAPACITY: usize = 32;
 const MAX_RECENT_EXECUTIONS: usize = 1024;
 const MAX_BLOB_FIND_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_WORKSPACE_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
@@ -56,6 +58,7 @@ pub enum Operation {
     Events,
     BlobRead,
     BlobWrite,
+    WorkspaceCreate,
 }
 
 pub trait PeerPrincipalResolver: Send + Sync + 'static {
@@ -127,6 +130,8 @@ pub struct NodeConfig {
     pub database_path: PathBuf,
     pub blob_root: PathBuf,
     pub blob_quota_bytes: u64,
+    pub workspace_root: PathBuf,
+    pub workspace_quota_bytes: u64,
     pub max_active_executions: u32,
     pub lease_ttl: Duration,
     pub tls: TlsServerConfig,
@@ -142,6 +147,7 @@ struct NodeState {
     runner: Arc<LocalProcessRunner>,
     store: store::ExecutionStore,
     blobs: blob::BlobStore,
+    workspaces: workspace::WorkspaceManager,
     lease_ttl: Duration,
     resolver: Arc<dyn PeerPrincipalResolver>,
     authorizer: Arc<dyn Authorizer>,
@@ -182,6 +188,9 @@ impl Service for NodeHttpService {
         match (head.method().as_str(), path) {
             ("POST", "/v1/blobs/missing" | "/v1/blobs/prepare") => RequestBodyPolicy::Buffer {
                 max_bytes: MAX_BLOB_FIND_REQUEST_BYTES as u64,
+            },
+            ("POST", "/v1/workspaces") => RequestBodyPolicy::Buffer {
+                max_bytes: MAX_WORKSPACE_REQUEST_BYTES as u64,
             },
             ("PUT", path)
                 if path.strip_prefix("/v1/blobs/").is_some_and(|digest| {
@@ -234,6 +243,9 @@ impl NodeServer {
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
         let blobs = blob::BlobStore::open(&config.blob_root, config.blob_quota_bytes)
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
+        let workspaces =
+            workspace::WorkspaceManager::open(&config.workspace_root, config.workspace_quota_bytes)
+                .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
         store
             .recover()
             .await
@@ -273,6 +285,7 @@ impl NodeServer {
             runner,
             store,
             blobs,
+            workspaces,
             lease_ttl: config.lease_ttl,
             resolver,
             authorizer,
@@ -368,6 +381,7 @@ fn operation_for(method: &str, path: &str) -> Option<(Operation, Route)> {
         ("POST", "/v1/executions") => Some((Operation::Execute, Route::Execute)),
         ("POST", "/v1/blobs/missing") => Some((Operation::BlobRead, Route::BlobMissing)),
         ("POST", "/v1/blobs/prepare") => Some((Operation::BlobWrite, Route::BlobPrepare)),
+        ("POST", "/v1/workspaces") => Some((Operation::WorkspaceCreate, Route::WorkspaceCreate)),
         _ => {
             let parts: Vec<_> = path.split('/').collect();
             if parts.len() == 4 && parts[..3] == ["", "v1", "executions"] {
@@ -424,6 +438,7 @@ enum Route {
     BlobUpload(eggwork_core::BlobDigest),
     BlobDownload(eggwork_core::BlobDigest),
     BlobInvalidDigest,
+    WorkspaceCreate,
 }
 
 async fn dispatch(
@@ -464,6 +479,8 @@ async fn dispatch(
                     "auth.mtls.v1".into(),
                     "blob.sha256.v1".into(),
                     "blob.stream.v1".into(),
+                    "workspace.manifest.v1".into(),
+                    "workspace.materialize.v1".into(),
                 ],
                 max_active_executions: state.max_active,
             },
@@ -483,6 +500,7 @@ async fn dispatch(
             "invalid_digest",
             "blob digest is invalid",
         )),
+        Route::WorkspaceCreate => workspace_create(state, request, principal).await,
     }
 }
 
@@ -514,6 +532,8 @@ fn node_status(state: &NodeState) -> NodeStatus {
                 "auth.mtls.v1".into(),
                 "blob.sha256.v1".into(),
                 "blob.stream.v1".into(),
+                "workspace.manifest.v1".into(),
+                "workspace.materialize.v1".into(),
             ],
             max_active_executions: state.max_active,
         },
@@ -554,6 +574,24 @@ struct PrepareBlobRequest {
 #[derive(Serialize)]
 struct PrepareBlobResponse {
     upload_required: bool,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceCreateRequest {
+    schema_version: u16,
+    workspace_id: eggwork_core::WorkspaceId,
+    handle: ExecutionHandle,
+    manifest: eggwork_core::WorkspaceManifest,
+}
+
+#[derive(Serialize)]
+struct WorkspaceReadyResponse {
+    schema_version: u16,
+    workspace_id: eggwork_core::WorkspaceId,
+    execution_id: ExecutionId,
+    generation: ExecutionGeneration,
+    manifest_digest: String,
+    logical_bytes: u64,
 }
 
 async fn blob_missing(
@@ -628,6 +666,101 @@ async fn blob_prepare(
     {
         Ok(upload_required) => Ok(json_response(200, &PrepareBlobResponse { upload_required })),
         Err(error) => Ok(blob_error_response(error)),
+    }
+}
+
+async fn workspace_create(
+    state: NodeState,
+    request: Request,
+    principal: NodePrincipal,
+) -> Result<Response, eggserve_core::server::ServiceError> {
+    let (_head, body, _context) = request.into_parts_with_context();
+    let bytes = match read_limited_body(body, MAX_WORKSPACE_REQUEST_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(()) => {
+            return Ok(error_response(
+                413,
+                "request_too_large",
+                "workspace manifest exceeds limit",
+            ));
+        }
+    };
+    let wire: WorkspaceCreateRequest = match serde_json::from_slice(&bytes) {
+        Ok(wire) => wire,
+        Err(_) => {
+            return Ok(error_response(
+                400,
+                "invalid_request",
+                "workspace request is invalid",
+            ));
+        }
+    };
+    if wire.schema_version != API_SCHEMA_VERSION {
+        return Ok(error_response(
+            426,
+            "protocol_version",
+            "unsupported schema version",
+        ));
+    }
+    if ExecutionGeneration::new(wire.handle.generation.get()).is_err() {
+        return Ok(error_response(
+            400,
+            "invalid_request",
+            "workspace owner is invalid",
+        ));
+    }
+    match state
+        .workspaces
+        .materialize(
+            wire.workspace_id.clone(),
+            &wire.handle,
+            &principal.id,
+            wire.manifest,
+            &state.blobs,
+        )
+        .await
+    {
+        Ok(ready) => Ok(json_response(
+            201,
+            &WorkspaceReadyResponse {
+                schema_version: API_SCHEMA_VERSION,
+                workspace_id: wire.workspace_id,
+                execution_id: wire.handle.execution_id,
+                generation: wire.handle.generation,
+                manifest_digest: ready.manifest_digest,
+                logical_bytes: ready.logical_bytes,
+            },
+        )),
+        Err(workspace::WorkspaceError::InvalidManifest) => Ok(error_response(
+            400,
+            "invalid_manifest",
+            "workspace manifest is invalid",
+        )),
+        Err(workspace::WorkspaceError::InvalidBlob) => Ok(error_response(
+            409,
+            "missing_blob",
+            "workspace references a missing or corrupt blob",
+        )),
+        Err(workspace::WorkspaceError::BlobSizeMismatch) => Ok(error_response(
+            409,
+            "blob_size_mismatch",
+            "workspace blob size does not match",
+        )),
+        Err(workspace::WorkspaceError::QuotaExceeded) => Ok(error_response(
+            507,
+            "quota_exceeded",
+            "workspace quota exceeded",
+        )),
+        Err(workspace::WorkspaceError::Conflict) => Ok(error_response(
+            409,
+            "workspace_identity_conflict",
+            "workspace identity conflicts",
+        )),
+        Err(_) => Ok(error_response(
+            500,
+            "workspace_error",
+            "workspace materialization failed",
+        )),
     }
 }
 
@@ -763,6 +896,13 @@ async fn execute(
             "unsupported schema version",
         ));
     }
+    if ExecutionGeneration::new(wire.handle.generation.get()).is_err() {
+        return Ok(error_response(
+            400,
+            "invalid_request",
+            "execution generation is invalid",
+        ));
+    }
     if wire.spec.schema_version != API_SCHEMA_VERSION {
         return Ok(error_response(
             426,
@@ -800,25 +940,43 @@ async fn execute(
     }
     let id = wire.handle.execution_id.clone();
     let generation = wire.handle.generation;
+    let (canonical_version, digest) =
+        match eggwork_core::request_digest_with_workspace(&wire.spec, wire.workspace_id.as_ref()) {
+            Ok((version, digest)) => (version, digest.as_str().to_owned()),
+            Err(_) => {
+                return Ok(error_response(
+                    400,
+                    "invalid_request",
+                    "execution specification is invalid",
+                ));
+            }
+        };
+    let execution_root = if let Some(workspace_id) = &wire.workspace_id {
+        match state
+            .workspaces
+            .resolve(workspace_id, &id, generation, &principal.id)
+        {
+            Ok(workspace) => workspace.root,
+            Err(_) => {
+                return Ok(error_response(
+                    409,
+                    "workspace_not_ready",
+                    "workspace is unavailable for this execution",
+                ));
+            }
+        }
+    } else {
+        state.execution_root.clone()
+    };
     let runner_request = match RunnerRequest::from_spec(
         &wire.spec,
-        state.execution_root.clone(),
+        execution_root,
         ExecutionProvenance {
             execution_id: Some(id.clone()),
             generation: Some(generation),
         },
     ) {
         Ok(request) => request,
-        Err(_) => {
-            return Ok(error_response(
-                400,
-                "invalid_request",
-                "execution specification is invalid",
-            ));
-        }
-    };
-    let digest = match eggwork_core::request_digest(&wire.spec) {
-        Ok(digest) => digest.as_str().to_owned(),
         Err(_) => {
             return Ok(error_response(
                 400,
@@ -838,7 +996,7 @@ async fn execute(
         .await
         .map_err(|_| eggserve_core::server::ServiceError::internal("execution store unavailable"))?
     {
-        if existing.canonical_version != eggwork_core::CANONICAL_REQUEST_VERSION {
+        if existing.canonical_version != canonical_version {
             return Ok(error_response(
                 409,
                 "canonicalization_version_mismatch",
@@ -913,7 +1071,7 @@ async fn execute(
         .store
         .reserve(
             snapshot.clone(),
-            eggwork_core::CANONICAL_REQUEST_VERSION,
+            canonical_version,
             digest,
             principal_id,
             lease_hash.clone(),
@@ -1527,12 +1685,7 @@ async fn run_execution(
         .await;
     } else {
         let expired = record.lease.lock().await.expired.load(Ordering::Acquire);
-        let failure = match runner_error {
-            Some(RunnerError::Spawn(_)) => ExecutionFailure::Spawn,
-            Some(RunnerError::CancelledBeforeSpawn) => ExecutionFailure::Interrupted,
-            _ if expired => ExecutionFailure::LeaseExpired,
-            _ => ExecutionFailure::Internal,
-        };
+        let failure = failure_for_runner_error(runner_error.as_ref(), expired);
         let terminal = if expired {
             ExecutionState::Interrupted
         } else if matches!(failure, ExecutionFailure::Interrupted) {
@@ -1562,6 +1715,18 @@ fn failed_result(state: ExecutionState, failure: ExecutionFailure) -> ExecutionR
         stdout_omitted: 0,
         stderr_omitted: 0,
         cleanup_warning: None,
+    }
+}
+
+fn failure_for_runner_error(
+    runner_error: Option<&RunnerError>,
+    lease_expired: bool,
+) -> ExecutionFailure {
+    match runner_error {
+        Some(RunnerError::Spawn(_)) => ExecutionFailure::Spawn,
+        _ if lease_expired => ExecutionFailure::LeaseExpired,
+        Some(RunnerError::CancelledBeforeSpawn) => ExecutionFailure::Interrupted,
+        _ => ExecutionFailure::Internal,
     }
 }
 
@@ -1700,6 +1865,8 @@ fn error_response(status: u16, code: &str, message: &str) -> Response {
 struct ExecuteRequest {
     schema_version: u16,
     handle: ExecutionHandle,
+    #[serde(default)]
+    workspace_id: Option<eggwork_core::WorkspaceId>,
     spec: ExecutionSpec,
 }
 
@@ -1892,6 +2059,18 @@ mod tests {
         assert!(operation_for("POST", "/v1/execute-anywhere").is_none());
     }
 
+    #[test]
+    fn lease_expiry_takes_precedence_over_cancel_before_spawn() {
+        assert_eq!(
+            failure_for_runner_error(Some(&RunnerError::CancelledBeforeSpawn), true),
+            ExecutionFailure::LeaseExpired
+        );
+        assert_eq!(
+            failure_for_runner_error(Some(&RunnerError::CancelledBeforeSpawn), false),
+            ExecutionFailure::Interrupted
+        );
+    }
+
     #[tokio::test]
     async fn slow_event_consumer_is_bounded_and_gets_a_stream_error() {
         let id = ExecutionId::new("slow-reader").unwrap();
@@ -1947,6 +2126,8 @@ mod tests {
                 database_path: temp.path().join("node.sqlite"),
                 blob_root: temp.path().join("blob-store"),
                 blob_quota_bytes: 1024 * 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024 * 1024,
                 max_active_executions: 2,
                 lease_ttl: std::time::Duration::from_secs(3),
                 tls: tls_server_config(root.clone(), &server_identity),
@@ -1956,7 +2137,10 @@ mod tests {
             Arc::new(|_: &NodePrincipal, operation| {
                 !matches!(
                     operation,
-                    Operation::Execute | Operation::BlobRead | Operation::BlobWrite
+                    Operation::Execute
+                        | Operation::BlobRead
+                        | Operation::BlobWrite
+                        | Operation::WorkspaceCreate
                 )
             }),
         )
@@ -1992,6 +2176,19 @@ mod tests {
         assert!(matches!(
             unauthorized
                 .find_missing_blobs(std::slice::from_ref(&denied_digest))
+                .await,
+            Err(eggwork_client::ClientError::Api { status: 403, .. })
+        ));
+        assert!(matches!(
+            unauthorized
+                .create_workspace(
+                    &eggwork_core::WorkspaceId::new("denied-workspace").unwrap(),
+                    &execution_handle("denied-workspace-execution"),
+                    &eggwork_core::WorkspaceManifest {
+                        schema_version: 1,
+                        entries: vec![],
+                    },
+                )
                 .await,
             Err(eggwork_client::ClientError::Api { status: 403, .. })
         ));
@@ -2043,6 +2240,8 @@ mod tests {
                 database_path: temp.path().join("node.sqlite"),
                 blob_root: temp.path().join("blobs"),
                 blob_quota_bytes: 3 * 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 3 * 1024 * 1024,
                 max_active_executions: 1,
                 lease_ttl: std::time::Duration::from_secs(5),
                 tls: tls_server_config(root.clone(), &server_identity),
@@ -2140,6 +2339,72 @@ mod tests {
             Err(eggwork_client::ClientError::Api { status: 422, .. })
         ));
 
+        let workspace_bytes = b"workspace says hi\n";
+        let workspace_digest = eggwork_core::BlobDigest::from_bytes(workspace_bytes);
+        let workspace_chunks = vec![Ok::<_, eggfetch_core::Error>(Bytes::copy_from_slice(
+            workspace_bytes,
+        ))];
+        client
+            .upload_blob(
+                &workspace_digest,
+                workspace_bytes.len() as u64,
+                Box::pin(stream::iter(workspace_chunks)),
+            )
+            .await
+            .unwrap();
+        let workspace_id = eggwork_core::WorkspaceId::new("demo-workspace").unwrap();
+        let workspace_handle = execution_handle("workspace-execution");
+        let manifest = eggwork_core::WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![
+                eggwork_core::WorkspaceEntry::Directory {
+                    path: eggwork_core::RelativePath::new("src").unwrap(),
+                },
+                eggwork_core::WorkspaceEntry::File {
+                    path: eggwork_core::RelativePath::new("src/message.txt").unwrap(),
+                    digest: workspace_digest,
+                    size_bytes: workspace_bytes.len() as u64,
+                    executable: false,
+                },
+            ],
+        };
+        let ready = client
+            .create_workspace(&workspace_id, &workspace_handle, &manifest)
+            .await
+            .unwrap();
+        assert_eq!(ready.workspace_id, workspace_id);
+        let mut workspace_spec = execution_spec(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "cat message.txt".into(),
+        ]);
+        workspace_spec.command.cwd = Some(eggwork_core::RelativePath::new("src").unwrap());
+        let stream = client
+            .execute_in_workspace(&workspace_spec, &workspace_handle, &workspace_id)
+            .await
+            .unwrap();
+        let workspace_events = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            stream.into_events().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("workspace execution reaches terminal state")
+        .unwrap();
+        assert!(workspace_events.iter().any(|event| matches!(
+            &event.kind,
+            ExecutionEventKind::Stdout(bytes) if bytes == workspace_bytes
+        )));
+        assert!(matches!(
+            client
+                .execute_in_workspace(
+                    &workspace_spec,
+                    &execution_handle("foreign-workspace-execution"),
+                    &workspace_id,
+                )
+                .await,
+            Err(eggwork_client::ClientError::Api { status: 409, .. })
+        ));
+
         fs::write(server.state.blobs.path_for(&digest), b"corruption").unwrap();
         assert!(matches!(
             client.download_blob(&digest).await,
@@ -2170,6 +2435,8 @@ mod tests {
                 database_path: temp.path().join("node.sqlite"),
                 blob_root: temp.path().join("blob-store"),
                 blob_quota_bytes: 1024 * 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024 * 1024,
                 max_active_executions: 1,
                 lease_ttl: std::time::Duration::from_secs(5),
                 tls: tls_server_config(root.clone(), &server_identity),
@@ -2209,6 +2476,7 @@ mod tests {
         let unsupported_schema = serde_json::to_vec(&ExecuteRequest {
             schema_version: API_SCHEMA_VERSION + 1,
             handle: execution_handle("unsupported-schema"),
+            workspace_id: None,
             spec: execution_spec(vec!["/bin/true".into()]),
         })
         .unwrap();
@@ -2504,6 +2772,8 @@ mod tests {
                 database_path: temp.path().join("lease.sqlite"),
                 blob_root: temp.path().join("blob-store"),
                 blob_quota_bytes: 1024 * 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024 * 1024,
                 max_active_executions: 1,
                 lease_ttl: std::time::Duration::from_millis(150),
                 tls: tls_server_config(root.clone(), &server_identity),
@@ -2615,6 +2885,8 @@ mod tests {
                 database_path,
                 blob_root: temp.path().join("blob-store"),
                 blob_quota_bytes: 1024 * 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024 * 1024,
                 max_active_executions: 1,
                 lease_ttl: std::time::Duration::from_secs(30),
                 tls: tls_server_config(root.clone(), &server_identity),

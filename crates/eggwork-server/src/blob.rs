@@ -149,6 +149,22 @@ impl BlobStore {
         Ok(true)
     }
 
+    pub fn stored_size(&self, digest: &BlobDigest) -> Result<u64, BlobError> {
+        let size: Option<i64> = self
+            .inner
+            .metadata
+            .lock()
+            .map_err(|_| BlobError::Worker)?
+            .query_row(
+                "SELECT size_bytes FROM blobs WHERE digest = ?1",
+                [digest.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        size.map(|size| size.max(0) as u64)
+            .ok_or(BlobError::NotFound)
+    }
+
     pub async fn put_stream<S, E>(
         &self,
         digest: BlobDigest,
@@ -405,7 +421,7 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn unix_millis() -> i64 {
+pub(super) fn unix_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

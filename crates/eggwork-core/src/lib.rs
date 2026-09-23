@@ -23,6 +23,10 @@ pub const MAX_EVENT_CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const MAX_CAPABILITIES: usize = 256;
+pub const MAX_WORKSPACE_ENTRIES: usize = 4096;
+pub const MAX_WORKSPACE_PATH_BYTES: usize = 1024 * 1024;
+pub const MAX_WORKSPACE_DEPTH: usize = 128;
+pub const MAX_WORKSPACE_LOGICAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
@@ -445,6 +449,182 @@ impl ExecutionSpec {
     }
 }
 
+/// Portable file-tree description. Version 1 uses conservative ASCII paths
+/// and rejects symlinks so materialization stays identical across hosts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceManifest {
+    pub schema_version: u16,
+    pub entries: Vec<WorkspaceEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkspaceEntry {
+    Directory {
+        path: RelativePath,
+    },
+    File {
+        path: RelativePath,
+        digest: BlobDigest,
+        size_bytes: u64,
+        executable: bool,
+    },
+    Symlink {
+        path: RelativePath,
+        target: String,
+    },
+}
+
+impl WorkspaceEntry {
+    pub fn path(&self) -> &RelativePath {
+        match self {
+            Self::Directory { path } | Self::File { path, .. } | Self::Symlink { path, .. } => path,
+        }
+    }
+}
+
+impl WorkspaceManifest {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.schema_version != 1 {
+            return Err(ValidationError::OutOfRange {
+                field: "workspace schema version",
+            });
+        }
+        if self.entries.len() > MAX_WORKSPACE_ENTRIES {
+            return Err(ValidationError::TooMany {
+                field: "workspace entries",
+                max: MAX_WORKSPACE_ENTRIES,
+            });
+        }
+        let mut paths = std::collections::BTreeMap::<&str, bool>::new();
+        let mut folded = std::collections::HashSet::new();
+        let mut total_path_bytes = 0usize;
+        let mut total_file_bytes = 0u64;
+        for entry in &self.entries {
+            let raw_path = entry.path().as_str();
+            validate_portable_workspace_path(raw_path)?;
+            total_path_bytes = total_path_bytes.saturating_add(raw_path.len());
+            if total_path_bytes > MAX_WORKSPACE_PATH_BYTES {
+                return Err(ValidationError::OutOfRange {
+                    field: "workspace path bytes",
+                });
+            }
+            if !folded.insert(raw_path.to_ascii_lowercase()) {
+                return Err(ValidationError::InvalidSyntax {
+                    field: "workspace case collision",
+                });
+            }
+            let is_directory = matches!(entry, WorkspaceEntry::Directory { .. });
+            if paths.insert(raw_path, is_directory).is_some() {
+                return Err(ValidationError::InvalidSyntax {
+                    field: "duplicate workspace path",
+                });
+            }
+            match entry {
+                WorkspaceEntry::File { size_bytes, .. } => {
+                    total_file_bytes = total_file_bytes.saturating_add(*size_bytes);
+                    if total_file_bytes > MAX_WORKSPACE_LOGICAL_BYTES {
+                        return Err(ValidationError::OutOfRange {
+                            field: "workspace logical bytes",
+                        });
+                    }
+                }
+                WorkspaceEntry::Symlink { .. } => {
+                    return Err(ValidationError::Forbidden {
+                        field: "workspace symlink",
+                    });
+                }
+                WorkspaceEntry::Directory { .. } => {}
+            }
+        }
+        for entry in &self.entries {
+            let path = entry.path().as_str();
+            let mut parent_end = 0;
+            while let Some(relative) = path[parent_end..].find('/') {
+                parent_end += relative;
+                let parent = &path[..parent_end];
+                if paths.get(parent) != Some(&true) {
+                    return Err(ValidationError::InvalidPath {
+                        field: "workspace parent directory",
+                    });
+                }
+                parent_end += 1;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn logical_bytes(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(|entry| match entry {
+                WorkspaceEntry::File { size_bytes, .. } => *size_bytes,
+                _ => 0,
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+
+    pub fn digest(&self) -> Result<BlobDigest, serde_json::Error> {
+        let mut normalized = self.clone();
+        normalized
+            .entries
+            .sort_by(|a, b| a.path().as_str().cmp(b.path().as_str()));
+        let mut bytes = b"eggwork-workspace-manifest\0canonical-json-v1\0".to_vec();
+        bytes.extend(serde_json::to_vec(&normalized)?);
+        Ok(BlobDigest::from_bytes(&bytes))
+    }
+}
+
+fn validate_portable_workspace_path(path: &str) -> Result<(), ValidationError> {
+    if path.is_empty()
+        || path.len() > MAX_PATH_BYTES
+        || path.split('/').count() > MAX_WORKSPACE_DEPTH
+        || !path.is_ascii()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path.as_bytes().contains(&0)
+    {
+        return Err(ValidationError::InvalidPath {
+            field: "portable workspace path",
+        });
+    }
+    for component in path.split('/') {
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || component.ends_with('.')
+            || component.ends_with(' ')
+            || component.bytes().any(|byte| {
+                byte < 0x20 || matches!(byte, b'<' | b'>' | b':' | b'"' | b'|' | b'?' | b'*')
+            })
+        {
+            return Err(ValidationError::InvalidPath {
+                field: "portable workspace path",
+            });
+        }
+        let basename = component
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if matches!(
+            basename.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+        ) || basename
+            .strip_prefix("COM")
+            .or_else(|| basename.strip_prefix("LPT"))
+            .is_some_and(|number| {
+                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
+        {
+            return Err(ValidationError::InvalidPath {
+                field: "reserved workspace path",
+            });
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionState {
     Accepted,
@@ -635,9 +815,42 @@ pub struct ApiError {
 
 /// Version of the execution request canonicalization algorithm.
 pub const CANONICAL_REQUEST_VERSION: u16 = 2;
+/// Version used when a fixed workspace identity participates in execution identity.
+pub const CANONICAL_WORKSPACE_REQUEST_VERSION: u16 = 3;
 
 /// Stable canonical digest input: normalize unordered fields, then hash versioned JSON.
 pub fn request_digest(spec: &ExecutionSpec) -> Result<BlobDigest, serde_json::Error> {
+    let normalized = normalize_execution_spec(spec);
+    let mut bytes = b"eggwork-execution-spec\0canonical-json-v2\0".to_vec();
+    bytes.extend(serde_json::to_vec(&normalized)?);
+    Ok(BlobDigest::from_bytes(&bytes))
+}
+
+pub fn request_digest_with_workspace(
+    spec: &ExecutionSpec,
+    workspace_id: Option<&WorkspaceId>,
+) -> Result<(u16, BlobDigest), serde_json::Error> {
+    let Some(workspace_id) = workspace_id else {
+        return Ok((CANONICAL_REQUEST_VERSION, request_digest(spec)?));
+    };
+    #[derive(Serialize)]
+    struct CanonicalWorkspaceRequest<'a> {
+        spec: &'a ExecutionSpec,
+        workspace_id: &'a WorkspaceId,
+    }
+    let normalized = normalize_execution_spec(spec);
+    let mut bytes = b"eggwork-execution-spec\0canonical-json-v3\0".to_vec();
+    bytes.extend(serde_json::to_vec(&CanonicalWorkspaceRequest {
+        spec: &normalized,
+        workspace_id,
+    })?);
+    Ok((
+        CANONICAL_WORKSPACE_REQUEST_VERSION,
+        BlobDigest::from_bytes(&bytes),
+    ))
+}
+
+fn normalize_execution_spec(spec: &ExecutionSpec) -> ExecutionSpec {
     let mut normalized = spec.clone();
     normalized
         .command
@@ -652,9 +865,7 @@ pub fn request_digest(spec: &ExecutionSpec) -> Result<BlobDigest, serde_json::Er
             .cmp(b.path.as_str())
             .then_with(|| a.required.cmp(&b.required))
     });
-    let mut bytes = b"eggwork-execution-spec\0canonical-json-v2\0".to_vec();
-    bytes.extend(serde_json::to_vec(&normalized)?);
-    Ok(BlobDigest::from_bytes(&bytes))
+    normalized
 }
 
 #[cfg(test)]
@@ -751,6 +962,111 @@ mod tests {
             request_digest(&left).unwrap(),
             request_digest(&right).unwrap()
         );
+    }
+
+    #[test]
+    fn workspace_identity_participates_in_versioned_execution_digest() {
+        let spec = spec();
+        let one = WorkspaceId::new("workspace-one").unwrap();
+        let two = WorkspaceId::new("workspace-two").unwrap();
+        let (version_one, digest_one) = request_digest_with_workspace(&spec, Some(&one)).unwrap();
+        let (version_two, digest_two) = request_digest_with_workspace(&spec, Some(&two)).unwrap();
+        let (version_none, digest_none) = request_digest_with_workspace(&spec, None).unwrap();
+        assert_eq!(version_one, CANONICAL_WORKSPACE_REQUEST_VERSION);
+        assert_eq!(version_two, version_one);
+        assert_eq!(version_none, CANONICAL_REQUEST_VERSION);
+        assert_ne!(digest_one, digest_two);
+        assert_ne!(digest_one, digest_none);
+    }
+
+    #[test]
+    fn workspace_manifest_validates_tree_and_has_order_independent_digest() {
+        let directory = WorkspaceEntry::Directory {
+            path: RelativePath::new("src").unwrap(),
+        };
+        let file = WorkspaceEntry::File {
+            path: RelativePath::new("src/main.rs").unwrap(),
+            digest: BlobDigest::from_bytes(b"main"),
+            size_bytes: 4,
+            executable: false,
+        };
+        let first = WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![directory.clone(), file.clone()],
+        };
+        let second = WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![file, directory],
+        };
+        assert!(first.validate().is_ok());
+        assert_eq!(first.logical_bytes(), 4);
+        assert_eq!(first.digest().unwrap(), second.digest().unwrap());
+    }
+
+    #[test]
+    fn workspace_manifest_rejects_traversal_conflicts_and_symlinks() {
+        let file = |path: &str| WorkspaceEntry::File {
+            path: RelativePath::new(path).unwrap(),
+            digest: BlobDigest::from_bytes(b"x"),
+            size_bytes: 1,
+            executable: false,
+        };
+        let manifest = |entries| WorkspaceManifest {
+            schema_version: 1,
+            entries,
+        };
+        assert!(validate_portable_workspace_path("../secret").is_err());
+        assert!(validate_portable_workspace_path("C:/secret").is_err());
+        assert!(validate_portable_workspace_path("a/CON.txt").is_err());
+        assert!(validate_portable_workspace_path("café.txt").is_err());
+        assert!(manifest(vec![file("a"), file("a/b")]).validate().is_err());
+        assert!(manifest(vec![file("a"), file("a")]).validate().is_err());
+        assert!(manifest(vec![file("A"), file("a")]).validate().is_err());
+        assert!(
+            manifest(vec![file("missing-parent/file")])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            manifest(vec![WorkspaceEntry::Symlink {
+                path: RelativePath::new("link").unwrap(),
+                target: "../../etc/passwd".into(),
+            }])
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_manifest_enforces_depth_count_and_logical_size() {
+        let entries = (0..=MAX_WORKSPACE_DEPTH)
+            .map(|index| format!("d{index}"))
+            .collect::<Vec<_>>();
+        let deep = entries.join("/");
+        assert!(validate_portable_workspace_path(&deep).is_err());
+        let many = (0..=MAX_WORKSPACE_ENTRIES)
+            .map(|index| WorkspaceEntry::Directory {
+                path: RelativePath::new(format!("d{index}")).unwrap(),
+            })
+            .collect();
+        assert!(
+            WorkspaceManifest {
+                schema_version: 1,
+                entries: many,
+            }
+            .validate()
+            .is_err()
+        );
+        let too_large = WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![WorkspaceEntry::File {
+                path: RelativePath::new("large.bin").unwrap(),
+                digest: BlobDigest::from_bytes(b""),
+                size_bytes: MAX_WORKSPACE_LOGICAL_BYTES + 1,
+                executable: false,
+            }],
+        };
+        assert!(too_large.validate().is_err());
     }
 
     #[test]
