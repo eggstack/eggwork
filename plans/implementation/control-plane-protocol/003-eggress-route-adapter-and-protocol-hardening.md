@@ -1,6 +1,6 @@
 # Control Plane M003 — Eggress Route Adapter and Protocol Compatibility Hardening
 
-Status: ready for handoff
+Status: closed
 
 Source roadmap:
 

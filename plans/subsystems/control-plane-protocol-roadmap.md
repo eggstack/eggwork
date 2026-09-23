@@ -100,7 +100,7 @@ Exit conditions:
 
 Class: infrastructure/polish
 
-Status: ready
+Status: closed
 
 Implementation plan:
 

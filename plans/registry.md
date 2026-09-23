@@ -52,7 +52,7 @@ The repository is no longer planning-only.
 | Workstream | Status | Current work | Authority |
 |---|---|---|---|
 | Foundation / execution core | ready | M003 execution-ownership guards + runner API hardening | `plans/subsystems/foundation-execution-core-roadmap.md` |
-| Control-plane protocol | ready | M003 Eggress route adapter + protocol hardening | `plans/subsystems/control-plane-protocol-roadmap.md` |
+| Control-plane protocol | closed | M001-M003 complete | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | closed | M001-M003 complete | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | qualified | M004 waits on the new Foundation/Control/Operations surfaces | `plans/subsystems/security-isolation-resource-roadmap.md` |
 | Operations / distribution | ready | M002 Eggup deployment/service integration; producer packaging is separate M003 | `plans/subsystems/operations-distribution-roadmap.md` |
@@ -65,7 +65,7 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
 | Foundation | M003 ownership guards/API hardening | **ready** | `plans/implementation/foundation-execution-core/003-execution-ownership-guards-and-runner-api-hardening.md` | M002 is closed; current runner/helper/server surfaces are concrete. |
-| Control plane | M003 Eggress route/protocol hardening | **ready** | `plans/implementation/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md` | Eggfetch public `Dialer` and Eggress listener-free typed connector now satisfy the prior interface blocker. |
+| Control plane | M003 Eggress route/protocol hardening | **closed** | `plans/implementation/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md` | `plans/closure/control-plane-protocol/003-status.md` |
 | Operations | M002 Eggup deployment/service integration | **ready** | `plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md` | Eggup current main has Unix manager mechanics and native Windows SCM; exact published-or-pinned dependency disposition is part of implementation. |
 | CodeGG | M001 fixed-target remote executor | **ready external** | `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md` | Eggwork Phases 0-5 prerequisites are closed. Actual downstream code remains governed by CodeGG planning. |
 
