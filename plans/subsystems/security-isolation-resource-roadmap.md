@@ -1,6 +1,6 @@
 # Security, Isolation, and Resource Enforcement Roadmap
 
-Status: closed for the qualified Linux systemd user-manager path; other platform backends remain unsupported
+Status: qualified for the Linux systemd user-manager baseline; M004 final adversarial closure awaits current-surface milestones
 
 Canonical authority:
 
