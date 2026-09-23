@@ -121,6 +121,34 @@ impl BlobStore {
             .collect())
     }
 
+    pub async fn prepare_upload(
+        &self,
+        digest: &BlobDigest,
+        declared_length: u64,
+    ) -> Result<bool, BlobError> {
+        if declared_length > MAX_BLOB_BYTES {
+            return Err(BlobError::TooLarge);
+        }
+        if self.path_for(digest).exists() {
+            self.verify_existing(digest).await?;
+            return Ok(false);
+        }
+        let used: i64 = self
+            .inner
+            .metadata
+            .lock()
+            .map_err(|_| BlobError::Worker)?
+            .query_row(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM blobs",
+                [],
+                |row| row.get(0),
+            )?;
+        if (used.max(0) as u64).saturating_add(declared_length) > self.inner.quota_bytes {
+            return Err(BlobError::QuotaExceeded);
+        }
+        Ok(true)
+    }
+
     pub async fn put_stream<S, E>(
         &self,
         digest: BlobDigest,

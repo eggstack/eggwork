@@ -180,7 +180,7 @@ impl Service for NodeHttpService {
         use eggserve_core::primitives::request_body_policy::RequestBodyPolicy;
         let path = head.target().path();
         match (head.method().as_str(), path) {
-            ("POST", "/v1/blobs/missing") => RequestBodyPolicy::Buffer {
+            ("POST", "/v1/blobs/missing" | "/v1/blobs/prepare") => RequestBodyPolicy::Buffer {
                 max_bytes: MAX_BLOB_FIND_REQUEST_BYTES as u64,
             },
             ("PUT", path)
@@ -367,6 +367,7 @@ fn operation_for(method: &str, path: &str) -> Option<(Operation, Route)> {
         ("GET", "/v1/status") => Some((Operation::Status, Route::Status)),
         ("POST", "/v1/executions") => Some((Operation::Execute, Route::Execute)),
         ("POST", "/v1/blobs/missing") => Some((Operation::BlobRead, Route::BlobMissing)),
+        ("POST", "/v1/blobs/prepare") => Some((Operation::BlobWrite, Route::BlobPrepare)),
         _ => {
             let parts: Vec<_> = path.split('/').collect();
             if parts.len() == 4 && parts[..3] == ["", "v1", "executions"] {
@@ -419,6 +420,7 @@ enum Route {
     Renew(ExecutionId),
     Events(ExecutionId),
     BlobMissing,
+    BlobPrepare,
     BlobUpload(eggwork_core::BlobDigest),
     BlobDownload(eggwork_core::BlobDigest),
     BlobInvalidDigest,
@@ -473,6 +475,7 @@ async fn dispatch(
         Route::Renew(id) => control(state, id, request, principal, true).await,
         Route::Events(id) => events_route(state, id, query.as_deref(), principal).await,
         Route::BlobMissing => blob_missing(state, request).await,
+        Route::BlobPrepare => blob_prepare(state, request).await,
         Route::BlobUpload(digest) => blob_upload(state, request, digest).await,
         Route::BlobDownload(digest) => blob_download(state, digest).await,
         Route::BlobInvalidDigest => Ok(error_response(
@@ -542,6 +545,17 @@ struct FindMissingResponse {
     missing: Vec<eggwork_core::BlobDigest>,
 }
 
+#[derive(Deserialize)]
+struct PrepareBlobRequest {
+    digest: eggwork_core::BlobDigest,
+    size_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct PrepareBlobResponse {
+    upload_required: bool,
+}
+
 async fn blob_missing(
     state: NodeState,
     request: Request,
@@ -579,6 +593,41 @@ async fn blob_missing(
             "storage_error",
             "blob metadata is unavailable",
         )),
+    }
+}
+
+async fn blob_prepare(
+    state: NodeState,
+    request: Request,
+) -> Result<Response, eggserve_core::server::ServiceError> {
+    let (_head, body, _context) = request.into_parts_with_context();
+    let bytes = match read_limited_body(body, MAX_BLOB_FIND_REQUEST_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(()) => {
+            return Ok(error_response(
+                413,
+                "request_too_large",
+                "request body exceeds limit",
+            ));
+        }
+    };
+    let prepare: PrepareBlobRequest = match serde_json::from_slice(&bytes) {
+        Ok(prepare) => prepare,
+        Err(_) => {
+            return Ok(error_response(
+                400,
+                "invalid_request",
+                "request body is invalid",
+            ));
+        }
+    };
+    match state
+        .blobs
+        .prepare_upload(&prepare.digest, prepare.size_bytes)
+        .await
+    {
+        Ok(upload_required) => Ok(json_response(200, &PrepareBlobResponse { upload_required })),
+        Err(error) => Ok(blob_error_response(error)),
     }
 }
 

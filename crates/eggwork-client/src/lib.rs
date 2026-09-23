@@ -235,6 +235,26 @@ impl NodeClient {
         declared_length: u64,
         stream: BoxBytesStream,
     ) -> Result<(), ClientError> {
+        let mut preparation = self
+            .http
+            .post(&self.url("/v1/blobs/prepare"))?
+            .header("content-type", "application/json")
+            .bytes(
+                serde_json::to_vec(&PrepareBlobRequest {
+                    digest,
+                    size_bytes: declared_length,
+                })
+                .map_err(|_| ClientError::InvalidResponse)?,
+            )
+            .send()
+            .await?;
+        if !preparation.status().is_success() {
+            return Err(api_error(preparation.status().as_u16(), &mut preparation).await);
+        }
+        let preparation: PrepareBlobResponse = decode_json(&mut preparation).await?;
+        if !preparation.upload_required {
+            return Ok(());
+        }
         let length = usize::try_from(declared_length).map_err(|_| ClientError::InvalidResponse)?;
         let mut response = self
             .http
@@ -349,6 +369,17 @@ struct ControlRequest {
 #[derive(Serialize)]
 struct FindMissingRequest<'a> {
     digests: &'a [BlobDigest],
+}
+
+#[derive(Serialize)]
+struct PrepareBlobRequest<'a> {
+    digest: &'a BlobDigest,
+    size_bytes: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct PrepareBlobResponse {
+    upload_required: bool,
 }
 
 #[derive(serde::Deserialize)]
