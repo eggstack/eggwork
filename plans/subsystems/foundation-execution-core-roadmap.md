@@ -93,7 +93,11 @@ Exit conditions:
 
 Class: invariant/polish
 
-Status: blocked on M002 closure
+Status: ready
+
+Implementation plan:
+
+- `plans/implementation/foundation-execution-core/003-execution-ownership-guards-and-runner-api-hardening.md`
 
 Objective:
 
