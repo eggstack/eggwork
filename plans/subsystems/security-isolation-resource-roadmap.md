@@ -43,8 +43,6 @@ Class: invariant/infrastructure
 
 Status: closed
 
-Closure evidence: `plans/closure/security-isolation-resource/002-status.md`
-
 Implementation plan:
 
 - `plans/implementation/security-isolation-resource/001-authorization-redaction-and-threat-model.md`
@@ -66,6 +64,8 @@ Exit conditions:
 Class: invariant/capability
 
 Status: closed
+
+Closure evidence: `plans/closure/security-isolation-resource/002-status.md`
 
 Implementation plan:
 

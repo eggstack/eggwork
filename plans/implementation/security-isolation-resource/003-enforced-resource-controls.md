@@ -2,6 +2,8 @@
 
 Status: active
 
+Dependency evidence: `plans/closure/security-isolation-resource/002-status.md`
+
 Source roadmap:
 
 - `plans/subsystems/security-isolation-resource-roadmap.md`

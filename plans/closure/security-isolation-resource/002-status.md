@@ -4,7 +4,7 @@ Source plan: `plans/implementation/security-isolation-resource/002-trusted-landl
 Subsystem roadmap: `plans/subsystems/security-isolation-resource-roadmap.md`  
 Threat model: `plans/security/threat-model.md`  
 Reviewed implementation commit: `98d13f1`  
-Planning/closure commit: pending
+Planning/closure commit: `dfd9c70`
 
 ## Finding
 
