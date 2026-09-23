@@ -1,6 +1,6 @@
 # CodeGG Integration M001 — Fixed-Target Remote Executor
 
-Status: ready; execution is sequenced after Operations M002
+Status: ready for external/downstream handoff; independent of Operations M002
 
 Dependencies closed: Control Plane M002, Workspace/Artifact M003, and Security M003.
 
@@ -10,7 +10,7 @@ Source roadmap:
 
 CodeGG planning baseline:
 
-- `2f7d84f88070eee2a4fb9f70b6d7d5d10b01048d`
+- `7ee0a5c6abcf59370877cfb4368bc5d28eed28f9`
 
 Implementation MUST re-audit the current CodeGG head first.
 
