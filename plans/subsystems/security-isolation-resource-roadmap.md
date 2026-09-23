@@ -63,7 +63,7 @@ Exit conditions:
 
 Class: invariant/capability
 
-Status: blocked on Foundation M002 and Workspace M002 closure
+Status: ready; Foundation M002 and Workspace M002 dependencies are closed
 
 Implementation plan:
 

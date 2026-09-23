@@ -46,7 +46,7 @@ At planning bootstrap there was no Rust workspace or production code. That is hi
 |---|---|---|---|
 | Foundation / execution core | closed | M002 canonical local runner | `plans/subsystems/foundation-execution-core-roadmap.md` |
 | Control-plane protocol | active | M003 Eggress route adapter waits on current public Eggfetch/Eggress dial compatibility | `plans/subsystems/control-plane-protocol-roadmap.md` |
-| Workspace / artifacts | active | M002 safe workspace materialization | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
+| Workspace / artifacts | active | M003 declared artifacts, retention, and GC | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | ready | M001 authorization/redaction/threat-model foundation is ready; later M002/M003 remain blocked | `plans/subsystems/security-isolation-resource-roadmap.md` |
 | Operations / distribution | blocked | M001 waits on Control Plane M002 + Workspace M003 + Security M003 | `plans/subsystems/operations-distribution-roadmap.md` |
 | CodeGG integration | blocked | M001 waits on Control Plane M002 + Workspace M003 + Security M003 | `plans/subsystems/codegg-integration-roadmap.md` |
@@ -55,7 +55,7 @@ At planning bootstrap there was no Rust workspace or production code. That is hi
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Workspace | M002 safe workspace materialization | **active** | `plans/implementation/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md` | Workspace M001 closure: `plans/closure/workspace-artifact-transport/001-status.md`. |
+| Workspace | M003 declared artifacts/retention/GC | **active** | `plans/implementation/workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md` | Workspace M002 closure: `plans/closure/workspace-artifact-transport/002-status.md`. |
 | Security | M001 authorization/redaction/threat model | **ready** | `plans/implementation/security-isolation-resource/001-authorization-redaction-and-threat-model.md` | Foundation M001 and Control Plane M001 interfaces are available; scheduled after the requested dependency sequence reaches it. |
 
 ## Registered implementation plan statuses
@@ -65,11 +65,11 @@ At planning bootstrap there was no Rust workspace or production code. That is hi
 | Foundation | M001 repository bootstrap + domain contract | closed | `plans/implementation/foundation-execution-core/001-repository-bootstrap-and-domain-contract.md` | Closure: `plans/closure/foundation-execution-core/001-status.md`. |
 | Foundation | M002 canonical local runner | closed | `plans/implementation/foundation-execution-core/002-canonical-local-runner.md` | Closure: `plans/closure/foundation-execution-core/002-status.md`. |
 | Control plane | M001 authenticated fixed-target execution | closed | `plans/implementation/control-plane-protocol/001-authenticated-fixed-target-execution.md` | Closure: `plans/closure/control-plane-protocol/001-status.md`. |
-| Control plane | M002 idempotency/leases/events/recovery | closed | `plans/implementation/control-plane-protocol/002-idempotency-leases-events-and-recovery.md` | Closure: `plans/closure/control-plane-protocol/002-status.md`. |
+| Control plane | M002 idempotency/leases/events/recovery | closed | `plans/implementation/control-plane-protocol/002-idempotency-leases-events-and-recovery.md` | Closure: `plans/closure/control-plane-protocol/002-status.md`; current qualification: `plans/closure/control-plane-protocol/002-lease-expiry-race-correction.md`. |
 | Workspace | M001 blob store/digest protocol | closed | `plans/implementation/workspace-artifact-transport/001-blob-store-and-digest-protocol.md` | Closure: `plans/closure/workspace-artifact-transport/001-status.md`. |
-| Workspace | M002 safe workspace materialization | active | `plans/implementation/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md` | Workspace M001 closure: `plans/closure/workspace-artifact-transport/001-status.md`. |
-| Workspace | M003 declared artifacts/retention/GC | blocked | `plans/implementation/workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md` | Workspace M002 closure |
-| Security | M002 trusted Landlock sandbox | blocked | `plans/implementation/security-isolation-resource/002-trusted-landlock-sandbox-path.md` | Foundation M002 + Workspace M002 closure |
+| Workspace | M002 safe workspace materialization | closed | `plans/implementation/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md` | Closure: `plans/closure/workspace-artifact-transport/002-status.md`. |
+| Workspace | M003 declared artifacts/retention/GC | active | `plans/implementation/workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md` | Workspace M002 closure: `plans/closure/workspace-artifact-transport/002-status.md`. |
+| Security | M002 trusted Landlock sandbox | ready | `plans/implementation/security-isolation-resource/002-trusted-landlock-sandbox-path.md` | Foundation M002 and Workspace M002 closures are available; execute after Security M001 per requested sequence. |
 | Security | M003 enforced resource controls | blocked | `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md` | Security M002 closure |
 | Operations | M001 node operations surface | blocked | `plans/implementation/operations-distribution/001-node-operations-surface.md` | Control Plane M002 + Workspace M003 + Security M003 |
 | Operations | M002 packaging/services/Eggup | blocked | `plans/implementation/operations-distribution/002-packaging-services-and-eggup.md` | Operations M001 + stable Eggup consumer interface |
@@ -96,8 +96,8 @@ Do not create implementation plans for these merely to increase plan count. Writ
 ## Current execution order
 
 1. **Control Plane M001** — authenticated fixed-target execution (closed; closure: `plans/closure/control-plane-protocol/001-status.md`).
-2. **Control Plane M002** — idempotency/leases/events/recovery (active).
-3. Close Control Plane M002; execute **Workspace M001 -> M002 -> M003**.
+2. **Control Plane M002** — idempotency/leases/events/recovery (closed; lease-expiry race correction recorded).
+3. Control Plane M002 is closed with a recorded lease-expiry race correction; execute **Workspace M001 -> M002 -> M003**.
 4. After Workspace M003, execute **Security M001 -> M002 -> M003**. M001 is ready now because its interface dependencies are closed, but it remains inactive until this sequence reaches it.
 5. After Control Plane M002 + Workspace M003 + Security M003:
    - **Operations M001** may begin;

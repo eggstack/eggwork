@@ -1,6 +1,8 @@
 # Workspace and Artifact Transport M003 — Declared Artifacts, Retention, and GC
 
-Status: blocked on Workspace/Artifact M002 closure
+Status: active
+
+Dependency evidence: `plans/closure/workspace-artifact-transport/002-status.md`
 
 Source roadmap:
 

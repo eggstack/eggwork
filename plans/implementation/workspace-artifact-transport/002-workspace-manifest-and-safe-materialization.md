@@ -1,8 +1,10 @@
 # Workspace and Artifact Transport M002 — Workspace Manifest and Safe Materialization
 
-Status: active
+Status: closed
 
 Dependency evidence: `plans/closure/workspace-artifact-transport/001-status.md`
+
+Closure evidence: `plans/closure/workspace-artifact-transport/002-status.md`
 
 Source roadmap:
 

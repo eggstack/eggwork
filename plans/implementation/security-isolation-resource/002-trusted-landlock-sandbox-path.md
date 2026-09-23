@@ -1,6 +1,8 @@
 # Security M002 — Trusted Landlock Sandbox Path
 
-Status: blocked on Foundation M002 and Workspace M002 closure
+Status: ready
+
+Dependency evidence: `plans/closure/foundation-execution-core/002-status.md` and `plans/closure/workspace-artifact-transport/002-status.md`
 
 Source roadmap:
 

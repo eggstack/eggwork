@@ -3,7 +3,7 @@
 Source plan: `plans/implementation/control-plane-protocol/002-idempotency-leases-events-and-recovery.md`  
 Subsystem roadmap: `plans/subsystems/control-plane-protocol-roadmap.md`  
 Reviewed implementation commit: `83600ec`  
-Planning/closure commit: pending
+Planning/closure commit: `9b34717`
 
 ## Finding
 

@@ -63,7 +63,7 @@ Exit conditions:
 
 Class: capability/invariant
 
-Status: active
+Status: closed
 
 Implementation plan:
 
@@ -85,7 +85,7 @@ Exit conditions:
 
 Class: capability/infrastructure
 
-Status: blocked on M002 closure
+Status: active
 
 Implementation plan:
 
