@@ -1,6 +1,8 @@
 # Workspace and Artifact Transport M002 — Workspace Manifest and Safe Materialization
 
-Status: blocked on Workspace/Artifact M001 closure
+Status: active
+
+Dependency evidence: `plans/closure/workspace-artifact-transport/001-status.md`
 
 Source roadmap:
 

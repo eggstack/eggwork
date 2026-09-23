@@ -1,6 +1,8 @@
 # Workspace and Artifact Transport M001 — Blob Store and Digest Protocol
 
-Status: active
+Status: closed
+
+Closure evidence: `plans/closure/workspace-artifact-transport/001-status.md`
 
 Dependency evidence: `plans/closure/control-plane-protocol/002-status.md`
 

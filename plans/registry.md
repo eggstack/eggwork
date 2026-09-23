@@ -46,7 +46,7 @@ At planning bootstrap there was no Rust workspace or production code. That is hi
 |---|---|---|---|
 | Foundation / execution core | closed | M002 canonical local runner | `plans/subsystems/foundation-execution-core-roadmap.md` |
 | Control-plane protocol | active | M003 Eggress route adapter waits on current public Eggfetch/Eggress dial compatibility | `plans/subsystems/control-plane-protocol-roadmap.md` |
-| Workspace / artifacts | active | M001 blob store and digest protocol | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
+| Workspace / artifacts | active | M002 safe workspace materialization | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | ready | M001 authorization/redaction/threat-model foundation is ready; later M002/M003 remain blocked | `plans/subsystems/security-isolation-resource-roadmap.md` |
 | Operations / distribution | blocked | M001 waits on Control Plane M002 + Workspace M003 + Security M003 | `plans/subsystems/operations-distribution-roadmap.md` |
 | CodeGG integration | blocked | M001 waits on Control Plane M002 + Workspace M003 + Security M003 | `plans/subsystems/codegg-integration-roadmap.md` |
@@ -55,7 +55,7 @@ At planning bootstrap there was no Rust workspace or production code. That is hi
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Workspace | M001 blob store/digest protocol | **active** | `plans/implementation/workspace-artifact-transport/001-blob-store-and-digest-protocol.md` | Control Plane M002 closure: `plans/closure/control-plane-protocol/002-status.md`. |
+| Workspace | M002 safe workspace materialization | **active** | `plans/implementation/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md` | Workspace M001 closure: `plans/closure/workspace-artifact-transport/001-status.md`. |
 | Security | M001 authorization/redaction/threat model | **ready** | `plans/implementation/security-isolation-resource/001-authorization-redaction-and-threat-model.md` | Foundation M001 and Control Plane M001 interfaces are available; scheduled after the requested dependency sequence reaches it. |
 
 ## Registered implementation plan statuses
@@ -66,8 +66,8 @@ At planning bootstrap there was no Rust workspace or production code. That is hi
 | Foundation | M002 canonical local runner | closed | `plans/implementation/foundation-execution-core/002-canonical-local-runner.md` | Closure: `plans/closure/foundation-execution-core/002-status.md`. |
 | Control plane | M001 authenticated fixed-target execution | closed | `plans/implementation/control-plane-protocol/001-authenticated-fixed-target-execution.md` | Closure: `plans/closure/control-plane-protocol/001-status.md`. |
 | Control plane | M002 idempotency/leases/events/recovery | closed | `plans/implementation/control-plane-protocol/002-idempotency-leases-events-and-recovery.md` | Closure: `plans/closure/control-plane-protocol/002-status.md`. |
-| Workspace | M001 blob store/digest protocol | active | `plans/implementation/workspace-artifact-transport/001-blob-store-and-digest-protocol.md` | Control Plane M002 closure: `plans/closure/control-plane-protocol/002-status.md`. |
-| Workspace | M002 safe workspace materialization | blocked | `plans/implementation/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md` | Workspace M001 closure |
+| Workspace | M001 blob store/digest protocol | closed | `plans/implementation/workspace-artifact-transport/001-blob-store-and-digest-protocol.md` | Closure: `plans/closure/workspace-artifact-transport/001-status.md`. |
+| Workspace | M002 safe workspace materialization | active | `plans/implementation/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md` | Workspace M001 closure: `plans/closure/workspace-artifact-transport/001-status.md`. |
 | Workspace | M003 declared artifacts/retention/GC | blocked | `plans/implementation/workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md` | Workspace M002 closure |
 | Security | M002 trusted Landlock sandbox | blocked | `plans/implementation/security-isolation-resource/002-trusted-landlock-sandbox-path.md` | Foundation M002 + Workspace M002 closure |
 | Security | M003 enforced resource controls | blocked | `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md` | Security M002 closure |

@@ -40,7 +40,7 @@ It does not own Git repository/worktree semantics, CodeGG branch integration, sc
 
 Class: infrastructure/capability
 
-Status: active
+Status: closed
 
 Implementation plan:
 
@@ -63,7 +63,7 @@ Exit conditions:
 
 Class: capability/invariant
 
-Status: blocked on M001 closure
+Status: active
 
 Implementation plan:
 
