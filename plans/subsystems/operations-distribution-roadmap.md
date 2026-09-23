@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap
+Status: blocked on Eggup platform service-manager adapters for M002
 
 Canonical authority:
 
@@ -31,7 +31,9 @@ It does not own process lifecycle internals, scheduler placement, or CodeGG sema
 
 Class: capability/polish
 
-Status: active; M001 implementation is complete and its closure evidence is being finalized
+Status: closed
+
+Closure evidence: `plans/closure/operations-distribution/001-status.md`
 
 Implementation plan:
 
@@ -45,7 +47,7 @@ Add configuration, status, doctor, drain/undrain, execution/storage inspection, 
 
 Class: infrastructure/capability
 
-Status: blocked on M001 and stable Eggup consumer interfaces
+Status: blocked on Eggup platform service-manager adapters
 
 Implementation plan:
 

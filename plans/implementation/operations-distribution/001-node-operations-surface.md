@@ -1,6 +1,6 @@
 # Operations M001 — Node Operations Surface
 
-Status: closing
+Status: closed
 
 Dependencies closed: Control Plane M002, Workspace/Artifact M003, and Security M003.
 
@@ -101,4 +101,4 @@ Avoid cardinality explosions from raw execution IDs in default metrics.
 
 ## 8. Closure evidence
 
-Create `plans/closure/operations-distribution/001-status.md` with operator command matrix and live drain/storage evidence.
+Closure: `plans/closure/operations-distribution/001-status.md`.

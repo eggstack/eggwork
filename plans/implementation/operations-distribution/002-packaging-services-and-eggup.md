@@ -1,6 +1,11 @@
 # Operations M002 — Packaging, Services, and Eggup Integration
 
-Status: blocked on Operations M001 and stable Eggup consumer interfaces
+Status: blocked on Eggup platform service-manager adapters
+
+Operations M001 is closed. Current crates.io interfaces provide update transaction
+and transport-neutral service contracts, but `eggup-service` 0.1.0 contains no
+systemd, launchd, or Windows SCM adapters. Do not duplicate its lifecycle and
+ownership machinery in Eggwork to bypass this dependency.
 
 Source roadmap:
 
