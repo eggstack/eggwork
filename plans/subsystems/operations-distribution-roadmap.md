@@ -31,7 +31,7 @@ It does not own process lifecycle internals, scheduler placement, or CodeGG sema
 
 Class: capability/polish
 
-Status: ready; M001 is next in the execution sequence
+Status: active; M001 implementation is complete and its closure evidence is being finalized
 
 Implementation plan:
 

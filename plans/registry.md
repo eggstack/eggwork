@@ -55,7 +55,7 @@ At planning bootstrap there was no Rust workspace or production code. That is hi
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Operations | M001 node operations surface | **ready** | `plans/implementation/operations-distribution/001-node-operations-surface.md` | Control Plane M002, Workspace M003, and Security M003 closure evidence is available. |
+| Operations | M001 node operations surface | **closing** | `plans/implementation/operations-distribution/001-node-operations-surface.md` | Implementation and verification complete; closure record is being prepared. |
 | CodeGG | M001 fixed-target remote executor | **ready** | `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md` | Control Plane M002, Workspace M003, and Security M003 closure evidence is available. |
 
 ## Registered implementation plan statuses
@@ -73,7 +73,7 @@ At planning bootstrap there was no Rust workspace or production code. That is hi
 | Security | M002 trusted Landlock sandbox | closed | `plans/implementation/security-isolation-resource/002-trusted-landlock-sandbox-path.md` | Closure: `plans/closure/security-isolation-resource/002-status.md`; implementation `98d13f1`. |
 | Security | M002a Landlock `/dev/null` runtime correction | closed | `plans/implementation/security-isolation-resource/002a-landlock-runtime-devnull.md` | Closure: `plans/closure/security-isolation-resource/002a-status.md`; historical M002 record preserved. |
 | Security | M003 enforced resource controls | closed | `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md` | Closure: `plans/closure/security-isolation-resource/003-status.md`; Linux systemd user-manager path qualified. |
-| Operations | M001 node operations surface | ready | `plans/implementation/operations-distribution/001-node-operations-surface.md` | Control Plane M002, Workspace M003, and Security M003 closures available. |
+| Operations | M001 node operations surface | closing | `plans/implementation/operations-distribution/001-node-operations-surface.md` | Control Plane M002, Workspace M003, and Security M003 closures available. |
 | Operations | M002 packaging/services/Eggup | blocked | `plans/implementation/operations-distribution/002-packaging-services-and-eggup.md` | Operations M001 + stable Eggup consumer interface |
 | CodeGG | M001 fixed-target remote executor | ready | `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md` | Control Plane M002, Workspace M003, and Security M003 closures available; held behind Operations M001/M002 in requested execution order. |
 

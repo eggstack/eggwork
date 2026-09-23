@@ -106,6 +106,10 @@ impl ExecutionStore {
                PRIMARY KEY (execution_id, generation, sequence),
                FOREIGN KEY (execution_id, generation)
                  REFERENCES executions(execution_id, generation) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS node_metrics (
+               name TEXT PRIMARY KEY,
+               value INTEGER NOT NULL CHECK(value >= 0)
              );",
         )?;
         Ok(Self {
@@ -467,6 +471,30 @@ impl ExecutionStore {
                 serde_json::from_slice::<ExecutionSnapshot>(&row?).map_err(StoreError::from)
             })
             .collect()
+        })
+        .await
+        .map_err(|_| StoreError::Worker)?
+    }
+
+    pub async fn increment_metric(
+        &self,
+        name: &'static str,
+        amount: u64,
+    ) -> Result<(), StoreError> {
+        if name.is_empty() || name.len() > 64 {
+            return Err(StoreError::InvalidEvent);
+        }
+        let connection = self.connection.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = connection.lock().map_err(|_| StoreError::Worker)?;
+            connection.execute(
+                "INSERT INTO node_metrics(name,value) VALUES (?1,?2)
+                 ON CONFLICT(name) DO UPDATE SET value=CASE
+                   WHEN value > 9223372036854775807 - excluded.value THEN 9223372036854775807
+                   ELSE value + excluded.value END",
+                params![name, amount.min(i64::MAX as u64) as i64],
+            )?;
+            Ok(())
         })
         .await
         .map_err(|_| StoreError::Worker)?

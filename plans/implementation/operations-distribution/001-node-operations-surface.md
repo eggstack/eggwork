@@ -1,6 +1,6 @@
 # Operations M001 — Node Operations Surface
 
-Status: ready
+Status: closing
 
 Dependencies closed: Control Plane M002, Workspace/Artifact M003, and Security M003.
 
@@ -28,6 +28,15 @@ Design thin CLI/admin operations for at least:
 - version.
 
 Human output is rendered from machine-readable status/report types where practical.
+
+The initial control surface is the JSON-only `eggworkd` binary. Configuration is
+versioned JSON with relative paths resolved from the config file. TLS requires a
+server identity, client CA, and explicit per-principal operation grants. The
+config display redacts private-key paths and client certificate fingerprints.
+Execution listing uses bounded pages (maximum 200 rows); GC defaults to a
+read-only preview and requires `--apply` for mutation. Applying offline GC
+requires the node state lock; the live `NodeServer` maintenance API reuses its
+active stores and is safe while executions continue.
 
 ## 3. Drain semantics
 
@@ -80,6 +89,7 @@ Avoid cardinality explosions from raw execution IDs in default metrics.
 - list pagination/bounds;
 - GC trigger while execution live;
 - restart preserving documented drain behavior.
+- concurrent node start and offline GC lock contention.
 
 ## 7. Acceptance criteria
 

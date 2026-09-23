@@ -4,6 +4,7 @@
 
 mod artifact;
 mod blob;
+pub mod operations;
 mod store;
 mod workspace;
 
@@ -51,7 +52,7 @@ const MAX_RECENT_EXECUTIONS: usize = 1024;
 const MAX_BLOB_FIND_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_WORKSPACE_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Operation {
     Capabilities,
     Status,
@@ -145,6 +146,8 @@ pub enum NodeStartError {
     InvalidLimit,
     #[error("execution lease duration must be positive")]
     InvalidLease,
+    #[error("another node process already owns this state directory")]
+    AlreadyRunning,
 }
 
 impl std::fmt::Debug for NodeStartError {
@@ -154,6 +157,7 @@ impl std::fmt::Debug for NodeStartError {
             Self::EggServe(_) => f.write_str("NodeStartError::EggServe([REDACTED])"),
             Self::InvalidLimit => f.write_str("NodeStartError::InvalidLimit"),
             Self::InvalidLease => f.write_str("NodeStartError::InvalidLease"),
+            Self::AlreadyRunning => f.write_str("NodeStartError::AlreadyRunning"),
         }
     }
 }
@@ -180,6 +184,7 @@ struct NodeState {
     max_active: u32,
     permits: Arc<Semaphore>,
     draining: Arc<AtomicBool>,
+    drain_path: PathBuf,
     runner: Arc<LocalProcessRunner>,
     store: store::ExecutionStore,
     blobs: blob::BlobStore,
@@ -220,9 +225,10 @@ struct LeaseState {
 pub struct NodeServer {
     handle: ServerHandle,
     state: NodeState,
+    _state_lock: std::fs::File,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct NodeGcReport {
     pub workspace_candidates: u64,
     pub workspace_logical_bytes: u64,
@@ -300,6 +306,7 @@ impl NodeServer {
         if config.lease_ttl.is_zero() {
             return Err(NodeStartError::InvalidLease);
         }
+        let state_lock = acquire_state_lock(&config.database_path)?;
         let store = store::ExecutionStore::open(&config.database_path)
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
         let blobs = blob::BlobStore::open(&config.blob_root, config.blob_quota_bytes)
@@ -320,7 +327,10 @@ impl NodeServer {
                 &blobs,
             )
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
-        let draining = Arc::new(AtomicBool::new(false));
+        let drain_path = config.database_path.with_extension("drain");
+        let draining = Arc::new(AtomicBool::new(operations::is_persistently_draining(
+            &drain_path,
+        )));
         let resource_capabilities = runner.resource_capabilities().await;
         let mut executions = HashMap::new();
         for snapshot in store
@@ -353,6 +363,7 @@ impl NodeServer {
             max_active: config.max_active_executions,
             permits: Arc::new(Semaphore::new(config.max_active_executions as usize)),
             draining,
+            drain_path,
             runner,
             store,
             blobs,
@@ -385,7 +396,11 @@ impl NodeServer {
             .ready()
             .await
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
-        Ok(Self { handle, state })
+        Ok(Self {
+            handle,
+            state,
+            _state_lock: state_lock,
+        })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -393,7 +408,14 @@ impl NodeServer {
     }
 
     pub fn set_draining(&self, draining: bool) {
-        self.state.draining.store(draining, Ordering::Release);
+        if operations::set_persistent_drain(&self.state.drain_path, draining).is_ok() {
+            self.state.draining.store(draining, Ordering::Release);
+        }
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.state.draining.load(Ordering::Acquire)
+            || operations::is_persistently_draining(&self.state.drain_path)
     }
 
     pub async fn shutdown(&self) {
@@ -490,6 +512,24 @@ impl NodeServer {
     }
 }
 
+fn acquire_state_lock(database_path: &std::path::Path) -> Result<std::fs::File, NodeStartError> {
+    use fs2::FileExt;
+    let lock_path = database_path.with_extension("lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(lock_path)
+        .map_err(|error| NodeStartError::EggServe(error.to_string()))?;
+    file.try_lock_exclusive()
+        .map_err(|_| NodeStartError::AlreadyRunning)?;
+    Ok(file)
+}
+
 fn operation_for(method: &str, path: &str) -> Option<(Operation, Route)> {
     match (method, path) {
         ("GET", "/v1/capabilities") => Some((Operation::Capabilities, Route::Capabilities)),
@@ -575,9 +615,11 @@ async fn dispatch(
     let path = request.head().target().path().to_owned();
     let query = request.head().target().query().map(str::to_owned);
     let Some((operation, route)) = operation_for(&method, &path) else {
+        increment_metric(&state.store, "rejected_route", 1).await;
         return Ok(error_response(404, "not_found", "operation not found"));
     };
     let Some(principal) = authenticated_principal(&state, &request) else {
+        increment_metric(&state.store, "rejected_unauthenticated", 1).await;
         return Ok(error_response(
             401,
             "unauthenticated",
@@ -592,6 +634,7 @@ async fn dispatch(
         .authorizer
         .authorize_request(&principal, &authorization)
     {
+        increment_metric(&state.store, "rejected_unauthorized", 1).await;
         return Ok(error_response(
             403,
             "forbidden",
@@ -640,6 +683,10 @@ async fn dispatch(
         Route::ArtifactList(id) => artifact_list(state, id, query.as_deref(), principal).await,
         Route::ArtifactDownload(id) => artifact_download(state, id, principal).await,
     }
+}
+
+async fn increment_metric(store: &store::ExecutionStore, name: &'static str, amount: u64) {
+    let _ = store.increment_metric(name, amount).await;
 }
 
 fn resource_for_path(operation: Operation, path: &str) -> Option<ResourceId> {
@@ -697,7 +744,8 @@ fn authenticated_principal(state: &NodeState, request: &Request) -> Option<NodeP
 fn node_status(state: &NodeState) -> NodeStatus {
     NodeStatus {
         node_id: state.node_id.clone(),
-        draining: state.draining.load(Ordering::Acquire),
+        draining: state.draining.load(Ordering::Acquire)
+            || operations::is_persistently_draining(&state.drain_path),
         active_executions: state.max_active - state.permits.available_permits() as u32,
         capabilities: NodeCapabilities {
             protocol: ProtocolVersionRange {
@@ -712,6 +760,9 @@ fn node_status(state: &NodeState) -> NodeStatus {
                 "blob.stream.v1".into(),
                 "workspace.manifest.v1".into(),
                 "workspace.materialize.v1".into(),
+                "artifact.declared.v1".into(),
+                "artifact.stream.v1".into(),
+                "artifact.retention.v1".into(),
             ]
             .into_iter()
             .chain(state.resource_capabilities.iter().cloned())
@@ -927,6 +978,7 @@ async fn workspace_create(
         ));
     }
     if ExecutionGeneration::new(wire.handle.generation.get()).is_err() {
+        increment_metric(&state.store, "rejected_invalid", 1).await;
         return Ok(error_response(
             400,
             "invalid_request",
@@ -1030,10 +1082,13 @@ async fn blob_upload(
         }
     });
     match state.blobs.put_stream(digest, declared, input).await {
-        Ok(()) => Ok(Response::builder()
-            .status(StatusCode::new(201).expect("valid HTTP status"))
-            .body(ResponseBody::Empty)
-            .unwrap_or_else(|_| error_response(500, "internal", "internal error"))),
+        Ok(()) => {
+            increment_metric(&state.store, "blob_upload_bytes", declared).await;
+            Ok(Response::builder()
+                .status(StatusCode::new(201).expect("valid HTTP status"))
+                .body(ResponseBody::Empty)
+                .unwrap_or_else(|_| error_response(500, "internal", "internal error")))
+        }
         Err(error) => Ok(blob_error_response(error)),
     }
 }
@@ -1046,17 +1101,24 @@ async fn blob_download(
         Ok(file) => file,
         Err(error) => return Ok(blob_error_response(error)),
     };
-    let stream = stream::try_unfold(file, |mut file| async move {
-        let mut chunk = vec![0u8; 64 * 1024];
-        match tokio::io::AsyncReadExt::read(&mut file, &mut chunk).await {
-            Ok(0) => Ok(None),
-            Ok(size) => {
-                chunk.truncate(size);
-                Ok(Some((Bytes::from(chunk), file)))
+    let metric_store = state.store.clone();
+    let stream = stream::try_unfold(
+        (file, metric_store),
+        |(mut file, metric_store)| async move {
+            let mut chunk = vec![0u8; 64 * 1024];
+            match tokio::io::AsyncReadExt::read(&mut file, &mut chunk).await {
+                Ok(0) => Ok(None),
+                Ok(size) => {
+                    chunk.truncate(size);
+                    let _ = metric_store
+                        .increment_metric("blob_download_bytes", size as u64)
+                        .await;
+                    Ok(Some((Bytes::from(chunk), (file, metric_store))))
+                }
+                Err(_) => Err(ResponseStreamError::new("blob read failed")),
             }
-            Err(_) => Err(ResponseStreamError::new("blob read failed")),
-        }
-    });
+        },
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/octet-stream")
@@ -1270,6 +1332,7 @@ async fn execute(
         ));
     }
     if wire.spec.schema_version != API_SCHEMA_VERSION {
+        increment_metric(&state.store, "rejected_invalid", 1).await;
         return Ok(error_response(
             426,
             "protocol_version",
@@ -1278,6 +1341,7 @@ async fn execute(
     }
     if let Err(error) = wire.spec.validate() {
         let _ = error;
+        increment_metric(&state.store, "rejected_invalid", 1).await;
         return Ok(error_response(
             400,
             "invalid_request",
@@ -1285,13 +1349,17 @@ async fn execute(
         ));
     }
     if !wire.spec.command.declared_outputs.is_empty() && wire.workspace_id.is_none() {
+        increment_metric(&state.store, "rejected_invalid", 1).await;
         return Ok(error_response(
             400,
             "workspace_required",
             "declared outputs require an execution workspace",
         ));
     }
-    if state.draining.load(Ordering::Acquire) {
+    if state.draining.load(Ordering::Acquire)
+        || operations::is_persistently_draining(&state.drain_path)
+    {
+        increment_metric(&state.store, "rejected_draining", 1).await;
         return Ok(error_response(
             503,
             "draining",
@@ -1305,6 +1373,7 @@ async fn execute(
         wire.spec.command.network,
         eggwork_core::NetworkRequirement::Unrestricted
     ) {
+        increment_metric(&state.store, "rejected_capability", 1).await;
         return Ok(error_response(
             409,
             "capability_mismatch",
@@ -1317,6 +1386,7 @@ async fn execute(
         match eggwork_core::request_digest_with_workspace(&wire.spec, wire.workspace_id.as_ref()) {
             Ok((version, digest)) => (version, digest.as_str().to_owned()),
             Err(_) => {
+                increment_metric(&state.store, "rejected_invalid", 1).await;
                 return Ok(error_response(
                     400,
                     "invalid_request",
@@ -1331,6 +1401,7 @@ async fn execute(
         {
             Ok(workspace) => workspace.root,
             Err(_) => {
+                increment_metric(&state.store, "rejected_invalid", 1).await;
                 return Ok(error_response(
                     409,
                     "workspace_not_ready",
@@ -1357,6 +1428,7 @@ async fn execute(
     ) {
         Ok(request) => request,
         Err(_) => {
+            increment_metric(&state.store, "rejected_invalid", 1).await;
             return Ok(error_response(
                 400,
                 "invalid_request",
@@ -1407,7 +1479,10 @@ async fn execute(
         drop(executions);
         return event_response(state, id, generation, 0, record).await;
     }
-    if state.draining.load(Ordering::Acquire) {
+    if state.draining.load(Ordering::Acquire)
+        || operations::is_persistently_draining(&state.drain_path)
+    {
+        increment_metric(&state.store, "rejected_draining", 1).await;
         return Ok(error_response(
             503,
             "draining",
@@ -1416,7 +1491,10 @@ async fn execute(
     }
     let permit = match state.permits.clone().try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => return Ok(error_response(503, "busy", "node execution limit reached")),
+        Err(_) => {
+            increment_metric(&state.store, "rejected_busy", 1).await;
+            return Ok(error_response(503, "busy", "node execution limit reached"));
+        }
     };
     if executions.len() >= MAX_RECENT_EXECUTIONS {
         let mut terminal = Vec::new();
@@ -1433,6 +1511,7 @@ async fn execute(
         }
     }
     if executions.len() >= MAX_RECENT_EXECUTIONS {
+        increment_metric(&state.store, "rejected_storage", 1).await;
         return Ok(error_response(
             503,
             "storage_exhausted",
@@ -1447,6 +1526,7 @@ async fn execute(
     {
         drop(permit);
         drop(executions);
+        increment_metric(&state.store, "rejected_invalid", 1).await;
         return Ok(error_response(
             409,
             "workspace_not_ready",
@@ -1487,7 +1567,9 @@ async fn execute(
         }
     };
     match reservation {
-        store::ReserveResult::Created => {}
+        store::ReserveResult::Created => {
+            increment_metric(&state.store, "executions_accepted", 1).await;
+        }
         store::ReserveResult::Existing(snapshot) => {
             drop(permit);
             if is_terminal(&snapshot.state)
@@ -1532,6 +1614,7 @@ async fn execute(
             ));
         }
         store::ReserveResult::StorageFull => {
+            increment_metric(&state.store, "rejected_storage", 1).await;
             if let Some(workspace_id) = &wire.workspace_id {
                 let expiry =
                     artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
@@ -2020,6 +2103,7 @@ async fn event_response(
         ));
     };
     if after.saturating_add(1) < page.base_sequence {
+        increment_metric(&state.store, "event_history_resync", 1).await;
         return Ok(error_response(
             410,
             "history_expired",
@@ -2181,6 +2265,22 @@ async fn run_execution(
         }
     }
     let terminal = execution_result.state.clone();
+    let terminal_metric = match terminal {
+        ExecutionState::Succeeded => Some("terminal_succeeded"),
+        ExecutionState::Failed => Some("terminal_failed"),
+        ExecutionState::Cancelled => Some("terminal_cancelled"),
+        ExecutionState::TimedOut => Some("terminal_timed_out"),
+        ExecutionState::Interrupted => Some("terminal_interrupted"),
+        _ => None,
+    };
+    if let Some(name) = terminal_metric {
+        increment_metric(&record.store, name, 1).await;
+    }
+    increment_metric(&record.store, "stdout_bytes", execution_result.stdout_bytes).await;
+    increment_metric(&record.store, "stderr_bytes", execution_result.stderr_bytes).await;
+    if execution_result.cleanup_warning.is_some() {
+        increment_metric(&record.store, "cleanup_failures", 1).await;
+    }
     publish_terminal(
         &record,
         terminal.clone(),
@@ -3424,6 +3524,9 @@ mod tests {
             let stream = events_client.events(&running_handle, 0).await?;
             Ok::<_, eggwork_client::ClientError>(stream.try_collect::<Vec<_>>().await?)
         });
+        let live_gc = server.collect_garbage(false, 1).await.unwrap();
+        assert!(!live_gc.dry_run);
+        assert_eq!(client.status().await.unwrap().active_executions, 1);
         assert!(matches!(
             client
                 .execute(
@@ -3433,7 +3536,8 @@ mod tests {
                 .await,
             Err(eggwork_client::ClientError::Api { status: 503, .. })
         ));
-        server.set_draining(true);
+        operations::set_persistent_drain(&server.state.drain_path, true).unwrap();
+        assert!(server.is_draining());
         assert!(matches!(
             client
                 .execute(
@@ -3443,7 +3547,8 @@ mod tests {
                 .await,
             Err(eggwork_client::ClientError::Api { status: 503, .. })
         ));
-        server.set_draining(false);
+        operations::set_persistent_drain(&server.state.drain_path, false).unwrap();
+        assert!(!server.is_draining());
         drop(running); // A disconnected live stream does not cancel execution.
         let attached_events = tokio::time::timeout(std::time::Duration::from_secs(4), events_task)
             .await
@@ -3735,5 +3840,48 @@ mod tests {
         )));
         server.shutdown().await;
         server.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn operator_drain_persists_across_node_restart() {
+        init_tls();
+        let (root, server_identity, _, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let config = NodeConfig {
+            node_id: NodeId::new("node-drain-restart").unwrap(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            execution_root: work_root,
+            database_path: temp.path().join("drain.sqlite"),
+            blob_root: temp.path().join("blob-store"),
+            blob_quota_bytes: 1024 * 1024,
+            workspace_root: temp.path().join("workspace-store"),
+            workspace_quota_bytes: 1024 * 1024,
+            max_active_executions: 1,
+            lease_ttl: std::time::Duration::from_secs(30),
+            tls: tls_server_config(root, &server_identity),
+        };
+        let start = || {
+            NodeServer::start(
+                config.clone(),
+                Arc::new(LocalProcessRunner::default()),
+                Arc::new(FingerprintPrincipalResolver::default()),
+                Arc::new(|_: &NodePrincipal, _| true),
+            )
+        };
+        let first = start().await.unwrap();
+        assert!(matches!(start().await, Err(NodeStartError::AlreadyRunning)));
+        first.set_draining(true);
+        assert!(first.is_draining());
+        first.shutdown().await;
+        first.wait().await.unwrap();
+
+        let second = start().await.unwrap();
+        assert!(second.is_draining());
+        second.set_draining(false);
+        assert!(!second.is_draining());
+        second.shutdown().await;
+        second.wait().await.unwrap();
     }
 }

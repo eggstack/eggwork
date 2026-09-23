@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "node_id": "worker-01",
+  "bind": "127.0.0.1:7443",
+  "execution_root": "/var/lib/eggwork/executions",
+  "database_path": "/var/lib/eggwork/state/executions.sqlite",
+  "blob_root": "/var/lib/eggwork/blobs",
+  "blob_quota_bytes": 10737418240,
+  "workspace_root": "/var/lib/eggwork/workspaces",
+  "workspace_quota_bytes": 21474836480,
+  "max_active_executions": 4,
+  "lease_ttl_seconds": 30,
+  "sandbox_helper": "/usr/libexec/eggwork/eggwork-sandbox-helper",
+  "tls": {
+    "certificate_chain": "/etc/eggwork/node-chain.pem",
+    "private_key": "/etc/eggwork/node-key.pem",
+    "client_ca": "/etc/eggwork/controller-ca.pem"
+  },
+  "clients": [
+    {
+      "principal_id": "controller-01",
+      "certificate_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "operations": [
+        "capabilities",
+        "status",
+        "execute",
+        "observe",
+        "cancel",
+        "renew",
+        "events",
+        "blob-read",
+        "blob-write",
+        "workspace-create",
+        "artifact-read"
+      ]
+    }
+  ]
+}
