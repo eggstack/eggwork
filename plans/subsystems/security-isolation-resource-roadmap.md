@@ -43,6 +43,8 @@ Class: invariant/infrastructure
 
 Status: closed
 
+Closure evidence: `plans/closure/security-isolation-resource/002-status.md`
+
 Implementation plan:
 
 - `plans/implementation/security-isolation-resource/001-authorization-redaction-and-threat-model.md`
@@ -63,7 +65,7 @@ Exit conditions:
 
 Class: invariant/capability
 
-Status: active; Foundation M002 and Workspace M002 dependencies are closed
+Status: closed
 
 Implementation plan:
 
@@ -85,7 +87,9 @@ Exit conditions:
 
 Class: capability/invariant
 
-Status: blocked on M002 closure
+Status: active
+
+Host note: cgroups v2 controllers are present, but this session has no writable delegation. Probe and report runtime capability; do not claim enforcement without it.
 
 Implementation plan:
 

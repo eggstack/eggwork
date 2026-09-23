@@ -1,6 +1,6 @@
 # Security M003 — Enforced Resource Controls
 
-Status: blocked on Security M002 closure
+Status: active
 
 Source roadmap:
 

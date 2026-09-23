@@ -47,7 +47,7 @@ At planning bootstrap there was no Rust workspace or production code. That is hi
 | Foundation / execution core | closed | M002 canonical local runner | `plans/subsystems/foundation-execution-core-roadmap.md` |
 | Control-plane protocol | active | M003 Eggress route adapter waits on current public Eggfetch/Eggress dial compatibility | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | closed | M001-M003 complete; no current implementation plan | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
-| Security / isolation / resources | active | M002 trusted Landlock sandbox path | `plans/subsystems/security-isolation-resource-roadmap.md` |
+| Security / isolation / resources | active | M003 enforced resource controls | `plans/subsystems/security-isolation-resource-roadmap.md` |
 | Operations / distribution | blocked | M001 waits on Security M003; M002 also waits on stable Eggup consumer interface | `plans/subsystems/operations-distribution-roadmap.md` |
 | CodeGG integration | blocked | M001 waits on Security M003 | `plans/subsystems/codegg-integration-roadmap.md` |
 
@@ -55,7 +55,7 @@ At planning bootstrap there was no Rust workspace or production code. That is hi
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Security | M002 trusted Landlock sandbox | **active** | `plans/implementation/security-isolation-resource/002-trusted-landlock-sandbox-path.md` | Security M001 is closed; Foundation M002 and Workspace M002 dependencies are closed. |
+| Security | M003 enforced resource controls | **active** | `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md` | Security M002 closure: `plans/closure/security-isolation-resource/002-status.md`. Host cgroup v2 delegation is unavailable to this session; backend capability must reflect that. |
 
 ## Registered implementation plan statuses
 
@@ -69,8 +69,8 @@ At planning bootstrap there was no Rust workspace or production code. That is hi
 | Workspace | M002 safe workspace materialization | closed | `plans/implementation/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md` | Closure: `plans/closure/workspace-artifact-transport/002-status.md`. |
 | Workspace | M003 declared artifacts/retention/GC | closed | `plans/implementation/workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md` | Closure: `plans/closure/workspace-artifact-transport/003-status.md`. |
 | Security | M001 authorization/redaction/threat model | closed | `plans/implementation/security-isolation-resource/001-authorization-redaction-and-threat-model.md` | Closure: `plans/closure/security-isolation-resource/001-status.md`. |
-| Security | M002 trusted Landlock sandbox | active | `plans/implementation/security-isolation-resource/002-trusted-landlock-sandbox-path.md` | Security M001 closed; Foundation M002 and Workspace M002 closures are available. |
-| Security | M003 enforced resource controls | blocked | `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md` | Security M002 closure |
+| Security | M002 trusted Landlock sandbox | closed | `plans/implementation/security-isolation-resource/002-trusted-landlock-sandbox-path.md` | Closure: `plans/closure/security-isolation-resource/002-status.md`; implementation `98d13f1`. |
+| Security | M003 enforced resource controls | active | `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md` | Security M002 closure available. Host cgroup delegation is unavailable; do not claim cgroup enforcement here. |
 | Operations | M001 node operations surface | blocked | `plans/implementation/operations-distribution/001-node-operations-surface.md` | Security M003 closure |
 | Operations | M002 packaging/services/Eggup | blocked | `plans/implementation/operations-distribution/002-packaging-services-and-eggup.md` | Operations M001 + stable Eggup consumer interface |
 | CodeGG | M001 fixed-target remote executor | blocked | `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md` | Security M003 closure |
@@ -98,7 +98,7 @@ Do not create implementation plans for these merely to increase plan count. Writ
 1. **Control Plane M001** — authenticated fixed-target execution (closed; closure: `plans/closure/control-plane-protocol/001-status.md`).
 2. **Control Plane M002** — idempotency/leases/events/recovery (closed; lease-expiry race correction recorded).
 3. Control Plane M002 is closed with a recorded lease-expiry race correction; **Workspace M001 -> M002 -> M003** are now closed.
-4. **Security M001 is closed.** Execute **Security M002 -> M003**; M002 is active and M003 remains blocked on M002 closure.
+4. **Security M001 and M002 are closed.** Security M003 is active; its Linux runtime must expose unavailable cgroup delegation truthfully on this host.
 5. After Control Plane M002 + Workspace M003 + Security M003:
    - **Operations M001** may begin;
    - **CodeGG M001** may begin independently.

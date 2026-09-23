@@ -1,6 +1,8 @@
 # Security M002 — Trusted Landlock Sandbox Path
 
-Status: active
+Status: closed
+
+Closure evidence: `plans/closure/security-isolation-resource/002-status.md`
 
 Dependency evidence: `plans/closure/foundation-execution-core/002-status.md` and `plans/closure/workspace-artifact-transport/002-status.md`
 
