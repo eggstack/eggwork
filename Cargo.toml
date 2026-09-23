@@ -5,6 +5,7 @@ members = [
     "crates/eggwork-runner",
     "crates/eggwork-client",
     "crates/eggwork-server",
+    "crates/eggwork-sandbox-helper",
 ]
 
 [workspace.package]
@@ -32,6 +33,8 @@ base64 = "0.22"
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 eggserve-core = { version = "0.2.0", default-features = false, features = ["tls"] }
 eggfetch-core = { version = "0.2.0", default-features = false, features = ["standard-http1", "tls-rustls"] }
+landlock = "=0.4.7"
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

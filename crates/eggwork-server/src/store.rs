@@ -530,6 +530,7 @@ impl ExecutionStore {
                     cleanup_warning: None,
                     finalization_failure: None,
                     artifact_count: 0,
+                    sandbox: None,
                 });
                 let generation = snapshot.generation.get() as i64;
                 let sequence: i64 = transaction.query_row(

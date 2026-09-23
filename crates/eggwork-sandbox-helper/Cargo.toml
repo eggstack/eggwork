@@ -1,0 +1,26 @@
+[package]
+name = "eggwork-sandbox-helper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "eggwork-sandbox-helper"
+path = "src/main.rs"
+
+[dependencies]
+landlock.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+nix = { workspace = true, features = ["user"] }
+
+[dev-dependencies]
+eggwork-runner = { path = "../eggwork-runner" }
+eggwork-core = { path = "../eggwork-core" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tokio-util.workspace = true
+
+[lints]
+workspace = true

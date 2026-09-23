@@ -703,6 +703,14 @@ pub enum ExecutionFailure {
     LeaseExpired,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SandboxResult {
+    NotRequested,
+    NotApplied { reason: String },
+    Applied { profile: String },
+    Failed { reason: String },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionFinalizationFailure {
     ArtifactCapture,
     Retention,
@@ -721,6 +729,8 @@ pub struct ExecutionResult {
     pub finalization_failure: Option<ExecutionFinalizationFailure>,
     #[serde(default)]
     pub artifact_count: u32,
+    #[serde(default)]
+    pub sandbox: Option<SandboxResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

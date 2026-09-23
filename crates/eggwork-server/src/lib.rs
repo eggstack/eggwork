@@ -22,7 +22,9 @@ use eggwork_core::{
     ExecutionSpec, ExecutionState, LeaseId, NodeCapabilities, NodeId, NodeStatus, ProtocolVersion,
     ProtocolVersionRange,
 };
-use eggwork_runner::{ExecutionProvenance, LocalProcessRunner, RunnerError, RunnerRequest};
+use eggwork_runner::{
+    ExecutionProvenance, LocalProcessRunner, RunnerError, RunnerRequest, SandboxRequest,
+};
 use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2071,6 +2073,7 @@ async fn run_execution(
     let (output_tx, mut output_rx) = mpsc::channel(RUNNER_CHANNEL_CAPACITY);
     let runner = state.runner.clone();
     let cancellation = record.cancellation.clone();
+    let sandbox_request = request.sandbox.clone();
     let mut runner_task =
         tokio::spawn(async move { runner.run(request, cancellation, output_tx).await });
     let mut result = None;
@@ -2125,7 +2128,7 @@ async fn run_execution(
         } else {
             ExecutionState::Failed
         };
-        failed_result(terminal, failure)
+        failed_result(terminal, failure, sandbox_request)
     };
     if let Some(workspace) = workspace {
         let should_capture = runner_completed
@@ -2180,7 +2183,11 @@ async fn run_execution(
     record.finished.store(true, Ordering::Release);
 }
 
-fn failed_result(state: ExecutionState, failure: ExecutionFailure) -> ExecutionResult {
+fn failed_result(
+    state: ExecutionState,
+    failure: ExecutionFailure,
+    sandbox_request: SandboxRequest,
+) -> ExecutionResult {
     ExecutionResult {
         state,
         exit_code: None,
@@ -2192,6 +2199,15 @@ fn failed_result(state: ExecutionState, failure: ExecutionFailure) -> ExecutionR
         cleanup_warning: None,
         finalization_failure: None,
         artifact_count: 0,
+        sandbox: Some(match sandbox_request {
+            SandboxRequest::None => eggwork_core::SandboxResult::NotRequested,
+            SandboxRequest::BestEffort { .. } => eggwork_core::SandboxResult::NotApplied {
+                reason: "best-effort sandbox setup was unavailable".into(),
+            },
+            SandboxRequest::Required { .. } => eggwork_core::SandboxResult::Failed {
+                reason: "required sandbox setup failed".into(),
+            },
+        }),
     }
 }
 

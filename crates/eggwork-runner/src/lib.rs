@@ -8,13 +8,17 @@ use eggwork_core::{
     MAX_ENV_VALUE_BYTES, MAX_EVENT_CHUNK_BYTES, OverflowPolicy as CoreOverflowPolicy, RelativePath,
     StdinPolicy as CoreStdinPolicy,
 };
+use serde::Serialize;
 use std::{
     collections::VecDeque,
+    io::Write,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
 use thiserror::Error;
+#[cfg(target_os = "linux")]
+use tokio::net::UnixListener;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
@@ -140,6 +144,141 @@ pub trait ExecutionSetup: Send + Sync {
         resources: &ResourceSetupRequest,
         root: &Path,
     ) -> Result<SetupOutcome, RunnerError>;
+
+    /// Installation-selected wrapper used when a sandbox request is active.
+    fn sandbox_helper_path(&self) -> Option<&Path> {
+        None
+    }
+}
+
+/// Verifies and invokes the installation-owned Landlock sibling helper.
+#[derive(Debug, Clone)]
+pub struct TrustedLandlockSetup {
+    helper_path: PathBuf,
+}
+
+impl TrustedLandlockSetup {
+    pub fn new(helper_path: impl Into<PathBuf>) -> Self {
+        Self {
+            helper_path: helper_path.into(),
+        }
+    }
+
+    pub fn discover_sibling() -> Self {
+        let helper_path = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.canonicalize().ok())
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .map(|parent| parent.join("eggwork-sandbox-helper"))
+            .unwrap_or_else(|| PathBuf::from("eggwork-sandbox-helper"));
+        Self::new(helper_path)
+    }
+}
+
+#[async_trait::async_trait]
+impl ExecutionSetup for TrustedLandlockSetup {
+    async fn prepare(
+        &self,
+        sandbox: &SandboxRequest,
+        resources: &ResourceSetupRequest,
+        _root: &Path,
+    ) -> Result<SetupOutcome, RunnerError> {
+        if resources.required {
+            return Err(RunnerError::RequiredSetupUnavailable);
+        }
+        let resource_outcome = if resources.memory_bytes.is_some()
+            || resources.cpu_millis.is_some()
+            || resources.pids.is_some()
+        {
+            ResourceSetupOutcome::NotApplied {
+                reason: "no resource-control backend is configured".into(),
+            }
+        } else {
+            ResourceSetupOutcome::NotRequested
+        };
+        let outcome = match sandbox {
+            SandboxRequest::None => SandboxOutcome::NotRequested,
+            SandboxRequest::BestEffort { profile } | SandboxRequest::Required { profile } => {
+                if profile != "workspace_rw" {
+                    let reason = "unsupported sandbox profile".to_owned();
+                    if matches!(sandbox, SandboxRequest::BestEffort { .. }) {
+                        return Ok(SetupOutcome {
+                            sandbox: SandboxOutcome::NotApplied { reason },
+                            resources: resource_outcome,
+                        });
+                    }
+                    return Err(RunnerError::Setup(reason));
+                }
+                match verify_trusted_helper(&self.helper_path) {
+                    Ok(()) => SandboxOutcome::Applied {
+                        profile: profile.clone(),
+                    },
+                    Err(reason) if matches!(sandbox, SandboxRequest::BestEffort { .. }) => {
+                        SandboxOutcome::NotApplied { reason }
+                    }
+                    Err(reason) => return Err(RunnerError::Setup(reason)),
+                }
+            }
+        };
+        Ok(SetupOutcome {
+            sandbox: outcome,
+            resources: resource_outcome,
+        })
+    }
+
+    fn sandbox_helper_path(&self) -> Option<&Path> {
+        Some(&self.helper_path)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_trusted_helper(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| "sandbox helper is unavailable".to_owned())?;
+    let mode = metadata.permissions().mode();
+    let effective_uid = nix::unistd::geteuid().as_raw();
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || (metadata.uid() != 0 && metadata.uid() != effective_uid)
+        || mode & 0o022 != 0
+        || mode & 0o111 == 0
+    {
+        return Err("sandbox helper trust check failed".into());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "sandbox helper location is invalid".to_owned())?
+        .canonicalize()
+        .map_err(|_| "sandbox helper location is invalid".to_owned())?;
+    let parent_metadata =
+        std::fs::metadata(&parent).map_err(|_| "sandbox helper location is invalid".to_owned())?;
+    if !parent_metadata.is_dir()
+        || (parent_metadata.uid() != 0 && parent_metadata.uid() != effective_uid)
+        || parent_metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err("sandbox helper directory trust check failed".into());
+    }
+    let mut ancestor = parent.as_path();
+    while let Some(next) = ancestor.parent() {
+        let metadata =
+            std::fs::metadata(next).map_err(|_| "sandbox helper ancestor is invalid".to_owned())?;
+        let mode = metadata.permissions().mode();
+        let sticky_root_directory = metadata.is_dir() && metadata.uid() == 0 && mode & 0o1000 != 0;
+        if !metadata.is_dir()
+            || ((metadata.uid() != 0 && metadata.uid() != effective_uid) && !sticky_root_directory)
+            || (mode & 0o022 != 0 && !sticky_root_directory)
+        {
+            return Err("sandbox helper ancestor trust check failed".into());
+        }
+        ancestor = next;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_trusted_helper(_path: &Path) -> Result<(), String> {
+    Err("trusted Landlock is unsupported on this platform".into())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,10 +382,10 @@ impl RunnerRequest {
         let sandbox = match isolation {
             eggwork_core::IsolationRequirement::None => SandboxRequest::None,
             eggwork_core::IsolationRequirement::BestEffort => SandboxRequest::BestEffort {
-                profile: "default".into(),
+                profile: "workspace_rw".into(),
             },
             eggwork_core::IsolationRequirement::Required => SandboxRequest::Required {
-                profile: "default".into(),
+                profile: "workspace_rw".into(),
             },
         };
         Ok(Self {
@@ -429,6 +568,18 @@ impl RunnerResult {
                 .or_else(|| self.cleanup.stdin_error.clone()),
             finalization_failure: None,
             artifact_count: 0,
+            sandbox: Some(match &self.setup.sandbox {
+                SandboxOutcome::NotRequested => eggwork_core::SandboxResult::NotRequested,
+                SandboxOutcome::NotApplied { reason } => eggwork_core::SandboxResult::NotApplied {
+                    reason: reason.clone(),
+                },
+                SandboxOutcome::Applied { profile } => eggwork_core::SandboxResult::Applied {
+                    profile: profile.clone(),
+                },
+                SandboxOutcome::Failed { reason } => eggwork_core::SandboxResult::Failed {
+                    reason: reason.clone(),
+                },
+            }),
         }
     }
 }
@@ -464,7 +615,14 @@ pub struct LocalProcessRunner {
 
 impl Default for LocalProcessRunner {
     fn default() -> Self {
-        Self::new(NoExecutionSetup)
+        #[cfg(target_os = "linux")]
+        {
+            Self::new(TrustedLandlockSetup::discover_sibling())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::new(NoExecutionSetup)
+        }
     }
 }
 
@@ -492,44 +650,91 @@ impl LocalProcessRunner {
         }
         #[cfg(unix)]
         {
-            let setup = self
+            let mut setup = self
                 .setup
                 .prepare(&request.sandbox, &request.resources, &request.root)
                 .await?;
-            let mut command = Command::new(&request.argv[0]);
-            command
-                .args(&request.argv[1..])
-                .current_dir(cwd)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            command.env_clear();
-            let inherited_path = std::env::var_os("PATH").unwrap_or_default();
-            command
-                .env("PATH", inherited_path)
-                .env("LANG", "C.UTF-8")
-                .env("LC_ALL", "C.UTF-8")
-                .env("CI", "1")
-                .env("NO_COLOR", "1")
-                .env("TERM", "dumb")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .env("PAGER", "cat");
-            for (key, value) in &request.environment {
-                if !denied_environment_key(key) {
-                    command.env(key, value);
+            #[cfg(target_os = "linux")]
+            let use_helper = !matches!(request.sandbox, SandboxRequest::None)
+                && matches!(setup.sandbox, SandboxOutcome::Applied { .. })
+                && self.setup.sandbox_helper_path().is_some();
+            #[cfg(target_os = "linux")]
+            let mut channel = if use_helper {
+                match SandboxChannel::new(
+                    self.setup.sandbox_helper_path().expect("checked above"),
+                    &request,
+                    cwd.clone(),
+                ) {
+                    Ok(channel) => Some(channel),
+                    Err(error) if matches!(request.sandbox, SandboxRequest::BestEffort { .. }) => {
+                        setup.sandbox = SandboxOutcome::NotApplied {
+                            reason: error.to_string(),
+                        };
+                        None
+                    }
+                    Err(error) => return Err(error),
                 }
-            }
-            if let Some(id) = &request.provenance.execution_id {
-                command.env("EGGWORK_EXECUTION_ID", id.as_str());
-            }
-            if let Some(generation) = request.provenance.generation {
-                command.env("EGGWORK_EXECUTION_GENERATION", generation.get().to_string());
-            }
+            } else {
+                None
+            };
+            #[cfg(not(target_os = "linux"))]
+            let channel: Option<()> = None;
+            #[cfg(target_os = "linux")]
+            let mut command = if let Some(channel) = channel.as_ref() {
+                channel.command()
+            } else {
+                direct_command(&request, cwd.clone())
+            };
+            #[cfg(not(target_os = "linux"))]
+            let mut command = direct_command(&request, cwd.clone());
             command.process_group(0);
             let mut child = command
                 .spawn()
                 .map_err(|e| RunnerError::Spawn(e.to_string()))?;
+            #[cfg(target_os = "linux")]
+            if let Some(sandbox_channel) = channel.take() {
+                let handshake = sandbox_channel.wait(&mut child, cancellation.clone()).await;
+                match handshake {
+                    Ok(true) => {}
+                    Ok(false) if matches!(request.sandbox, SandboxRequest::BestEffort { .. }) => {
+                        let _ = child.wait().await;
+                        setup.sandbox = SandboxOutcome::NotApplied {
+                            reason: "Landlock helper could not enforce the requested profile"
+                                .into(),
+                        };
+                        let mut direct = direct_command(&request, cwd.clone());
+                        direct.process_group(0);
+                        child = direct
+                            .spawn()
+                            .map_err(|error| RunnerError::Spawn(error.to_string()))?;
+                    }
+                    Ok(false) => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        return Err(RunnerError::RequiredSetupUnavailable);
+                    }
+                    Err(SandboxWaitError::BeforeTarget(error))
+                        if matches!(request.sandbox, SandboxRequest::BestEffort { .. })
+                            && !matches!(error, RunnerError::CancelledBeforeSpawn) =>
+                    {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        setup.sandbox = SandboxOutcome::NotApplied {
+                            reason: error.to_string(),
+                        };
+                        let mut direct = direct_command(&request, cwd.clone());
+                        direct.process_group(0);
+                        child = direct
+                            .spawn()
+                            .map_err(|spawn_error| RunnerError::Spawn(spawn_error.to_string()))?;
+                    }
+                    Err(error) => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        return Err(error.into_runner_error());
+                    }
+                }
+            }
             let process_group = child.id();
             let stdin_task = match (child.stdin.take(), &request.stdin) {
                 (Some(mut stdin), StdinPolicy::Bytes(bytes)) => {
@@ -682,6 +887,231 @@ fn denied_environment_key(key: &str) -> bool {
     ]
     .iter()
     .any(|denied| upper == *denied || upper.starts_with(denied))
+}
+
+fn direct_command(request: &RunnerRequest, cwd: PathBuf) -> Command {
+    let mut command = Command::new(&request.argv[0]);
+    command
+        .args(&request.argv[1..])
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command.env_clear();
+    command
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "C.UTF-8")
+        .env("LC_ALL", "C.UTF-8")
+        .env("CI", "1")
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("PAGER", "cat");
+    for (key, value) in &request.environment {
+        if !denied_environment_key(key) {
+            command.env(key, value);
+        }
+    }
+    if let Some(id) = &request.provenance.execution_id {
+        command.env("EGGWORK_EXECUTION_ID", id.as_str());
+    }
+    if let Some(generation) = request.provenance.generation {
+        command.env("EGGWORK_EXECUTION_GENERATION", generation.get().to_string());
+    }
+    command
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+struct SandboxLaunchSpec {
+    schema_version: u16,
+    profile: String,
+    root: PathBuf,
+    cwd: PathBuf,
+    argv: Vec<String>,
+    environment: Vec<(String, String)>,
+}
+
+#[cfg(target_os = "linux")]
+struct SandboxChannel {
+    _directory: tempfile::TempDir,
+    spec_path: PathBuf,
+    status_path: PathBuf,
+    listener: UnixListener,
+    helper_path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+enum SandboxWaitError {
+    BeforeTarget(RunnerError),
+    AfterTarget(RunnerError),
+}
+
+#[cfg(target_os = "linux")]
+impl SandboxWaitError {
+    fn into_runner_error(self) -> RunnerError {
+        match self {
+            Self::BeforeTarget(error) | Self::AfterTarget(error) => error,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SandboxChannel {
+    fn new(helper_path: &Path, request: &RunnerRequest, cwd: PathBuf) -> Result<Self, RunnerError> {
+        let profile = match &request.sandbox {
+            SandboxRequest::BestEffort { profile } | SandboxRequest::Required { profile }
+                if profile == "workspace_rw" =>
+            {
+                profile.clone()
+            }
+            _ => return Err(RunnerError::Setup("unsupported sandbox profile".into())),
+        };
+        let directory = tempfile::Builder::new()
+            .prefix("eggwork-sandbox-")
+            .tempdir()
+            .map_err(|_| RunnerError::Setup("sandbox channel unavailable".into()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| RunnerError::Setup("sandbox channel unavailable".into()))?;
+        }
+        let spec_path = directory.path().join("spec.json");
+        let status_path = directory.path().join("status.sock");
+        let listener = UnixListener::bind(&status_path)
+            .map_err(|_| RunnerError::Setup("sandbox status channel unavailable".into()))?;
+        let mut environment = vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("LANG".into(), "C.UTF-8".into()),
+            ("LC_ALL".into(), "C.UTF-8".into()),
+            ("CI".into(), "1".into()),
+            ("NO_COLOR".into(), "1".into()),
+            ("TERM".into(), "dumb".into()),
+            ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+            ("PAGER".into(), "cat".into()),
+        ];
+        for (key, value) in &request.environment {
+            if !denied_environment_key(key) {
+                environment.push((key.clone(), value.clone()));
+            }
+        }
+        if let Some(id) = &request.provenance.execution_id {
+            environment.push(("EGGWORK_EXECUTION_ID".into(), id.as_str().into()));
+        }
+        if let Some(generation) = request.provenance.generation {
+            environment.push((
+                "EGGWORK_EXECUTION_GENERATION".into(),
+                generation.get().to_string(),
+            ));
+        }
+        let spec = SandboxLaunchSpec {
+            schema_version: 1,
+            profile,
+            root: request
+                .root
+                .canonicalize()
+                .map_err(|_| RunnerError::InvalidRoot("execution root is invalid".into()))?,
+            cwd,
+            argv: request.argv.clone(),
+            environment,
+        };
+        let encoded = serde_json::to_vec(&spec)
+            .map_err(|_| RunnerError::Setup("sandbox specification is invalid".into()))?;
+        if encoded.len() > 1024 * 1024 {
+            return Err(RunnerError::Setup(
+                "sandbox specification exceeds its bound".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&spec_path)
+                .map_err(|_| RunnerError::Setup("sandbox specification unavailable".into()))?;
+            file.write_all(&encoded)
+                .map_err(|_| RunnerError::Setup("sandbox specification unavailable".into()))?;
+        }
+        Ok(Self {
+            _directory: directory,
+            spec_path,
+            status_path,
+            listener,
+            helper_path: helper_path.to_path_buf(),
+        })
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.helper_path);
+        command
+            .arg("--spec")
+            .arg(&self.spec_path)
+            .arg("--status")
+            .arg(&self.status_path)
+            .current_dir(self.spec_path.parent().expect("spec parent"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LANG", "C.UTF-8")
+            .env("LC_ALL", "C.UTF-8");
+        command
+    }
+
+    async fn wait(
+        self,
+        _child: &mut tokio::process::Child,
+        cancellation: CancellationToken,
+    ) -> Result<bool, SandboxWaitError> {
+        let (mut stream, _) = tokio::select! {
+            _ = cancellation.cancelled() => return Err(SandboxWaitError::BeforeTarget(RunnerError::CancelledBeforeSpawn)),
+            accepted = tokio::time::timeout(Duration::from_secs(5), self.listener.accept()) => {
+                accepted
+                    .map_err(|_| SandboxWaitError::BeforeTarget(RunnerError::Setup("sandbox status timed out".into())))?
+                    .map_err(|_| SandboxWaitError::BeforeTarget(RunnerError::Setup("sandbox status channel failed".into())))?
+            }
+        };
+        let mut status = [0u8; 1];
+        tokio::select! {
+            _ = cancellation.cancelled() => Err(SandboxWaitError::BeforeTarget(RunnerError::CancelledBeforeSpawn)),
+            result = tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut status)) => {
+                result
+                    .map_err(|_| SandboxWaitError::BeforeTarget(RunnerError::Setup("sandbox status timed out".into())))?
+                    .map_err(|_| SandboxWaitError::BeforeTarget(RunnerError::Setup("sandbox status channel failed".into())))?;
+                match status[0] {
+                    0 => Ok(false),
+                    2 => Ok(false),
+                    3 => Ok(false),
+                    30 => Ok(false),
+                    31 => Ok(false),
+                    code if code >= 4 => Err(SandboxWaitError::BeforeTarget(RunnerError::Setup(format!("sandbox helper rejected its launch specification (status {code})")))),
+                    1 => {
+                        let mut target_spawned = [0u8; 1];
+                        tokio::select! {
+                            _ = cancellation.cancelled() => return Err(SandboxWaitError::AfterTarget(RunnerError::CancelledBeforeSpawn)),
+                            result = tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut target_spawned)) => {
+                                result
+                                    .map_err(|_| SandboxWaitError::AfterTarget(RunnerError::Setup("sandbox status timed out".into())))?
+                                    .map_err(|_| SandboxWaitError::AfterTarget(RunnerError::Setup("sandbox status channel failed".into())))?;
+                            }
+                        }
+                        match target_spawned[0] {
+                            1 => Ok(true),
+                            0 => Err(SandboxWaitError::AfterTarget(RunnerError::Spawn("sandbox target could not start".into()))),
+                            _ => Err(SandboxWaitError::AfterTarget(RunnerError::Setup("sandbox status was invalid".into()))),
+                        }
+                    }
+                    _ => Err(SandboxWaitError::BeforeTarget(RunnerError::Setup("sandbox status was invalid".into()))),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
