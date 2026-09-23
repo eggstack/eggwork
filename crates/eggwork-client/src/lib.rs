@@ -7,8 +7,8 @@ use eggfetch_core::{
     BoxBytesStream, Client as HttpClient, Error as HttpError, RequestBody, TlsConfig,
 };
 use eggwork_core::{
-    ApiError, BlobDigest, ExecutionEvent, ExecutionHandle, ExecutionId, ExecutionSnapshot,
-    ExecutionSpec, NodeCapabilities, NodeStatus, WorkspaceId, WorkspaceManifest,
+    ApiError, ArtifactId, ArtifactRecord, BlobDigest, ExecutionEvent, ExecutionHandle, ExecutionId,
+    ExecutionSnapshot, ExecutionSpec, NodeCapabilities, NodeStatus, WorkspaceId, WorkspaceManifest,
 };
 use futures_util::{StreamExt, stream};
 use serde::{Serialize, de::DeserializeOwned};
@@ -335,6 +335,47 @@ impl NodeClient {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| BlobDigest::parse(value.to_owned()).ok());
         if returned_digest.as_ref() != Some(digest) {
+            return Err(ClientError::InvalidResponse);
+        }
+        Ok(response.bytes_stream()?)
+    }
+
+    pub async fn artifacts(
+        &self,
+        execution_id: &ExecutionId,
+        generation: u64,
+    ) -> Result<Vec<ArtifactRecord>, ClientError> {
+        self.get_json(&format!(
+            "/v1/executions/{execution_id}/artifacts?generation={generation}"
+        ))
+        .await
+    }
+
+    pub async fn download_artifact(
+        &self,
+        artifact: &ArtifactRecord,
+    ) -> Result<BoxBytesStream, ClientError> {
+        let mut response = self
+            .http
+            .get(&self.url(&format!("/v1/artifacts/{}", artifact.artifact_id.as_str())))?
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(api_error(response.status().as_u16(), &mut response).await);
+        }
+        let returned_id = response
+            .headers()
+            .get("eggwork-artifact-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| ArtifactId::new(value.to_owned()).ok());
+        let returned_digest = response
+            .headers()
+            .get("eggwork-artifact-digest")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| BlobDigest::parse(value.to_owned()).ok());
+        if returned_id.as_ref() != Some(&artifact.artifact_id)
+            || returned_digest.as_ref() != Some(&artifact.digest)
+        {
             return Err(ClientError::InvalidResponse);
         }
         Ok(response.bytes_stream()?)

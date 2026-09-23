@@ -2,6 +2,7 @@
 
 //! Authenticated fixed-target Eggwork node service, built on EggServe.
 
+mod artifact;
 mod blob;
 mod store;
 mod workspace;
@@ -16,9 +17,9 @@ use eggserve_core::{
     tls::{ClientAuthMode, TlsServerConfig},
 };
 use eggwork_core::{
-    ApiError, ExecutionEvent, ExecutionEventKind, ExecutionFailure, ExecutionGeneration,
-    ExecutionHandle, ExecutionId, ExecutionResult, ExecutionSnapshot, ExecutionSpec,
-    ExecutionState, LeaseId, NodeCapabilities, NodeId, NodeStatus, ProtocolVersion,
+    ApiError, ExecutionEvent, ExecutionEventKind, ExecutionFailure, ExecutionFinalizationFailure,
+    ExecutionGeneration, ExecutionHandle, ExecutionId, ExecutionResult, ExecutionSnapshot,
+    ExecutionSpec, ExecutionState, LeaseId, NodeCapabilities, NodeId, NodeStatus, ProtocolVersion,
     ProtocolVersionRange,
 };
 use eggwork_runner::{ExecutionProvenance, LocalProcessRunner, RunnerError, RunnerRequest};
@@ -59,6 +60,7 @@ pub enum Operation {
     BlobRead,
     BlobWrite,
     WorkspaceCreate,
+    ArtifactRead,
 }
 
 pub trait PeerPrincipalResolver: Send + Sync + 'static {
@@ -148,6 +150,7 @@ struct NodeState {
     store: store::ExecutionStore,
     blobs: blob::BlobStore,
     workspaces: workspace::WorkspaceManager,
+    artifacts: artifact::ArtifactStore,
     lease_ttl: Duration,
     resolver: Arc<dyn PeerPrincipalResolver>,
     authorizer: Arc<dyn Authorizer>,
@@ -165,6 +168,14 @@ struct ExecutionRecord {
     lease: tokio::sync::Mutex<LeaseState>,
 }
 
+#[derive(Clone)]
+struct WorkspaceCapture {
+    id: eggwork_core::WorkspaceId,
+    root: PathBuf,
+    principal: eggwork_core::PrincipalId,
+    outputs: Vec<eggwork_core::DeclaredOutput>,
+}
+
 struct LeaseState {
     expires_at: tokio::time::Instant,
     notify: Arc<tokio::sync::Notify>,
@@ -174,6 +185,21 @@ struct LeaseState {
 pub struct NodeServer {
     handle: ServerHandle,
     state: NodeState,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NodeGcReport {
+    pub workspace_candidates: u64,
+    pub workspace_logical_bytes: u64,
+    pub workspaces_deleted: u64,
+    pub artifact_candidates: u64,
+    pub artifacts_deleted: u64,
+    pub expired_blob_references: u64,
+    pub blob_candidates: u64,
+    pub blob_candidate_bytes: u64,
+    pub blobs_deleted: u64,
+    pub blob_bytes_deleted: u64,
+    pub dry_run: bool,
 }
 
 struct NodeHttpService(NodeState);
@@ -246,9 +272,18 @@ impl NodeServer {
         let workspaces =
             workspace::WorkspaceManager::open(&config.workspace_root, config.workspace_quota_bytes)
                 .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
+        let artifact_path = config.database_path.with_extension("artifacts.sqlite");
+        let artifacts = artifact::ArtifactStore::open(&artifact_path)
+            .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
         store
             .recover()
             .await
+            .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
+        workspaces
+            .recover_retention(
+                artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS),
+                &blobs,
+            )
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
         let draining = Arc::new(AtomicBool::new(false));
         let mut executions = HashMap::new();
@@ -286,6 +321,7 @@ impl NodeServer {
             store,
             blobs,
             workspaces,
+            artifacts,
             lease_ttl: config.lease_ttl,
             resolver,
             authorizer,
@@ -343,6 +379,49 @@ impl NodeServer {
         self.handle.shutdown();
     }
 
+    /// Run a bounded local maintenance pass; no remote GC route is exposed.
+    pub async fn collect_garbage(
+        &self,
+        dry_run: bool,
+        requested_limit: usize,
+    ) -> Result<NodeGcReport, String> {
+        let limit = requested_limit.clamp(1, 1024);
+        let now = artifact::now_unix_ms();
+        let (workspace_candidates, workspace_logical_bytes, workspaces_deleted) = self
+            .state
+            .workspaces
+            .garbage_collect(now, limit, dry_run)
+            .map_err(|error| error.to_string())?;
+        let artifact_report = self
+            .state
+            .artifacts
+            .garbage_collect(now, limit, dry_run)
+            .map_err(|error| error.to_string())?;
+        let blob_report = self
+            .state
+            .blobs
+            .garbage_collect(now, limit, dry_run)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(NodeGcReport {
+            workspace_candidates,
+            workspace_logical_bytes,
+            workspaces_deleted,
+            artifact_candidates: artifact_report.candidate_artifacts,
+            artifacts_deleted: artifact_report.deleted_artifacts,
+            expired_blob_references: if dry_run {
+                blob_report.expired_references
+            } else {
+                blob_report.expired_references_removed
+            },
+            blob_candidates: blob_report.candidate_blobs,
+            blob_candidate_bytes: blob_report.candidate_bytes,
+            blobs_deleted: blob_report.removed_blobs,
+            blob_bytes_deleted: blob_report.removed_bytes,
+            dry_run,
+        })
+    }
+
     pub async fn wait(self) -> Result<(), NodeStartError> {
         self.handle
             .wait()
@@ -384,6 +463,11 @@ fn operation_for(method: &str, path: &str) -> Option<(Operation, Route)> {
         ("POST", "/v1/workspaces") => Some((Operation::WorkspaceCreate, Route::WorkspaceCreate)),
         _ => {
             let parts: Vec<_> = path.split('/').collect();
+            if parts.len() == 4 && parts[..2] == ["", "v1"] && parts[2] == "artifacts" {
+                let artifact = eggwork_core::ArtifactId::new(parts[3].to_owned()).ok()?;
+                return (method == "GET")
+                    .then_some((Operation::ArtifactRead, Route::ArtifactDownload(artifact)));
+            }
             if parts.len() == 4 && parts[..3] == ["", "v1", "executions"] {
                 let id = ExecutionId::new(parts[3]).ok()?;
                 return match method {
@@ -397,6 +481,9 @@ fn operation_for(method: &str, path: &str) -> Option<(Operation, Route)> {
                     ("POST", "cancel") => Some((Operation::Cancel, Route::Cancel(id))),
                     ("POST", "renew") => Some((Operation::Renew, Route::Renew(id))),
                     ("GET", "events") => Some((Operation::Events, Route::Events(id))),
+                    ("GET", "artifacts") => {
+                        Some((Operation::ArtifactRead, Route::ArtifactList(id)))
+                    }
                     _ => None,
                 };
             }
@@ -439,6 +526,8 @@ enum Route {
     BlobDownload(eggwork_core::BlobDigest),
     BlobInvalidDigest,
     WorkspaceCreate,
+    ArtifactList(ExecutionId),
+    ArtifactDownload(eggwork_core::ArtifactId),
 }
 
 async fn dispatch(
@@ -481,6 +570,9 @@ async fn dispatch(
                     "blob.stream.v1".into(),
                     "workspace.manifest.v1".into(),
                     "workspace.materialize.v1".into(),
+                    "artifact.declared.v1".into(),
+                    "artifact.stream.v1".into(),
+                    "artifact.retention.v1".into(),
                 ],
                 max_active_executions: state.max_active,
             },
@@ -501,6 +593,8 @@ async fn dispatch(
             "blob digest is invalid",
         )),
         Route::WorkspaceCreate => workspace_create(state, request, principal).await,
+        Route::ArtifactList(id) => artifact_list(state, id, query.as_deref(), principal).await,
+        Route::ArtifactDownload(id) => artifact_download(state, id, principal).await,
     }
 }
 
@@ -841,6 +935,129 @@ async fn blob_download(
         .map_err(|e| eggserve_core::server::ServiceError::internal(e.to_string()))
 }
 
+async fn artifact_list(
+    state: NodeState,
+    execution_id: ExecutionId,
+    query: Option<&str>,
+    principal: NodePrincipal,
+) -> Result<Response, eggserve_core::server::ServiceError> {
+    let generation = match query_parameter(query, "generation") {
+        Ok(Some(value)) => value
+            .parse::<u64>()
+            .ok()
+            .and_then(|value| ExecutionGeneration::new(value).ok()),
+        _ => None,
+    };
+    let Some(generation) = generation else {
+        return Ok(error_response(
+            400,
+            "invalid_request",
+            "generation is invalid",
+        ));
+    };
+    match state
+        .artifacts
+        .list(&execution_id, generation, &principal.id)
+    {
+        Ok(records) => Ok(json_response(200, &records)),
+        Err(_) => Ok(error_response(
+            500,
+            "storage_error",
+            "artifact metadata unavailable",
+        )),
+    }
+}
+
+struct BlobReferenceLease {
+    blobs: blob::BlobStore,
+    owner_id: String,
+}
+
+impl BlobReferenceLease {
+    fn renew(&self) -> Result<(), blob::BlobError> {
+        self.blobs.set_reference_expiry(
+            "reader",
+            &self.owner_id,
+            artifact::now_unix_ms().saturating_add(30 * 60 * 1000),
+        )
+    }
+}
+
+impl Drop for BlobReferenceLease {
+    fn drop(&mut self) {
+        let _ = self.blobs.release_references("reader", &self.owner_id);
+    }
+}
+
+async fn artifact_download(
+    state: NodeState,
+    artifact_id: eggwork_core::ArtifactId,
+    principal: NodePrincipal,
+) -> Result<Response, eggserve_core::server::ServiceError> {
+    let record = match state.artifacts.get(&artifact_id, &principal.id) {
+        Ok(record) => record,
+        Err(_) => {
+            return Ok(error_response(
+                404,
+                "artifact_not_found",
+                "artifact not found",
+            ));
+        }
+    };
+    let owner_id = uuid::Uuid::new_v4().to_string();
+    if state
+        .blobs
+        .retain(
+            "reader",
+            &owner_id,
+            std::slice::from_ref(&record.digest),
+            Some(artifact::now_unix_ms().saturating_add(30 * 60 * 1000)),
+        )
+        .is_err()
+    {
+        return Ok(error_response(
+            404,
+            "artifact_not_found",
+            "artifact not found",
+        ));
+    }
+    let lease = BlobReferenceLease {
+        blobs: state.blobs.clone(),
+        owner_id,
+    };
+    let file = match state.blobs.open_verified(&record.digest).await {
+        Ok(file) => file,
+        Err(_) => {
+            return Ok(error_response(
+                500,
+                "artifact_unavailable",
+                "artifact bytes unavailable",
+            ));
+        }
+    };
+    let stream = stream::try_unfold((file, lease), |(mut file, lease)| async move {
+        let mut chunk = vec![0u8; 64 * 1024];
+        match tokio::io::AsyncReadExt::read(&mut file, &mut chunk).await {
+            Ok(0) => Ok(None),
+            Ok(size) => {
+                lease
+                    .renew()
+                    .map_err(|_| ResponseStreamError::new("artifact lease refresh failed"))?;
+                chunk.truncate(size);
+                Ok(Some((Bytes::from(chunk), (file, lease))))
+            }
+            Err(_) => Err(ResponseStreamError::new("artifact read failed")),
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .and_then(|builder| builder.header("eggwork-artifact-id", artifact_id.as_str()))
+        .and_then(|builder| builder.header("eggwork-artifact-digest", record.digest.as_str()))
+        .and_then(|builder| builder.body(ResponseBody::Stream(ResponseStream::new(stream))))
+        .map_err(|e| eggserve_core::server::ServiceError::internal(e.to_string()))
+}
+
 fn blob_error_response(error: blob::BlobError) -> Response {
     match error {
         blob::BlobError::TooLarge => {
@@ -918,6 +1135,13 @@ async fn execute(
             "execution specification is invalid",
         ));
     }
+    if !wire.spec.command.declared_outputs.is_empty() && wire.workspace_id.is_none() {
+        return Ok(error_response(
+            400,
+            "workspace_required",
+            "declared outputs require an execution workspace",
+        ));
+    }
     if state.draining.load(Ordering::Acquire) {
         return Ok(error_response(
             503,
@@ -968,6 +1192,12 @@ async fn execute(
     } else {
         state.execution_root.clone()
     };
+    let workspace_capture = wire.workspace_id.clone().map(|id| WorkspaceCapture {
+        id,
+        root: execution_root.clone(),
+        principal: principal.id.clone(),
+        outputs: wire.spec.command.declared_outputs.clone(),
+    });
     let runner_request = match RunnerRequest::from_spec(
         &wire.spec,
         execution_root,
@@ -1060,6 +1290,20 @@ async fn execute(
             "recent execution capacity reached",
         ));
     }
+    if let Some(workspace_id) = &wire.workspace_id
+        && state
+            .workspaces
+            .mark_active(workspace_id, &state.blobs)
+            .is_err()
+    {
+        drop(permit);
+        drop(executions);
+        return Ok(error_response(
+            409,
+            "workspace_not_ready",
+            "workspace is unavailable for this execution",
+        ));
+    }
     let snapshot = ExecutionSnapshot {
         schema_version: API_SCHEMA_VERSION,
         execution_id: id.clone(),
@@ -1067,7 +1311,7 @@ async fn execute(
         state: ExecutionState::Accepted,
         result: None,
     };
-    match state
+    let reservation = match state
         .store
         .reserve(
             snapshot.clone(),
@@ -1078,16 +1322,46 @@ async fn execute(
             lease_expires_unix_ms,
         )
         .await
-        .map_err(|_| eggserve_core::server::ServiceError::internal("execution store unavailable"))?
     {
+        Ok(reservation) => reservation,
+        Err(_) => {
+            if let Some(workspace_id) = &wire.workspace_id {
+                let expiry =
+                    artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
+                let _ = state
+                    .workspaces
+                    .mark_terminal(workspace_id, expiry, &state.blobs);
+            }
+            return Err(eggserve_core::server::ServiceError::internal(
+                "execution store unavailable",
+            ));
+        }
+    };
+    match reservation {
         store::ReserveResult::Created => {}
         store::ReserveResult::Existing(snapshot) => {
             drop(permit);
+            if is_terminal(&snapshot.state)
+                && let Some(workspace_id) = &wire.workspace_id
+            {
+                let expiry =
+                    artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
+                let _ = state
+                    .workspaces
+                    .mark_terminal(workspace_id, expiry, &state.blobs);
+            }
             let record = recovered_record(snapshot, state.store.clone(), lease_hash);
             drop(executions);
             return event_response(state, id, generation, 0, record).await;
         }
         store::ReserveResult::Conflict => {
+            if let Some(workspace_id) = &wire.workspace_id {
+                let expiry =
+                    artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
+                let _ = state
+                    .workspaces
+                    .mark_terminal(workspace_id, expiry, &state.blobs);
+            }
             return Ok(error_response(
                 409,
                 "execution_identity_conflict",
@@ -1095,6 +1369,13 @@ async fn execute(
             ));
         }
         store::ReserveResult::StaleGeneration => {
+            if let Some(workspace_id) = &wire.workspace_id {
+                let expiry =
+                    artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
+                let _ = state
+                    .workspaces
+                    .mark_terminal(workspace_id, expiry, &state.blobs);
+            }
             return Ok(error_response(
                 409,
                 "generation_mismatch",
@@ -1102,6 +1383,13 @@ async fn execute(
             ));
         }
         store::ReserveResult::StorageFull => {
+            if let Some(workspace_id) = &wire.workspace_id {
+                let expiry =
+                    artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
+                let _ = state
+                    .workspaces
+                    .mark_terminal(workspace_id, expiry, &state.blobs);
+            }
             return Ok(error_response(
                 503,
                 "storage_exhausted",
@@ -1129,8 +1417,16 @@ async fn execute(
     tokio::spawn(async move { monitor_lease(lease_record).await });
     let service_state = state.clone();
     let execution_record = record.clone();
+    let workspace_capture = workspace_capture.clone();
     tokio::spawn(async move {
-        run_execution(service_state, execution_record, runner_request, permit).await;
+        run_execution(
+            service_state,
+            execution_record,
+            runner_request,
+            workspace_capture,
+            permit,
+        )
+        .await;
     });
     event_response(state, id, generation, 0, record).await
 }
@@ -1621,6 +1917,7 @@ async fn run_execution(
     state: NodeState,
     record: Arc<ExecutionRecord>,
     request: RunnerRequest,
+    workspace: Option<WorkspaceCapture>,
     _permit: OwnedSemaphorePermit,
 ) {
     publish(
@@ -1668,21 +1965,15 @@ async fn run_execution(
         };
         publish(&record, ExecutionState::Running, None, kind).await;
     }
-    if let Some(result) = result {
+    let runner_completed = result.is_some();
+    let mut execution_result = if let Some(result) = result {
         let mut execution_result = result.execution_result();
         if record.lease.lock().await.expired.load(Ordering::Acquire) {
             execution_result.state = ExecutionState::Interrupted;
             execution_result.failure = Some(ExecutionFailure::LeaseExpired);
             execution_result.exit_code = None;
         }
-        let state_value = execution_result.state.clone();
-        publish_terminal(
-            &record,
-            state_value.clone(),
-            execution_result,
-            ExecutionEventKind::State(state_value),
-        )
-        .await;
+        execution_result
     } else {
         let expired = record.lease.lock().await.expired.load(Ordering::Acquire);
         let failure = failure_for_runner_error(runner_error.as_ref(), expired);
@@ -1693,15 +1984,58 @@ async fn run_execution(
         } else {
             ExecutionState::Failed
         };
-        let result = failed_result(terminal.clone(), failure);
-        publish_terminal(
-            &record,
-            terminal.clone(),
-            result,
-            ExecutionEventKind::State(terminal),
-        )
-        .await;
+        failed_result(terminal, failure)
+    };
+    if let Some(workspace) = workspace {
+        let should_capture = runner_completed
+            && !workspace.outputs.is_empty()
+            && matches!(
+                execution_result.state,
+                ExecutionState::Succeeded | ExecutionState::Failed
+            )
+            && execution_result.failure != Some(ExecutionFailure::OutputLimit);
+        if should_capture {
+            let expiry = artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
+            let (execution_id, generation) = {
+                let snapshot = record.snapshot.read().await;
+                (snapshot.execution_id.clone(), snapshot.generation)
+            };
+            match artifact::capture_declared(
+                &state.artifacts,
+                &state.blobs,
+                &workspace.root,
+                &workspace.outputs,
+                &execution_id,
+                generation,
+                &workspace.principal,
+                expiry,
+            )
+            .await
+            {
+                Ok(count) => execution_result.artifact_count = count,
+                Err(_) => {
+                    execution_result.finalization_failure =
+                        Some(ExecutionFinalizationFailure::ArtifactCapture);
+                }
+            }
+        }
+        let expiry = artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
+        if state
+            .workspaces
+            .mark_terminal(&workspace.id, expiry, &state.blobs)
+            .is_err()
+        {
+            execution_result.finalization_failure = Some(ExecutionFinalizationFailure::Retention);
+        }
     }
+    let terminal = execution_result.state.clone();
+    publish_terminal(
+        &record,
+        terminal.clone(),
+        execution_result,
+        ExecutionEventKind::State(terminal),
+    )
+    .await;
     record.finished.store(true, Ordering::Release);
 }
 
@@ -1715,6 +2049,8 @@ fn failed_result(state: ExecutionState, failure: ExecutionFailure) -> ExecutionR
         stdout_omitted: 0,
         stderr_omitted: 0,
         cleanup_warning: None,
+        finalization_failure: None,
+        artifact_count: 0,
     }
 }
 
@@ -2056,6 +2392,14 @@ mod tests {
             operation_for("GET", "/v1/executions/exec-1"),
             Some((Operation::Observe, _))
         ));
+        assert!(matches!(
+            operation_for("GET", "/v1/executions/exec-1/artifacts"),
+            Some((Operation::ArtifactRead, Route::ArtifactList(_)))
+        ));
+        assert!(matches!(
+            operation_for("GET", "/v1/artifacts/00000000-0000-4000-8000-000000000000"),
+            Some((Operation::ArtifactRead, Route::ArtifactDownload(_)))
+        ));
         assert!(operation_for("POST", "/v1/execute-anywhere").is_none());
     }
 
@@ -2141,6 +2485,7 @@ mod tests {
                         | Operation::BlobRead
                         | Operation::BlobWrite
                         | Operation::WorkspaceCreate
+                        | Operation::ArtifactRead
                 )
             }),
         )
@@ -2189,6 +2534,12 @@ mod tests {
                         entries: vec![],
                     },
                 )
+                .await,
+            Err(eggwork_client::ClientError::Api { status: 403, .. })
+        ));
+        assert!(matches!(
+            unauthorized
+                .artifacts(&ExecutionId::new("denied-artifact-read").unwrap(), 1)
                 .await,
             Err(eggwork_client::ClientError::Api { status: 403, .. })
         ));
@@ -2376,9 +2727,13 @@ mod tests {
         let mut workspace_spec = execution_spec(vec![
             "/bin/sh".into(),
             "-c".into(),
-            "cat message.txt".into(),
+            "cat message.txt | tee result.txt".into(),
         ]);
         workspace_spec.command.cwd = Some(eggwork_core::RelativePath::new("src").unwrap());
+        workspace_spec.command.declared_outputs = vec![eggwork_core::DeclaredOutput {
+            path: eggwork_core::RelativePath::new("src/result.txt").unwrap(),
+            required: true,
+        }];
         let stream = client
             .execute_in_workspace(&workspace_spec, &workspace_handle, &workspace_id)
             .await
@@ -2394,6 +2749,132 @@ mod tests {
             &event.kind,
             ExecutionEventKind::Stdout(bytes) if bytes == workspace_bytes
         )));
+        let final_snapshot = client
+            .observe_generation(
+                &workspace_handle.execution_id,
+                workspace_handle.generation.get(),
+            )
+            .await
+            .unwrap();
+        let result = final_snapshot.result.unwrap();
+        assert_eq!(result.artifact_count, 1);
+        assert_eq!(result.finalization_failure, None);
+        let artifacts = client
+            .artifacts(
+                &workspace_handle.execution_id,
+                workspace_handle.generation.get(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].path.as_str(), "src/result.txt");
+        let downloaded = client
+            .download_artifact(&artifacts[0])
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(downloaded, workspace_bytes);
+        let missing_handle = execution_handle("artifact-finalization-failure");
+        let missing_workspace =
+            eggwork_core::WorkspaceId::new("artifact-missing-workspace").unwrap();
+        client
+            .create_workspace(
+                &missing_workspace,
+                &missing_handle,
+                &eggwork_core::WorkspaceManifest {
+                    schema_version: 1,
+                    entries: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        let mut missing_output_spec = execution_spec(vec!["/bin/true".into()]);
+        missing_output_spec.command.declared_outputs = vec![eggwork_core::DeclaredOutput {
+            path: eggwork_core::RelativePath::new("required-missing.txt").unwrap(),
+            required: true,
+        }];
+        client
+            .execute_in_workspace(&missing_output_spec, &missing_handle, &missing_workspace)
+            .await
+            .unwrap()
+            .into_events()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let failed_finalization = client
+            .observe_generation(
+                &missing_handle.execution_id,
+                missing_handle.generation.get(),
+            )
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(failed_finalization.state, ExecutionState::Succeeded);
+        assert_eq!(failed_finalization.exit_code, Some(0));
+        assert_eq!(failed_finalization.artifact_count, 0);
+        assert_eq!(
+            failed_finalization.finalization_failure,
+            Some(ExecutionFinalizationFailure::ArtifactCapture)
+        );
+        let timeout_handle = execution_handle("artifact-timeout");
+        let timeout_workspace =
+            eggwork_core::WorkspaceId::new("artifact-timeout-workspace").unwrap();
+        client
+            .create_workspace(
+                &timeout_workspace,
+                &timeout_handle,
+                &eggwork_core::WorkspaceManifest {
+                    schema_version: 1,
+                    entries: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        let mut timeout_spec = execution_spec(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf partial > partial.txt; sleep 1".into(),
+        ]);
+        timeout_spec.command.timeout_millis = 100;
+        timeout_spec.command.declared_outputs = vec![eggwork_core::DeclaredOutput {
+            path: eggwork_core::RelativePath::new("partial.txt").unwrap(),
+            required: true,
+        }];
+        client
+            .execute_in_workspace(&timeout_spec, &timeout_handle, &timeout_workspace)
+            .await
+            .unwrap()
+            .into_events()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let timed_out = client
+            .observe_generation(
+                &timeout_handle.execution_id,
+                timeout_handle.generation.get(),
+            )
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(timed_out.state, ExecutionState::TimedOut);
+        assert_eq!(timed_out.artifact_count, 0);
+        assert!(
+            client
+                .artifacts(
+                    &timeout_handle.execution_id,
+                    timeout_handle.generation.get()
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(matches!(
             client
                 .execute_in_workspace(

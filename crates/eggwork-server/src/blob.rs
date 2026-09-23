@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use eggwork_core::BlobDigest;
 use futures_util::{Stream, StreamExt};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
@@ -18,6 +18,16 @@ use tokio::{io::AsyncWriteExt, sync::Mutex};
 
 pub const MAX_BLOB_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_FIND_DIGESTS: usize = 512;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GcReport {
+    pub expired_references: u64,
+    pub expired_references_removed: u64,
+    pub candidate_blobs: u64,
+    pub candidate_bytes: u64,
+    pub removed_blobs: u64,
+    pub removed_bytes: u64,
+}
 
 #[derive(Debug, Error)]
 pub enum BlobError {
@@ -72,12 +82,31 @@ impl BlobStore {
         metadata.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
+             PRAGMA foreign_keys=ON;
              CREATE TABLE IF NOT EXISTS blobs (
                digest TEXT PRIMARY KEY,
                size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
                reference_count INTEGER NOT NULL DEFAULT 0 CHECK(reference_count >= 0),
                last_used_unix_ms INTEGER NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS blob_references (
+               owner_kind TEXT NOT NULL,
+               owner_id TEXT NOT NULL,
+               digest TEXT NOT NULL,
+               expires_unix_ms INTEGER,
+               PRIMARY KEY(owner_kind, owner_id, digest),
+               FOREIGN KEY(digest) REFERENCES blobs(digest) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS blob_references_expiry
+               ON blob_references(expires_unix_ms);
+             CREATE TRIGGER IF NOT EXISTS blob_reference_insert
+             AFTER INSERT ON blob_references BEGIN
+               UPDATE blobs SET reference_count = reference_count + 1 WHERE digest = NEW.digest;
+             END;
+             CREATE TRIGGER IF NOT EXISTS blob_reference_delete
+             AFTER DELETE ON blob_references BEGIN
+               UPDATE blobs SET reference_count = MAX(0, reference_count - 1) WHERE digest = OLD.digest;
+             END;",
         )?;
         let store = Self {
             inner: Arc::new(BlobStoreInner {
@@ -163,6 +192,183 @@ impl BlobStore {
             .optional()?;
         size.map(|size| size.max(0) as u64)
             .ok_or(BlobError::NotFound)
+    }
+
+    /// Retain content before publishing a new workspace or artifact reference.
+    /// Expired references are safe to reclaim; `None` is reserved for live workspaces.
+    pub fn retain(
+        &self,
+        owner_kind: &str,
+        owner_id: &str,
+        digests: &[BlobDigest],
+        expires_unix_ms: Option<u64>,
+    ) -> Result<(), BlobError> {
+        let mut connection = self.inner.metadata.lock().map_err(|_| BlobError::Worker)?;
+        let transaction = connection.transaction()?;
+        for digest in digests {
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE digest = ?1)",
+                [digest.as_str()],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(BlobError::NotFound);
+            }
+            transaction.execute(
+                "INSERT INTO blob_references(owner_kind, owner_id, digest, expires_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(owner_kind, owner_id, digest) DO UPDATE
+                   SET expires_unix_ms = excluded.expires_unix_ms",
+                params![
+                    owner_kind,
+                    owner_id,
+                    digest.as_str(),
+                    expires_unix_ms.map(|v| v as i64)
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn set_reference_expiry(
+        &self,
+        owner_kind: &str,
+        owner_id: &str,
+        expires_unix_ms: u64,
+    ) -> Result<(), BlobError> {
+        self.inner
+            .metadata
+            .lock()
+            .map_err(|_| BlobError::Worker)?
+            .execute(
+                "UPDATE blob_references SET expires_unix_ms = ?3
+                 WHERE owner_kind = ?1 AND owner_id = ?2",
+                params![owner_kind, owner_id, expires_unix_ms as i64],
+            )?;
+        Ok(())
+    }
+
+    pub fn clear_reference_expiry(
+        &self,
+        owner_kind: &str,
+        owner_id: &str,
+    ) -> Result<(), BlobError> {
+        self.inner
+            .metadata
+            .lock()
+            .map_err(|_| BlobError::Worker)?
+            .execute(
+                "UPDATE blob_references SET expires_unix_ms = NULL
+                 WHERE owner_kind = ?1 AND owner_id = ?2",
+                params![owner_kind, owner_id],
+            )?;
+        Ok(())
+    }
+
+    pub fn release_references(&self, owner_kind: &str, owner_id: &str) -> Result<(), BlobError> {
+        self.inner
+            .metadata
+            .lock()
+            .map_err(|_| BlobError::Worker)?
+            .execute(
+                "DELETE FROM blob_references WHERE owner_kind = ?1 AND owner_id = ?2",
+                params![owner_kind, owner_id],
+            )?;
+        Ok(())
+    }
+
+    /// Remove expired references and then a bounded number of unreferenced blobs.
+    pub async fn garbage_collect(
+        &self,
+        now_unix_ms: u64,
+        limit: usize,
+        dry_run: bool,
+    ) -> Result<GcReport, BlobError> {
+        let _guard = self.inner.write_lock.lock().await;
+        let mut connection = self.inner.metadata.lock().map_err(|_| BlobError::Worker)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expired_references: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM blob_references WHERE expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?1",
+            [now_unix_ms as i64],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let mut statement = transaction.prepare(
+            "SELECT digest, size_bytes FROM blobs
+             WHERE NOT EXISTS (SELECT 1 FROM blob_references r WHERE r.digest = blobs.digest)
+             ORDER BY last_used_unix_ms ASC LIMIT ?1",
+        )?;
+        let mut candidates = statement
+            .query_map([limit.min(i64::MAX as usize) as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut removed_blobs = 0u64;
+        let mut removed_bytes = 0u64;
+        let mut expired_references_removed = 0u64;
+        if !dry_run {
+            expired_references_removed = transaction.execute(
+                "DELETE FROM blob_references WHERE rowid IN
+                 (SELECT rowid FROM blob_references WHERE expires_unix_ms IS NOT NULL
+                   AND expires_unix_ms <= ?1 LIMIT ?2)",
+                params![now_unix_ms as i64, limit.min(i64::MAX as usize) as i64],
+            )? as u64;
+            candidates = {
+                let mut statement = transaction.prepare(
+                    "SELECT digest, size_bytes FROM blobs
+                     WHERE NOT EXISTS (SELECT 1 FROM blob_references r WHERE r.digest = blobs.digest)
+                     ORDER BY last_used_unix_ms ASC LIMIT ?1",
+                )?;
+                statement
+                    .query_map([limit.min(i64::MAX as usize) as i64], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?.max(0) as u64,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for (encoded, size) in &candidates {
+                let Ok(digest) = BlobDigest::parse(encoded.clone()) else {
+                    continue;
+                };
+                let path = self.path_for(&digest);
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        transaction.execute(
+                            "DELETE FROM blobs WHERE digest = ?1 AND NOT EXISTS
+                               (SELECT 1 FROM blob_references WHERE digest = ?1)",
+                            [digest.as_str()],
+                        )?;
+                        removed_blobs += 1;
+                        removed_bytes = removed_bytes.saturating_add(*size);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        transaction.execute(
+                            "DELETE FROM blobs WHERE digest = ?1 AND NOT EXISTS
+                               (SELECT 1 FROM blob_references WHERE digest = ?1)",
+                            [digest.as_str()],
+                        )?;
+                    }
+                    Err(error) => return Err(BlobError::Io(error)),
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(GcReport {
+            expired_references: expired_references.max(0) as u64,
+            expired_references_removed,
+            candidate_blobs: candidates.len() as u64,
+            candidate_bytes: candidates
+                .iter()
+                .fold(0u64, |sum, (_, size)| sum.saturating_add(*size)),
+            removed_blobs,
+            removed_bytes,
+        })
     }
 
     pub async fn put_stream<S, E>(

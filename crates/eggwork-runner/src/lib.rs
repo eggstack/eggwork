@@ -377,6 +377,8 @@ impl RunnerResult {
                 .clone()
                 .or_else(|| self.cleanup.wait_error.clone())
                 .or_else(|| self.cleanup.stdin_error.clone()),
+            finalization_failure: None,
+            artifact_count: 0,
         }
     }
 }

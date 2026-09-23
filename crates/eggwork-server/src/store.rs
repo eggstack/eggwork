@@ -490,6 +490,8 @@ impl ExecutionStore {
                     stdout_omitted: 0,
                     stderr_omitted: 0,
                     cleanup_warning: None,
+                    finalization_failure: None,
+                    artifact_count: 0,
                 });
                 let generation = snapshot.generation.get() as i64;
                 let sequence: i64 = transaction.query_row(

@@ -4,7 +4,7 @@ Eggwork is a Rust-native, fixed-target remote execution fabric: a caller selects
 
 Eggwork is deliberately **not another scheduler**. Global queues, worker selection, priorities/fairness, workflow DAGs, and semantic retry remain caller-owned. This makes Eggwork suitable as an execution backend for systems such as CodeGG without competing with their orchestration policy.
 
-The initial Rust workspace, protocol-neutral domain contract, and canonical local finite-process runner are implemented. The authenticated remote control plane, durable leases, workspace transfer, security enforcement, operations surface, and CodeGG adapter remain planned work.
+The protocol-neutral core, canonical local finite-process runner, authenticated remote control plane, durable leases, workspace transfer, declared artifact capture, and bounded retention/garbage collection are implemented. Security enforcement, the node operations surface, and the CodeGG adapter remain planned work.
 
 Start here:
 

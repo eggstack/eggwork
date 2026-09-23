@@ -658,6 +658,11 @@ pub enum ExecutionFailure {
     LeaseExpired,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionFinalizationFailure {
+    ArtifactCapture,
+    Retention,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionResult {
     pub state: ExecutionState,
     pub exit_code: Option<i32>,
@@ -667,6 +672,30 @@ pub struct ExecutionResult {
     pub stdout_omitted: u64,
     pub stderr_omitted: u64,
     pub cleanup_warning: Option<String>,
+    #[serde(default)]
+    pub finalization_failure: Option<ExecutionFinalizationFailure>,
+    #[serde(default)]
+    pub artifact_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactRecord {
+    pub artifact_id: ArtifactId,
+    pub execution_id: ExecutionId,
+    pub generation: ExecutionGeneration,
+    pub path: RelativePath,
+    pub kind: ArtifactType,
+    pub digest: BlobDigest,
+    pub size_bytes: u64,
+    pub executable: bool,
+    pub created_unix_ms: u64,
+    pub expires_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactType {
+    File,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventMetadata {

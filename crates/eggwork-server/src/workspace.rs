@@ -5,6 +5,7 @@ use eggwork_core::{
     ExecutionGeneration, ExecutionHandle, ExecutionId, PrincipalId, WorkspaceEntry, WorkspaceId,
     WorkspaceManifest,
 };
+use rusqlite::TransactionBehavior;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
     collections::HashSet,
@@ -31,6 +32,8 @@ pub enum WorkspaceError {
     NotFound,
     #[error("workspace metadata is unavailable")]
     Metadata(#[from] rusqlite::Error),
+    #[error("workspace blob reference operation failed")]
+    Blob(#[from] crate::blob::BlobError),
     #[error("workspace filesystem operation failed")]
     Io(#[from] io::Error),
     #[error("workspace manifest serialization failed")]
@@ -80,9 +83,24 @@ impl WorkspaceManager {
                storage_key TEXT NOT NULL UNIQUE,
                logical_bytes INTEGER NOT NULL,
                state TEXT NOT NULL,
-               created_unix_ms INTEGER NOT NULL
+               created_unix_ms INTEGER NOT NULL,
+               expires_unix_ms INTEGER
              );",
         )?;
+        let has_expiry = {
+            let mut columns = metadata.prepare("PRAGMA table_info(workspaces)")?;
+            columns
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(|name| name == "expires_unix_ms")
+        };
+        if !has_expiry {
+            metadata.execute(
+                "ALTER TABLE workspaces ADD COLUMN expires_unix_ms INTEGER",
+                [],
+            )?;
+        }
         let manager = Self {
             inner: Arc::new(WorkspaceManagerInner {
                 root,
@@ -117,6 +135,9 @@ impl WorkspaceManager {
                 || existing.generation != handle.generation.get()
                 || existing.principal_id != principal_id.as_str()
                 || existing.manifest_digest != manifest_digest
+                || existing
+                    .expires_unix_ms
+                    .is_some_and(|expires| expires <= crate::artifact::now_unix_ms())
             {
                 return Err(WorkspaceError::Conflict);
             }
@@ -165,6 +186,25 @@ impl WorkspaceManager {
             }
         }
 
+        let digests = manifest
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                WorkspaceEntry::File { digest, .. } => Some(digest.clone()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let initial_expiry = crate::artifact::now_unix_ms()
+            .saturating_add(crate::artifact::DEFAULT_RETENTION_MILLIS);
+        blobs.retain(
+            "workspace",
+            workspace_id.as_str(),
+            &digests,
+            Some(initial_expiry),
+        )?;
+
         let nonce = uuid::Uuid::new_v4().to_string();
         let stage_key = format!(".staging-{nonce}");
         let storage_key = format!("workspace-{nonce}");
@@ -181,26 +221,30 @@ impl WorkspaceManager {
             Ok(result) => result,
             Err(_) => {
                 let _ = fs::remove_dir_all(&stage);
+                let _ = blobs.release_references("workspace", workspace_id.as_str());
                 return Err(WorkspaceError::Worker);
             }
         };
         if let Err(error) = result {
             let _ = fs::remove_dir_all(&stage);
+            let _ = blobs.release_references("workspace", workspace_id.as_str());
             return Err(error);
         }
         if let Err(error) = fs::rename(&stage, &target) {
             let _ = fs::remove_dir_all(&stage);
+            let _ = blobs.release_references("workspace", workspace_id.as_str());
             return Err(error.into());
         }
         if let Err(error) = sync_directory(&self.inner.root) {
             let _ = fs::remove_dir_all(&target);
+            let _ = blobs.release_references("workspace", workspace_id.as_str());
             return Err(error.into());
         }
         let inserted = match self.inner.metadata.lock() {
             Ok(connection) => connection.execute(
                 "INSERT INTO workspaces(workspace_id, execution_id, generation, principal_id,
-                   manifest_digest, storage_key, logical_bytes, state, created_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'Ready', ?8)",
+                   manifest_digest, storage_key, logical_bytes, state, created_unix_ms, expires_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'Ready', ?8, ?9)",
                 params![
                     workspace_id.as_str(),
                     handle.execution_id.as_str(),
@@ -210,15 +254,18 @@ impl WorkspaceManager {
                     storage_key,
                     logical_bytes as i64,
                     crate::blob::unix_millis(),
+                    initial_expiry as i64,
                 ],
             ),
             Err(_) => {
                 let _ = fs::remove_dir_all(&target);
+                let _ = blobs.release_references("workspace", workspace_id.as_str());
                 return Err(WorkspaceError::Worker);
             }
         };
         if let Err(error) = inserted {
             let _ = fs::remove_dir_all(&target);
+            let _ = blobs.release_references("workspace", workspace_id.as_str());
             return Err(WorkspaceError::Metadata(error));
         }
         Ok(ReadyWorkspace {
@@ -226,6 +273,148 @@ impl WorkspaceManager {
             logical_bytes,
             manifest_digest,
         })
+    }
+
+    pub fn mark_terminal(
+        &self,
+        workspace_id: &WorkspaceId,
+        expires_unix_ms: u64,
+        blobs: &BlobStore,
+    ) -> Result<(), WorkspaceError> {
+        self.inner
+            .metadata
+            .lock()
+            .map_err(|_| WorkspaceError::Worker)?
+            .execute(
+                "UPDATE workspaces SET expires_unix_ms = ?2 WHERE workspace_id = ?1",
+                params![workspace_id.as_str(), expires_unix_ms as i64],
+            )?;
+        blobs.set_reference_expiry("workspace", workspace_id.as_str(), expires_unix_ms)?;
+        Ok(())
+    }
+
+    pub fn mark_active(
+        &self,
+        workspace_id: &WorkspaceId,
+        blobs: &BlobStore,
+    ) -> Result<(), WorkspaceError> {
+        let mut connection = self
+            .inner
+            .metadata
+            .lock()
+            .map_err(|_| WorkspaceError::Worker)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let key: Option<String> = transaction
+            .query_row(
+                "SELECT storage_key FROM workspaces WHERE workspace_id = ?1 AND state = 'Ready'
+                 AND (expires_unix_ms IS NULL OR expires_unix_ms > ?2)",
+                params![workspace_id.as_str(), crate::artifact::now_unix_ms() as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(key) = key.filter(|key| valid_storage_key(key)) else {
+            return Err(WorkspaceError::NotFound);
+        };
+        let root = self.inner.root.join(key);
+        let metadata = fs::symlink_metadata(root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(WorkspaceError::NotFound);
+        }
+        transaction.execute(
+            "UPDATE workspaces SET expires_unix_ms = NULL WHERE workspace_id = ?1",
+            [workspace_id.as_str()],
+        )?;
+        transaction.commit()?;
+        blobs.clear_reference_expiry("workspace", workspace_id.as_str())?;
+        Ok(())
+    }
+
+    pub fn recover_retention(
+        &self,
+        expires_unix_ms: u64,
+        blobs: &BlobStore,
+    ) -> Result<(), WorkspaceError> {
+        let ids = {
+            let connection = self
+                .inner
+                .metadata
+                .lock()
+                .map_err(|_| WorkspaceError::Worker)?;
+            let mut statement = connection
+                .prepare("SELECT workspace_id FROM workspaces WHERE expires_unix_ms IS NULL")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        self.inner
+            .metadata
+            .lock()
+            .map_err(|_| WorkspaceError::Worker)?
+            .execute(
+                "UPDATE workspaces SET expires_unix_ms = ?1 WHERE expires_unix_ms IS NULL",
+                [expires_unix_ms as i64],
+            )?;
+        for id in ids {
+            blobs.set_reference_expiry("workspace", &id, expires_unix_ms)?;
+        }
+        Ok(())
+    }
+
+    pub fn garbage_collect(
+        &self,
+        now_unix_ms: u64,
+        limit: usize,
+        dry_run: bool,
+    ) -> Result<(u64, u64, u64), WorkspaceError> {
+        let mut connection = self
+            .inner
+            .metadata
+            .lock()
+            .map_err(|_| WorkspaceError::Worker)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let candidates: Vec<(String, String, u64)> = {
+            let mut statement = transaction.prepare(
+                "SELECT workspace_id, storage_key, logical_bytes FROM workspaces
+                 WHERE expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?1
+                 ORDER BY expires_unix_ms ASC LIMIT ?2",
+            )?;
+            statement
+                .query_map(
+                    params![now_unix_ms as i64, limit.min(i64::MAX as usize) as i64],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get::<_, i64>(2)?.max(0) as u64,
+                        ))
+                    },
+                )?
+                .collect::<Result<_, _>>()?
+        };
+        let bytes = candidates
+            .iter()
+            .fold(0u64, |sum, (_, _, size)| sum.saturating_add(*size));
+        let mut deleted = 0u64;
+        if !dry_run {
+            for (workspace_id, key, _) in &candidates {
+                if !valid_storage_key(key) {
+                    continue;
+                }
+                match fs::remove_dir_all(self.inner.root.join(key)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(WorkspaceError::Io(error)),
+                }
+                transaction.execute(
+                    "DELETE FROM workspaces WHERE workspace_id = ?1
+                         AND expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?2",
+                    params![workspace_id, now_unix_ms as i64],
+                )?;
+                deleted += 1;
+            }
+        }
+        transaction.commit()?;
+        Ok((candidates.len() as u64, bytes, deleted))
     }
 
     pub fn resolve(
@@ -242,6 +431,9 @@ impl WorkspaceManager {
             || record.execution_id != execution_id.as_str()
             || record.generation != generation.get()
             || record.principal_id != principal_id.as_str()
+            || record
+                .expires_unix_ms
+                .is_some_and(|expires| expires <= crate::artifact::now_unix_ms())
         {
             return Err(WorkspaceError::NotFound);
         }
@@ -249,7 +441,8 @@ impl WorkspaceManager {
             return Err(WorkspaceError::NotFound);
         }
         let root = self.inner.root.join(record.storage_key);
-        if !root.is_dir() {
+        let metadata = fs::symlink_metadata(&root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(WorkspaceError::NotFound);
         }
         Ok(ReadyWorkspace {
@@ -271,7 +464,7 @@ impl WorkspaceManager {
         connection
             .query_row(
                 "SELECT execution_id, generation, principal_id, manifest_digest, storage_key,
-                   logical_bytes, state FROM workspaces WHERE workspace_id = ?1",
+                   logical_bytes, state, expires_unix_ms FROM workspaces WHERE workspace_id = ?1",
                 [workspace_id.as_str()],
                 |row| {
                     Ok(WorkspaceRecord {
@@ -282,6 +475,7 @@ impl WorkspaceManager {
                         storage_key: row.get(4)?,
                         logical_bytes: row.get::<_, i64>(5)?.max(0) as u64,
                         state: row.get(6)?,
+                        expires_unix_ms: row.get::<_, Option<i64>>(7)?.map(|value| value as u64),
                     })
                 },
             )
@@ -342,6 +536,7 @@ struct WorkspaceRecord {
     storage_key: String,
     logical_bytes: u64,
     state: String,
+    expires_unix_ms: Option<u64>,
 }
 
 fn valid_storage_key(key: &str) -> bool {
@@ -683,5 +878,50 @@ mod tests {
                 .await,
             Err(WorkspaceError::QuotaExceeded)
         ));
+    }
+
+    #[tokio::test]
+    async fn terminal_retention_gc_preserves_live_workspace_then_reclaims_inputs() {
+        let temp = TempDir::new().unwrap();
+        let blobs = BlobStore::open(temp.path().join("blobs"), 1024).unwrap();
+        let digest = upload_blob(&blobs, b"retained input").await;
+        let manager = WorkspaceManager::open(temp.path().join("workspaces"), 1024).unwrap();
+        let workspace_id = WorkspaceId::new("ws-retention").unwrap();
+        let manifest = WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![WorkspaceEntry::File {
+                path: eggwork_core::RelativePath::new("input.txt").unwrap(),
+                digest: digest.clone(),
+                size_bytes: 14,
+                executable: false,
+            }],
+        };
+        let ready = manager
+            .materialize(
+                workspace_id.clone(),
+                &owner_handle("workspace-retention"),
+                &PrincipalId::new("principal-a").unwrap(),
+                manifest,
+                &blobs,
+            )
+            .await
+            .unwrap();
+        let now = crate::artifact::now_unix_ms();
+        let active_gc = blobs.garbage_collect(now, 8, false).await.unwrap();
+        assert_eq!(active_gc.removed_blobs, 0);
+        assert!(ready.root.exists());
+
+        manager.mark_terminal(&workspace_id, 1_000, &blobs).unwrap();
+        let dry = manager.garbage_collect(1_000, 1, true).unwrap();
+        assert_eq!(dry.0, 1);
+        assert!(ready.root.exists());
+        assert!(blobs.open_verified(&digest).await.is_ok());
+
+        let deleted = manager.garbage_collect(1_000, 1, false).unwrap();
+        assert_eq!(deleted.0, 1);
+        assert!(!ready.root.exists());
+        let reclaimed = blobs.garbage_collect(1_000, 1, false).await.unwrap();
+        assert_eq!(reclaimed.removed_blobs, 1);
+        assert!(blobs.open_verified(&digest).await.is_err());
     }
 }
