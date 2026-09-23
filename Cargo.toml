@@ -29,6 +29,7 @@ futures-util = { version = "0.3", features = ["sink"] }
 uuid = { version = "1", features = ["v4"] }
 url = "2"
 base64 = "0.22"
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 eggserve-core = { version = "0.2.0", default-features = false, features = ["tls"] }
 eggfetch-core = { version = "0.2.0", default-features = false, features = ["standard-http1", "tls-rustls"] }
 

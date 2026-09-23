@@ -5,8 +5,8 @@
 use bytes::BytesMut;
 use eggfetch_core::{BoxBytesStream, Client as HttpClient, Error as HttpError, TlsConfig};
 use eggwork_core::{
-    ApiError, ExecutionEvent, ExecutionId, ExecutionSnapshot, ExecutionSpec, NodeCapabilities,
-    NodeStatus,
+    ApiError, ExecutionEvent, ExecutionHandle, ExecutionId, ExecutionSnapshot, ExecutionSpec,
+    NodeCapabilities, NodeStatus,
 };
 use futures_util::{StreamExt, stream};
 use serde::{Serialize, de::DeserializeOwned};
@@ -88,9 +88,14 @@ impl NodeClient {
 
     /// Submit to this node and return its execution identifier and live event stream.
     /// A dropped stream leaves execution running; cancellation is explicit.
-    pub async fn execute(&self, spec: &ExecutionSpec) -> Result<ExecutionStream, ClientError> {
+    pub async fn execute(
+        &self,
+        spec: &ExecutionSpec,
+        handle: &ExecutionHandle,
+    ) -> Result<ExecutionStream, ClientError> {
         let payload = ExecuteRequest {
             schema_version: API_SCHEMA_VERSION,
+            handle: handle.clone(),
             spec,
         };
         let mut response = self
@@ -110,7 +115,11 @@ impl NodeClient {
             .and_then(|value| ExecutionId::new(value.to_owned()).ok())
             .ok_or(ClientError::InvalidResponse)?;
         let events = response.bytes_stream()?;
+        if id != handle.execution_id {
+            return Err(ClientError::InvalidResponse);
+        }
         Ok(ExecutionStream {
+            handle: handle.clone(),
             execution_id: id,
             events,
         })
@@ -120,10 +129,19 @@ impl NodeClient {
         self.get_json(&format!("/v1/executions/{id}")).await
     }
 
-    pub async fn cancel(&self, id: &ExecutionId) -> Result<ExecutionSnapshot, ClientError> {
+    pub async fn cancel(&self, handle: &ExecutionHandle) -> Result<ExecutionSnapshot, ClientError> {
         let mut response = self
             .http
-            .post(&self.url(&format!("/v1/executions/{id}/cancel")))?
+            .post(&self.url(&format!("/v1/executions/{}/cancel", handle.execution_id)))?
+            .header("content-type", "application/json")
+            .bytes(
+                serde_json::to_vec(&ControlRequest {
+                    schema_version: API_SCHEMA_VERSION,
+                    handle: handle.clone(),
+                    renewal_id: None,
+                })
+                .map_err(|_| ClientError::InvalidResponse)?,
+            )
             .send()
             .await?;
         if !response.status().is_success() {
@@ -132,10 +150,53 @@ impl NodeClient {
         decode_json(&mut response).await
     }
 
-    pub async fn events(&self, id: &ExecutionId) -> Result<BoxBytesStream, ClientError> {
+    pub async fn renew(
+        &self,
+        handle: &ExecutionHandle,
+        renewal_id: &str,
+    ) -> Result<ExecutionSnapshot, ClientError> {
         let mut response = self
             .http
-            .get(&self.url(&format!("/v1/executions/{id}/events")))?
+            .post(&self.url(&format!("/v1/executions/{}/renew", handle.execution_id)))?
+            .header("content-type", "application/json")
+            .bytes(
+                serde_json::to_vec(&ControlRequest {
+                    schema_version: API_SCHEMA_VERSION,
+                    handle: handle.clone(),
+                    renewal_id: Some(renewal_id.to_owned()),
+                })
+                .map_err(|_| ClientError::InvalidResponse)?,
+            )
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(api_error(response.status().as_u16(), &mut response).await);
+        }
+        decode_json(&mut response).await
+    }
+
+    pub async fn observe_generation(
+        &self,
+        id: &ExecutionId,
+        generation: u64,
+    ) -> Result<ExecutionSnapshot, ClientError> {
+        self.get_json(&format!("/v1/executions/{id}?generation={generation}"))
+            .await
+    }
+
+    pub async fn events(
+        &self,
+        handle: &ExecutionHandle,
+        after_sequence: u64,
+    ) -> Result<BoxBytesStream, ClientError> {
+        let mut response = self
+            .http
+            .get(&self.url(&format!(
+                "/v1/executions/{}/events?generation={}&after={after_sequence}&lease={}",
+                handle.execution_id,
+                handle.generation.get(),
+                handle.lease_id.as_str(),
+            )))?
             .send()
             .await?;
         if !response.status().is_success() {
@@ -158,6 +219,7 @@ impl NodeClient {
 }
 
 pub struct ExecutionStream {
+    pub handle: ExecutionHandle,
     pub execution_id: ExecutionId,
     events: BoxBytesStream,
 }
@@ -205,7 +267,15 @@ impl ExecutionStream {
 #[derive(Serialize)]
 struct ExecuteRequest<'a> {
     schema_version: u16,
+    handle: ExecutionHandle,
     spec: &'a ExecutionSpec,
+}
+
+#[derive(Serialize)]
+struct ControlRequest {
+    schema_version: u16,
+    handle: ExecutionHandle,
+    renewal_id: Option<String>,
 }
 
 async fn decode_json<T: DeserializeOwned>(

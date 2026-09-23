@@ -19,6 +19,7 @@ serde.workspace = true
 sha2.workspace = true
 hex.workspace = true
 tokio-util.workspace = true
+rusqlite.workspace = true
 
 [dev-dependencies]
 rcgen = "0.13"

@@ -2,6 +2,8 @@
 
 //! Authenticated fixed-target Eggwork node service, built on EggServe.
 
+mod store;
+
 use bytes::Bytes;
 use eggserve_core::{
     primitives::{
@@ -13,9 +15,10 @@ use eggserve_core::{
     tls::{ClientAuthMode, TlsServerConfig},
 };
 use eggwork_core::{
-    ApiError, EventMetadata, EventSequence, ExecutionEvent, ExecutionEventKind, ExecutionFailure,
-    ExecutionGeneration, ExecutionId, ExecutionResult, ExecutionSnapshot, ExecutionSpec,
-    ExecutionState, NodeCapabilities, NodeId, NodeStatus, ProtocolVersion, ProtocolVersionRange,
+    ApiError, ExecutionEvent, ExecutionEventKind, ExecutionFailure, ExecutionGeneration,
+    ExecutionHandle, ExecutionId, ExecutionResult, ExecutionSnapshot, ExecutionSpec,
+    ExecutionState, LeaseId, NodeCapabilities, NodeId, NodeStatus, ProtocolVersion,
+    ProtocolVersionRange,
 };
 use eggwork_runner::{ExecutionProvenance, LocalProcessRunner, RunnerError, RunnerRequest};
 use futures_util::stream;
@@ -27,19 +30,18 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 const API_SCHEMA_VERSION: u16 = 1;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const EVENT_CAPACITY: usize = 32;
 const RUNNER_CHANNEL_CAPACITY: usize = 32;
-const EXECUTION_GENERATION: u64 = 1;
 const MAX_RECENT_EXECUTIONS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +51,7 @@ pub enum Operation {
     Execute,
     Observe,
     Cancel,
+    Renew,
     Events,
 }
 
@@ -109,6 +112,8 @@ pub enum NodeStartError {
     EggServe(String),
     #[error("maximum active execution count must be positive")]
     InvalidLimit,
+    #[error("execution lease duration must be positive")]
+    InvalidLease,
 }
 
 #[derive(Clone)]
@@ -116,7 +121,9 @@ pub struct NodeConfig {
     pub node_id: NodeId,
     pub bind: SocketAddr,
     pub execution_root: PathBuf,
+    pub database_path: PathBuf,
     pub max_active_executions: u32,
+    pub lease_ttl: Duration,
     pub tls: TlsServerConfig,
 }
 
@@ -128,6 +135,8 @@ struct NodeState {
     permits: Arc<Semaphore>,
     draining: Arc<AtomicBool>,
     runner: Arc<LocalProcessRunner>,
+    store: store::ExecutionStore,
+    lease_ttl: Duration,
     resolver: Arc<dyn PeerPrincipalResolver>,
     authorizer: Arc<dyn Authorizer>,
     executions: Arc<Mutex<HashMap<ExecutionId, Arc<ExecutionRecord>>>>,
@@ -137,7 +146,17 @@ struct ExecutionRecord {
     snapshot: RwLock<ExecutionSnapshot>,
     cancellation: CancellationToken,
     events: broadcast::Sender<ExecutionEvent>,
-    next_sequence: AtomicU64,
+    store: store::ExecutionStore,
+    draining: Arc<AtomicBool>,
+    finished: AtomicBool,
+    lease_hash: String,
+    lease: tokio::sync::Mutex<LeaseState>,
+}
+
+struct LeaseState {
+    expires_at: tokio::time::Instant,
+    notify: Arc<tokio::sync::Notify>,
+    expired: Arc<AtomicBool>,
 }
 
 pub struct NodeServer {
@@ -162,16 +181,53 @@ impl NodeServer {
         {
             return Err(NodeStartError::TlsPolicy);
         }
+        if config.lease_ttl.is_zero() {
+            return Err(NodeStartError::InvalidLease);
+        }
+        let store = store::ExecutionStore::open(&config.database_path)
+            .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
+        store
+            .recover()
+            .await
+            .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
+        let draining = Arc::new(AtomicBool::new(false));
+        let mut executions = HashMap::new();
+        for snapshot in store
+            .load_all()
+            .await
+            .map_err(|e| NodeStartError::EggServe(e.to_string()))?
+        {
+            let (events, _) = broadcast::channel(EVENT_CAPACITY);
+            executions.insert(
+                snapshot.execution_id.clone(),
+                Arc::new(ExecutionRecord {
+                    snapshot: RwLock::new(snapshot),
+                    cancellation: CancellationToken::new(),
+                    events,
+                    store: store.clone(),
+                    draining: draining.clone(),
+                    finished: AtomicBool::new(true),
+                    lease_hash: String::new(),
+                    lease: tokio::sync::Mutex::new(LeaseState {
+                        expires_at: tokio::time::Instant::now(),
+                        notify: Arc::new(tokio::sync::Notify::new()),
+                        expired: Arc::new(AtomicBool::new(false)),
+                    }),
+                }),
+            );
+        }
         let state = NodeState {
             node_id: config.node_id,
             execution_root: config.execution_root,
             max_active: config.max_active_executions,
             permits: Arc::new(Semaphore::new(config.max_active_executions as usize)),
-            draining: Arc::new(AtomicBool::new(false)),
+            draining,
             runner,
+            store,
+            lease_ttl: config.lease_ttl,
             resolver,
             authorizer,
-            executions: Arc::new(Mutex::new(HashMap::new())),
+            executions: Arc::new(Mutex::new(executions)),
         };
         let runtime = RuntimeConfig::builder()
             .bind(config.bind)
@@ -225,7 +281,9 @@ impl NodeServer {
             .cloned()
             .collect();
         for record in records {
-            if !is_terminal(&record.snapshot.read().await.state) {
+            if !record.finished.load(Ordering::Acquire)
+                && !is_terminal(&record.snapshot.read().await.state)
+            {
                 record.cancellation.cancel();
             }
         }
@@ -248,7 +306,9 @@ impl NodeServer {
                 .collect();
             let mut active = false;
             for record in records {
-                if !is_terminal(&record.snapshot.read().await.state) {
+                if !record.finished.load(Ordering::Acquire)
+                    && !is_terminal(&record.snapshot.read().await.state)
+                {
                     active = true;
                     break;
                 }
@@ -279,6 +339,7 @@ fn operation_for(method: &str, path: &str) -> Option<(Operation, Route)> {
                 let id = ExecutionId::new(parts[3]).ok()?;
                 return match (method, parts[4]) {
                     ("POST", "cancel") => Some((Operation::Cancel, Route::Cancel(id))),
+                    ("POST", "renew") => Some((Operation::Renew, Route::Renew(id))),
                     ("GET", "events") => Some((Operation::Events, Route::Events(id))),
                     _ => None,
                 };
@@ -294,6 +355,7 @@ enum Route {
     Execute,
     Observe(ExecutionId),
     Cancel(ExecutionId),
+    Renew(ExecutionId),
     Events(ExecutionId),
 }
 
@@ -303,6 +365,7 @@ async fn dispatch(
 ) -> Result<Response, eggserve_core::server::ServiceError> {
     let method = request.head().method().as_str().to_owned();
     let path = request.head().target().path().to_owned();
+    let query = request.head().target().query().map(str::to_owned);
     let Some((operation, route)) = operation_for(&method, &path) else {
         return Ok(error_response(404, "not_found", "operation not found"));
     };
@@ -337,42 +400,11 @@ async fn dispatch(
             },
         )),
         Route::Status => Ok(json_response(200, &node_status(&state))),
-        Route::Execute => execute(state, request).await,
-        Route::Observe(id) => {
-            let Some(record) = state.executions.lock().await.get(&id).cloned() else {
-                return Ok(error_response(
-                    404,
-                    "execution_not_found",
-                    "execution not found",
-                ));
-            };
-            let snapshot = record.snapshot.read().await.clone();
-            Ok(json_response(200, &snapshot))
-        }
-        Route::Cancel(id) => {
-            let Some(record) = state.executions.lock().await.get(&id).cloned() else {
-                return Ok(error_response(
-                    404,
-                    "execution_not_found",
-                    "execution not found",
-                ));
-            };
-            let snapshot = record.snapshot.read().await.clone();
-            if !is_terminal(&snapshot.state) {
-                record.cancellation.cancel();
-            }
-            Ok(json_response(202, &snapshot))
-        }
-        Route::Events(id) => {
-            let Some(record) = state.executions.lock().await.get(&id).cloned() else {
-                return Ok(error_response(
-                    404,
-                    "execution_not_found",
-                    "execution not found",
-                ));
-            };
-            Ok(event_stream_response(id, record.events.subscribe()))
-        }
+        Route::Execute => execute(state, request, principal).await,
+        Route::Observe(id) => observe(state, id, query.as_deref()).await,
+        Route::Cancel(id) => control(state, id, request, principal, false).await,
+        Route::Renew(id) => control(state, id, request, principal, true).await,
+        Route::Events(id) => events_route(state, id, query.as_deref(), principal).await,
     }
 }
 
@@ -411,6 +443,7 @@ fn node_status(state: &NodeState) -> NodeStatus {
 async fn execute(
     state: NodeState,
     request: Request,
+    principal: NodePrincipal,
 ) -> Result<Response, eggserve_core::server::ServiceError> {
     let (_head, body, _context) = request.into_parts_with_context();
     let body = match body.read_all().await {
@@ -475,8 +508,8 @@ async fn execute(
             "requested execution capability is unavailable",
         ));
     }
-    let id = ExecutionId::new(Uuid::new_v4().to_string()).expect("UUID is a valid execution id");
-    let generation = ExecutionGeneration::new(EXECUTION_GENERATION).expect("generation is nonzero");
+    let id = wire.handle.execution_id.clone();
+    let generation = wire.handle.generation;
     let runner_request = match RunnerRequest::from_spec(
         &wire.spec,
         state.execution_root.clone(),
@@ -494,49 +527,149 @@ async fn execute(
             ));
         }
     };
+    let digest = match eggwork_core::request_digest(&wire.spec) {
+        Ok(digest) => digest.as_str().to_owned(),
+        Err(_) => {
+            return Ok(error_response(
+                400,
+                "invalid_request",
+                "execution specification is invalid",
+            ));
+        }
+    };
+    let lease_hash = store::lease_hash(wire.handle.lease_id.as_str());
+    let principal_id = principal.id.as_str().to_owned();
+    let lease_expires_unix_ms = store::unix_millis()
+        .saturating_add(state.lease_ttl.as_millis().min(i64::MAX as u128) as i64);
+    let mut executions = state.executions.lock().await;
+    if let Some(existing) = state
+        .store
+        .lookup(id.clone(), generation)
+        .await
+        .map_err(|_| eggserve_core::server::ServiceError::internal("execution store unavailable"))?
+    {
+        if existing.canonical_version != eggwork_core::CANONICAL_REQUEST_VERSION {
+            return Ok(error_response(
+                409,
+                "canonicalization_version_mismatch",
+                "execution identity uses an unsupported request canonicalization version",
+            ));
+        }
+        if existing.principal_id != principal_id {
+            return Ok(error_response(
+                403,
+                "forbidden",
+                "execution belongs to another principal",
+            ));
+        }
+        if existing.digest != digest || existing.lease_token_hash != lease_hash {
+            return Ok(error_response(
+                409,
+                "execution_identity_conflict",
+                "execution identity conflicts with an existing request",
+            ));
+        }
+        let record = match executions.get(&id) {
+            Some(record) if record.snapshot.read().await.generation == generation => record.clone(),
+            _ => recovered_record(
+                existing.snapshot.clone(),
+                state.store.clone(),
+                existing.lease_token_hash,
+            ),
+        };
+        drop(executions);
+        return event_response(state, id, generation, 0, record).await;
+    }
+    if state.draining.load(Ordering::Acquire) {
+        return Ok(error_response(
+            503,
+            "draining",
+            "node is not accepting executions",
+        ));
+    }
     let permit = match state.permits.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => return Ok(error_response(503, "busy", "node execution limit reached")),
     };
-    let (events, _) = broadcast::channel(EVENT_CAPACITY);
-    let record = Arc::new(ExecutionRecord {
-        snapshot: RwLock::new(ExecutionSnapshot {
-            schema_version: API_SCHEMA_VERSION,
-            execution_id: id.clone(),
-            generation,
-            state: ExecutionState::Accepted,
-            result: None,
-        }),
-        cancellation: CancellationToken::new(),
-        events,
-        next_sequence: AtomicU64::new(1),
-    });
-    {
-        let mut executions = state.executions.lock().await;
-        if executions.len() >= MAX_RECENT_EXECUTIONS {
-            let mut terminal = Vec::new();
-            for (old_id, old_record) in executions.iter() {
-                if is_terminal(&old_record.snapshot.read().await.state) {
-                    terminal.push(old_id.clone());
-                }
-                if executions.len() - terminal.len() < MAX_RECENT_EXECUTIONS {
-                    break;
-                }
+    if executions.len() >= MAX_RECENT_EXECUTIONS {
+        let mut terminal = Vec::new();
+        for (old_id, old_record) in executions.iter() {
+            if is_terminal(&old_record.snapshot.read().await.state) {
+                terminal.push(old_id.clone());
             }
-            for old_id in terminal {
-                executions.remove(&old_id);
+            if executions.len() - terminal.len() < MAX_RECENT_EXECUTIONS {
+                break;
             }
         }
-        if executions.len() >= MAX_RECENT_EXECUTIONS {
+        for old_id in terminal {
+            executions.remove(&old_id);
+        }
+    }
+    if executions.len() >= MAX_RECENT_EXECUTIONS {
+        return Ok(error_response(
+            503,
+            "storage_exhausted",
+            "recent execution capacity reached",
+        ));
+    }
+    let snapshot = ExecutionSnapshot {
+        schema_version: API_SCHEMA_VERSION,
+        execution_id: id.clone(),
+        generation,
+        state: ExecutionState::Accepted,
+        result: None,
+    };
+    match state
+        .store
+        .reserve(
+            snapshot.clone(),
+            eggwork_core::CANONICAL_REQUEST_VERSION,
+            digest,
+            principal_id,
+            lease_hash.clone(),
+            lease_expires_unix_ms,
+        )
+        .await
+        .map_err(|_| eggserve_core::server::ServiceError::internal("execution store unavailable"))?
+    {
+        store::ReserveResult::Created => {}
+        store::ReserveResult::Existing(snapshot) => {
+            drop(permit);
+            let record = recovered_record(snapshot, state.store.clone(), lease_hash);
+            drop(executions);
+            return event_response(state, id, generation, 0, record).await;
+        }
+        store::ReserveResult::Conflict => {
+            return Ok(error_response(
+                409,
+                "execution_identity_conflict",
+                "execution identity conflicts with an existing request",
+            ));
+        }
+        store::ReserveResult::StaleGeneration => {
+            return Ok(error_response(
+                409,
+                "generation_mismatch",
+                "execution generation is stale or out of sequence",
+            ));
+        }
+        store::ReserveResult::StorageFull => {
             return Ok(error_response(
                 503,
                 "storage_exhausted",
-                "recent execution capacity reached",
+                "execution identity capacity reached",
             ));
         }
-        executions.insert(id.clone(), record.clone());
     }
-    let receiver = record.events.subscribe();
+    let record = new_record(
+        snapshot,
+        state.store.clone(),
+        state.draining.clone(),
+        lease_hash,
+        state.lease_ttl,
+    );
+    executions.insert(id.clone(), record.clone());
+    drop(executions);
     publish(
         &record,
         ExecutionState::Accepted,
@@ -544,12 +677,496 @@ async fn execute(
         ExecutionEventKind::State(ExecutionState::Accepted),
     )
     .await;
+    let lease_record = record.clone();
+    tokio::spawn(async move { monitor_lease(lease_record).await });
     let service_state = state.clone();
     let execution_record = record.clone();
     tokio::spawn(async move {
         run_execution(service_state, execution_record, runner_request, permit).await;
     });
-    Ok(event_stream_response(id, receiver))
+    event_response(state, id, generation, 0, record).await
+}
+
+fn new_record(
+    snapshot: ExecutionSnapshot,
+    store: store::ExecutionStore,
+    draining: Arc<AtomicBool>,
+    lease_hash: String,
+    lease_ttl: Duration,
+) -> Arc<ExecutionRecord> {
+    let (events, _) = broadcast::channel(EVENT_CAPACITY);
+    Arc::new(ExecutionRecord {
+        snapshot: RwLock::new(snapshot),
+        cancellation: CancellationToken::new(),
+        events,
+        store,
+        draining,
+        finished: AtomicBool::new(false),
+        lease_hash,
+        lease: tokio::sync::Mutex::new(LeaseState {
+            expires_at: tokio::time::Instant::now() + lease_ttl,
+            notify: Arc::new(tokio::sync::Notify::new()),
+            expired: Arc::new(AtomicBool::new(false)),
+        }),
+    })
+}
+
+fn recovered_record(
+    snapshot: ExecutionSnapshot,
+    store: store::ExecutionStore,
+    lease_hash: String,
+) -> Arc<ExecutionRecord> {
+    let (events, _) = broadcast::channel(EVENT_CAPACITY);
+    Arc::new(ExecutionRecord {
+        snapshot: RwLock::new(snapshot),
+        cancellation: CancellationToken::new(),
+        events,
+        store,
+        draining: Arc::new(AtomicBool::new(false)),
+        finished: AtomicBool::new(true),
+        lease_hash,
+        lease: tokio::sync::Mutex::new(LeaseState {
+            expires_at: tokio::time::Instant::now(),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            expired: Arc::new(AtomicBool::new(false)),
+        }),
+    })
+}
+
+async fn monitor_lease(record: Arc<ExecutionRecord>) {
+    loop {
+        if is_terminal(&record.snapshot.read().await.state) {
+            return;
+        }
+        let (deadline, notify) = {
+            let lease = record.lease.lock().await;
+            (lease.expires_at, lease.notify.clone())
+        };
+        tokio::select! {
+            _ = record.cancellation.cancelled() => return,
+            _ = notify.notified() => continue,
+            _ = tokio::time::sleep_until(deadline) => {
+                let lease = record.lease.lock().await;
+                if tokio::time::Instant::now() >= lease.expires_at {
+                    lease.expired.store(true, Ordering::Release);
+                    record.cancellation.cancel();
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn observe(
+    state: NodeState,
+    id: ExecutionId,
+    query: Option<&str>,
+) -> Result<Response, eggserve_core::server::ServiceError> {
+    let generation = match query_parameter(query, "generation") {
+        Ok(Some(value)) => match value
+            .parse::<u64>()
+            .ok()
+            .and_then(|v| ExecutionGeneration::new(v).ok())
+        {
+            Some(generation) => Some(generation),
+            None => {
+                return Ok(error_response(
+                    400,
+                    "invalid_request",
+                    "generation is invalid",
+                ));
+            }
+        },
+        Ok(None) => None,
+        Err(()) => return Ok(error_response(400, "invalid_request", "query is invalid")),
+    };
+    match state
+        .store
+        .load_snapshot(id, generation)
+        .await
+        .map_err(|_| eggserve_core::server::ServiceError::internal("execution store unavailable"))?
+    {
+        Some(snapshot) => Ok(json_response(200, &snapshot)),
+        None => Ok(error_response(
+            404,
+            "execution_not_found",
+            "execution not found",
+        )),
+    }
+}
+
+async fn control(
+    state: NodeState,
+    id: ExecutionId,
+    request: Request,
+    principal: NodePrincipal,
+    renew: bool,
+) -> Result<Response, eggserve_core::server::ServiceError> {
+    let (_head, body, _context) = request.into_parts_with_context();
+    let bytes = match body.read_all().await {
+        Ok(bytes) if bytes.len() <= MAX_REQUEST_BYTES => bytes,
+        _ => {
+            return Ok(error_response(
+                413,
+                "request_too_large",
+                "request body exceeds limit",
+            ));
+        }
+    };
+    let request: ControlRequest = match serde_json::from_slice(&bytes) {
+        Ok(request) => request,
+        Err(_) => {
+            return Ok(error_response(
+                400,
+                "invalid_request",
+                "request body is invalid",
+            ));
+        }
+    };
+    if request.schema_version != API_SCHEMA_VERSION || request.handle.execution_id != id {
+        return Ok(error_response(
+            400,
+            "invalid_request",
+            "control request is invalid",
+        ));
+    }
+    let Some(existing) = state
+        .store
+        .lookup(id.clone(), request.handle.generation)
+        .await
+        .map_err(|_| {
+            eggserve_core::server::ServiceError::internal("execution store unavailable")
+        })?
+    else {
+        return Ok(error_response(
+            404,
+            "execution_not_found",
+            "execution not found",
+        ));
+    };
+    if existing.principal_id != principal.id.as_str() {
+        return Ok(error_response(
+            403,
+            "forbidden",
+            "execution belongs to another principal",
+        ));
+    }
+    if existing.lease_token_hash != store::lease_hash(request.handle.lease_id.as_str()) {
+        return Ok(error_response(
+            403,
+            "invalid_lease",
+            "execution lease is invalid",
+        ));
+    }
+    let Some(latest) = state
+        .store
+        .load_snapshot(id.clone(), None)
+        .await
+        .map_err(|_| {
+            eggserve_core::server::ServiceError::internal("execution store unavailable")
+        })?
+    else {
+        return Ok(error_response(
+            404,
+            "execution_not_found",
+            "execution not found",
+        ));
+    };
+    if latest.generation != request.handle.generation {
+        return Ok(error_response(
+            409,
+            "generation_mismatch",
+            "execution generation is stale",
+        ));
+    }
+    let Some(record) = state.executions.lock().await.get(&id).cloned() else {
+        return Ok(error_response(
+            404,
+            "execution_not_found",
+            "execution not found",
+        ));
+    };
+    if record.lease_hash != existing.lease_token_hash {
+        return Ok(error_response(
+            403,
+            "invalid_lease",
+            "execution lease is invalid",
+        ));
+    }
+    let snapshot = record.snapshot.read().await.clone();
+    if renew {
+        let Some(renewal_id) = request.renewal_id.as_deref() else {
+            return Ok(error_response(
+                400,
+                "invalid_request",
+                "renewal identifier is required",
+            ));
+        };
+        if renewal_id.is_empty() || renewal_id.len() > eggwork_core::MAX_ID_BYTES {
+            return Ok(error_response(
+                400,
+                "invalid_request",
+                "renewal identifier is invalid",
+            ));
+        }
+        if is_terminal(&snapshot.state) {
+            return Ok(error_response(
+                409,
+                "execution_terminal",
+                "terminal execution cannot be renewed",
+            ));
+        }
+        let mut lease = record.lease.lock().await;
+        if lease.expired.load(Ordering::Acquire) || tokio::time::Instant::now() >= lease.expires_at
+        {
+            return Ok(error_response(
+                409,
+                "lease_expired",
+                "execution lease has expired",
+            ));
+        }
+        let requested_expires_unix_ms = store::unix_millis()
+            .saturating_add(state.lease_ttl.as_millis().min(i64::MAX as u128) as i64);
+        let expires_unix_ms = state
+            .store
+            .update_lease(
+                id,
+                request.handle.generation,
+                existing.lease_token_hash,
+                renewal_id.to_owned(),
+                requested_expires_unix_ms,
+            )
+            .await
+            .map_err(|_| {
+                eggserve_core::server::ServiceError::internal("execution store unavailable")
+            })?;
+        let Some(expires_unix_ms) = expires_unix_ms else {
+            return Ok(error_response(
+                409,
+                "lease_expired",
+                "execution lease has expired",
+            ));
+        };
+        let remaining_ms = expires_unix_ms.saturating_sub(store::unix_millis()).max(0) as u64;
+        lease.expires_at = tokio::time::Instant::now() + Duration::from_millis(remaining_ms);
+        lease.notify.notify_waiters();
+        return Ok(json_response(200, &snapshot));
+    }
+    if !is_terminal(&snapshot.state) && snapshot.state != ExecutionState::Cancelling {
+        let lease = record.lease.lock().await;
+        if lease.expired.load(Ordering::Acquire) || tokio::time::Instant::now() >= lease.expires_at
+        {
+            return Ok(error_response(
+                409,
+                "lease_expired",
+                "execution lease has expired",
+            ));
+        }
+        drop(lease);
+        publish(
+            &record,
+            ExecutionState::Cancelling,
+            None,
+            ExecutionEventKind::State(ExecutionState::Cancelling),
+        )
+        .await;
+        if !is_terminal(&record.snapshot.read().await.state) {
+            record.cancellation.cancel();
+        }
+    } else if snapshot.state == ExecutionState::Cancelling {
+        record.cancellation.cancel();
+    }
+    Ok(json_response(202, &record.snapshot.read().await.clone()))
+}
+
+async fn events_route(
+    state: NodeState,
+    id: ExecutionId,
+    query: Option<&str>,
+    principal: NodePrincipal,
+) -> Result<Response, eggserve_core::server::ServiceError> {
+    let generation = match query_parameter(query, "generation") {
+        Ok(Some(value)) => match value
+            .parse::<u64>()
+            .ok()
+            .and_then(|v| ExecutionGeneration::new(v).ok())
+        {
+            Some(generation) => generation,
+            None => {
+                return Ok(error_response(
+                    400,
+                    "invalid_request",
+                    "generation is invalid",
+                ));
+            }
+        },
+        _ => {
+            return Ok(error_response(
+                400,
+                "invalid_request",
+                "generation is required",
+            ));
+        }
+    };
+    let after = match query_parameter(query, "after") {
+        Ok(Some(value)) => match value.parse::<u64>() {
+            Ok(after) => after,
+            Err(_) => {
+                return Ok(error_response(
+                    400,
+                    "invalid_request",
+                    "event cursor is invalid",
+                ));
+            }
+        },
+        _ => {
+            return Ok(error_response(
+                400,
+                "invalid_request",
+                "event cursor is required",
+            ));
+        }
+    };
+    if after > i64::MAX as u64 {
+        return Ok(error_response(
+            416,
+            "cursor_ahead",
+            "event cursor is ahead of the journal",
+        ));
+    }
+    let lease_id = match query_parameter(query, "lease") {
+        Ok(Some(value)) => match LeaseId::new(value.to_owned()) {
+            Ok(lease_id) => lease_id,
+            Err(_) => {
+                return Ok(error_response(
+                    400,
+                    "invalid_request",
+                    "execution lease is invalid",
+                ));
+            }
+        },
+        _ => {
+            return Ok(error_response(
+                400,
+                "invalid_request",
+                "execution lease is required",
+            ));
+        }
+    };
+    let Some(existing) = state
+        .store
+        .lookup(id.clone(), generation)
+        .await
+        .map_err(|_| {
+            eggserve_core::server::ServiceError::internal("execution store unavailable")
+        })?
+    else {
+        return Ok(error_response(
+            404,
+            "execution_not_found",
+            "execution not found",
+        ));
+    };
+    if existing.principal_id != principal.id.as_str()
+        || existing.lease_token_hash != store::lease_hash(lease_id.as_str())
+    {
+        return Ok(error_response(
+            403,
+            "forbidden",
+            "execution event access is not authorized",
+        ));
+    }
+    let record = state.executions.lock().await.get(&id).cloned();
+    let record = match record {
+        Some(record) if record.snapshot.read().await.generation == generation => record,
+        _ => recovered_record(
+            match state
+                .store
+                .load_snapshot(id.clone(), Some(generation))
+                .await
+                .map_err(|_| {
+                    eggserve_core::server::ServiceError::internal("execution store unavailable")
+                })? {
+                Some(snapshot) => snapshot,
+                None => {
+                    return Ok(error_response(
+                        404,
+                        "execution_not_found",
+                        "execution not found",
+                    ));
+                }
+            },
+            state.store.clone(),
+            String::new(),
+        ),
+    };
+    event_response(state, id, generation, after, record).await
+}
+
+async fn event_response(
+    state: NodeState,
+    id: ExecutionId,
+    generation: ExecutionGeneration,
+    after: u64,
+    record: Arc<ExecutionRecord>,
+) -> Result<Response, eggserve_core::server::ServiceError> {
+    let receiver = record.events.subscribe();
+    let Some(page) = state
+        .store
+        .load_page(id.clone(), generation, after)
+        .await
+        .map_err(|_| {
+            eggserve_core::server::ServiceError::internal("execution store unavailable")
+        })?
+    else {
+        return Ok(error_response(
+            404,
+            "execution_not_found",
+            "execution not found",
+        ));
+    };
+    if after.saturating_add(1) < page.base_sequence {
+        return Ok(error_response(
+            410,
+            "history_expired",
+            "event history has expired",
+        ));
+    }
+    if after >= page.next_sequence {
+        return Ok(error_response(
+            416,
+            "cursor_ahead",
+            "event cursor is ahead of the journal",
+        ));
+    }
+    let terminal = is_terminal(&record.snapshot.read().await.state);
+    Ok(event_stream_response(
+        id,
+        generation,
+        after,
+        page.events,
+        receiver,
+        terminal,
+    ))
+}
+
+fn query_parameter<'a>(query: Option<&'a str>, name: &str) -> Result<Option<&'a str>, ()> {
+    let Some(query) = query else { return Ok(None) };
+    let mut found = None;
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err(());
+        };
+        if key == name {
+            if found.is_some() {
+                return Err(());
+            }
+            found = Some(value);
+        } else if key != "generation" && key != "after" && key != "lease" {
+            return Err(());
+        }
+    }
+    Ok(found)
 }
 
 async fn run_execution(
@@ -604,7 +1221,12 @@ async fn run_execution(
         publish(&record, ExecutionState::Running, None, kind).await;
     }
     if let Some(result) = result {
-        let execution_result = result.execution_result();
+        let mut execution_result = result.execution_result();
+        if record.lease.lock().await.expired.load(Ordering::Acquire) {
+            execution_result.state = ExecutionState::Interrupted;
+            execution_result.failure = Some(ExecutionFailure::LeaseExpired);
+            execution_result.exit_code = None;
+        }
         let state_value = execution_result.state.clone();
         publish_terminal(
             &record,
@@ -614,12 +1236,16 @@ async fn run_execution(
         )
         .await;
     } else {
+        let expired = record.lease.lock().await.expired.load(Ordering::Acquire);
         let failure = match runner_error {
             Some(RunnerError::Spawn(_)) => ExecutionFailure::Spawn,
             Some(RunnerError::CancelledBeforeSpawn) => ExecutionFailure::Interrupted,
+            _ if expired => ExecutionFailure::LeaseExpired,
             _ => ExecutionFailure::Internal,
         };
-        let terminal = if matches!(failure, ExecutionFailure::Interrupted) {
+        let terminal = if expired {
+            ExecutionState::Interrupted
+        } else if matches!(failure, ExecutionFailure::Interrupted) {
             ExecutionState::Cancelled
         } else {
             ExecutionState::Failed
@@ -633,6 +1259,7 @@ async fn run_execution(
         )
         .await;
     }
+    record.finished.store(true, Ordering::Release);
 }
 
 fn failed_result(state: ExecutionState, failure: ExecutionFailure) -> ExecutionResult {
@@ -655,12 +1282,25 @@ async fn publish(
     kind: ExecutionEventKind,
 ) {
     let mut current = record.snapshot.write().await;
-    current.state = state;
-    if let Some(result) = result {
-        current.result = Some(result);
+    if is_terminal(&current.state) {
+        return;
     }
-    drop(current);
-    emit(record, kind);
+    let mut proposed = current.clone();
+    proposed.state = state;
+    if let Some(result) = result {
+        proposed.result = Some(result);
+    }
+    match record.store.commit_event(proposed.clone(), kind).await {
+        Ok(Some(event)) => {
+            *current = proposed;
+            let _ = record.events.send(event);
+        }
+        Ok(None) => {}
+        Err(_) => {
+            record.draining.store(true, Ordering::Release);
+            record.cancellation.cancel();
+        }
+    }
 }
 
 async fn publish_terminal(
@@ -669,54 +1309,68 @@ async fn publish_terminal(
     result: ExecutionResult,
     kind: ExecutionEventKind,
 ) {
-    let mut current = record.snapshot.write().await;
-    current.state = state;
-    current.result = Some(result);
-    drop(current);
-    emit(record, kind);
-}
-
-fn emit(record: &ExecutionRecord, kind: ExecutionEventKind) {
-    let sequence = EventSequence::new(record.next_sequence.fetch_add(1, Ordering::Relaxed));
-    let event = ExecutionEvent {
-        sequence,
-        kind,
-        metadata: EventMetadata { fields: vec![] },
-    };
-    let _ = record.events.send(event);
+    publish(record, state, Some(result), kind).await;
 }
 
 fn event_stream_response(
     id: ExecutionId,
+    generation: ExecutionGeneration,
+    after_sequence: u64,
+    replay: Vec<ExecutionEvent>,
     receiver: broadcast::Receiver<ExecutionEvent>,
+    initial_terminal: bool,
 ) -> Response {
-    let stream = stream::unfold((receiver, false), |(mut receiver, ended)| async move {
-        if ended {
-            return None;
-        }
-        match receiver.recv().await {
-            Ok(event) => {
-                let terminal =
-                    matches!(&event.kind, ExecutionEventKind::State(state) if is_terminal(state));
+    let replay: std::collections::VecDeque<_> = replay.into();
+    let ended = initial_terminal && replay.is_empty();
+    let stream = stream::unfold(
+        (receiver, replay, after_sequence, ended),
+        |(mut receiver, mut replay, mut last_sequence, ended)| async move {
+            if ended {
+                return None;
+            }
+            loop {
+                let event = if let Some(event) = replay.pop_front() {
+                    event
+                } else {
+                    match receiver.recv().await {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            return Some((
+                                Err(ResponseStreamError::new(
+                                    "event consumer exceeded bounded retained history",
+                                )),
+                                (receiver, replay, last_sequence, true),
+                            ));
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    }
+                };
+                if event.sequence.get() <= last_sequence {
+                    continue;
+                }
+                last_sequence = event.sequence.get();
+                let terminal = matches!(
+                    &event.kind,
+                    ExecutionEventKind::State(state) if is_terminal(state)
+                );
                 let bytes = serde_json::to_vec(&event).unwrap_or_default();
                 let mut line = bytes;
                 line.push(b'\n');
-                Some((Ok(Bytes::from(line)), (receiver, terminal)))
+                return Some((
+                    Ok(Bytes::from(line)),
+                    (receiver, replay, last_sequence, terminal),
+                ));
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => Some((
-                Err(ResponseStreamError::new(
-                    "event consumer exceeded bounded live history",
-                )),
-                (receiver, true),
-            )),
-            Err(broadcast::error::RecvError::Closed) => None,
-        }
-    });
+        },
+    );
     let stream = ResponseStream::new(stream);
     Response::builder()
         .status(StatusCode::new(202).expect("valid HTTP status"))
         .header("content-type", "application/x-ndjson")
         .and_then(|builder| builder.header("eggwork-execution-id", id.to_string()))
+        .and_then(|builder| {
+            builder.header("eggwork-execution-generation", generation.get().to_string())
+        })
         .and_then(|builder| builder.body(ResponseBody::Stream(stream)))
         .unwrap_or_else(|_| error_response(500, "internal", "internal error"))
 }
@@ -755,7 +1409,15 @@ fn error_response(status: u16, code: &str, message: &str) -> Response {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExecuteRequest {
     schema_version: u16,
+    handle: ExecutionHandle,
     spec: ExecutionSpec,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ControlRequest {
+    schema_version: u16,
+    handle: ExecutionHandle,
+    renewal_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -764,14 +1426,15 @@ mod tests {
     use eggfetch_core::TlsConfig;
     use eggwork_client::NodeClient;
     use eggwork_core::{
-        CommandSpec, EnvironmentEntry, IsolationRequirement, NetworkRequirement, OutputPolicy,
-        ResourceRequirements, StdinPolicy,
+        CommandSpec, EnvironmentEntry, EventMetadata, EventSequence, ExecutionHandle,
+        IsolationRequirement, NetworkRequirement, OutputPolicy, ResourceRequirements, StdinPolicy,
     };
-    use futures_util::{StreamExt, TryStreamExt};
+    use futures_util::{StreamExt, TryStreamExt, future::join_all};
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::{fs, sync::Arc};
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     fn init_tls() {
         static INIT: std::sync::Once = std::sync::Once::new();
@@ -908,6 +1571,14 @@ mod tests {
         }
     }
 
+    fn execution_handle(id: &str) -> ExecutionHandle {
+        ExecutionHandle {
+            execution_id: ExecutionId::new(id).unwrap(),
+            generation: ExecutionGeneration::new(1).unwrap(),
+            lease_id: LeaseId::new(Uuid::new_v4().to_string()).unwrap(),
+        }
+    }
+
     #[test]
     fn fingerprint_mapping_uses_leaf_der_only() {
         let cert = b"verified certificate DER";
@@ -935,7 +1606,14 @@ mod tests {
     async fn slow_event_consumer_is_bounded_and_gets_a_stream_error() {
         let id = ExecutionId::new("slow-reader").unwrap();
         let (sender, receiver) = broadcast::channel(EVENT_CAPACITY);
-        let mut response = event_stream_response(id, receiver);
+        let mut response = event_stream_response(
+            id,
+            ExecutionGeneration::new(1).unwrap(),
+            0,
+            vec![],
+            receiver,
+            false,
+        );
         let ResponseBody::Stream(mut stream) = response.take_body().unwrap() else {
             panic!("event response must stream");
         };
@@ -976,7 +1654,9 @@ mod tests {
                 node_id: NodeId::new("node-a").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
                 max_active_executions: 2,
+                lease_ttl: std::time::Duration::from_secs(3),
                 tls: tls_server_config(root.clone(), &server_identity),
             },
             Arc::new(LocalProcessRunner::default()),
@@ -992,12 +1672,16 @@ mod tests {
         )
         .unwrap();
         let marker = temp.path().join("must-not-exist");
+        let denied_handle = execution_handle("denied-execution");
         let denied = unauthorized
-            .execute(&execution_spec(vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                format!("touch {}", marker.display()),
-            ]))
+            .execute(
+                &execution_spec(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("touch {}", marker.display()),
+                ]),
+                &denied_handle,
+            )
             .await;
         assert!(matches!(
             denied,
@@ -1046,7 +1730,9 @@ mod tests {
                 node_id: NodeId::new("node-a").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
                 max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(5),
                 tls: tls_server_config(root.clone(), &server_identity),
             },
             Arc::new(LocalProcessRunner::default()),
@@ -1083,6 +1769,7 @@ mod tests {
         );
         let unsupported_schema = serde_json::to_vec(&ExecuteRequest {
             schema_version: API_SCHEMA_VERSION + 1,
+            handle: execution_handle("unsupported-schema"),
             spec: execution_spec(vec!["/bin/true".into()]),
         })
         .unwrap();
@@ -1096,10 +1783,10 @@ mod tests {
             426
         );
         let execution = client
-            .execute(&execution_spec(vec![
-                "/bin/echo".into(),
-                "hello eggwork".into(),
-            ]))
+            .execute(
+                &execution_spec(vec!["/bin/echo".into(), "hello eggwork".into()]),
+                &execution_handle("echo-output"),
+            )
             .await
             .unwrap();
         let id = execution.execution_id.clone();
@@ -1122,31 +1809,115 @@ mod tests {
         assert_eq!(snapshot.state, ExecutionState::Succeeded);
         assert!(snapshot.result.is_some());
 
+        let idempotent_handle = execution_handle("concurrent-same-request");
+        let marker = temp.path().join("spawn-count");
+        let idempotent_spec = execution_spec(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("printf x >> '{}'; sleep 0.25", marker.display()),
+        ]);
+        let submissions = join_all((0..24).map(|_| {
+            let client = client.clone();
+            let handle = idempotent_handle.clone();
+            let spec = idempotent_spec.clone();
+            async move { client.execute(&spec, &handle).await }
+        }))
+        .await;
+        let streams: Vec<_> = submissions.into_iter().map(Result::unwrap).collect();
+        assert!(
+            streams
+                .iter()
+                .all(|stream| stream.execution_id == idempotent_handle.execution_id)
+        );
+        drop(streams);
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                if client
+                    .observe(&idempotent_handle.execution_id)
+                    .await
+                    .unwrap()
+                    .state
+                    == ExecutionState::Succeeded
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the single idempotent execution must finish");
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "x");
+        assert!(matches!(
+            client
+                .execute(
+                    &execution_spec(vec!["/bin/true".into()]),
+                    &idempotent_handle
+                )
+                .await,
+            Err(eggwork_client::ClientError::Api { status: 409, .. })
+        ));
+
+        let next_generation = ExecutionHandle {
+            generation: ExecutionGeneration::new(2).unwrap(),
+            lease_id: LeaseId::new(Uuid::new_v4().to_string()).unwrap(),
+            ..idempotent_handle.clone()
+        };
+        let generation_two = client
+            .execute(&execution_spec(vec!["/bin/true".into()]), &next_generation)
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.cancel(&idempotent_handle).await,
+            Err(eggwork_client::ClientError::Api { status: 409, .. })
+        ));
+        drop(generation_two);
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                if client
+                    .observe_generation(&next_generation.execution_id, 2)
+                    .await
+                    .unwrap()
+                    .state
+                    == ExecutionState::Succeeded
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("next generation must become terminal");
+
         let running = client
-            .execute(&execution_spec(vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "sleep 2".into(),
-            ]))
+            .execute(
+                &execution_spec(vec!["/bin/sh".into(), "-c".into(), "sleep 2".into()]),
+                &execution_handle("disconnected-run"),
+            )
             .await
             .unwrap();
         let running_id = running.execution_id.clone();
+        let running_handle = running.handle.clone();
         let events_client = client.clone();
-        let events_id = running_id.clone();
         let events_task = tokio::spawn(async move {
-            let stream = events_client.events(&events_id).await?;
+            let stream = events_client.events(&running_handle, 0).await?;
             Ok::<_, eggwork_client::ClientError>(stream.try_collect::<Vec<_>>().await?)
         });
         assert!(matches!(
             client
-                .execute(&execution_spec(vec!["/bin/true".into()]))
+                .execute(
+                    &execution_spec(vec!["/bin/true".into()]),
+                    &execution_handle("busy-one")
+                )
                 .await,
             Err(eggwork_client::ClientError::Api { status: 503, .. })
         ));
         server.set_draining(true);
         assert!(matches!(
             client
-                .execute(&execution_spec(vec!["/bin/true".into()]))
+                .execute(
+                    &execution_spec(vec!["/bin/true".into()]),
+                    &execution_handle("drain-one")
+                )
                 .await,
             Err(eggwork_client::ClientError::Api { status: 503, .. })
         ));
@@ -1170,16 +1941,25 @@ mod tests {
         .expect("disconnect must not cancel execution");
 
         let cancellable = client
-            .execute(&execution_spec(vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "sleep 5".into(),
-            ]))
+            .execute(
+                &execution_spec(vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()]),
+                &execution_handle("cancel-run"),
+            )
             .await
             .unwrap();
         let cancellable_id = cancellable.execution_id.clone();
+        let cancellable_handle = cancellable.handle.clone();
         drop(cancellable);
-        client.cancel(&cancellable_id).await.unwrap();
+        client
+            .renew(&cancellable_handle, "renewal-one")
+            .await
+            .unwrap();
+        client
+            .renew(&cancellable_handle, "renewal-one")
+            .await
+            .unwrap();
+        client.cancel(&cancellable_handle).await.unwrap();
+        client.cancel(&cancellable_handle).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(4), async {
             loop {
                 if client.observe(&cancellable_id).await.unwrap().state == ExecutionState::Cancelled
@@ -1196,6 +1976,40 @@ mod tests {
             cancelled_snapshot.result.unwrap().state,
             ExecutionState::Cancelled
         );
+        let cancelled_events = client.events(&cancellable_handle, 0).await.unwrap();
+        let event_chunks = cancelled_events.try_collect::<Vec<_>>().await.unwrap();
+        let joined: Vec<u8> = event_chunks.into_iter().flatten().collect();
+        let cancelled_events: Vec<ExecutionEvent> = joined
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(
+            cancelled_events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    ExecutionEventKind::State(ExecutionState::Cancelled)
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            cancelled_events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    ExecutionEventKind::State(ExecutionState::Cancelling)
+                ))
+                .count(),
+            1
+        );
+        let last_sequence = cancelled_events.last().unwrap().sequence.get();
+        let resumed = client
+            .events(&cancellable_handle, last_sequence)
+            .await
+            .unwrap();
+        assert!(resumed.try_collect::<Vec<_>>().await.unwrap().is_empty());
 
         let no_cert = eggfetch_core::TlsConfig::builder()
             .ca_certificate_path({
@@ -1208,11 +2022,10 @@ mod tests {
         let unauthenticated = NodeClient::new(&address, no_cert).unwrap();
         assert!(unauthenticated.status().await.is_err());
         let shutdown_execution = client
-            .execute(&execution_spec(vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "sleep 5".into(),
-            ]))
+            .execute(
+                &execution_spec(vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()]),
+                &execution_handle("shutdown-run"),
+            )
             .await
             .unwrap();
         let shutdown_record = server
@@ -1230,5 +2043,167 @@ mod tests {
             shutdown_record.snapshot.read().await.state,
             ExecutionState::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn expired_lease_terminates_process_with_a_typed_terminal_result() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-lease").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("lease.sqlite"),
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_millis(150),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+        let handle = execution_handle("lease-expiry");
+        let stream = client
+            .execute(
+                &execution_spec(vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()]),
+                &handle,
+            )
+            .await
+            .unwrap();
+        drop(stream);
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                let snapshot = client.observe(&handle.execution_id).await.unwrap();
+                if is_terminal(&snapshot.state) {
+                    break snapshot;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("lease expiry must terminate the process");
+        assert_eq!(snapshot.state, ExecutionState::Interrupted);
+        assert_eq!(
+            snapshot.result.unwrap().failure,
+            Some(ExecutionFailure::LeaseExpired)
+        );
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_uncertain_execution_as_interrupted_without_replay() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let database_path = temp.path().join("recovery.sqlite");
+        let store = store::ExecutionStore::open(&database_path).unwrap();
+        let handle = execution_handle("restart-recovery");
+        let running = ExecutionSnapshot {
+            schema_version: API_SCHEMA_VERSION,
+            execution_id: handle.execution_id.clone(),
+            generation: handle.generation,
+            state: ExecutionState::Running,
+            result: None,
+        };
+        assert!(matches!(
+            store
+                .reserve(
+                    ExecutionSnapshot {
+                        state: ExecutionState::Accepted,
+                        ..running.clone()
+                    },
+                    eggwork_core::CANONICAL_REQUEST_VERSION,
+                    "a".repeat(64),
+                    "controller-a".into(),
+                    store::lease_hash(handle.lease_id.as_str()),
+                    store::unix_millis() + 60_000,
+                )
+                .await
+                .unwrap(),
+            store::ReserveResult::Created
+        ));
+        store
+            .commit_event(
+                ExecutionSnapshot {
+                    state: ExecutionState::Accepted,
+                    ..running.clone()
+                },
+                ExecutionEventKind::State(ExecutionState::Accepted),
+            )
+            .await
+            .unwrap();
+        store
+            .commit_event(
+                running.clone(),
+                ExecutionEventKind::State(ExecutionState::Running),
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-recovery").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(30),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+        let recovered = client.observe(&handle.execution_id).await.unwrap();
+        assert_eq!(recovered.state, ExecutionState::Interrupted);
+        assert_eq!(client.status().await.unwrap().active_executions, 0);
+        let event_stream = client.events(&handle, 0).await.unwrap();
+        let event_bytes = event_stream.try_collect::<Vec<_>>().await.unwrap();
+        let joined: Vec<u8> = event_bytes.into_iter().flatten().collect();
+        let lines: Vec<ExecutionEvent> = joined
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert!(lines.iter().any(|event| matches!(
+            event.kind,
+            ExecutionEventKind::State(ExecutionState::Interrupted)
+        )));
+        server.shutdown().await;
+        server.wait().await.unwrap();
     }
 }

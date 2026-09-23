@@ -384,6 +384,17 @@ impl CommandSpec {
         for e in &self.environment {
             EnvironmentEntry::new(&e.name, &e.value)?;
         }
+        let mut environment_names =
+            std::collections::HashSet::with_capacity(self.environment.len());
+        if self
+            .environment
+            .iter()
+            .any(|entry| !environment_names.insert(entry.name.as_str()))
+        {
+            return Err(ValidationError::InvalidSyntax {
+                field: "duplicate environment name",
+            });
+        }
         if self.declared_outputs.len() > MAX_OUTPUTS {
             return Err(ValidationError::TooMany {
                 field: "declared outputs",
@@ -464,6 +475,7 @@ pub enum ExecutionFailure {
     Sandbox,
     ResourceLimit,
     Interrupted,
+    LeaseExpired,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionResult {
@@ -596,6 +608,24 @@ pub struct ExecutionSnapshot {
     pub result: Option<ExecutionResult>,
 }
 
+/// Fenced handle for control operations on one execution generation.
+/// The lease token is bearer authority and is omitted from Debug output.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionHandle {
+    pub execution_id: ExecutionId,
+    pub generation: ExecutionGeneration,
+    pub lease_id: LeaseId,
+}
+impl fmt::Debug for ExecutionHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutionHandle")
+            .field("execution_id", &self.execution_id)
+            .field("generation", &self.generation)
+            .field("lease_id", &"[REDACTED]")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiError {
     pub schema_version: u16,
@@ -603,10 +633,27 @@ pub struct ApiError {
     pub message: String,
 }
 
-/// Stable canonical digest input: version prefix and serde_json output with struct field order.
+/// Version of the execution request canonicalization algorithm.
+pub const CANONICAL_REQUEST_VERSION: u16 = 2;
+
+/// Stable canonical digest input: normalize unordered fields, then hash versioned JSON.
 pub fn request_digest(spec: &ExecutionSpec) -> Result<BlobDigest, serde_json::Error> {
-    let mut bytes = b"eggwork-execution-spec\0v1\0".to_vec();
-    bytes.extend(serde_json::to_vec(spec)?);
+    let mut normalized = spec.clone();
+    normalized
+        .command
+        .environment
+        .sort_by(|a, b| a.name.cmp(&b.name));
+    normalized
+        .metadata
+        .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    normalized.command.declared_outputs.sort_by(|a, b| {
+        a.path
+            .as_str()
+            .cmp(b.path.as_str())
+            .then_with(|| a.required.cmp(&b.required))
+    });
+    let mut bytes = b"eggwork-execution-spec\0canonical-json-v2\0".to_vec();
+    bytes.extend(serde_json::to_vec(&normalized)?);
     Ok(BlobDigest::from_bytes(&bytes))
 }
 
@@ -682,5 +729,37 @@ mod tests {
         let mut invalid = c;
         invalid.protocol.min = ProtocolVersion { major: 2, minor: 0 };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn canonical_request_digest_ignores_unordered_field_order() {
+        let mut left = spec();
+        left.command
+            .environment
+            .push(EnvironmentEntry::new("ZED", "z").unwrap());
+        left.metadata = vec![("z".into(), "last".into()), ("a".into(), "first".into())];
+        let mut right = left.clone();
+        right.command.environment.reverse();
+        right.metadata.reverse();
+        assert_eq!(
+            request_digest(&left).unwrap(),
+            request_digest(&right).unwrap()
+        );
+
+        right.command.argv[1] = "different".into();
+        assert_ne!(
+            request_digest(&left).unwrap(),
+            request_digest(&right).unwrap()
+        );
+    }
+
+    #[test]
+    fn duplicate_environment_names_are_rejected() {
+        let mut value = spec();
+        value
+            .command
+            .environment
+            .push(EnvironmentEntry::new("LANG", "C").unwrap());
+        assert!(value.validate().is_err());
     }
 }
