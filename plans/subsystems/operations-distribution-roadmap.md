@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M002 ready, producer packaging waits on Eggpack
+Status: active roadmap; M002 blocked on Eggup post-commit rollback contract, producer packaging waits on Eggpack
 
 Canonical authority:
 
@@ -47,7 +47,7 @@ Add configuration, status, doctor, drain/undrain, execution/storage inspection, 
 
 Class: infrastructure/capability
 
-Status: ready
+Status: blocked on Eggup post-commit rollback contract
 
 Implementation plan:
 
@@ -61,7 +61,7 @@ Objective:
 
 Use Eggup for consumer-side verified multi-artifact deployment, rollback, install ownership, and native service lifecycle while keeping Eggwork's drain/restart policy application-owned.
 
-Current interface review confirms Eggup main contains Unix manager mechanics and a native Windows SCM adapter. A published version is preferred; an exact immutable Git revision may be used for integration qualification when publication lags, with that disposition recorded at closure.
+Current interface review confirms Eggup main contains Unix manager mechanics and a native Windows SCM adapter. However, its transaction API does not retain backups or expose post-commit rollback for the required post-start health failure case. M002 remains blocked until Eggup provides that contract or the architecture owner revises the rollback ownership requirement. Evidence: `plans/closure/operations-distribution/002-status.md`.
 
 ### M003 — Eggpack producer packaging integration
 

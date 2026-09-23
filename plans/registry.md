@@ -55,7 +55,7 @@ The repository is no longer planning-only.
 | Control-plane protocol | closed | M001-M003 complete | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | closed | M001-M003 complete | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | qualified | M004 waits on the new Foundation/Control/Operations surfaces | `plans/subsystems/security-isolation-resource-roadmap.md` |
-| Operations / distribution | ready | M002 Eggup deployment/service integration; producer packaging is separate M003 | `plans/subsystems/operations-distribution-roadmap.md` |
+| Operations / distribution | blocked | M002 awaits Eggup post-commit rollback contract; producer packaging is separate M003 | `plans/subsystems/operations-distribution-roadmap.md` |
 | CodeGG integration | ready external | M001 fixed-target remote executor; independent of Operations M002 | `plans/subsystems/codegg-integration-roadmap.md` |
 
 ## Dependency-ready implementation plans
@@ -66,7 +66,7 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 |---|---|---|---|---|
 | Foundation | M003 ownership guards/API hardening | **closed** | `plans/implementation/foundation-execution-core/003-execution-ownership-guards-and-runner-api-hardening.md` | `plans/closure/foundation-execution-core/003-status.md` |
 | Control plane | M003 Eggress route/protocol hardening | **closed** | `plans/implementation/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md` | `plans/closure/control-plane-protocol/003-status.md` |
-| Operations | M002 Eggup deployment/service integration | **ready** | `plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md` | Eggup current main has Unix manager mechanics and native Windows SCM; exact published-or-pinned dependency disposition is part of implementation. |
+| Operations | M002 Eggup deployment/service integration | **blocked** | `plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md` | Eggup revision `66813b3b94de3a9b2f270e0000dc339ef6f0b478` lacks post-commit rollback required for health failure recovery; see blocker record. |
 | CodeGG | M001 fixed-target remote executor | **ready external** | `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md` | Eggwork Phases 0-5 prerequisites are closed. Actual downstream code remains governed by CodeGG planning. |
 
 ## Closed and superseded implementation plans
@@ -91,7 +91,7 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Work | Status | Blocker / rationale |
 |---|---|---|
-| Security M004 adversarial + cross-platform closure | blocked | wait for Foundation M003 + Control Plane M003 + Operations M002 so final security evidence includes those surfaces |
+| Security M004 adversarial + cross-platform closure | blocked | Foundation M003 and Control Plane M003 are closed; wait for blocked Operations M002 so final security evidence includes that surface |
 | Operations M003 Eggpack producer packaging | blocked | Eggpack ReleaseManifest M001 and build/qualification interfaces are not yet closed/concrete |
 | Operations M004 operational/release qualification | blocked | Operations M002 + M003 |
 | Operations M005 reverse-connect relay | deferred | no immediate product need; stable identity/lease semantics already exist |
@@ -107,7 +107,7 @@ Do not author Operations M003 merely to increase plan count. Its producer inputs
 ```text
 Foundation M002 [closed] ------------------> Foundation M003 [READY]
 Control Plane M002 [closed] ---------------> Control Plane M003 [READY]
-Operations M001 [closed] + Eggup adapters --> Operations M002 [READY]
+Operations M001 [closed] + Eggup adapters --> Operations M002 [blocked: post-commit rollback contract]
 
 Eggwork Phases 0-5 [closed/qualified] ------> CodeGG M001 [READY EXTERNAL]
 
@@ -142,7 +142,7 @@ Implementation agents MUST re-check current APIs at execution time.
 1. **False Operations → CodeGG dependency:** removed. CodeGG M001 is independently ready.
 2. **Foundation M003 stale blocker:** M002 is closed; M003 now has a concrete ready handoff.
 3. **Control Plane M003 stale dial-interface blocker:** Eggfetch/Eggress now expose a compatible public raw-stream boundary; M003 is ready.
-4. **Operations M002 stale Eggup blocker:** Eggup main now includes platform manager mechanics; consumer deployment integration is ready.
+4. **Operations M002 manager-adapter blocker:** resolved by Eggup main, but implementation recheck found a separate missing post-commit rollback contract; see the M002 blocker record.
 5. **Eggup/Eggpack authority mix:** corrected. Eggup owns local deployment/service lifecycle; Eggpack owns producer packaging/release construction/evidence.
 6. **Final security sweep ordering:** M004 now waits for the newly ready route/ownership/deployment surfaces instead of incorrectly claiming only M001-M003 prerequisites.
 7. **Stale CodeGG baseline:** M001 planning rebaselined to current reviewed CodeGG head.
