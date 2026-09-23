@@ -93,7 +93,7 @@ Exit conditions:
 
 Class: invariant/polish
 
-Status: ready
+Status: closed
 
 Implementation plan:
 

@@ -1,6 +1,6 @@
 # Foundation and Execution Core M003 — Execution Ownership Guards and Runner API Hardening
 
-Status: ready for handoff
+Status: closed
 
 Source roadmap:
 
