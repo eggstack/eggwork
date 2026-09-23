@@ -1,6 +1,8 @@
 # CodeGG Integration M001 — Fixed-Target Remote Executor
 
-Status: blocked on Eggwork Control Plane M002, Workspace/Artifact M003, and Security M003 closure
+Status: ready; execution is sequenced after Operations M002
+
+Dependencies closed: Control Plane M002, Workspace/Artifact M003, and Security M003.
 
 Source roadmap:
 

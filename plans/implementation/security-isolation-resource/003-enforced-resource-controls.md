@@ -1,6 +1,6 @@
 # Security M003 — Enforced Resource Controls
 
-Status: closing
+Status: closed
 
 Dependency evidence: `plans/closure/security-isolation-resource/002-status.md`
 
@@ -92,4 +92,4 @@ Hosted platform tests are required for claims of actual enforcement.
 
 ## 8. Closure evidence
 
-Create `plans/closure/security-isolation-resource/003-status.md` with per-platform capability/enforcement matrix and actual host evidence.
+Closure: `plans/closure/security-isolation-resource/003-status.md`.

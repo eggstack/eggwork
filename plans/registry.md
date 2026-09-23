@@ -47,16 +47,16 @@ At planning bootstrap there was no Rust workspace or production code. That is hi
 | Foundation / execution core | closed | M002 canonical local runner | `plans/subsystems/foundation-execution-core-roadmap.md` |
 | Control-plane protocol | active | M003 Eggress route adapter waits on current public Eggfetch/Eggress dial compatibility | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | closed | M001-M003 complete; no current implementation plan | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
-| Security / isolation / resources | active | M003 enforced resource controls | `plans/subsystems/security-isolation-resource-roadmap.md` |
-| Operations / distribution | blocked | M001 waits on Security M003; M002 also waits on stable Eggup consumer interface | `plans/subsystems/operations-distribution-roadmap.md` |
-| CodeGG integration | blocked | M001 waits on Security M003 | `plans/subsystems/codegg-integration-roadmap.md` |
+| Security / isolation / resources | closed | M001-M003 complete for the qualified Linux user-manager path | `plans/subsystems/security-isolation-resource-roadmap.md` |
+| Operations / distribution | active | M001 node operations surface | `plans/subsystems/operations-distribution-roadmap.md` |
+| CodeGG integration | ready | M001 fixed-target remote executor | `plans/subsystems/codegg-integration-roadmap.md` |
 
 ## Dependency-ready implementation plans
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Security | M002a Landlock `/dev/null` runtime correction | **closing** | `plans/implementation/security-isolation-resource/002a-landlock-runtime-devnull.md` | Regression and runtime evidence gathered; closure record being written. |
-| Security | M003 enforced resource controls | **closing** | `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md` | Linux systemd user-scope evidence gathered; closure record being written. |
+| Operations | M001 node operations surface | **ready** | `plans/implementation/operations-distribution/001-node-operations-surface.md` | Control Plane M002, Workspace M003, and Security M003 closure evidence is available. |
+| CodeGG | M001 fixed-target remote executor | **ready** | `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md` | Control Plane M002, Workspace M003, and Security M003 closure evidence is available. |
 
 ## Registered implementation plan statuses
 
@@ -71,11 +71,11 @@ At planning bootstrap there was no Rust workspace or production code. That is hi
 | Workspace | M003 declared artifacts/retention/GC | closed | `plans/implementation/workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md` | Closure: `plans/closure/workspace-artifact-transport/003-status.md`. |
 | Security | M001 authorization/redaction/threat model | closed | `plans/implementation/security-isolation-resource/001-authorization-redaction-and-threat-model.md` | Closure: `plans/closure/security-isolation-resource/001-status.md`. |
 | Security | M002 trusted Landlock sandbox | closed | `plans/implementation/security-isolation-resource/002-trusted-landlock-sandbox-path.md` | Closure: `plans/closure/security-isolation-resource/002-status.md`; implementation `98d13f1`. |
-| Security | M002a Landlock `/dev/null` runtime correction | closing | `plans/implementation/security-isolation-resource/002a-landlock-runtime-devnull.md` | M003 cancellation-under-limits regression exposed a missing runtime read; historical M002 closure remains preserved. |
-| Security | M003 enforced resource controls | closing | `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md` | Direct writes to this session's cgroup are unavailable; the systemd user manager can create scopes, and runtime probes gate claims on those scopes. |
-| Operations | M001 node operations surface | blocked | `plans/implementation/operations-distribution/001-node-operations-surface.md` | Security M003 closure |
+| Security | M002a Landlock `/dev/null` runtime correction | closed | `plans/implementation/security-isolation-resource/002a-landlock-runtime-devnull.md` | Closure: `plans/closure/security-isolation-resource/002a-status.md`; historical M002 record preserved. |
+| Security | M003 enforced resource controls | closed | `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md` | Closure: `plans/closure/security-isolation-resource/003-status.md`; Linux systemd user-manager path qualified. |
+| Operations | M001 node operations surface | ready | `plans/implementation/operations-distribution/001-node-operations-surface.md` | Control Plane M002, Workspace M003, and Security M003 closures available. |
 | Operations | M002 packaging/services/Eggup | blocked | `plans/implementation/operations-distribution/002-packaging-services-and-eggup.md` | Operations M001 + stable Eggup consumer interface |
-| CodeGG | M001 fixed-target remote executor | blocked | `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md` | Security M003 closure |
+| CodeGG | M001 fixed-target remote executor | ready | `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md` | Control Plane M002, Workspace M003, and Security M003 closures available; held behind Operations M001/M002 in requested execution order. |
 
 ## Roadmap-level work without implementation handoff yet
 
@@ -100,11 +100,9 @@ Do not create implementation plans for these merely to increase plan count. Writ
 1. **Control Plane M001** — authenticated fixed-target execution (closed; closure: `plans/closure/control-plane-protocol/001-status.md`).
 2. **Control Plane M002** — idempotency/leases/events/recovery (closed; lease-expiry race correction recorded).
 3. Control Plane M002 is closed with a recorded lease-expiry race correction; **Workspace M001 -> M002 -> M003** are now closed.
-4. **Security M001 and M002 are closed.** Security M003 is active; its Linux runtime must expose unavailable cgroup delegation truthfully on this host.
-5. After Control Plane M002 + Workspace M003 + Security M003:
-   - **Operations M001** may begin;
-   - **CodeGG M001** may begin independently.
-6. Operations M002 waits on Operations M001 and the required stable Eggup interface.
+4. **Security M001-M003 are closed** for the Linux systemd user-manager path qualified in `plans/closure/security-isolation-resource/003-status.md`.
+5. Operations M001 and CodeGG M001 are unblocked; Operations M001 is next in the requested execution order.
+6. Operations M002 waits on Operations M001 and the required stable Eggup interface. CodeGG M001 is ready and follows Operations M002 in the requested sequence.
 7. Generate later roadmap-level handoffs only after their concrete dependencies exist.
 
 ## External interface research baselines

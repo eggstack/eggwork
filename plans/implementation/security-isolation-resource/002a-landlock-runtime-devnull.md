@@ -1,6 +1,6 @@
 # Security M002 Corrective — Landlock Runtime `/dev/null` Read
 
-Status: closing
+Status: closed
 
 Source roadmap:
 
@@ -34,5 +34,4 @@ cancels it, and proves the process tree is reaped. Grant no other `/dev` access.
 
 ## Closure evidence
 
-Create `plans/closure/security-isolation-resource/002a-status.md` with the
-regression command, actual host/runtime evidence, and implementation commit.
+Closure: `plans/closure/security-isolation-resource/002a-status.md`.

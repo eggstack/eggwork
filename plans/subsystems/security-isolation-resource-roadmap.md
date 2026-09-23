@@ -1,6 +1,6 @@
 # Security, Isolation, and Resource Enforcement Roadmap
 
-Status: active roadmap
+Status: closed for the qualified Linux systemd user-manager path; other platform backends remain unsupported
 
 Canonical authority:
 
@@ -87,7 +87,9 @@ Exit conditions:
 
 Class: capability/invariant
 
-Status: active
+Status: closed for the qualified Linux systemd user-manager path
+
+Closure evidence: `plans/closure/security-isolation-resource/003-status.md`
 
 Host note: direct writes to this session cgroup are unavailable; the systemd user manager can create transient scopes. The backend probes each requested controller and verifies the cgroup properties before target start.
 

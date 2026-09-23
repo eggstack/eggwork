@@ -31,7 +31,7 @@ It does not own process lifecycle internals, scheduler placement, or CodeGG sema
 
 Class: capability/polish
 
-Status: blocked on Control Plane M002, Workspace M003, and Security M003
+Status: ready; M001 is next in the execution sequence
 
 Implementation plan:
 
