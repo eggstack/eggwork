@@ -317,10 +317,13 @@ impl NodeServer {
         let artifact_path = config.database_path.with_extension("artifacts.sqlite");
         let artifacts = artifact::ArtifactStore::open(&artifact_path)
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
-        store
+        let recovered = store
             .recover()
             .await
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
+        if !recovered.is_empty() {
+            increment_metric(&store, "terminal_interrupted", recovered.len() as u64).await;
+        }
         workspaces
             .recover_retention(
                 artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS),

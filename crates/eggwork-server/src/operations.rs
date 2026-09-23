@@ -926,10 +926,23 @@ pub fn inspect_blob(
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(OperationsError::NotFound);
     }
+    let db = read_only_database(&config.blob_root.join("metadata.sqlite"))?;
+    let size_recorded: Option<(i64, i64)> = db
+        .query_row(
+            "SELECT size_bytes,reference_count FROM blobs WHERE digest=?1",
+            [digest.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|_| OperationsError::Data)?;
+    let (size_recorded, references) = size_recorded.ok_or(OperationsError::NotFound)?;
+    if size_recorded.max(0) as u64 != metadata.len() {
+        return Err(OperationsError::Data);
+    }
     Ok(ResourceInspection {
         kind: "blob",
         id: digest.as_str().into(),
-        metadata: serde_json::json!({"size_bytes": metadata.len(), "stored": true}),
+        metadata: serde_json::json!({"size_bytes": metadata.len(), "reference_count": references.max(0), "stored": true}),
     })
 }
 
