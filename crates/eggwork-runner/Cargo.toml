@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 eggwork-core = { path = "../eggwork-core" }
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "process"] }
 tokio-util.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true

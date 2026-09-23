@@ -1,6 +1,13 @@
 #![forbid(unsafe_code)]
 
 //! Canonical owner of finite, noninteractive process execution.
+//!
+//! Embedding API: construct a validated [`RunnerRequest`] from an
+//! [`eggwork_core::ExecutionSpec`] with [`RunnerRequest::from_spec`], then run
+//! it through [`LocalProcessRunner`]. Request fields remain private so callers
+//! cannot bypass protocol bounds. Platform setup is supplied through
+//! [`ExecutionSetup`]; neither this API nor its result types carry scheduler
+//! placement, priority, or project fairness policy.
 
 use eggwork_core::{
     CommandSpec, ExecutionFailure, ExecutionGeneration, ExecutionId, ExecutionResult,
@@ -92,13 +99,6 @@ impl BoundedCapture {
             .total_bytes
             .saturating_sub((self.head.len() + self.tail.len()) as u64);
     }
-}
-
-/// Requested process-tree behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProcessTreePolicy {
-    /// Require a host process-group primitive that can terminate descendants.
-    Required,
 }
 
 /// Typed optional setup hook. Best-effort outcomes are surfaced and never
@@ -612,18 +612,18 @@ impl ExecutionSetup for NoExecutionSetup {
 
 #[derive(Clone)]
 pub struct RunnerRequest {
-    pub argv: Vec<String>,
-    pub root: PathBuf,
-    pub cwd: Option<RelativePath>,
-    pub environment: Vec<(String, String)>,
-    pub stdin: StdinPolicy,
-    pub timeout: Duration,
-    pub capture_limit: usize,
-    pub event_chunk_bytes: usize,
-    pub overflow: CoreOverflowPolicy,
-    pub provenance: ExecutionProvenance,
-    pub sandbox: SandboxRequest,
-    pub resources: ResourceSetupRequest,
+    argv: Vec<String>,
+    root: PathBuf,
+    cwd: Option<RelativePath>,
+    environment: Vec<(String, String)>,
+    stdin: StdinPolicy,
+    timeout: Duration,
+    capture_limit: usize,
+    event_chunk_bytes: usize,
+    overflow: CoreOverflowPolicy,
+    provenance: ExecutionProvenance,
+    sandbox: SandboxRequest,
+    resources: ResourceSetupRequest,
 }
 
 impl std::fmt::Debug for RunnerRequest {
@@ -646,6 +646,86 @@ impl std::fmt::Debug for RunnerRequest {
 }
 
 impl RunnerRequest {
+    /// Create an embedding request with conservative defaults. [`run`](LocalProcessRunner::run)
+    /// validates every field before setup or child creation.
+    pub fn new(argv: Vec<String>, root: impl Into<PathBuf>) -> Self {
+        Self {
+            argv,
+            root: root.into(),
+            cwd: None,
+            environment: Vec::new(),
+            stdin: StdinPolicy::Null,
+            timeout: Duration::from_secs(30),
+            capture_limit: MAX_CAPTURE_BYTES,
+            event_chunk_bytes: MAX_EVENT_CHUNK_BYTES,
+            overflow: CoreOverflowPolicy::Truncate,
+            provenance: ExecutionProvenance::default(),
+            sandbox: SandboxRequest::None,
+            resources: ResourceSetupRequest {
+                memory_bytes: Requirement::NotRequested,
+                cpu_millis: Requirement::NotRequested,
+                pids: Requirement::NotRequested,
+            },
+        }
+    }
+
+    pub fn set_argv(&mut self, argv: Vec<String>) {
+        self.argv = argv;
+    }
+
+    pub fn set_working_directory(&mut self, cwd: Option<RelativePath>) {
+        self.cwd = cwd;
+    }
+
+    pub fn set_environment(&mut self, environment: Vec<(String, String)>) {
+        self.environment = environment;
+    }
+
+    pub fn set_stdin_policy(&mut self, stdin: StdinPolicy) {
+        self.stdin = stdin;
+    }
+
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+    }
+
+    pub fn set_output_policy(
+        &mut self,
+        capture_limit: usize,
+        event_chunk_bytes: usize,
+        overflow: CoreOverflowPolicy,
+    ) {
+        self.capture_limit = capture_limit;
+        self.event_chunk_bytes = event_chunk_bytes;
+        self.overflow = overflow;
+    }
+
+    pub fn set_provenance(&mut self, provenance: ExecutionProvenance) {
+        self.provenance = provenance;
+    }
+
+    pub fn set_sandbox_request(&mut self, sandbox: SandboxRequest) {
+        self.sandbox = sandbox;
+    }
+
+    pub fn set_resource_setup_request(&mut self, resources: ResourceSetupRequest) {
+        self.resources = resources;
+    }
+
+    pub fn resource_setup_request_mut(&mut self) -> &mut ResourceSetupRequest {
+        &mut self.resources
+    }
+
+    /// Return the requested sandbox policy without exposing request internals.
+    pub fn sandbox_request(&self) -> &SandboxRequest {
+        &self.sandbox
+    }
+
+    /// Return requested resource controls without exposing request internals.
+    pub fn resource_setup_request(&self) -> &ResourceSetupRequest {
+        &self.resources
+    }
+
     /// Translate a validated protocol-neutral command to a local request.
     pub fn from_spec(
         spec: &ExecutionSpec,
@@ -1801,6 +1881,34 @@ mod tests {
         assert_eq!(result.stdout.head.len() + result.stdout.tail.len(), 128);
         assert!(result.stream_chunks_dropped > 0);
         drop(rx);
+    }
+
+    #[cfg(unix)]
+    #[ignore = "manual output/drain characterization; no timing threshold"]
+    #[tokio::test]
+    async fn characterize_output_drain_overhead() {
+        let temp = tempfile::tempdir().unwrap();
+        for bytes in [4_096usize, 8 * 1024 * 1024] {
+            let command = format!("head -c {bytes} /dev/zero");
+            let mut req = request(temp.path(), &["sh", "-c", &command]);
+            req.capture_limit = 64 * 1024;
+            req.event_chunk_bytes = 16 * 1024;
+            let runner = LocalProcessRunner::default();
+            let (tx, _rx) = mpsc::channel(16);
+            let started = std::time::Instant::now();
+            let result = runner.run(req, CancellationToken::new(), tx).await.unwrap();
+            let elapsed = started.elapsed();
+            let captured = result.stdout.head.len() + result.stdout.tail.len();
+            assert_eq!(result.stdout.total_bytes, bytes as u64);
+            assert!(captured <= 64 * 1024);
+            eprintln!(
+                "runner output characterization: bytes={} elapsed_ms={} throughput_mib_s={:.2} retained_bytes={}",
+                result.stdout.total_bytes,
+                elapsed.as_millis(),
+                bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0),
+                captured,
+            );
+        }
     }
 
     #[cfg(unix)]

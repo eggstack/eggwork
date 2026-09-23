@@ -8,33 +8,28 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 fn request(root: &Path, outside_read: &Path, outside_write: &Path) -> RunnerRequest {
-    RunnerRequest {
-        argv: vec![
+    let mut request = RunnerRequest::new(vec![
             "/bin/sh".into(),
             "-c".into(),
             "cat input; printf ok > output; if cat \"$1\" >/dev/null 2>&1; then exit 77; fi; touch \"$2\" 2>/dev/null && exit 78; exit 0".into(),
             "landlock-test".into(),
             outside_read.display().to_string(),
             outside_write.display().to_string(),
-        ],
-        root: root.into(),
-        cwd: None,
-        environment: vec![("PATH".into(), "/malicious/path".into())],
-        stdin: StdinPolicy::Null,
-        timeout: Duration::from_secs(5),
-        capture_limit: 4096,
-        event_chunk_bytes: 1024,
-        overflow: OverflowPolicy::Truncate,
-        provenance: ExecutionProvenance::default(),
-        sandbox: SandboxRequest::Required {
-            profile: "workspace_rw".into(),
-        },
-        resources: ResourceSetupRequest {
-            memory_bytes: Requirement::NotRequested,
-            cpu_millis: Requirement::NotRequested,
-            pids: Requirement::NotRequested,
-        },
-    }
+        ], root);
+    request.set_environment(vec![("PATH".into(), "/malicious/path".into())]);
+    request.set_stdin_policy(StdinPolicy::Null);
+    request.set_timeout(Duration::from_secs(5));
+    request.set_output_policy(4096, 1024, OverflowPolicy::Truncate);
+    request.set_provenance(ExecutionProvenance::default());
+    request.set_sandbox_request(SandboxRequest::Required {
+        profile: "workspace_rw".into(),
+    });
+    request.set_resource_setup_request(ResourceSetupRequest {
+        memory_bytes: Requirement::NotRequested,
+        cpu_millis: Requirement::NotRequested,
+        pids: Requirement::NotRequested,
+    });
+    request
 }
 
 #[cfg(target_os = "linux")]
@@ -132,10 +127,10 @@ async fn helper_trust_checks_reject_missing_wrong_and_symlinked_helpers() {
     assert!(matches!(outcome.sandbox, SandboxOutcome::NotApplied { .. }));
 
     let mut best_effort_request = request(&root, &root.join("unused"), &root.join("unused2"));
-    best_effort_request.sandbox = SandboxRequest::BestEffort {
+    best_effort_request.set_sandbox_request(SandboxRequest::BestEffort {
         profile: "workspace_rw".into(),
-    };
-    best_effort_request.argv = vec!["/bin/true".into()];
+    });
+    best_effort_request.set_argv(vec!["/bin/true".into()]);
     let runner = LocalProcessRunner::new(TrustedLandlockSetup::new(temp.path().join("missing")));
     let (tx, _rx) = mpsc::channel(8);
     let result = runner
@@ -150,10 +145,10 @@ async fn helper_trust_checks_reject_missing_wrong_and_symlinked_helpers() {
 
     let marker = root.join("required-must-not-run");
     let mut required_request = request(&root, &root.join("unused"), &root.join("unused2"));
-    required_request.argv = vec![
+    required_request.set_argv(vec![
         "/usr/bin/touch".into(),
         marker.to_string_lossy().into_owned(),
-    ];
+    ]);
     let runner = LocalProcessRunner::new(TrustedLandlockSetup::new(temp.path().join("missing")));
     let (tx, _rx) = mpsc::channel(8);
     assert!(
@@ -182,7 +177,7 @@ async fn workspace_symlink_cannot_read_outside_workspace() {
     fs::set_permissions(helper_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
     let mut request = request(&root, &secret, &temp.path().join("unused"));
-    request.argv = vec!["/bin/cat".into(), "escape".into()];
+    request.set_argv(vec!["/bin/cat".into(), "escape".into()]);
     let runner = LocalProcessRunner::new(TrustedLandlockSetup::new(helper));
     let (tx, _rx) = mpsc::channel(8);
     let result = runner
@@ -210,7 +205,7 @@ async fn cwd_symlink_outside_workspace_is_rejected_before_launch() {
     fs::create_dir(&outside).unwrap();
     symlink(&outside, root.join("escape")).unwrap();
     let mut request = request(&root, &outside.join("secret"), &outside.join("write"));
-    request.cwd = Some(eggwork_core::RelativePath::new("escape").unwrap());
+    request.set_working_directory(Some(eggwork_core::RelativePath::new("escape").unwrap()));
     let helper_dir = tempfile::tempdir().unwrap();
     let helper = helper_dir.path().join("eggwork-sandbox-helper");
     fs::copy(env!("CARGO_BIN_EXE_eggwork-sandbox-helper"), &helper).unwrap();
@@ -247,9 +242,9 @@ async fn sandbox_timeout_and_cancellation_reap_the_helper_process_group() {
     assert!(capabilities.contains(&"resources.cgroups-v2.cpu".into()));
     assert!(capabilities.contains(&"resources.cgroups-v2.pids".into()));
     let mut timed_request = request(&root, &root.join("unused"), &root.join("unused2"));
-    timed_request.resources.cpu_millis = Requirement::Required(1000);
-    timed_request.argv = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
-    timed_request.timeout = Duration::from_millis(100);
+    timed_request.resource_setup_request_mut().cpu_millis = Requirement::Required(1000);
+    timed_request.set_argv(vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()]);
+    timed_request.set_timeout(Duration::from_millis(100));
     let (tx, _rx) = mpsc::channel(8);
     let timed = runner
         .run(timed_request, CancellationToken::new(), tx)
@@ -261,12 +256,12 @@ async fn sandbox_timeout_and_cancellation_reap_the_helper_process_group() {
     );
 
     let mut cancel_request = request(&root, &root.join("unused"), &root.join("unused2"));
-    cancel_request.resources.cpu_millis = Requirement::Required(1000);
-    cancel_request.argv = vec![
+    cancel_request.resource_setup_request_mut().cpu_millis = Requirement::Required(1000);
+    cancel_request.set_argv(vec![
         "/bin/sh".into(),
         "-c".into(),
         "sleep 30 & echo $! > child-pid; wait".into(),
-    ];
+    ]);
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
     let task_runner = runner;
@@ -320,13 +315,13 @@ async fn required_memory_limit_is_enforced_and_classified() {
     fs::set_permissions(helper_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
     let mut request = request(&root, &root.join("unused"), &root.join("unused2"));
-    request.sandbox = SandboxRequest::None;
-    request.resources.memory_bytes = Requirement::Required(16 * 1024 * 1024);
-    request.argv = vec![
+    request.set_sandbox_request(SandboxRequest::None);
+    request.resource_setup_request_mut().memory_bytes = Requirement::Required(16 * 1024 * 1024);
+    request.set_argv(vec![
         "/usr/bin/python3".into(),
         "-c".into(),
         "x=bytearray(64*1024*1024); [x.__setitem__(i,1) for i in range(0,len(x),4096)]".into(),
-    ];
+    ]);
     let runner = LocalProcessRunner::new(TrustedLandlockSetup::new(helper));
     let (tx, _rx) = mpsc::channel(8);
     let result = runner
@@ -358,13 +353,13 @@ async fn required_pid_limit_is_enforced_and_classified() {
     fs::set_permissions(helper_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
     let mut request = request(&root, &root.join("unused"), &root.join("unused2"));
-    request.sandbox = SandboxRequest::None;
-    request.resources.pids = Requirement::Required(12);
-    request.argv = vec![
+    request.set_sandbox_request(SandboxRequest::None);
+    request.resource_setup_request_mut().pids = Requirement::Required(12);
+    request.set_argv(vec![
         "/usr/bin/python3".into(),
         "-c".into(),
         "import os,time; kids=[]\nfor _ in range(64):\n try: pid=os.fork()\n except OSError: break\n if pid==0: time.sleep(0.2); os._exit(0)\n kids.append(pid)\nfor pid in kids: os.waitpid(pid,0)".into(),
-    ];
+    ]);
     let runner = LocalProcessRunner::new(TrustedLandlockSetup::new(helper));
     let (tx, _rx) = mpsc::channel(8);
     let result = runner
@@ -396,9 +391,13 @@ async fn required_cpu_quota_is_verified_before_target_start() {
     fs::set_permissions(helper_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
     let mut request = request(&root, &root.join("unused"), &root.join("unused2"));
-    request.sandbox = SandboxRequest::None;
-    request.resources.cpu_millis = Requirement::Required(500);
-    request.argv = vec!["/bin/sh".into(), "-c".into(), "printf quota-ok".into()];
+    request.set_sandbox_request(SandboxRequest::None);
+    request.resource_setup_request_mut().cpu_millis = Requirement::Required(500);
+    request.set_argv(vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf quota-ok".into(),
+    ]);
     let runner = LocalProcessRunner::new(TrustedLandlockSetup::new(helper));
     let (tx, _rx) = mpsc::channel(8);
     let result = runner
@@ -439,17 +438,17 @@ async fn concurrent_resource_scopes_keep_pid_limits_isolated() {
         &low_root.join("unused"),
         &low_root.join("unused2"),
     );
-    low.sandbox = SandboxRequest::None;
-    low.resources.pids = Requirement::Required(6);
-    low.argv = argv.clone();
+    low.set_sandbox_request(SandboxRequest::None);
+    low.resource_setup_request_mut().pids = Requirement::Required(6);
+    low.set_argv(argv.clone());
     let mut high = request(
         &high_root,
         &high_root.join("unused"),
         &high_root.join("unused2"),
     );
-    high.sandbox = SandboxRequest::None;
-    high.resources.pids = Requirement::Required(32);
-    high.argv = argv;
+    high.set_sandbox_request(SandboxRequest::None);
+    high.resource_setup_request_mut().pids = Requirement::Required(32);
+    high.set_argv(argv);
     let (low_tx, _low_rx) = mpsc::channel(8);
     let (high_tx, _high_rx) = mpsc::channel(8);
     let (low_result, high_result) = tokio::join!(

@@ -2167,8 +2167,8 @@ async fn run_execution(
     let (output_tx, mut output_rx) = mpsc::channel(RUNNER_CHANNEL_CAPACITY);
     let runner = state.runner.clone();
     let cancellation = record.cancellation.clone();
-    let sandbox_request = request.sandbox.clone();
-    let resource_request = request.resources.clone();
+    let sandbox_request = request.sandbox_request().clone();
+    let resource_request = request.resource_setup_request().clone();
     let mut runner_task =
         tokio::spawn(async move { runner.run(request, cancellation, output_tx).await });
     let mut result = None;

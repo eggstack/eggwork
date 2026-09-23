@@ -7,6 +7,6 @@ Crate ownership:
 - `eggwork-core`: transport-neutral identities, requests, results, validation, and events.
 - `eggwork-runner`: the one process lifecycle owner; depends on core.
 - `eggwork-server`: node service and admission; depends on core and runner.
-- `eggwork-client`: explicit fixed-target client; depends on core.
+- `eggwork-client`: explicit fixed-target client; depends on core. Its optional `eggress-route` feature adds an in-process outbound route without changing the target identity.
 
 The dependency graph is intentionally one-way. Details are in [domain](domain.md), [execution ownership](execution-ownership.md), and [protocol intent](protocol.md).
