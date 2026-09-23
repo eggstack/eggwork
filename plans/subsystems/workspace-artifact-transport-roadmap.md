@@ -40,7 +40,7 @@ It does not own Git repository/worktree semantics, CodeGG branch integration, sc
 
 Class: infrastructure/capability
 
-Status: blocked on Control Plane M002 closure
+Status: active
 
 Implementation plan:
 

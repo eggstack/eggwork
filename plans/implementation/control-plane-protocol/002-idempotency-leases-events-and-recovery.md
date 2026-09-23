@@ -1,6 +1,8 @@
 # Control Plane M002 — Idempotency, Leases, Resumable Events, and Recovery
 
-Status: active
+Status: closed
+
+Closure evidence: `plans/closure/control-plane-protocol/002-status.md`
 
 Dependency evidence: `plans/closure/control-plane-protocol/001-status.md`
 

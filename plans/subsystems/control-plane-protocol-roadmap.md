@@ -76,7 +76,7 @@ Exit conditions:
 
 Class: invariant/capability
 
-Status: active
+Status: closed
 
 Implementation plan:
 
@@ -100,7 +100,7 @@ Exit conditions:
 
 Class: infrastructure/polish
 
-Status: blocked on M002 closure and current public Eggfetch/Eggress dial compatibility
+Status: blocked on current public Eggfetch/Eggress dial compatibility
 
 Objective:
 

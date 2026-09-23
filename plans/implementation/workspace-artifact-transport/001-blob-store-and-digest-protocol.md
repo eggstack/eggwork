@@ -1,6 +1,8 @@
 # Workspace and Artifact Transport M001 — Blob Store and Digest Protocol
 
-Status: blocked on Control Plane M002 closure
+Status: active
+
+Dependency evidence: `plans/closure/control-plane-protocol/002-status.md`
 
 Source roadmap:
 
