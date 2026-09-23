@@ -100,7 +100,16 @@ Exit conditions:
 
 Class: infrastructure/polish
 
-Status: blocked on current public Eggfetch/Eggress dial compatibility
+Status: ready
+
+Implementation plan:
+
+- `plans/implementation/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md`
+
+Interface review:
+
+- Eggfetch now exposes the public advanced-routing `Dialer`/`ClientBuilder::dialer` raw-stream seam.
+- Eggress exposes listener-free `OutboundConnector::connect_tcp_detailed` with typed failure facts.
 
 Objective:
 
