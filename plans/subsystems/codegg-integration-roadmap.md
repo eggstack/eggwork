@@ -11,7 +11,7 @@ Canonical authority:
 
 Planning baseline reviewed:
 
-- CodeGG commit `2f7d84f88070eee2a4fb9f70b6d7d5d10b01048d`
+- CodeGG commit `7ee0a5c6abcf59370877cfb4368bc5d28eed28f9`
 
 Implementation agents MUST re-check the current CodeGG head before coding.
 
@@ -58,7 +58,7 @@ Eggwork should align with these seams rather than create a second CodeGG daemon 
 
 Class: capability/invariant
 
-Status: ready; execution is sequenced after Operations M002
+Status: ready; independent of Operations M002
 
 Implementation plan:
 
