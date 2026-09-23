@@ -113,7 +113,7 @@ Exit conditions:
 
 Class: invariant/polish
 
-Status: blocked on M001-M003
+Status: blocked on Foundation M003, Control Plane M003, and Operations M002 closure
 
 Objective:
 
