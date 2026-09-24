@@ -6,7 +6,7 @@ Implementation plan: `plans/implementation/security-isolation-resource-remote-ad
 
 Corrective authority: `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md`
 
-Reviewed implementation commit: `a060482` (baseline `d192a7d0dfa456693b278028d1f9288f7bea7a04`).
+Reviewed implementation commit: `6cc8134` (baseline `d192a7d0dfa456693b278028d1f9288f7bea7a04`).
 
 Downstream evidence that exposed the gap: CodeGG corrective closure `d3d390d56620fb5c6f755a5dfb0987e0a1c01651`.
 
