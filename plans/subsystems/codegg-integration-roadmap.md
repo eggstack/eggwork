@@ -11,7 +11,9 @@ Canonical authority:
 
 Planning baseline reviewed:
 
-- CodeGG commit `7ee0a5c6abcf59370877cfb4368bc5d28eed28f9`
+- CodeGG planning head `5f4532659dbf0df2cd9f2b3bdb024217d2ea7868`
+- CodeGG M001 implementation `67f8f3d33651846bbdbd3e4a3bc239e50a0237a6`
+- CodeGG historical M001 closure `338074062e3e8748ba83708ea3c2a7e33de12f74`
 
 Implementation agents MUST re-check the current CodeGG head before coding.
 
@@ -58,19 +60,22 @@ Eggwork should align with these seams rather than create a second CodeGG daemon 
 
 Class: capability/invariant
 
-Status: external implementation registered in CodeGG; Eggwork contract remains reference authority
+Status: downstream M001 implemented/closed historically; CodeGG post-closure corrective C001 is ready and controls current qualification
 
 Eggwork integration-contract plan:
 
 - `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md`
 
-Controlling downstream implementation handoff:
+Controlling downstream records in CodeGG:
 
-- `dbowm91/codegg@1093ad0e3285e8ee66684e8a7f3401a200c0596e`
-- `plans/subsystems/eggwork-fixed-target-remote-execution-roadmap.md`
-- `plans/implementation/eggwork-fixed-target-remote-execution/001-fixed-target-finite-job-executor.md`
+- M001 implementation: `67f8f3d33651846bbdbd3e4a3bc239e50a0237a6`
+- historical closure: `338074062e3e8748ba83708ea3c2a7e33de12f74`
+- current planning head: `5f4532659dbf0df2cd9f2b3bdb024217d2ea7868`
+- roadmap: `plans/subsystems/eggwork-fixed-target-remote-execution-roadmap.md`
+- post-closure corrective: `plans/subsystems/eggwork-fixed-target-remote-execution-post-closure-corrective-addendum.md`
+- corrective C001: `plans/implementation/eggwork-fixed-target-remote-execution-corrective/001-lease-identity-and-live-node-qualification.md`
 
-Actual CodeGG code/closure work MUST follow the CodeGG plan above; this Eggwork document defines the substrate-side contract only.
+Post-closure review found that CodeGG M001 generated a different persisted lease token from the live Eggwork handle and did not qualify the production NodeClient against a real local mTLS Eggwork server. Eggwork's lease-fencing behavior is the intended contract; the fix belongs downstream in CodeGG. This Eggwork document remains substrate-side reference authority only.
 
 Objective:
 
@@ -89,7 +94,7 @@ Exit conditions:
 
 Class: infrastructure/polish
 
-Status: blocked on M001
+Status: blocked on downstream CodeGG corrective C001
 
 Objective:
 
@@ -99,7 +104,7 @@ Expose node capability/status facts to CodeGG's own configuration/selection poli
 
 Class: capability/infrastructure
 
-Status: blocked on M001 and a separately reviewed Eggwork optimized materializer interface
+Status: blocked on downstream CodeGG corrective C001 and a separately reviewed Eggwork optimized materializer interface
 
 Objective:
 
@@ -109,7 +114,7 @@ Reduce workspace transfer using repository commit/bundle/object/patch evidence w
 
 Class: capability
 
-Status: blocked on M001-M003 and stable CodeGG AgentRun worker-entry contract
+Status: blocked on downstream corrective C001, M002-M003, and stable CodeGG AgentRun worker-entry contract
 
 Objective:
 
