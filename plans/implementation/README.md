@@ -21,6 +21,7 @@ Foundation M001-M003, Control Plane M001-M003, Workspace M001-M003, Security M00
 The registry authorizes these Eggwork-local handoffs independently:
 
 - `operations-distribution/002-eggup-deployment-and-service-integration.md` — re-opened after Eggup M007 supplied the required post-commit rollback seam.
+- `security-isolation-resource-remote-admission-corrective/001-remote-enforcement-admission-and-capability-truthfulness.md` — expose runtime-qualified isolation/resource controls through remote execution and unify capability advertisement.
 
 The `foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md` handoff has closed; closure evidence lives in `plans/closure/foundation-execution-core-ci-corrective/001-status.md`.
 
