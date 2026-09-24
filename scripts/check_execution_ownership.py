@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -142,6 +144,11 @@ def crate_for_source(path: Path) -> str | None:
     return None
 
 
+def scan_file_for_spawns(path: Path) -> list[str]:
+    """Run the per-file spawn pattern scan used by the production scanner."""
+    return process_spawn_patterns(path.read_text(encoding="utf-8"))
+
+
 def scan_sources() -> tuple[list[str], dict[str, int]]:
     errors: list[str] = []
     approved_hits: dict[str, int] = {}
@@ -149,7 +156,7 @@ def scan_sources() -> tuple[list[str], dict[str, int]]:
         crate = crate_for_source(path)
         if crate is None:
             continue
-        hits = process_spawn_patterns(path.read_text(encoding="utf-8"))
+        hits = scan_file_for_spawns(path)
         if not hits:
             continue
         if crate in APPROVED_PROCESS_OWNERS:
@@ -163,7 +170,7 @@ def scan_sources() -> tuple[list[str], dict[str, int]]:
 
 def check_dependencies() -> list[str]:
     result = subprocess.run(
-        ["rtk", "cargo", "metadata", "--no-deps", "--format-version", "1"],
+        ["cargo", "metadata", "--no-deps", "--format-version", "1"],
         cwd=ROOT,
         check=True,
         capture_output=True,
@@ -196,9 +203,60 @@ def check_dependencies() -> list[str]:
     return errors
 
 
-def main() -> int:
+def prove_negative_exit() -> int:
+    """Deterministically prove the guard exits nonzero on a forbidden production spawn.
+
+    Writes a synthetic Rust source file containing a forbidden process spawn into a
+    temporary directory outside ``crates/`` (so the production scanner does not pick
+    it up) and runs the same per-file scanner used against production sources. A
+    regression that drops the spawn pattern would be detected here; CI runs this
+    alongside the normal guard so the failure path is exercised on every push.
+    """
+    synthetic_source = (
+        "use std::process::Command;\n"
+        "fn forbidden() { let _child = Command::new(\"tool\").spawn(); }\n"
+    )
+    with tempfile.TemporaryDirectory(prefix="eggwork-ownership-proof-") as tmp:
+        probe = Path(tmp) / "forbidden.rs"
+        probe.write_text(synthetic_source, encoding="utf-8")
+        try:
+            hits = scan_file_for_spawns(probe)
+        except OSError as error:
+            print(f"execution ownership guard failed: {error}", file=sys.stderr)
+            return 1
+    if not hits:
+        print(
+            "execution ownership guard failed: scanner regression — "
+            "synthetic forbidden spawn was not detected",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "execution ownership guard negative-exit proof passed: "
+        f"synthetic forbidden spawn detected ({', '.join(hits)})"
+    )
+    return 0
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Guard Eggwork child-process ownership and crate dependency direction.",
+    )
+    parser.add_argument(
+        "--prove-negative-exit",
+        action="store_true",
+        help="Deterministically exercise the guard's nonzero-exit failure path on a "
+        "synthetic forbidden spawn and exit 0 if detection succeeds.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
         self_test()
+        if args.prove_negative_exit:
+            return prove_negative_exit()
         source_errors, approved_hits = scan_sources()
         errors = source_errors + check_dependencies()
     except (OSError, RuntimeError, subprocess.CalledProcessError, json.JSONDecodeError) as error:

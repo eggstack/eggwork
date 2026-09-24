@@ -11,6 +11,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: execution ownership guard
+        run: python3 scripts/check_execution_ownership.py
+      - name: execution ownership guard negative-exit proof
+        run: python3 scripts/check_execution_ownership.py --prove-negative-exit
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-targets
