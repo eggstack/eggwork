@@ -67,13 +67,13 @@ Current interface review confirms Eggup main contains Unix manager mechanics, a 
 
 Class: infrastructure/capability
 
-Status: blocked on Eggpack ReleaseManifest and build/qualification interfaces
+Status: blocked on Eggpack build/qualification and release-orchestration interfaces
 
 Objective:
 
 Map Eggwork's release target/artifact policy into Eggpack's producer-side contracts, manifests, build/qualification plan, bootstrap installer, and generated release-CI surfaces without recreating producer distribution logic in Eggwork.
 
-Do not write the implementation handoff until Eggpack closes the concrete ReleaseManifest and build/qualification interfaces needed by a consumer repository.
+Eggpack ReleaseManifest M001/M001a is closed. Do not write the implementation handoff until Eggpack closes the concrete build/qualification and downstream release-orchestration interfaces needed by a consumer repository.
 
 ### M004 — Operational and release qualification
 
