@@ -91,7 +91,7 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 | Work | Status | Blocker / rationale |
 |---|---|---|
 | Security M004 adversarial + cross-platform closure | blocked | wait for Foundation corrective C001 + Operations M002 so final security evidence includes enforced ownership CI and deployment/update surfaces |
-| Operations M003 Eggpack producer packaging | blocked | Eggpack ReleaseManifest M001 and build/qualification interfaces are not yet closed/concrete |
+| Operations M003 Eggpack producer packaging | blocked | Eggpack ReleaseManifest M001/M001a is closed; Build/Qualification M001 and downstream release-orchestration interfaces are not yet closed/concrete |
 | Operations M004 operational/release qualification | blocked | Operations M002 + M003 |
 | Operations M005 reverse-connect relay | deferred | no immediate product need; stable identity/lease semantics already exist |
 | Operations M006 PTY extension | deferred | requires a separate interactive ownership/attach design |
@@ -114,7 +114,7 @@ Foundation corrective C001 --+
 Control M003 [closed] --------+--> Security M004 [blocked until C001 + Operations M002 close]
 Operations M002 --------------+
 
-Eggpack ReleaseManifest/build interfaces ---> Operations M003 [blocked]
+Eggpack build/qualification + release interfaces -> Operations M003 [blocked]
 Operations M002 + Operations M003 ----------> Operations M004
 ```
 
