@@ -143,3 +143,15 @@ Subsystem closure requires:
 ## 6. Deferred work
 
 PTY/interactivity is not part of this subsystem's initial closure. It belongs to later operations/distribution work and may reuse the same lifecycle principles.
+
+
+## 7. Post-closure corrective
+
+Foundation M003 remains historically closed, but a later review found that its execution-ownership guard is not run by ordinary GitHub Actions and currently invokes undeclared local wrapper `rtk` for `cargo metadata`.
+
+Current corrective authority:
+
+- `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md`
+- C001: `plans/implementation/foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md` — ready.
+
+Until C001 closes, treat CI enforcement of the ownership invariant as corrective-required rather than rewriting the M003 closure.
