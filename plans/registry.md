@@ -33,9 +33,9 @@ Founding ADRs:
 
 ## Current Eggwork implementation baseline
 
-Latest Eggwork implementation/closure head reviewed for this planning correction:
+Latest Eggwork implementation/closure head reviewed for this planning alignment:
 
-- `e7d9a8e5a9b66f7c68ff4236c9a074ba81e035d7` — Operations M002 blocker record after Foundation/Control Plane M003 closure.
+- `128f808c62f176d414dd18a705773e45f5e2891a` — Foundation execution-ownership CI corrective C001 closure.
 
 Implemented and closed/qualified at that baseline:
 
@@ -56,7 +56,7 @@ The repository is no longer planning-only.
 | Workspace / artifacts | closed | M001-M003 complete | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | qualified | M004 waits on Operations M002; ownership CI corrective now contributes enforced evidence | `plans/subsystems/security-isolation-resource-roadmap.md` |
 | Operations / distribution | ready | M002 re-opened on qualified Eggup M007 post-commit rollback seam; producer packaging remains separate M003 | `plans/subsystems/operations-distribution-roadmap.md` |
-| CodeGG integration | external registered | substrate contract retained here; controlling M001 implementation handoff is registered in `dbowm91/codegg` | `plans/subsystems/codegg-integration-roadmap.md` |
+| CodeGG integration | external corrective required | CodeGG M001 implementation/closure is historical; downstream corrective C001 lease identity + live-node qualification is ready and controls current qualification | `plans/subsystems/codegg-integration-roadmap.md` |
 
 ## Dependency-ready implementation plans
 
@@ -65,7 +65,7 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
 | Operations | M002 Eggup deployment/service integration | **ready** | `plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md` | Eggup M007 closure `2cab1f97` supplies `commit_with_post_commit` and rollback-on-health-failure semantics; historical blocker remains in `plans/closure/operations-distribution/002-status.md`. |
-| CodeGG downstream | M001 fixed-target finite-job executor | **registered in CodeGG** | `dbowm91/codegg: plans/implementation/eggwork-fixed-target-remote-execution/001-fixed-target-finite-job-executor.md` | Registered by CodeGG planning commit `1093ad0e3285e8ee66684e8a7f3401a200c0596e`; implement/close in CodeGG, not Eggwork. |
+| CodeGG downstream corrective | C001 lease identity + live-node qualification | **registered/ready in CodeGG** | `dbowm91/codegg: plans/implementation/eggwork-fixed-target-remote-execution-corrective/001-lease-identity-and-live-node-qualification.md` | M001 implementation `67f8f3d3` and historical closure `33807406` remain immutable. CodeGG planning head `5f453265` gates M002/M003 until exact lease persistence and real NodeClient→mTLS→eggworkd qualification close. |
 
 ## Closed and superseded implementation plans
 
@@ -96,9 +96,9 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 | Operations M004 operational/release qualification | blocked | Operations M002 + M003 |
 | Operations M005 reverse-connect relay | deferred | no immediate product need; stable identity/lease semantics already exist |
 | Operations M006 PTY extension | deferred | requires a separate interactive ownership/attach design |
-| CodeGG M002 capability/target projection | blocked | CodeGG M001 |
-| CodeGG M003 Git-aware materializer | deferred | first remote executor + optimized Eggwork materializer contract |
-| CodeGG M004 remote AgentRun worker | deferred | CodeGG M001-M003 + stable worker-entry contract |
+| CodeGG M002 capability/target projection | blocked | downstream CodeGG corrective C001 |
+| CodeGG M003 Git-aware materializer | deferred | downstream CodeGG corrective C001 + optimized Eggwork materializer contract |
+| CodeGG M004 remote AgentRun worker | deferred | downstream corrective C001 + CodeGG M002-M003 + stable worker-entry contract |
 
 Do not author Operations M003 merely to increase plan count. Its producer inputs are still moving in Eggpack.
 
@@ -109,7 +109,9 @@ Foundation M003 [closed] --+--> Foundation corrective C001 [CLOSED]
 Control Plane M003 [closed]
 Operations M001 [closed] + Eggup M007 ------> Operations M002 [READY]
 
-Eggwork Phases 0-5 [closed/qualified] ------> CodeGG M001 [REGISTERED/READY IN CODEGG]
+Eggwork Phases 0-5 [closed/qualified] ------> CodeGG M001 [IMPLEMENTED/HISTORICALLY CLOSED]
+                                                   |
+                                                   +--> CodeGG C001 lease/live-node corrective [READY]
 
 Control M003 [closed] --------+--> Security M004 [blocked until Operations M002 closes]
 Operations M002 --------------+   (C001 contributes enforced ownership-CI evidence)
@@ -126,7 +128,7 @@ These are reviewed research baselines, not permanent dependency pins.
 
 | Project | Reviewed baseline | Current relevant state |
 |---|---|---|
-| CodeGG | `e508de52083a30a1b234f5f9b619910cad6792d4` | typed `JobExecutor`/`JobExecutionContext`, durable attempt executor provenance, and scheduler ownership remain available; Eggwork M001 handoff registered at CodeGG planning commit `1093ad0e...` |
+| CodeGG | planning `5f4532659dbf0df2cd9f2b3bdb024217d2ea7868`; M001 impl `67f8f3d33651846bbdbd3e4a3bc239e50a0237a6`; historical closure `338074062e3e8748ba83708ea3c2a7e33de12f74` | fixed-target executor landed, but downstream corrective C001 now controls current qualification because persisted/live lease tokens diverged and the production mTLS node boundary lacked real-node qualification |
 | Eggfetch | `b90b32541bd5dac6c5256feed141cadfd124debe` / `eggfetch-core 0.2.0` | public advanced-routing `Dialer` and `ClientBuilder::dialer` preserve Eggfetch-owned HTTP/TLS |
 | Eggress | `e141d4082d211cc5f122414c74617fde846ffbae` / 1.0.8 line | listener-free `OutboundConnector::connect_tcp_detailed` returns a Tokio stream and typed route failure facts |
 | EggServe | `dc8ce30e2c9f0a95f73682cea07163e8076995bd` / 0.2.x line | server/TLS service baseline; re-check exact published patch before dependency changes |
@@ -146,6 +148,7 @@ Implementation agents MUST re-check current APIs at execution time.
 6. **Final security sweep ordering:** M004 now waits for the newly ready route/ownership/deployment surfaces instead of incorrectly claiming only M001-M003 prerequisites.
 7. **CodeGG execution authority:** the downstream implementation handoff is now registered in the CodeGG repository; Eggwork's M001 document is reference-contract material only.
 8. **Foundation M003 CI enforcement defect:** registered as corrective C001 because the guard used undeclared `rtk` and was not invoked by ordinary GitHub Actions; C001 is now closed (`plans/closure/foundation-execution-core-ci-corrective/001-status.md`) — the guard calls `cargo metadata` directly, runs as a required GitHub Actions step on push/PR, and a deterministic `--prove-negative-exit` mode exercises the failure path on every CI run.
+9. **CodeGG M001 post-closure correctness:** M001 landed downstream, but later review found CodeGG persisted a different random lease token from the live Eggwork handle and qualified restart behavior only through scripted clients. The fix is correctly owned by CodeGG C001; Eggwork lease fencing remains unchanged.
 
 ## Remaining interface gates
 
