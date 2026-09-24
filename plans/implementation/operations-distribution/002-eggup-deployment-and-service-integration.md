@@ -1,8 +1,10 @@
 # Operations M002 — Eggup Deployment and Service Integration
 
-Status: blocked
+Status: ready for handoff
 
-Blocker: the Eggup transaction contract at the reviewed implementation baseline does not retain backups or expose post-commit rollback. M002 requires a bounded health/version check after service restart followed by Eggup-owned rollback on failure. Eggwork must not implement filesystem rollback itself because that would cross the stated transaction ownership boundary. See `plans/closure/operations-distribution/002-status.md` for evidence and unblock conditions.
+Previously blocked: Eggup revision `66813b3b94de3a9b2f270e0000dc339ef6f0b478` did not retain backups through post-start health validation. That blocker is historical and remains recorded in `plans/closure/operations-distribution/002-status.md`.
+
+Unblock evidence: Eggup Verified Update Core M007 implemented `ValidatedTransaction::commit_with_post_commit` with `PostCommitFailurePolicy::{KeepInstalled, RollBack}` at implementation `8d5fc12f7224145285f22d0975a7bb91e1e363ea` and closed/qualified it at `2cab1f97ef30fa347c2030da321462459672c521`. The callback executes while the mutation lock and backup set remain owned, which satisfies this milestone's required bounded post-start health check/rollback boundary.
 
 Source roadmap:
 
@@ -20,13 +22,12 @@ Boundary references:
 
 Current upstream baselines reviewed:
 
-- Eggup `66acd739f792437cb9fa1701b8fa456c4ba4c403`;
+- Eggup M007 closure head `2cab1f97ef30fa347c2030da321462459672c521`;
+- Eggup M007 implementation `8d5fc12f7224145285f22d0975a7bb91e1e363ea`;
 - Eggup service M004 closure baseline `d894ae63a8963914e545a6d93dc3db92b998138c`;
-- Eggpack `c5fd88f5a44a17104f00f93c9888b568272a01ea`.
+- Eggpack current reviewed line after ReleaseManifest M001/M001a closure.
 
-Implementation recheck found the Eggup main revision currently available at `66813b3b94de3a9b2f270e0000dc339ef6f0b478`. Its manager adapters are present, but its transaction API does not provide the post-commit rollback required by this plan. Implementation stops at this boundary.
-
-The current Eggup source includes Unix manager mechanics and a native Windows SCM adapter. The earlier "no platform service-manager adapters" blocker is obsolete; the missing post-commit rollback contract is the active blocker.
+The current Eggup source includes Unix manager mechanics, a native Windows SCM adapter, and the post-commit rollback seam required by this plan. Implementation must re-check the exact API at handoff and use a published release when available or an exact immutable Git revision when publication lags.
 
 ## 1. Objective
 
@@ -109,7 +110,7 @@ Implement a thin orchestration layer:
 6. perform Eggup transactional replacement;
 7. start/restart owned service;
 8. run bounded post-update health/version check;
-9. commit success or invoke Eggup rollback according to the transaction contract;
+9. invoke Eggup's post-commit check boundary so the bounded health/version probe runs while backups remain retained; select `RollBack` on failure unless an explicitly documented operator policy chooses `KeepInstalled`;
 10. preserve/inspect execution recovery state after restart.
 
 Eggup owns filesystem transaction/rollback mechanics. Eggwork owns the decision that remote execution should be drained before replacement.
