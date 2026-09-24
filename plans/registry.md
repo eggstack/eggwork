@@ -98,7 +98,8 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 | Operations M004 operational/release qualification | blocked | Operations M002 + M003 |
 | Operations M005 reverse-connect relay | deferred | no immediate product need; stable identity/lease semantics already exist |
 | Operations M006 PTY extension | deferred | requires a separate interactive ownership/attach design |
-| CodeGG M002 capability/target projection | eligible for planning downstream | CodeGG corrective C001 is closed; strict-isolation live requalification has an interface/operational dependency on Eggwork Security remote-admission C001 |
+| CodeGG M002 capability/target projection | ready downstream | CodeGG plan `002-target-capability-projection-and-operator-policy.md` is registered/ready and may proceed against this repo's written capability contract |
+| CodeGG M002a restricted-spec live requalification | blocked downstream | requires CodeGG M002 closure + Eggwork Security remote-admission C001 closure; this is the gate for claiming real required-Landlock execution through CodeGG |
 | CodeGG M003 Git-aware materializer | deferred | optimized Eggwork materializer contract; downstream CodeGG corrective C001 is closed |
 | CodeGG M004 remote AgentRun worker | deferred | CodeGG M002-M003 + stable worker-entry contract |
 
