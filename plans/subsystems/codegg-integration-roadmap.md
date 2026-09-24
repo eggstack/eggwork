@@ -11,7 +11,7 @@ Canonical authority:
 
 Planning baseline reviewed:
 
-- CodeGG planning head `5f4532659dbf0df2cd9f2b3bdb024217d2ea7868`
+- CodeGG current reviewed head `d3d390d56620fb5c6f755a5dfb0987e0a1c01651`
 - CodeGG M001 implementation `67f8f3d33651846bbdbd3e4a3bc239e50a0237a6`
 - CodeGG historical M001 closure `338074062e3e8748ba83708ea3c2a7e33de12f74`
 
@@ -60,7 +60,7 @@ Eggwork should align with these seams rather than create a second CodeGG daemon 
 
 Class: capability/invariant
 
-Status: Eggwork reference contract closed; downstream CodeGG corrective C001 is ready and controls current downstream qualification
+Status: Eggwork reference contract closed; downstream CodeGG M001 + corrective C001 are closed
 
 Eggwork integration-contract plan:
 
@@ -75,7 +75,7 @@ Controlling downstream records in CodeGG:
 - post-closure corrective: `plans/subsystems/eggwork-fixed-target-remote-execution-post-closure-corrective-addendum.md`
 - corrective C001: `plans/implementation/eggwork-fixed-target-remote-execution-corrective/001-lease-identity-and-live-node-qualification.md`
 
-CodeGG corrective C001 closed the lease-identity and real-node mTLS gap. That live qualification then exposed an Eggwork substrate defect: the server currently rejects all remotely requested filesystem isolation even though the runner can enforce Landlock. Eggwork remote-admission corrective C001 now owns that upstream gap. This document remains substrate-side reference authority only. The Eggwork reference-contract milestone itself is closed with contract evidence in `plans/closure/codegg-integration/001-status.md` (reviewed head `4efc91efa53da06663c9bf7d6a948fa240122454`; zero production changes; existing Phases 0-5 closures re-verified). Current downstream qualification is still gated by CodeGG C001; M002/M003/M004 remain blocked.
+CodeGG corrective C001 closed the lease-identity and real-node mTLS gap. That live qualification then exposed an Eggwork substrate defect: the server currently rejects all remotely requested filesystem isolation even though the runner can enforce Landlock. Eggwork remote-admission corrective C001 now owns that upstream gap. This document remains substrate-side reference authority only. The Eggwork reference-contract milestone itself is closed with contract evidence in `plans/closure/codegg-integration/001-status.md` (reviewed head `4efc91efa53da06663c9bf7d6a948fa240122454`; zero production changes; existing Phases 0-5 closures re-verified). Downstream CodeGG C001 is closed. M002 is registered/ready; M002a is the restricted-spec live gate and waits on CodeGG M002 plus Eggwork remote-admission C001. M003/M004 retain their separate blockers.
 
 Objective:
 
