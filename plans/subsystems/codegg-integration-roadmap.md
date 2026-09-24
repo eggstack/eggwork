@@ -94,7 +94,12 @@ Exit conditions:
 
 Class: infrastructure/polish
 
-Status: eligible for planning; strict-isolation live qualification depends on Eggwork remote-admission corrective C001
+Status: downstream M002 ready; M002a restricted-spec live requalification blocked on M002 + Eggwork remote-admission corrective C001
+
+Controlling downstream plans:
+
+- `dbowm91/codegg: plans/implementation/eggwork-fixed-target-remote-execution/002-target-capability-projection-and-operator-policy.md` — ready.
+- `dbowm91/codegg: plans/implementation/eggwork-fixed-target-remote-execution/002a-restricted-spec-live-requalification.md` — blocked on CodeGG M002 + this repo's Security remote-admission C001.
 
 Objective:
 
