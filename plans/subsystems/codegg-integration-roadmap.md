@@ -58,11 +58,19 @@ Eggwork should align with these seams rather than create a second CodeGG daemon 
 
 Class: capability/invariant
 
-Status: ready; independent of Operations M002
+Status: external implementation registered in CodeGG; Eggwork contract remains reference authority
 
-Implementation plan:
+Eggwork integration-contract plan:
 
 - `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md`
+
+Controlling downstream implementation handoff:
+
+- `dbowm91/codegg@1093ad0e3285e8ee66684e8a7f3401a200c0596e`
+- `plans/subsystems/eggwork-fixed-target-remote-execution-roadmap.md`
+- `plans/implementation/eggwork-fixed-target-remote-execution/001-fixed-target-finite-job-executor.md`
+
+Actual CodeGG code/closure work MUST follow the CodeGG plan above; this Eggwork document defines the substrate-side contract only.
 
 Objective:
 
