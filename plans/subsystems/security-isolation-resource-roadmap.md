@@ -1,6 +1,6 @@
 # Security, Isolation, and Resource Enforcement Roadmap
 
-Status: qualified for the Linux systemd user-manager baseline; M004 final adversarial closure awaits current-surface milestones
+Status: qualified for the Linux systemd user-manager baseline; remote-admission corrective C001 ready; M004 awaits C001 + Operations M002
 
 Canonical authority:
 
@@ -109,11 +109,31 @@ Exit conditions:
 - enforcement failures cannot become advisory silently;
 - capability report matches runtime probes.
 
+### C001 — Remote enforcement admission and capability truthfulness
+
+Class: invariant/corrective
+
+Status: ready
+
+Corrective authority:
+
+- `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md`
+
+Implementation plan:
+
+- `plans/implementation/security-isolation-resource-remote-admission-corrective/001-remote-enforcement-admission-and-capability-truthfulness.md`
+
+Objective:
+
+Expose the already-implemented Landlock/resource enforcement path through authenticated remote execution, unify runtime capability advertisement across `/v1/capabilities` and status, and keep unsupported network restrictions fail-closed.
+
+This corrective was discovered by real downstream CodeGG qualification and does not rewrite M002/M003 historical closure evidence.
+
 ### M004 — Security closure and cross-platform adversarial qualification
 
 Class: invariant/polish
 
-Status: blocked on Operations M002 closure; Foundation corrective C001 (portable ownership guard + CI enforcement) and Control Plane M003 are closed
+Status: blocked on remote-admission corrective C001 + Operations M002 closure; Foundation ownership-CI corrective and Control Plane M003 are closed
 
 Objective:
 
