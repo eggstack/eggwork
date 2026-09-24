@@ -1,6 +1,6 @@
 # CodeGG Integration M001 — Fixed-Target Remote Executor
 
-Status: reference contract; downstream implementation is registered in CodeGG at `1093ad0e3285e8ee66684e8a7f3401a200c0596e`
+Status: reference contract; downstream M001 was implemented at `67f8f3d33651846bbdbd3e4a3bc239e50a0237a6` and historically closed at `338074062e3e8748ba83708ea3c2a7e33de12f74`, but current qualification is gated by CodeGG corrective C001 at planning head `5f4532659dbf0df2cd9f2b3bdb024217d2ea7868`
 
 Dependencies closed: Control Plane M002, Workspace/Artifact M003, and Security M003.
 
@@ -44,13 +44,14 @@ This milestone does not define automatic cluster scheduling. Any selection polic
 
 ## 4. Deterministic remote identity
 
-Define a persisted deterministic mapping from CodeGG JobId/AttemptId (and daemon generation where needed) to Eggwork ExecutionId/ExecutionGeneration.
+Define a persisted deterministic mapping from CodeGG JobId/AttemptId (and daemon generation where needed) to Eggwork ExecutionId/ExecutionGeneration, and persist the exact lease token of the accepted live Eggwork handle.
 
 Requirements:
 
 - transport retry reuses the same identity;
 - retry/new CodeGG attempt does not collide with prior execution;
 - identity can be inspected in both systems;
+- the persisted lease token is exactly the token used for the accepted `ExecutionHandle`; never generate a second lease value for durable provenance;
 - no display-title/string concatenation with ambiguous parsing.
 
 ## 5. Workspace transfer
