@@ -20,14 +20,15 @@ Foundation M001-M003, Control Plane M001-M003, Workspace M001-M003, Security M00
 
 The registry authorizes these Eggwork-local handoffs independently:
 
-- `foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md` — post-closure invariant/CI corrective.
 - `operations-distribution/002-eggup-deployment-and-service-integration.md` — re-opened after Eggup M007 supplied the required post-commit rollback seam.
+
+The `foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md` handoff has closed; closure evidence lives in `plans/closure/foundation-execution-core-ci-corrective/001-status.md`.
 
 CodeGG integration implementation authority has moved to the CodeGG repository. Eggwork retains its integration-contract roadmap as architecture/reference material, but downstream CodeGG changes should be planned, implemented, and closed in CodeGG.
 
 ## Blocked later work
 
-- Security M004 final adversarial/cross-platform qualification waits for the ownership CI corrective and Operations M002 so its evidence covers the current execution/deployment surfaces.
+- Security M004 final adversarial/cross-platform qualification now waits only on Operations M002; ownership-CI enforcement is closed and contributes enforced evidence.
 - Operations M003 producer packaging waits on Eggpack's concrete build/qualification interfaces.
 - Operations M004 waits on M002 + M003.
 - Reverse-connect and PTY work remain deferred.

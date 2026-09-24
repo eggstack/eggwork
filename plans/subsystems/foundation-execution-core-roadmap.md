@@ -1,6 +1,6 @@
 # Foundation and Execution Core Roadmap
 
-Status: active roadmap
+Status: roadmap milestones closed; C001 post-closure CI corrective closed
 
 Canonical authority:
 
@@ -147,11 +147,12 @@ PTY/interactivity is not part of this subsystem's initial closure. It belongs to
 
 ## 7. Post-closure corrective
 
-Foundation M003 remains historically closed, but a later review found that its execution-ownership guard is not run by ordinary GitHub Actions and currently invokes undeclared local wrapper `rtk` for `cargo metadata`.
+Foundation M003 remains historically closed, but a later review found that its execution-ownership guard was not run by ordinary GitHub Actions and invoked undeclared local wrapper `rtk` for `cargo metadata`.
 
-Current corrective authority:
+Closed corrective authority:
 
 - `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md`
-- C001: `plans/implementation/foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md` — ready.
+- C001 implementation: `plans/implementation/foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md`
+- C001 closure: `plans/closure/foundation-execution-core-ci-corrective/001-status.md`
 
-Until C001 closes, treat CI enforcement of the ownership invariant as corrective-required rather than rewriting the M003 closure.
+C001 closed: the guard now invokes `cargo metadata` directly, runs as a required GitHub Actions step on push/PR, and a deterministic `--prove-negative-exit` mode exercises the failure path on every CI run. The M003 closure record remains immutable historical evidence; ownership-CI enforcement is now closed rather than corrective-required.

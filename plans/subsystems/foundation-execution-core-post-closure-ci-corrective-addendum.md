@@ -1,6 +1,6 @@
 # Foundation and Execution Core Post-Closure CI Corrective Addendum
 
-Status: active corrective; C001 ready
+Status: corrective closed; C001 closed
 
 Predecessor:
 
@@ -30,11 +30,15 @@ A source guard that only works through an undeclared developer wrapper is not a 
 
 Class: invariant/corrective
 
-Status: ready
+Status: closed
 
 Implementation plan:
 
 - `plans/implementation/foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md`
+
+Closure evidence:
+
+- `plans/closure/foundation-execution-core-ci-corrective/001-status.md`
 
 Objective:
 
@@ -62,4 +66,4 @@ This corrective does not:
 
 ## 5. Downstream relationship
 
-Security M004 should treat C001 closure as part of the current execution-ownership evidence. Operations M002 and CodeGG integration do not need to wait for C001 unless their implementation directly alters process ownership files; merged-head closure verification must still include the guard once C001 lands.
+Security M004 should treat C001 closure as part of the current execution-ownership evidence. C001 is now closed, so Security M004's remaining blocker is Operations M002. Operations M002 and CodeGG integration do not need to wait for C001 unless their implementation directly alters process ownership files; merged-head closure verification must still include the guard.

@@ -39,7 +39,7 @@ Latest Eggwork implementation/closure head reviewed for this planning correction
 
 Implemented and closed/qualified at that baseline:
 
-- Foundation M001-M003, with post-closure CI enforcement corrective C001 now ready;
+- Foundation M001-M003, plus the post-closure CI enforcement corrective C001;
 - Control Plane M001-M003 plus lease-expiry correction;
 - Workspace/Artifact M001-M003;
 - Security M001-M003 plus Landlock `/dev/null` corrective;
@@ -51,10 +51,10 @@ The repository is no longer planning-only.
 
 | Workstream | Status | Current work | Authority |
 |---|---|---|---|
-| Foundation / execution core | corrective required | M001-M003 historically closed; C001 portable ownership-guard CI enforcement ready | `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md` |
+| Foundation / execution core | closed | M001-M003 closed; C001 portable ownership-guard CI enforcement closed | `plans/subsystems/foundation-execution-core-roadmap.md`, `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md` |
 | Control-plane protocol | closed | M001-M003 complete | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | closed | M001-M003 complete | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
-| Security / isolation / resources | qualified | M004 waits on the new Foundation/Control/Operations surfaces | `plans/subsystems/security-isolation-resource-roadmap.md` |
+| Security / isolation / resources | qualified | M004 waits on Operations M002; ownership CI corrective now contributes enforced evidence | `plans/subsystems/security-isolation-resource-roadmap.md` |
 | Operations / distribution | ready | M002 re-opened on qualified Eggup M007 post-commit rollback seam; producer packaging remains separate M003 | `plans/subsystems/operations-distribution-roadmap.md` |
 | CodeGG integration | external registered | substrate contract retained here; controlling M001 implementation handoff is registered in `dbowm91/codegg` | `plans/subsystems/codegg-integration-roadmap.md` |
 
@@ -64,7 +64,6 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Foundation corrective | C001 portable ownership guard + CI enforcement | **ready** | `plans/implementation/foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md` | M003 is historically closed; corrective makes the invariant portable and required in ordinary CI. |
 | Operations | M002 Eggup deployment/service integration | **ready** | `plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md` | Eggup M007 closure `2cab1f97` supplies `commit_with_post_commit` and rollback-on-health-failure semantics; historical blocker remains in `plans/closure/operations-distribution/002-status.md`. |
 | CodeGG downstream | M001 fixed-target finite-job executor | **registered in CodeGG** | `dbowm91/codegg: plans/implementation/eggwork-fixed-target-remote-execution/001-fixed-target-finite-job-executor.md` | Registered by CodeGG planning commit `1093ad0e3285e8ee66684e8a7f3401a200c0596e`; implement/close in CodeGG, not Eggwork. |
 
@@ -74,6 +73,8 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 |---|---|---|---|
 | Foundation | M001 domain/bootstrap | closed | `plans/closure/foundation-execution-core/001-status.md` |
 | Foundation | M002 local runner | closed | `plans/closure/foundation-execution-core/002-status.md` |
+| Foundation | M003 execution-ownership guards + runner API hardening | closed | `plans/closure/foundation-execution-core/003-status.md` |
+| Foundation corrective | C001 portable ownership guard + CI enforcement | closed | `plans/closure/foundation-execution-core-ci-corrective/001-status.md` |
 | Control plane | M001 authenticated execution | closed | `plans/closure/control-plane-protocol/001-status.md` |
 | Control plane | M002 idempotency/leases/events/recovery | closed | `plans/closure/control-plane-protocol/002-status.md` + lease-expiry correction |
 | Workspace | M001 blob store | closed | `plans/closure/workspace-artifact-transport/001-status.md` |
@@ -90,7 +91,7 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Work | Status | Blocker / rationale |
 |---|---|---|
-| Security M004 adversarial + cross-platform closure | blocked | wait for Foundation corrective C001 + Operations M002 so final security evidence includes enforced ownership CI and deployment/update surfaces |
+| Security M004 adversarial + cross-platform closure | blocked | wait for Operations M002 so final security evidence includes the deployment/update surface; ownership-CI enforcement corrective C001 is now closed and contributes enforced evidence |
 | Operations M003 Eggpack producer packaging | blocked | Eggpack ReleaseManifest M001/M001a is closed; Build/Qualification M001 and downstream release-orchestration interfaces are not yet closed/concrete |
 | Operations M004 operational/release qualification | blocked | Operations M002 + M003 |
 | Operations M005 reverse-connect relay | deferred | no immediate product need; stable identity/lease semantics already exist |
@@ -104,15 +105,14 @@ Do not author Operations M003 merely to increase plan count. Its producer inputs
 ## Corrected execution graph
 
 ```text
-Foundation M003 [closed] -------------------> Foundation corrective C001 [READY]
+Foundation M003 [closed] --+--> Foundation corrective C001 [CLOSED]
 Control Plane M003 [closed]
 Operations M001 [closed] + Eggup M007 ------> Operations M002 [READY]
 
 Eggwork Phases 0-5 [closed/qualified] ------> CodeGG M001 [REGISTERED/READY IN CODEGG]
 
-Foundation corrective C001 --+
-Control M003 [closed] --------+--> Security M004 [blocked until C001 + Operations M002 close]
-Operations M002 --------------+
+Control M003 [closed] --------+--> Security M004 [blocked until Operations M002 closes]
+Operations M002 --------------+   (C001 contributes enforced ownership-CI evidence)
 
 Eggpack build/qualification + release interfaces -> Operations M003 [blocked]
 Operations M002 + Operations M003 ----------> Operations M004
@@ -145,7 +145,7 @@ Implementation agents MUST re-check current APIs at execution time.
 5. **Eggup/Eggpack authority mix:** corrected. Eggup owns local deployment/service lifecycle; Eggpack owns producer packaging/release construction/evidence.
 6. **Final security sweep ordering:** M004 now waits for the newly ready route/ownership/deployment surfaces instead of incorrectly claiming only M001-M003 prerequisites.
 7. **CodeGG execution authority:** the downstream implementation handoff is now registered in the CodeGG repository; Eggwork's M001 document is reference-contract material only.
-8. **Foundation M003 CI enforcement defect:** registered as corrective C001 because the guard used undeclared `rtk` and was not invoked by ordinary GitHub Actions.
+8. **Foundation M003 CI enforcement defect:** registered as corrective C001 because the guard used undeclared `rtk` and was not invoked by ordinary GitHub Actions; C001 is now closed (`plans/closure/foundation-execution-core-ci-corrective/001-status.md`) — the guard calls `cargo metadata` directly, runs as a required GitHub Actions step on push/PR, and a deterministic `--prove-negative-exit` mode exercises the failure path on every CI run.
 
 ## Remaining interface gates
 
