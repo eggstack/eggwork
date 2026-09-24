@@ -1,6 +1,6 @@
 # CodeGG Integration M001 — Fixed-Target Remote Executor
 
-Status: ready for external/downstream handoff; independent of Operations M002
+Status: reference contract; downstream implementation is registered in CodeGG at `1093ad0e3285e8ee66684e8a7f3401a200c0596e`
 
 Dependencies closed: Control Plane M002, Workspace/Artifact M003, and Security M003.
 
