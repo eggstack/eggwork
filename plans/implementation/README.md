@@ -14,49 +14,22 @@ Implementation plans are bounded handoff documents derived from canonical direct
 
 ## Closed implementation sequence
 
-Foundation:
+Foundation M001-M003, Control Plane M001-M003, Workspace M001-M003, Security M001-M003 plus M002a, and Operations M001 have closure evidence. See `plans/registry.md` for the compact controlling status.
 
-1. `foundation-execution-core/001-repository-bootstrap-and-domain-contract.md`
-2. `foundation-execution-core/002-canonical-local-runner.md`
+## Current dependency-ready Eggwork work
 
-Control plane:
+The registry authorizes these Eggwork-local handoffs independently:
 
-3. `control-plane-protocol/001-authenticated-fixed-target-execution.md`
-4. `control-plane-protocol/002-idempotency-leases-events-and-recovery.md`
+- `foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md` — post-closure invariant/CI corrective.
+- `operations-distribution/002-eggup-deployment-and-service-integration.md` — re-opened after Eggup M007 supplied the required post-commit rollback seam.
 
-Workspace/artifacts:
+CodeGG integration implementation authority has moved to the CodeGG repository. Eggwork retains its integration-contract roadmap as architecture/reference material, but downstream CodeGG changes should be planned, implemented, and closed in CodeGG.
 
-5. `workspace-artifact-transport/001-blob-store-and-digest-protocol.md`
-6. `workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md`
-7. `workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md`
+## Blocked later work
 
-Security/isolation:
-
-8. `security-isolation-resource/001-authorization-redaction-and-threat-model.md`
-9. `security-isolation-resource/002-trusted-landlock-sandbox-path.md`
-10. `security-isolation-resource/002a-landlock-runtime-devnull.md`
-11. `security-isolation-resource/003-enforced-resource-controls.md`
-
-Operations:
-
-12. `operations-distribution/001-node-operations-surface.md`
-
-## Current parallel-ready wave
-
-The registry explicitly authorizes these independent handoffs to proceed in parallel:
-
-- `foundation-execution-core/003-execution-ownership-guards-and-runner-api-hardening.md`
-- `control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md`
-- `operations-distribution/002-eggup-deployment-and-service-integration.md`
-- `codegg-integration/001-codegg-fixed-target-remote-executor.md` — downstream/external handoff; actual CodeGG changes remain governed by CodeGG's own planning system.
-
-The former `operations-distribution/002-packaging-services-and-eggup.md` is superseded because it mixed Eggup consumer authority with Eggpack producer authority.
-
-## Next blocked work
-
-- Security M004 final adversarial/cross-platform qualification waits on Foundation M003, Control Plane M003, and Operations M002 so it tests the current surfaces.
-- Operations M003 producer packaging waits on Eggpack's concrete ReleaseManifest + build/qualification interfaces.
-- CodeGG M002 waits on CodeGG integration M001.
+- Security M004 final adversarial/cross-platform qualification waits for the ownership CI corrective and Operations M002 so its evidence covers the current execution/deployment surfaces.
+- Operations M003 producer packaging waits on Eggpack's concrete build/qualification interfaces.
+- Operations M004 waits on M002 + M003.
 - Reverse-connect and PTY work remain deferred.
 
-Parallel execution is allowed only where `plans/registry.md` says so. Shared-file conflicts between parallel agents must be resolved before closure evidence is accepted.
+The superseded `operations-distribution/002-packaging-services-and-eggup.md` remains historical evidence of the pre-Eggpack ownership split.
