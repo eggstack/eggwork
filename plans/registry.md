@@ -104,11 +104,11 @@ Do not author Operations M003 merely to increase plan count. Its producer inputs
 ## Corrected execution graph
 
 ```text
-Foundation M002 [closed] ------------------> Foundation M003 [READY]
-Control Plane M002 [closed] ---------------> Control Plane M003 [READY]
-Operations M001 [closed] + Eggup M007 --------> Operations M002 [READY]
+Foundation M003 [closed] -------------------> Foundation corrective C001 [READY]
+Control Plane M003 [closed]
+Operations M001 [closed] + Eggup M007 ------> Operations M002 [READY]
 
-Eggwork Phases 0-5 [closed/qualified] ------> CodeGG M001 [READY EXTERNAL]
+Eggwork Phases 0-5 [closed/qualified] ------> CodeGG M001 [REGISTERED/READY IN CODEGG]
 
 Foundation corrective C001 --+
 Control M003 [closed] --------+--> Security M004 [blocked until C001 + Operations M002 close]
