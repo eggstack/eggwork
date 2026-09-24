@@ -56,7 +56,7 @@ The repository is no longer planning-only.
 | Workspace / artifacts | closed | M001-M003 complete | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | qualified | M004 waits on Operations M002; ownership CI corrective now contributes enforced evidence | `plans/subsystems/security-isolation-resource-roadmap.md` |
 | Operations / distribution | ready | M002 re-opened on qualified Eggup M007 post-commit rollback seam; producer packaging remains separate M003 | `plans/subsystems/operations-distribution-roadmap.md` |
-| CodeGG integration | external corrective required | CodeGG M001 implementation/closure is historical; downstream corrective C001 lease identity + live-node qualification is ready and controls current qualification | `plans/subsystems/codegg-integration-roadmap.md` |
+| CodeGG integration | Eggwork reference closed; downstream corrective required | Eggwork M001 reference contract closed (`plans/closure/codegg-integration/001-status.md`); downstream corrective C001 lease identity + live-node qualification is ready and controls current downstream qualification | `plans/subsystems/codegg-integration-roadmap.md` |
 
 ## Dependency-ready implementation plans
 
@@ -86,6 +86,7 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 | Security | M003 resource enforcement | qualified/closed | `plans/closure/security-isolation-resource/003-status.md` |
 | Operations | M001 node operations | closed | `plans/closure/operations-distribution/001-status.md` |
 | Operations | former combined M002 packaging/services/Eggup | superseded | `plans/implementation/operations-distribution/002-packaging-services-and-eggup.md`; split because Eggpack now owns producer packaging |
+| CodeGG | M001 fixed-target remote executor (Eggwork reference contract) | closed | `plans/closure/codegg-integration/001-status.md` (reviewed head `4efc91efa53da06663c9bf7d6a948fa240122454`; zero production changes; Phases 0-5 contract re-verified; downstream CodeGG C001 still gates current qualification) |
 
 ## Planned / blocked work
 

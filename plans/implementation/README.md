@@ -24,7 +24,7 @@ The registry authorizes these Eggwork-local handoffs independently:
 
 The `foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md` handoff has closed; closure evidence lives in `plans/closure/foundation-execution-core-ci-corrective/001-status.md`.
 
-CodeGG integration implementation authority has moved to the CodeGG repository. Eggwork retains its integration-contract roadmap as architecture/reference material, but downstream CodeGG changes should be planned, implemented, and closed in CodeGG.
+CodeGG integration implementation authority has moved to the CodeGG repository. Eggwork retains its integration-contract roadmap as architecture/reference material, but downstream CodeGG changes should be planned, implemented, and closed in CodeGG. The Eggwork M001 reference-contract milestone is closed (`plans/closure/codegg-integration/001-status.md`); downstream qualification remains gated by CodeGG corrective C001.
 
 ## Blocked later work
 

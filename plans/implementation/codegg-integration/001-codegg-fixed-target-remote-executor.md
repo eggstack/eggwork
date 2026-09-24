@@ -1,6 +1,10 @@
 # CodeGG Integration M001 — Fixed-Target Remote Executor
 
-Status: reference contract; downstream M001 was implemented at `67f8f3d33651846bbdbd3e4a3bc239e50a0237a6` and historically closed at `338074062e3e8748ba83708ea3c2a7e33de12f74`, but current qualification is gated by CodeGG corrective C001 at planning head `5f4532659dbf0df2cd9f2b3bdb024217d2ea7868`
+Status: closed (Eggwork substrate-side reference contract)
+
+Closure evidence: `plans/closure/codegg-integration/001-status.md`
+
+Downstream M001 was implemented at `67f8f3d33651846bbdbd3e4a3bc239e50a0237a6` and historically closed at `338074062e3e8748ba83708ea3c2a7e33de12f74`, but current downstream qualification is gated by CodeGG corrective C001 at planning head `5f4532659dbf0df2cd9f2b3bdb024217d2ea7868`
 
 Dependencies closed: Control Plane M002, Workspace/Artifact M003, and Security M003.
 

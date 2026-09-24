@@ -60,7 +60,7 @@ Eggwork should align with these seams rather than create a second CodeGG daemon 
 
 Class: capability/invariant
 
-Status: downstream M001 implemented/closed historically; CodeGG post-closure corrective C001 is ready and controls current qualification
+Status: Eggwork reference contract closed; downstream CodeGG corrective C001 is ready and controls current downstream qualification
 
 Eggwork integration-contract plan:
 
@@ -75,7 +75,7 @@ Controlling downstream records in CodeGG:
 - post-closure corrective: `plans/subsystems/eggwork-fixed-target-remote-execution-post-closure-corrective-addendum.md`
 - corrective C001: `plans/implementation/eggwork-fixed-target-remote-execution-corrective/001-lease-identity-and-live-node-qualification.md`
 
-Post-closure review found that CodeGG M001 generated a different persisted lease token from the live Eggwork handle and did not qualify the production NodeClient against a real local mTLS Eggwork server. Eggwork's lease-fencing behavior is the intended contract; the fix belongs downstream in CodeGG. This Eggwork document remains substrate-side reference authority only.
+Post-closure review found that CodeGG M001 generated a different persisted lease token from the live Eggwork handle and did not qualify the production NodeClient against a real local mTLS Eggwork server. Eggwork's lease-fencing behavior is the intended contract; the fix belongs downstream in CodeGG. This Eggwork document remains substrate-side reference authority only. The Eggwork reference-contract milestone itself is closed with contract evidence in `plans/closure/codegg-integration/001-status.md` (reviewed head `4efc91efa53da06663c9bf7d6a948fa240122454`; zero production changes; existing Phases 0-5 closures re-verified). Current downstream qualification is still gated by CodeGG C001; M002/M003/M004 remain blocked.
 
 Objective:
 
