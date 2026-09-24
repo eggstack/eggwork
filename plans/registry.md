@@ -56,7 +56,7 @@ The repository is no longer planning-only.
 | Workspace / artifacts | closed | M001-M003 complete | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | corrective required | M002/M003 historical closures remain qualified, but remote-admission corrective C001 is ready; M004 waits on C001 + Operations M002 | `plans/subsystems/security-isolation-resource-roadmap.md`, `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md` |
 | Operations / distribution | ready | M002 re-opened on qualified Eggup M007 post-commit rollback seam; producer packaging remains separate M003 | `plans/subsystems/operations-distribution-roadmap.md` |
-| CodeGG integration | Eggwork reference closed; downstream M001+C001 closed | CodeGG lease/live-node corrective closed at `d3d390d5`; M002 eligible for planning. Live qualification exposed Eggwork remote-isolation admission gap now owned by Security corrective C001. | `plans/subsystems/codegg-integration-roadmap.md` |
+| CodeGG integration | Eggwork reference closed; downstream M001+C001 closed | CodeGG lease/live-node corrective closed at `d3d390d5`; M002 is registered/ready and M002a waits on M002 + Eggwork remote-admission C001. | `plans/subsystems/codegg-integration-roadmap.md` |
 
 ## Dependency-ready implementation plans
 
