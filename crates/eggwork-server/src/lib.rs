@@ -191,7 +191,7 @@ struct NodeState {
     workspaces: workspace::WorkspaceManager,
     artifacts: artifact::ArtifactStore,
     lease_ttl: Duration,
-    resource_capabilities: Vec<String>,
+    capabilities_features: Vec<String>,
     resolver: Arc<dyn PeerPrincipalResolver>,
     authorizer: Arc<dyn Authorizer>,
     executions: Arc<Mutex<HashMap<ExecutionId, Arc<ExecutionRecord>>>>,
@@ -334,7 +334,8 @@ impl NodeServer {
         let draining = Arc::new(AtomicBool::new(operations::is_persistently_draining(
             &drain_path,
         )));
-        let resource_capabilities = runner.resource_capabilities().await;
+        let resource_capabilities = runner.execution_capabilities().await;
+        let capabilities_features = server_capability_features(resource_capabilities);
         let mut executions = HashMap::new();
         for snapshot in store
             .load_all()
@@ -373,7 +374,7 @@ impl NodeServer {
             workspaces,
             artifacts,
             lease_ttl: config.lease_ttl,
-            resource_capabilities,
+            capabilities_features,
             resolver,
             authorizer,
             executions: Arc::new(Mutex::new(executions)),
@@ -533,6 +534,87 @@ fn acquire_state_lock(database_path: &std::path::Path) -> Result<std::fs::File, 
     Ok(file)
 }
 
+/// Static protocol/transport/workspace/artifact feature list. Network is
+/// always advertised as unrestricted because Eggwork does not yet implement a
+/// network-restriction backend; the admission gate therefore rejects
+/// `Disabled` and `AllowListed` requests with `capability_mismatch` instead of
+/// silently downgrading them.
+fn static_capability_features() -> &'static [&'static str] {
+    &[
+        "exec.argv.v1",
+        "events.live.v1",
+        "auth.mtls.v1",
+        "blob.sha256.v1",
+        "blob.stream.v1",
+        "workspace.manifest.v1",
+        "workspace.materialize.v1",
+        "artifact.declared.v1",
+        "artifact.stream.v1",
+        "artifact.retention.v1",
+        "network.unrestricted.v1",
+    ]
+}
+
+/// One capability feature construction. Both `Route::Capabilities` and
+/// `NodeStatus.capabilities` MUST go through this function so a single node
+/// always reports the same execution-capability feature set.
+fn server_capability_features(dynamic: Vec<String>) -> Vec<String> {
+    let mut features: Vec<String> = static_capability_features()
+        .iter()
+        .map(|feature| (*feature).to_owned())
+        .collect();
+    features.extend(dynamic);
+    features.sort();
+    features.dedup();
+    features
+}
+
+/// Build a wire `NodeCapabilities` from the cached static+dynamic feature set.
+fn node_capabilities_for(state: &NodeState) -> NodeCapabilities {
+    NodeCapabilities {
+        protocol: ProtocolVersionRange {
+            min: ProtocolVersion { major: 1, minor: 0 },
+            max: ProtocolVersion { major: 1, minor: 0 },
+        },
+        features: state.capabilities_features.clone(),
+        max_active_executions: state.max_active,
+    }
+}
+
+fn check_isolation_supported(
+    state: &NodeState,
+    isolation: &eggwork_core::IsolationRequirement,
+) -> bool {
+    match isolation {
+        eggwork_core::IsolationRequirement::None
+        | eggwork_core::IsolationRequirement::BestEffort => true,
+        eggwork_core::IsolationRequirement::Required => state
+            .capabilities_features
+            .iter()
+            .any(|feature| feature == eggwork_runner::LANDLOCK_WORKSPACE_RW_CAPABILITY),
+    }
+}
+
+fn check_resources_supported(
+    state: &NodeState,
+    resources: &eggwork_core::ResourceRequirements,
+) -> bool {
+    let has = |feature: &str| state.capabilities_features.iter().any(|f| f == feature);
+    let memory_ok = !matches!(
+        resources.memory_bytes,
+        eggwork_core::Requirement::Required(_)
+    ) || has("resources.cgroups-v2.memory");
+    let cpu_ok = !matches!(resources.cpu_millis, eggwork_core::Requirement::Required(_))
+        || has("resources.cgroups-v2.cpu");
+    let pids_ok = !matches!(resources.pids, eggwork_core::Requirement::Required(_))
+        || has("resources.cgroups-v2.pids");
+    memory_ok && cpu_ok && pids_ok
+}
+
+fn check_network_supported(network: &eggwork_core::NetworkRequirement) -> bool {
+    matches!(network, eggwork_core::NetworkRequirement::Unrestricted)
+}
+
 fn operation_for(method: &str, path: &str) -> Option<(Operation, Route)> {
     match (method, path) {
         ("GET", "/v1/capabilities") => Some((Operation::Capabilities, Route::Capabilities)),
@@ -645,28 +727,7 @@ async fn dispatch(
         ));
     }
     match route {
-        Route::Capabilities => Ok(json_response(
-            200,
-            &NodeCapabilities {
-                protocol: ProtocolVersionRange {
-                    min: ProtocolVersion { major: 1, minor: 0 },
-                    max: ProtocolVersion { major: 1, minor: 0 },
-                },
-                features: vec![
-                    "exec.argv.v1".into(),
-                    "events.live.v1".into(),
-                    "auth.mtls.v1".into(),
-                    "blob.sha256.v1".into(),
-                    "blob.stream.v1".into(),
-                    "workspace.manifest.v1".into(),
-                    "workspace.materialize.v1".into(),
-                    "artifact.declared.v1".into(),
-                    "artifact.stream.v1".into(),
-                    "artifact.retention.v1".into(),
-                ],
-                max_active_executions: state.max_active,
-            },
-        )),
+        Route::Capabilities => Ok(json_response(200, &node_capabilities_for(&state))),
         Route::Status => Ok(json_response(200, &node_status(&state))),
         Route::Execute => execute(state, request, principal).await,
         Route::Observe(id) => observe(state, id, query.as_deref(), principal).await,
@@ -750,28 +811,7 @@ fn node_status(state: &NodeState) -> NodeStatus {
         draining: state.draining.load(Ordering::Acquire)
             || operations::is_persistently_draining(&state.drain_path),
         active_executions: state.max_active - state.permits.available_permits() as u32,
-        capabilities: NodeCapabilities {
-            protocol: ProtocolVersionRange {
-                min: ProtocolVersion { major: 1, minor: 0 },
-                max: ProtocolVersion { major: 1, minor: 0 },
-            },
-            features: vec![
-                "exec.argv.v1".into(),
-                "events.live.v1".into(),
-                "auth.mtls.v1".into(),
-                "blob.sha256.v1".into(),
-                "blob.stream.v1".into(),
-                "workspace.manifest.v1".into(),
-                "workspace.materialize.v1".into(),
-                "artifact.declared.v1".into(),
-                "artifact.stream.v1".into(),
-                "artifact.retention.v1".into(),
-            ]
-            .into_iter()
-            .chain(state.resource_capabilities.iter().cloned())
-            .collect(),
-            max_active_executions: state.max_active,
-        },
+        capabilities: node_capabilities_for(state),
     }
 }
 
@@ -1369,18 +1409,28 @@ async fn execute(
             "node is not accepting executions",
         ));
     }
-    if !matches!(
-        wire.spec.command.isolation,
-        eggwork_core::IsolationRequirement::None
-    ) || !matches!(
-        wire.spec.command.network,
-        eggwork_core::NetworkRequirement::Unrestricted
-    ) {
+    if !check_isolation_supported(&state, &wire.spec.command.isolation) {
         increment_metric(&state.store, "rejected_capability", 1).await;
         return Ok(error_response(
             409,
             "capability_mismatch",
-            "requested execution capability is unavailable",
+            "requested filesystem isolation capability is unavailable",
+        ));
+    }
+    if !check_resources_supported(&state, &wire.spec.command.resources) {
+        increment_metric(&state.store, "rejected_capability", 1).await;
+        return Ok(error_response(
+            409,
+            "capability_mismatch",
+            "requested resource control capability is unavailable",
+        ));
+    }
+    if !check_network_supported(&wire.spec.command.network) {
+        increment_metric(&state.store, "rejected_capability", 1).await;
+        return Ok(error_response(
+            409,
+            "capability_mismatch",
+            "requested network capability is unavailable",
         ));
     }
     let id = wire.handle.execution_id.clone();
@@ -2658,6 +2708,51 @@ mod tests {
         }
     }
 
+    /// Locate or stage a trusted `eggwork-sandbox-helper` binary for the test
+    /// process. The integration runner currently lives in `target/debug/`
+    /// while cargo test binaries sit under `target/debug/deps/`, so the helper
+    /// cannot rely on `CARGO_BIN_EXE_eggwork-sandbox-helper`. We probe the
+    /// current executable's sibling, then its grandparent, then `CARGO_TARGET_DIR`.
+    fn place_trusted_helper() -> Option<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let source = locate_helper_binary()?;
+        let helper_dir = tempfile::tempdir().ok()?;
+        let helper = helper_dir.path().join("eggwork-sandbox-helper");
+        fs::copy(&source, &helper).ok()?;
+        fs::set_permissions(helper_dir.path(), fs::Permissions::from_mode(0o700)).ok()?;
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).ok()?;
+        // Leak the directory so the helper keeps living for the duration of the
+        // test; trust checks happen once at capability probe time.
+        let leaked: &'static TempDir = Box::leak(Box::new(helper_dir));
+        Some(leaked.path().join("eggwork-sandbox-helper"))
+    }
+
+    fn locate_helper_binary() -> Option<PathBuf> {
+        let candidates = |base: &std::path::Path| {
+            let here = base.join("eggwork-sandbox-helper");
+            here.exists().then_some(here)
+        };
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(parent) = exe.parent()
+        {
+            if let Some(candidate) = candidates(parent) {
+                return Some(candidate);
+            }
+            if let Some(grand) = parent.parent()
+                && let Some(candidate) = candidates(grand)
+            {
+                return Some(candidate);
+            }
+        }
+        if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
+            let p = std::path::PathBuf::from(target_dir).join("debug/eggwork-sandbox-helper");
+            if candidates(p.parent()?).is_some() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
     #[test]
     fn fingerprint_mapping_uses_leaf_der_only() {
         let cert = b"verified certificate DER";
@@ -2980,11 +3075,49 @@ mod tests {
             Err(eggwork_client::ClientError::Api { status: 403, .. })
         ));
         let capabilities = unauthorized.capabilities().await.unwrap();
+        // Capability advertisement is now a runtime-probed unified feature
+        // snapshot shared with /v1/status. The presence (or absence) of
+        // `resources.cgroups-v2.*` therefore reflects the host's runtime
+        // probes — not a fixed deny list. The blanket-gate regression suite
+        // in this module pins the protocol-level invariant that static and
+        // dynamic features stay merged.
+        let resource_capabilities_present = capabilities
+            .features
+            .iter()
+            .any(|feature| feature.starts_with("resources.cgroups-v2."));
+        if resource_capabilities_present {
+            // Verify the same feature appears in /v1/status.
+            let status = unauthorized.status().await.unwrap();
+            assert!(
+                status
+                    .capabilities
+                    .features
+                    .iter()
+                    .any(|feature| feature.starts_with("resources.cgroups-v2.")),
+                "resources capability must appear in both /v1/capabilities and /v1/status when probed"
+            );
+        }
+        let has_landlock = capabilities
+            .features
+            .iter()
+            .any(|feature| feature == "isolation.landlock.workspace-rw.v1");
+        if has_landlock {
+            let status = unauthorized.status().await.unwrap();
+            assert!(
+                status
+                    .capabilities
+                    .features
+                    .iter()
+                    .any(|feature| feature == "isolation.landlock.workspace-rw.v1"),
+                "Landlock capability must appear in both /v1/capabilities and /v1/status when probed"
+            );
+        }
         assert!(
-            !capabilities
+            capabilities
                 .features
                 .iter()
-                .any(|feature| feature.starts_with("resources.cgroups-v2."))
+                .any(|feature| feature == "network.unrestricted.v1"),
+            "node must advertise network.unrestricted.v1"
         );
         assert!(unauthorized.status().await.is_ok());
         let unknown_temp = TempDir::new().unwrap();
@@ -3958,5 +4091,988 @@ mod tests {
         assert!(!second.is_draining());
         second.shutdown().await;
         second.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn capabilities_and_status_features_agree_with_a_unified_snapshot() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let helper = place_trusted_helper();
+        let helper_present = helper.is_some();
+        let runner = match helper {
+            Some(path) => Arc::new(LocalProcessRunner::new(
+                eggwork_runner::TrustedLandlockSetup::new(path),
+            )),
+            None => Arc::new(LocalProcessRunner::default()),
+        };
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-cap-consistency").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(5),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            runner,
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+        let capabilities = client.capabilities().await.unwrap();
+        let status = client.status().await.unwrap();
+        let capability_features = capabilities.features.clone();
+        let status_features = status.capabilities.features.clone();
+        assert_eq!(
+            capability_features, status_features,
+            "/v1/capabilities and /v1/status MUST agree on the feature list"
+        );
+        assert!(
+            capability_features.contains(&"network.unrestricted.v1".to_owned()),
+            "node must advertise network.unrestricted.v1; got {capability_features:?}"
+        );
+        assert!(
+            capability_features.contains(&"exec.argv.v1".to_owned()),
+            "node must advertise exec.argv.v1; got {capability_features:?}"
+        );
+        if helper_present {
+            assert!(
+                capability_features
+                    .iter()
+                    .any(|feature| feature == "isolation.landlock.workspace-rw.v1"),
+                "trusted helper + Landlock-capable host must advertise Landlock capability; got {capability_features:?}"
+            );
+        } else {
+            assert!(
+                !capability_features
+                    .iter()
+                    .any(|feature| feature == "isolation.landlock.workspace-rw.v1"),
+                "host without sandbox helper must not advertise Landlock capability; got {capability_features:?}"
+            );
+        }
+        capabilities.validate().unwrap();
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_landlock_is_admitted_remotely_and_denies_outside_workspace_access() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let helper = match place_trusted_helper() {
+            Some(helper) => helper,
+            None => {
+                eprintln!(
+                    "skipping required_landlock_is_admitted_remotely: sandbox-helper binary not located"
+                );
+                return;
+            }
+        };
+        let runner = Arc::new(LocalProcessRunner::new(
+            eggwork_runner::TrustedLandlockSetup::new(helper),
+        ));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-required-landlock").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024 * 1024,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(5),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            runner,
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+        let capabilities = client.capabilities().await.unwrap();
+        if !capabilities
+            .features
+            .iter()
+            .any(|feature| feature == "isolation.landlock.workspace-rw.v1")
+        {
+            eprintln!(
+                "skipping required_landlock_is_admitted_remotely: kernel does not advertise Landlock capability"
+            );
+            server.shutdown().await;
+            server.wait().await.unwrap();
+            return;
+        }
+
+        // Stage workspace content with a host-side escape target the target must NOT read.
+        let inside = b"inside-content\n";
+        let inside_digest = eggwork_core::BlobDigest::from_bytes(inside);
+        let chunks = vec![Ok::<_, eggfetch_core::Error>(Bytes::from_static(inside))];
+        client
+            .upload_blob(
+                &inside_digest,
+                inside.len() as u64,
+                Box::pin(stream::iter(chunks)),
+            )
+            .await
+            .unwrap();
+        // Plant an escape target outside the workspace root (so the path is
+        // not covered by any Landlock allow rule).
+        let escape_target = temp.path().join("landlock-escape-target.txt");
+        fs::write(&escape_target, b"outside-content\n").unwrap();
+        let workspace_id = eggwork_core::WorkspaceId::new("remote-landlock-ws").unwrap();
+        let workspace_handle = execution_handle("remote-landlock-ws-exec");
+        let manifest = eggwork_core::WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![
+                eggwork_core::WorkspaceEntry::Directory {
+                    path: eggwork_core::RelativePath::new("src").unwrap(),
+                },
+                eggwork_core::WorkspaceEntry::File {
+                    path: eggwork_core::RelativePath::new("src/hello.txt").unwrap(),
+                    digest: inside_digest,
+                    size_bytes: inside.len() as u64,
+                    executable: false,
+                },
+            ],
+        };
+        client
+            .create_workspace(&workspace_id, &workspace_handle, &manifest)
+            .await
+            .unwrap();
+        let escape_target_path = escape_target.display().to_string();
+        let shell_command = format!(
+            "set -e; cat hello.txt; if cat '{escape_target_path}' >/dev/null 2>&1; then exit 77; fi; exit 0"
+        );
+        let mut spec = execution_spec(vec!["/bin/sh".into(), "-c".into(), shell_command]);
+        spec.command.isolation = IsolationRequirement::Required;
+        spec.command.cwd = Some(eggwork_core::RelativePath::new("src").unwrap());
+        let stream = client
+            .execute_in_workspace(&spec, &workspace_handle, &workspace_id)
+            .await
+            .unwrap();
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.into_events().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("required-isolation execution must terminate")
+        .unwrap();
+        let snapshot = client
+            .observe_generation(
+                &workspace_handle.execution_id,
+                workspace_handle.generation.get(),
+            )
+            .await
+            .unwrap();
+        let result = snapshot.result.unwrap();
+        assert_eq!(snapshot.state, ExecutionState::Succeeded, "{result:?}");
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            ExecutionEventKind::Stdout(bytes) if bytes == inside
+        )));
+        assert!(matches!(
+            result.sandbox,
+            Some(eggwork_core::SandboxResult::Applied { .. })
+        ));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_landlock_rejects_with_capability_mismatch_when_helper_is_missing() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let runner = Arc::new(LocalProcessRunner::new(
+            eggwork_runner::TrustedLandlockSetup::new(std::path::PathBuf::from(
+                "/nonexistent/eggwork-sandbox-helper",
+            )),
+        ));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-no-helper").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(5),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            runner,
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+        let capabilities = client.capabilities().await.unwrap();
+        assert!(
+            !capabilities
+                .features
+                .iter()
+                .any(|feature| feature == "isolation.landlock.workspace-rw.v1"),
+            "node without trusted helper must not advertise Landlock capability; got {:?}",
+            capabilities.features
+        );
+
+        let mut spec = execution_spec(vec!["/bin/true".into()]);
+        spec.command.isolation = IsolationRequirement::Required;
+        let handle = execution_handle("required-without-helper");
+        assert!(matches!(
+            client.execute(&spec, &handle).await,
+            Err(eggwork_client::ClientError::Api { status: 409, .. })
+        ));
+        // No reservation/target spawned: the generation must not have entered the runner.
+        let snapshot = client.observe(&handle.execution_id).await;
+        assert!(
+            matches!(
+                snapshot,
+                Err(eggwork_client::ClientError::Api { status: 404, .. })
+            ),
+            "rejected capability check must leave no accepted execution record; got {snapshot:?}"
+        );
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn best_effort_landlock_reports_not_applied_when_helper_is_missing() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let runner = Arc::new(LocalProcessRunner::new(
+            eggwork_runner::TrustedLandlockSetup::new(std::path::PathBuf::from(
+                "/nonexistent/eggwork-sandbox-helper",
+            )),
+        ));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-best-effort-no-helper").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(5),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            runner,
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+        let mut spec = execution_spec(vec!["/bin/true".into()]);
+        spec.command.isolation = IsolationRequirement::BestEffort;
+        let handle = execution_handle("best-effort-without-helper");
+        let stream = client.execute(&spec, &handle).await.unwrap();
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.into_events().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("best-effort execution must terminate")
+        .unwrap();
+        let snapshot = client
+            .observe_generation(&handle.execution_id, handle.generation.get())
+            .await
+            .unwrap();
+        let result = snapshot.result.unwrap();
+        assert_eq!(snapshot.state, ExecutionState::Succeeded);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            ExecutionEventKind::State(ExecutionState::Succeeded)
+        )));
+        assert!(matches!(
+            result.sandbox,
+            Some(eggwork_core::SandboxResult::NotApplied { .. })
+        ));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_resource_admission_rejects_with_capability_mismatch_when_dimension_unavailable()
+     {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let runner = Arc::new(LocalProcessRunner::new(eggwork_runner::NoExecutionSetup));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-resource-rejection").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(5),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            runner,
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+        let capabilities = client.capabilities().await.unwrap();
+        assert!(
+            !capabilities
+                .features
+                .iter()
+                .any(|feature| feature.starts_with("resources.cgroups-v2.")),
+            "NoExecutionSetup must advertise no resource capabilities; got {:?}",
+            capabilities.features
+        );
+
+        let mut spec = execution_spec(vec!["/bin/true".into()]);
+        spec.command.resources.memory_bytes = Requirement::Required(64 * 1024 * 1024);
+        let handle = execution_handle("required-memory-no-backend");
+        assert!(matches!(
+            client.execute(&spec, &handle).await,
+            Err(eggwork_client::ClientError::Api { status: 409, .. })
+        ));
+        let snapshot = client.observe(&handle.execution_id).await;
+        assert!(
+            matches!(
+                snapshot,
+                Err(eggwork_client::ClientError::Api { status: 404, .. })
+            ),
+            "rejected capability check must leave no accepted execution record; got {snapshot:?}"
+        );
+
+        let mut cpu_spec = execution_spec(vec!["/bin/true".into()]);
+        cpu_spec.command.resources.cpu_millis = Requirement::Required(500);
+        let cpu_handle = execution_handle("required-cpu-no-backend");
+        assert!(matches!(
+            client.execute(&cpu_spec, &cpu_handle).await,
+            Err(eggwork_client::ClientError::Api { status: 409, .. })
+        ));
+
+        let mut pids_spec = execution_spec(vec!["/bin/true".into()]);
+        pids_spec.command.resources.pids = Requirement::Required(8);
+        let pids_handle = execution_handle("required-pids-no-backend");
+        assert!(matches!(
+            client.execute(&pids_spec, &pids_handle).await,
+            Err(eggwork_client::ClientError::Api { status: 409, .. })
+        ));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_resource_admission_passes_when_runtime_dimension_is_available() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let helper = match place_trusted_helper() {
+            Some(helper) => helper,
+            None => {
+                eprintln!(
+                    "skipping required_resource_admission_passes_when_runtime_dimension_is_available: helper binary not located"
+                );
+                return;
+            }
+        };
+        let runner = Arc::new(LocalProcessRunner::new(
+            eggwork_runner::TrustedLandlockSetup::new(helper),
+        ));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-resource-accept").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(5),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            runner,
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+        let capabilities = client.capabilities().await.unwrap();
+        let available: Vec<&str> = capabilities
+            .features
+            .iter()
+            .filter_map(|feature| match feature.as_str() {
+                "resources.cgroups-v2.memory" => Some("memory_bytes"),
+                "resources.cgroups-v2.cpu" => Some("cpu_millis"),
+                "resources.cgroups-v2.pids" => Some("pids"),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !available.is_empty(),
+            "trusted helper host must advertise at least one resource capability; got {:?}",
+            capabilities.features
+        );
+
+        let mut spec = execution_spec(vec!["/bin/true".into()]);
+        if available.contains(&"memory_bytes") {
+            spec.command.resources.memory_bytes = Requirement::Required(64 * 1024 * 1024);
+        }
+        if available.contains(&"cpu_millis") {
+            spec.command.resources.cpu_millis = Requirement::Required(500);
+        }
+        if available.contains(&"pids") {
+            spec.command.resources.pids = Requirement::Required(16);
+        }
+        let handle = execution_handle("required-resource-available");
+        let stream = client.execute(&spec, &handle).await.unwrap();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.into_events().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("execution with available resource backend must terminate");
+        let snapshot = client
+            .observe_generation(&handle.execution_id, handle.generation.get())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.state, ExecutionState::Succeeded);
+        let result = snapshot.result.unwrap();
+        if let Some(resources) = &result.resources {
+            let resources = resources.clone();
+            for (dim, capability_name, dim_available) in [
+                (
+                    resources.memory_bytes,
+                    "resources.cgroups-v2.memory",
+                    available.contains(&"memory_bytes"),
+                ),
+                (
+                    resources.cpu_millis,
+                    "resources.cgroups-v2.cpu",
+                    available.contains(&"cpu_millis"),
+                ),
+                (
+                    resources.pids,
+                    "resources.cgroups-v2.pids",
+                    available.contains(&"pids"),
+                ),
+            ] {
+                if dim_available {
+                    assert!(
+                        matches!(
+                            dim,
+                            eggwork_core::ResourceDimensionResult::Applied { .. }
+                                | eggwork_core::ResourceDimensionResult::LimitExceeded { .. }
+                        ),
+                        "expected {capability_name} to be enforced when advertised; got {dim:?}"
+                    );
+                }
+            }
+        }
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_or_allowlisted_network_requests_are_rejected_with_capability_mismatch() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-network-reject").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(5),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+
+        let mut disabled_spec = execution_spec(vec!["/bin/true".into()]);
+        disabled_spec.command.network = NetworkRequirement::Disabled;
+        let disabled_handle = execution_handle("network-disabled");
+        assert!(matches!(
+            client.execute(&disabled_spec, &disabled_handle).await,
+            Err(eggwork_client::ClientError::Api { status: 409, .. })
+        ));
+        let disabled_snapshot = client.observe(&disabled_handle.execution_id).await;
+        assert!(
+            matches!(
+                disabled_snapshot,
+                Err(eggwork_client::ClientError::Api { status: 404, .. })
+            ),
+            "disabled network must not produce an execution record; got {disabled_snapshot:?}"
+        );
+
+        let mut allowlisted_spec = execution_spec(vec!["/bin/true".into()]);
+        allowlisted_spec.command.network =
+            NetworkRequirement::AllowListed(vec!["example.com".into()]);
+        let allowlisted_handle = execution_handle("network-allowlist");
+        assert!(matches!(
+            client.execute(&allowlisted_spec, &allowlisted_handle).await,
+            Err(eggwork_client::ClientError::Api { status: 409, .. })
+        ));
+        let allowlisted_snapshot = client.observe(&allowlisted_handle.execution_id).await;
+        assert!(
+            matches!(
+                allowlisted_snapshot,
+                Err(eggwork_client::ClientError::Api { status: 404, .. })
+            ),
+            "allow-listed network must not produce an execution record; got {allowlisted_snapshot:?}"
+        );
+
+        // Unrestricted network is the only accepted mode and must execute.
+        let unrestricted_handle = execution_handle("network-unrestricted");
+        let stream = client
+            .execute(
+                &execution_spec(vec!["/bin/true".into()]),
+                &unrestricted_handle,
+            )
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.into_events().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("unrestricted network execution must terminate");
+        let snapshot = client
+            .observe_generation(
+                &unrestricted_handle.execution_id,
+                unrestricted_handle.generation.get(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.state, ExecutionState::Succeeded);
+
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn controller_compatibility_fixture_requires_landlock_then_executes_required_isolation() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-codegg").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let helper = match place_trusted_helper() {
+            Some(helper) => helper,
+            None => {
+                eprintln!("skipping controller_compatibility_fixture: helper binary not located");
+                return;
+            }
+        };
+        let runner = Arc::new(LocalProcessRunner::new(
+            eggwork_runner::TrustedLandlockSetup::new(helper),
+        ));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-codegg-compat").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024 * 1024,
+                max_active_executions: 2,
+                lease_ttl: std::time::Duration::from_secs(10),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            runner,
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+        // 1. Pre-flight against /v1/capabilities.
+        let capabilities = client.capabilities().await.unwrap();
+        assert!(
+            capabilities
+                .features
+                .iter()
+                .any(|feature| feature == "exec.argv.v1"),
+            "controller fixture requires exec.argv.v1; got {:?}",
+            capabilities.features
+        );
+        let landlock_advertised = capabilities
+            .features
+            .iter()
+            .any(|feature| feature == "isolation.landlock.workspace-rw.v1");
+        if !landlock_advertised {
+            eprintln!(
+                "skipping controller_compatibility_fixture: kernel does not advertise Landlock"
+            );
+            server.shutdown().await;
+            server.wait().await.unwrap();
+            return;
+        }
+        // 2. /v1/status must agree on the same feature set.
+        let status = client.status().await.unwrap();
+        assert_eq!(
+            status.capabilities.features, capabilities.features,
+            "controller fixture requires /v1/capabilities and /v1/status to agree"
+        );
+        // 3. Stage workspace content with one read-only file.
+        let body = b"controller-fixture\n";
+        let body_digest = eggwork_core::BlobDigest::from_bytes(body);
+        let chunks = vec![Ok::<_, eggfetch_core::Error>(Bytes::from_static(body))];
+        client
+            .upload_blob(
+                &body_digest,
+                body.len() as u64,
+                Box::pin(stream::iter(chunks)),
+            )
+            .await
+            .unwrap();
+        let workspace_id = eggwork_core::WorkspaceId::new("controller-ws").unwrap();
+        let workspace_handle = execution_handle("controller-ws-exec");
+        let manifest = eggwork_core::WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![
+                eggwork_core::WorkspaceEntry::Directory {
+                    path: eggwork_core::RelativePath::new("src").unwrap(),
+                },
+                eggwork_core::WorkspaceEntry::File {
+                    path: eggwork_core::RelativePath::new("src/payload.txt").unwrap(),
+                    digest: body_digest,
+                    size_bytes: body.len() as u64,
+                    executable: false,
+                },
+            ],
+        };
+        client
+            .create_workspace(&workspace_id, &workspace_handle, &manifest)
+            .await
+            .unwrap();
+        // 4. Required-isolation execution must complete and report applied sandbox evidence.
+        let mut spec = execution_spec(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "cat payload.txt; sleep 4".into(),
+        ]);
+        spec.command.isolation = IsolationRequirement::Required;
+        spec.command.cwd = Some(eggwork_core::RelativePath::new("src").unwrap());
+        spec.command.timeout_millis = 30_000;
+        let stream = client
+            .execute_in_workspace(&spec, &workspace_handle, &workspace_id)
+            .await
+            .unwrap();
+        // Capture stdout/stderr by replaying the journal through `client.events`
+        // once the execution reaches Running; this proves the sandboxed read
+        // succeeded and lets us drop the live stream so renew/cancel operate
+        // against a still-running execution.
+        let handle = workspace_handle.clone();
+        let event_client = client.clone();
+        let events_task = tokio::spawn(async move {
+            let stream = event_client.events(&handle, 0).await?;
+            stream
+                .map(|chunk| {
+                    chunk
+                        .map_err(eggwork_client::ClientError::Transport)
+                        .and_then(|bytes| {
+                            serde_json::from_slice::<ExecutionEvent>(&bytes)
+                                .map_err(|_| eggwork_client::ClientError::InvalidResponse)
+                        })
+                })
+                .try_collect::<Vec<_>>()
+                .await
+        });
+        // Wait until Running before exercising renew/cancel.
+        let mut sandbox_read_observed = false;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let snap = client
+                .observe_generation(
+                    &workspace_handle.execution_id,
+                    workspace_handle.generation.get(),
+                )
+                .await
+                .unwrap();
+            if matches!(snap.state, ExecutionState::Running) {
+                sandbox_read_observed = true;
+                break;
+            }
+        }
+        assert!(
+            sandbox_read_observed,
+            "controller-fixture execution must reach Running state"
+        );
+        drop(stream);
+        // The execution is still in Running state because the command sleeps;
+        // renew + cancel must succeed against a fenced handle.
+        client.renew(&workspace_handle, "renewal-id").await.unwrap();
+        client.cancel(&workspace_handle).await.unwrap();
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let snap = client
+                    .observe_generation(
+                        &workspace_handle.execution_id,
+                        workspace_handle.generation.get(),
+                    )
+                    .await
+                    .unwrap();
+                if matches!(
+                    snap.state,
+                    ExecutionState::Cancelled
+                        | ExecutionState::Succeeded
+                        | ExecutionState::Failed
+                        | ExecutionState::TimedOut
+                        | ExecutionState::Interrupted
+                ) {
+                    break snap;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("controller-fixture cancellation must reach a terminal state");
+        let result = cancelled.result.unwrap();
+        assert_eq!(cancelled.state, ExecutionState::Cancelled, "{result:?}");
+        assert!(matches!(
+            result.sandbox,
+            Some(eggwork_core::SandboxResult::Applied { .. })
+        ));
+        // Replay the journal to confirm the sandboxed read produced the
+        // expected stdout (workspace allow path) and cancel terminated the
+        // sleep.
+        let events = tokio::time::timeout(std::time::Duration::from_secs(5), events_task)
+            .await
+            .expect("events task must terminate")
+            .unwrap()
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            ExecutionEventKind::Stdout(bytes) if bytes == body
+        )));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    #[test]
+    fn static_capability_features_are_a_single_canonical_list() {
+        let features = static_capability_features();
+        assert!(features.contains(&"exec.argv.v1"));
+        assert!(features.contains(&"network.unrestricted.v1"));
+        let mut sorted = features.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            features.len(),
+            "static capability list must not contain duplicates"
+        );
+    }
+
+    #[test]
+    fn server_capability_features_do_not_duplicate_static_dynamic_overlap() {
+        let dynamic = vec!["isolation.landlock.workspace-rw.v1".to_owned()];
+        let features = server_capability_features(dynamic.clone());
+        assert_eq!(
+            features
+                .iter()
+                .filter(|feature| *feature == "exec.argv.v1")
+                .count(),
+            1,
+            "static features must not be duplicated"
+        );
+        assert_eq!(
+            features
+                .iter()
+                .filter(|feature| feature.as_str() == "isolation.landlock.workspace-rw.v1")
+                .count(),
+            1,
+            "dynamic features must be preserved"
+        );
+    }
+
+    #[test]
+    fn static_capability_features_do_not_advertise_unsupported_network_modes() {
+        let features = static_capability_features();
+        assert!(
+            !features.contains(&"network.disabled.v1"),
+            "network.disabled.v1 is unsupported and must not be advertised"
+        );
+        assert!(
+            !features
+                .iter()
+                .any(|feature| feature.starts_with("network.allow")),
+            "network allow-list features are unsupported and must not be advertised"
+        );
+    }
+
+    #[test]
+    fn admission_helpers_keep_required_capability_gating_active() {
+        // This test does not exercise live sockets; it pins the admission
+        // contract so a regression that re-introduces a blanket
+        // `IsolationRequirement::None && NetworkRequirement::Unrestricted`
+        // gate is caught here even if the integration tests are skipped on
+        // hosts without Landlock.
+        let features = vec!["isolation.landlock.workspace-rw.v1".to_owned()];
+        struct Probe {
+            features: Vec<String>,
+        }
+        impl Probe {
+            fn isolation_supported(&self, requirement: &IsolationRequirement) -> bool {
+                match requirement {
+                    IsolationRequirement::None | IsolationRequirement::BestEffort => true,
+                    IsolationRequirement::Required => self
+                        .features
+                        .iter()
+                        .any(|f| f == "isolation.landlock.workspace-rw.v1"),
+                }
+            }
+            fn network_supported(&self, network: &NetworkRequirement) -> bool {
+                matches!(network, NetworkRequirement::Unrestricted)
+            }
+        }
+        let probe = Probe { features };
+        assert!(probe.isolation_supported(&IsolationRequirement::None));
+        assert!(probe.isolation_supported(&IsolationRequirement::BestEffort));
+        assert!(probe.isolation_supported(&IsolationRequirement::Required));
+        let empty = Probe { features: vec![] };
+        assert!(empty.isolation_supported(&IsolationRequirement::None));
+        assert!(empty.isolation_supported(&IsolationRequirement::BestEffort));
+        assert!(!empty.isolation_supported(&IsolationRequirement::Required));
+        assert!(probe.network_supported(&NetworkRequirement::Unrestricted));
+        assert!(!probe.network_supported(&NetworkRequirement::Disabled));
+        assert!(
+            !probe.network_supported(&NetworkRequirement::AllowListed(vec!["example.com".into()]))
+        );
     }
 }

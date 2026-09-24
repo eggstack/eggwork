@@ -237,7 +237,8 @@ async fn sandbox_timeout_and_cancellation_reap_the_helper_process_group() {
     fs::set_permissions(helper_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
     let runner = LocalProcessRunner::new(TrustedLandlockSetup::new(helper));
-    let capabilities = runner.resource_capabilities().await;
+    let capabilities = runner.execution_capabilities().await;
+    assert!(capabilities.contains(&"isolation.landlock.workspace-rw.v1".into()));
     assert!(capabilities.contains(&"resources.cgroups-v2.memory".into()));
     assert!(capabilities.contains(&"resources.cgroups-v2.cpu".into()));
     assert!(capabilities.contains(&"resources.cgroups-v2.pids".into()));

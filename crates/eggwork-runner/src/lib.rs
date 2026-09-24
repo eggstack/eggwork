@@ -383,7 +383,10 @@ pub trait ExecutionSetup: Send + Sync {
         root: &Path,
     ) -> Result<SetupOutcome, RunnerError>;
 
-    async fn resource_capabilities(&self) -> Vec<String> {
+    /// Runtime-probed execution capabilities: filesystem isolation and OS
+    /// resource controllers. Each returned feature string must reflect a live
+    /// probe — never a compile-time or configuration-time guess.
+    async fn execution_capabilities(&self) -> Vec<String> {
         Vec::new()
     }
 
@@ -476,9 +479,10 @@ impl ExecutionSetup for TrustedLandlockSetup {
         })
     }
 
-    async fn resource_capabilities(&self) -> Vec<String> {
-        if verify_trusted_helper(&self.helper_path).is_err() {
-            return Vec::new();
+    async fn execution_capabilities(&self) -> Vec<String> {
+        let mut capabilities = Vec::new();
+        if verify_trusted_helper(&self.helper_path).is_ok() && probe_landlock_ruleset() {
+            capabilities.push("isolation.landlock.workspace-rw.v1".into());
         }
         let probes = [
             (
@@ -506,7 +510,6 @@ impl ExecutionSetup for TrustedLandlockSetup {
                 },
             ),
         ];
-        let mut capabilities = Vec::new();
         for (feature, request) in probes {
             if SystemdCgroupBackend::probe(&request).await.is_ok() {
                 capabilities.push(feature.into());
@@ -518,6 +521,61 @@ impl ExecutionSetup for TrustedLandlockSetup {
     fn sandbox_helper_path(&self) -> Option<&Path> {
         Some(&self.helper_path)
     }
+}
+
+/// Public capability feature name advertised for the closed Landlock
+/// `workspace_rw` profile used by `IsolationRequirement::{BestEffort, Required}`.
+pub const LANDLOCK_WORKSPACE_RW_CAPABILITY: &str = "isolation.landlock.workspace-rw.v1";
+
+/// Probe the kernel Landlock ABI V4 with the same set of handles and rules
+/// the trusted helper uses for `workspace_rw`. Returns `true` only if the
+/// in-process ruleset can be created and the runtime read paths can be added;
+/// this proves the kernel supports the exact rights needed without actually
+/// applying Landlock to the probe process. Failures (kernel too old, missing
+/// runtime paths, unsupported rights) are folded into `false` so callers can
+/// treat the result as a single boolean capability fact.
+#[cfg(target_os = "linux")]
+fn probe_landlock_ruleset() -> bool {
+    use landlock::{
+        ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
+    };
+
+    let abi = ABI::V4;
+    let handled = AccessFs::from_all(abi);
+    let ruleset = match Ruleset::default().handle_access(handled) {
+        Ok(ruleset) => ruleset,
+        Err(_) => return false,
+    };
+    let mut ruleset = match ruleset.create() {
+        Ok(ruleset) => ruleset,
+        Err(_) => return false,
+    };
+    for path_str in ["/usr", "/etc/ld.so.cache", "/etc/ssl/certs", "/dev/null"] {
+        let path = Path::new(path_str);
+        let canonical = match path.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(_) => continue,
+        };
+        let path_fd = match PathFd::new(&canonical) {
+            Ok(fd) => fd,
+            Err(_) => return false,
+        };
+        let access = if canonical.is_dir() {
+            AccessFs::from_read(abi) | AccessFs::Execute
+        } else {
+            landlock::make_bitflags!(AccessFs::{ReadFile})
+        };
+        ruleset = match ruleset.add_rule(PathBeneath::new(path_fd, access)) {
+            Ok(ruleset) => ruleset,
+            Err(_) => return false,
+        };
+    }
+    true
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_landlock_ruleset() -> bool {
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -1060,8 +1118,12 @@ impl LocalProcessRunner {
         }
     }
 
-    pub async fn resource_capabilities(&self) -> Vec<String> {
-        self.setup.resource_capabilities().await
+    /// Returns the runtime-probed execution capability feature strings
+    /// contributed by the configured `ExecutionSetup`. Callers MUST combine
+    /// these with the static protocol/workspace/artifact feature list; the
+    /// runner owns dynamic facts only.
+    pub async fn execution_capabilities(&self) -> Vec<String> {
+        self.setup.execution_capabilities().await
     }
 
     pub async fn run(
@@ -2067,5 +2129,20 @@ mod tests {
             terminal.cleanup_warning.as_deref(),
             Some("permission denied")
         );
+    }
+
+    #[test]
+    fn capability_feature_string_is_frozen_for_workspace_rw_profile() {
+        assert_eq!(
+            LANDLOCK_WORKSPACE_RW_CAPABILITY,
+            "isolation.landlock.workspace-rw.v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_setup_advertises_empty_dynamic_capabilities() {
+        let setup = NoExecutionSetup;
+        let runtime = setup.execution_capabilities().await;
+        assert!(runtime.is_empty());
     }
 }

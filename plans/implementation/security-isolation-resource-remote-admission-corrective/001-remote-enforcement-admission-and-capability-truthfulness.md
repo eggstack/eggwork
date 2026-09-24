@@ -1,6 +1,8 @@
 # Security Remote-Admission Corrective C001 — Remote Enforcement Admission and Capability Truthfulness
 
-Status: ready for handoff
+Status: closed
+
+Closure evidence: `plans/closure/security-isolation-resource-remote-admission-corrective/001-status.md`
 
 Source corrective:
 

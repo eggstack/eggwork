@@ -54,7 +54,7 @@ The repository is no longer planning-only.
 | Foundation / execution core | closed | M001-M003 closed; C001 portable ownership-guard CI enforcement closed | `plans/subsystems/foundation-execution-core-roadmap.md`, `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md` |
 | Control-plane protocol | closed | M001-M003 complete | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | closed | M001-M003 complete | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
-| Security / isolation / resources | corrective required | M002/M003 historical closures remain qualified, but remote-admission corrective C001 is ready; M004 waits on C001 + Operations M002 | `plans/subsystems/security-isolation-resource-roadmap.md`, `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md` |
+| Security / isolation / resources | C001 closed; M004 blocked on Operations M002 | M002/M003 historical closures remain qualified; remote-admission corrective C001 is closed (`plans/closure/security-isolation-resource-remote-admission-corrective/001-status.md`); M004 waits on Operations M002 | `plans/subsystems/security-isolation-resource-roadmap.md`, `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md` |
 | Operations / distribution | ready | M002 re-opened on qualified Eggup M007 post-commit rollback seam; producer packaging remains separate M003 | `plans/subsystems/operations-distribution-roadmap.md` |
 | CodeGG integration | Eggwork reference closed; downstream M001+C001 closed | CodeGG lease/live-node corrective closed at `d3d390d5`; M002 is registered/ready and M002a waits on M002 + Eggwork remote-admission C001. | `plans/subsystems/codegg-integration-roadmap.md` |
 
@@ -64,7 +64,6 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Security corrective | C001 remote enforcement admission + capability truthfulness | **ready** | `plans/implementation/security-isolation-resource-remote-admission-corrective/001-remote-enforcement-admission-and-capability-truthfulness.md` | Runner already supports Landlock/resources; server must admit supported requirements, unify `/v1/capabilities` + status dynamic features, and keep network-disabled/allow-list unsupported. |
 | Operations | M002 Eggup deployment/service integration | **ready** | `plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md` | Eggup M007 closure `2cab1f97` supplies `commit_with_post_commit` and rollback-on-health-failure semantics; historical blocker remains in `plans/closure/operations-distribution/002-status.md`. |
 | CodeGG downstream | C001 lease identity + live-node qualification | **closed in CodeGG** | `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution-corrective/001-status.md` | Closure/current head `d3d390d5`; real mTLS qualification passed and M002 is eligible for planning. The live fixture exposed this repo's remote-admission C001 gap. |
 
@@ -85,6 +84,7 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 | Security | M002 Landlock | closed | `plans/closure/security-isolation-resource/002-status.md` |
 | Security | M002a `/dev/null` corrective | closed | `plans/closure/security-isolation-resource/002a-status.md` |
 | Security | M003 resource enforcement | qualified/closed | `plans/closure/security-isolation-resource/003-status.md` |
+| Security corrective | C001 remote enforcement admission + capability truthfulness | closed | `plans/closure/security-isolation-resource-remote-admission-corrective/001-status.md` |
 | Operations | M001 node operations | closed | `plans/closure/operations-distribution/001-status.md` |
 | Operations | former combined M002 packaging/services/Eggup | superseded | `plans/implementation/operations-distribution/002-packaging-services-and-eggup.md`; split because Eggpack now owns producer packaging |
 | CodeGG | M001 fixed-target remote executor (Eggwork reference contract) | closed | `plans/closure/codegg-integration/001-status.md` (reviewed head `4efc91efa53da06663c9bf7d6a948fa240122454`; zero production changes; Phases 0-5 contract re-verified; downstream CodeGG C001 still gates current qualification) |
@@ -93,13 +93,13 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Work | Status | Blocker / rationale |
 |---|---|---|
-| Security M004 adversarial + cross-platform closure | blocked | wait for Security remote-admission C001 + Operations M002 so final evidence covers remotely reachable Landlock/resource controls and deployment/update surfaces |
+| Security M004 adversarial + cross-platform closure | blocked | wait for Operations M002 so final evidence covers remotely reachable Landlock/resource controls and deployment/update surfaces (Security remote-admission C001 is closed) |
 | Operations M003 Eggpack producer packaging | blocked | Eggpack ReleaseManifest M001/M001a is closed; Build/Qualification M001 and downstream release-orchestration interfaces are not yet closed/concrete |
 | Operations M004 operational/release qualification | blocked | Operations M002 + M003 |
 | Operations M005 reverse-connect relay | deferred | no immediate product need; stable identity/lease semantics already exist |
 | Operations M006 PTY extension | deferred | requires a separate interactive ownership/attach design |
 | CodeGG M002 capability/target projection | ready downstream | CodeGG plan `002-target-capability-projection-and-operator-policy.md` is registered/ready and may proceed against this repo's written capability contract |
-| CodeGG M002a restricted-spec live requalification | blocked downstream | requires CodeGG M002 closure + Eggwork Security remote-admission C001 closure; this is the gate for claiming real required-Landlock execution through CodeGG |
+| CodeGG M002a restricted-spec live requalification | blocked downstream | requires CodeGG M002 closure (Eggwork Security remote-admission C001 is closed); this is the gate for claiming real required-Landlock execution through CodeGG |
 | CodeGG M003 Git-aware materializer | deferred | optimized Eggwork materializer contract; downstream CodeGG corrective C001 is closed |
 | CodeGG M004 remote AgentRun worker | deferred | CodeGG M002-M003 + stable worker-entry contract |
 
@@ -116,11 +116,11 @@ Eggwork Phases 0-5 [historical] -----------> CodeGG M001 [IMPLEMENTED/HISTORICAL
                                                    |
                                                    +--> CodeGG C001 lease/live-node corrective [CLOSED]
                                                               |
-                                                              +--> exposed Eggwork remote-admission C001 [READY]
+                                                               +--> exposed Eggwork remote-admission C001 [CLOSED]
 
-Security remote-admission C001 --+
-Control M003 [closed] ------------+--> Security M004 [blocked until remote-admission C001 + Operations M002 close]
-Operations M002 ------------------+
+Security remote-admission C001 [CLOSED] --+
+Control M003 [closed] -----------------+--> Security M004 [blocked until Operations M002 closes]
+Operations M002 -----------------------+
 
 Eggpack build/qualification + release interfaces -> Operations M003 [blocked]
 Operations M002 + Operations M003 ----------> Operations M004
@@ -155,7 +155,7 @@ Implementation agents MUST re-check current APIs at execution time.
 7. **CodeGG execution authority:** the downstream implementation handoff is now registered in the CodeGG repository; Eggwork's M001 document is reference-contract material only.
 8. **Foundation M003 CI enforcement defect:** registered as corrective C001 because the guard used undeclared `rtk` and was not invoked by ordinary GitHub Actions; C001 is now closed (`plans/closure/foundation-execution-core-ci-corrective/001-status.md`) — the guard calls `cargo metadata` directly, runs as a required GitHub Actions step on push/PR, and a deterministic `--prove-negative-exit` mode exercises the failure path on every CI run.
 9. **CodeGG M001 post-closure correctness:** CodeGG C001 is now closed at `d3d390d5`; lease identity and real-node mTLS/restart/cancel/renew behavior are qualified.
-10. **Remote enforcement admission gap:** that live qualification proved Eggwork's server rejects all remote filesystem-isolation requests even though the canonical runner can enforce the closed Landlock `workspace_rw` profile. Registered as Security remote-admission corrective C001; network-disabled/allow-list remain intentionally unsupported.
+10. **Remote enforcement admission gap:** that live qualification proved Eggwork's server rejects all remote filesystem-isolation requests even though the canonical runner can enforce the closed Landlock `workspace_rw` profile. Registered as Security remote-admission corrective C001 (now closed: `plans/closure/security-isolation-resource-remote-admission-corrective/001-status.md`); network-disabled/allow-list remain intentionally unsupported.
 
 ## Remaining interface gates
 

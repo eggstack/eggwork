@@ -455,7 +455,7 @@ pub async fn doctor(config: &OperatorConfig) -> DoctorReport {
         let runner = eggwork_runner::LocalProcessRunner::new(
             eggwork_runner::TrustedLandlockSetup::new(helper),
         );
-        runner.resource_capabilities().await
+        runner.execution_capabilities().await
     } else {
         Vec::new()
     };
@@ -467,7 +467,7 @@ pub async fn doctor(config: &OperatorConfig) -> DoctorReport {
         } else if !helper_ok {
             "configured sandbox helper is missing or fails installation ownership checks".into()
         } else if capabilities.is_empty() {
-            "trusted helper configured; no resource controllers passed runtime probes".into()
+            "trusted helper configured; no execution capability passed runtime probes".into()
         } else {
             format!("runtime-probed capabilities: {}", capabilities.join(", "))
         },
