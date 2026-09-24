@@ -70,12 +70,12 @@ Controlling downstream records in CodeGG:
 
 - M001 implementation: `67f8f3d33651846bbdbd3e4a3bc239e50a0237a6`
 - historical closure: `338074062e3e8748ba83708ea3c2a7e33de12f74`
-- current planning head: `5f4532659dbf0df2cd9f2b3bdb024217d2ea7868`
+- CodeGG corrective closure/current head: `d3d390d56620fb5c6f755a5dfb0987e0a1c01651`
 - roadmap: `plans/subsystems/eggwork-fixed-target-remote-execution-roadmap.md`
 - post-closure corrective: `plans/subsystems/eggwork-fixed-target-remote-execution-post-closure-corrective-addendum.md`
 - corrective C001: `plans/implementation/eggwork-fixed-target-remote-execution-corrective/001-lease-identity-and-live-node-qualification.md`
 
-Post-closure review found that CodeGG M001 generated a different persisted lease token from the live Eggwork handle and did not qualify the production NodeClient against a real local mTLS Eggwork server. Eggwork's lease-fencing behavior is the intended contract; the fix belongs downstream in CodeGG. This Eggwork document remains substrate-side reference authority only. The Eggwork reference-contract milestone itself is closed with contract evidence in `plans/closure/codegg-integration/001-status.md` (reviewed head `4efc91efa53da06663c9bf7d6a948fa240122454`; zero production changes; existing Phases 0-5 closures re-verified). Current downstream qualification is still gated by CodeGG C001; M002/M003/M004 remain blocked.
+CodeGG corrective C001 closed the lease-identity and real-node mTLS gap. That live qualification then exposed an Eggwork substrate defect: the server currently rejects all remotely requested filesystem isolation even though the runner can enforce Landlock. Eggwork remote-admission corrective C001 now owns that upstream gap. This document remains substrate-side reference authority only. The Eggwork reference-contract milestone itself is closed with contract evidence in `plans/closure/codegg-integration/001-status.md` (reviewed head `4efc91efa53da06663c9bf7d6a948fa240122454`; zero production changes; existing Phases 0-5 closures re-verified). Current downstream qualification is still gated by CodeGG C001; M002/M003/M004 remain blocked.
 
 Objective:
 
@@ -94,7 +94,7 @@ Exit conditions:
 
 Class: infrastructure/polish
 
-Status: blocked on downstream CodeGG corrective C001
+Status: eligible for planning; strict-isolation live qualification depends on Eggwork remote-admission corrective C001
 
 Objective:
 
@@ -104,7 +104,7 @@ Expose node capability/status facts to CodeGG's own configuration/selection poli
 
 Class: capability/infrastructure
 
-Status: blocked on downstream CodeGG corrective C001 and a separately reviewed Eggwork optimized materializer interface
+Status: blocked on a separately reviewed Eggwork optimized materializer interface; CodeGG corrective C001 is closed
 
 Objective:
 
@@ -114,7 +114,7 @@ Reduce workspace transfer using repository commit/bundle/object/patch evidence w
 
 Class: capability
 
-Status: blocked on downstream corrective C001, M002-M003, and stable CodeGG AgentRun worker-entry contract
+Status: blocked on M002-M003 and stable CodeGG AgentRun worker-entry contract; CodeGG corrective C001 is closed
 
 Objective:
 
