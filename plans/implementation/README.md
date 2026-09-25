@@ -35,3 +35,8 @@ CodeGG integration implementation authority has moved to the CodeGG repository. 
 - Reverse-connect and PTY work remain deferred.
 
 The superseded `operations-distribution/002-packaging-services-and-eggup.md` remains historical evidence of the pre-Eggpack ownership split.
+
+
+## Registered blocked handoffs
+
+- `security-isolation-resource/004-security-closure-and-cross-platform-adversarial-qualification.md` — registered but blocked on Operations M002 closure.
