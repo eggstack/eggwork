@@ -233,6 +233,8 @@ pub struct NodeGcReport {
     pub workspace_candidates: u64,
     pub workspace_logical_bytes: u64,
     pub workspaces_deleted: u64,
+    pub manifest_candidates: u64,
+    pub manifests_deleted: u64,
     pub artifact_candidates: u64,
     pub artifacts_deleted: u64,
     pub expired_blob_references: u64,
@@ -257,6 +259,9 @@ impl Service for NodeHttpService {
                 max_bytes: MAX_BLOB_FIND_REQUEST_BYTES as u64,
             },
             ("POST", "/v1/workspaces") => RequestBodyPolicy::Buffer {
+                max_bytes: MAX_WORKSPACE_REQUEST_BYTES as u64,
+            },
+            ("POST", "/v1/workspaces/derive") => RequestBodyPolicy::Buffer {
                 max_bytes: MAX_WORKSPACE_REQUEST_BYTES as u64,
             },
             ("PUT", path)
@@ -329,6 +334,14 @@ impl NodeServer {
                 artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS),
                 &blobs,
             )
+            .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
+        workspaces
+            .recover_manifest_retention(
+                artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS),
+            )
+            .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
+        workspaces
+            .reconcile_manifests(&blobs, artifact::now_unix_ms(), 1024)
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
         let drain_path = config.database_path.with_extension("drain");
         let draining = Arc::new(AtomicBool::new(operations::is_persistently_draining(
@@ -455,6 +468,11 @@ impl NodeServer {
             .workspaces
             .garbage_collect(now, limit, dry_run)
             .map_err(|error| error.to_string())?;
+        let (manifest_candidates, manifests_deleted) = self
+            .state
+            .workspaces
+            .manifest_garbage_collect(now, limit, dry_run, &self.state.blobs)
+            .map_err(|error| error.to_string())?;
         let artifact_report = self
             .state
             .artifacts
@@ -470,6 +488,8 @@ impl NodeServer {
             workspace_candidates,
             workspace_logical_bytes,
             workspaces_deleted,
+            manifest_candidates,
+            manifests_deleted,
             artifact_candidates: artifact_report.candidate_artifacts,
             artifacts_deleted: artifact_report.deleted_artifacts,
             expired_blob_references: if dry_run {
@@ -548,6 +568,7 @@ fn static_capability_features() -> &'static [&'static str] {
         "blob.stream.v1",
         "workspace.manifest.v1",
         "workspace.materialize.v1",
+        "workspace.derive.v1",
         "artifact.declared.v1",
         "artifact.stream.v1",
         "artifact.retention.v1",
@@ -623,6 +644,9 @@ fn operation_for(method: &str, path: &str) -> Option<(Operation, Route)> {
         ("POST", "/v1/blobs/missing") => Some((Operation::BlobRead, Route::BlobMissing)),
         ("POST", "/v1/blobs/prepare") => Some((Operation::BlobWrite, Route::BlobPrepare)),
         ("POST", "/v1/workspaces") => Some((Operation::WorkspaceCreate, Route::WorkspaceCreate)),
+        ("POST", "/v1/workspaces/derive") => {
+            Some((Operation::WorkspaceCreate, Route::WorkspaceDerive))
+        }
         _ => {
             let parts: Vec<_> = path.split('/').collect();
             if parts.len() == 4 && parts[..2] == ["", "v1"] && parts[2] == "artifacts" {
@@ -688,6 +712,7 @@ enum Route {
     BlobDownload(eggwork_core::BlobDigest),
     BlobInvalidDigest,
     WorkspaceCreate,
+    WorkspaceDerive,
     ArtifactList(ExecutionId),
     ArtifactDownload(eggwork_core::ArtifactId),
 }
@@ -744,6 +769,7 @@ async fn dispatch(
             "blob digest is invalid",
         )),
         Route::WorkspaceCreate => workspace_create(state, request, principal).await,
+        Route::WorkspaceDerive => workspace_derive(state, request, principal).await,
         Route::ArtifactList(id) => artifact_list(state, id, query.as_deref(), principal).await,
         Route::ArtifactDownload(id) => artifact_download(state, id, principal).await,
     }
@@ -1039,16 +1065,156 @@ async fn workspace_create(
         )
         .await
     {
-        Ok(ready) => Ok(json_response(
-            201,
-            &WorkspaceReadyResponse {
-                schema_version: API_SCHEMA_VERSION,
-                workspace_id: wire.workspace_id,
-                execution_id: wire.handle.execution_id,
-                generation: wire.handle.generation,
-                manifest_digest: ready.manifest_digest,
-                logical_bytes: ready.logical_bytes,
-            },
+        Ok(ready) => {
+            increment_metric(&state.store, "workspace_manifest_registrations", 1).await;
+            Ok(json_response(
+                201,
+                &WorkspaceReadyResponse {
+                    schema_version: API_SCHEMA_VERSION,
+                    workspace_id: wire.workspace_id,
+                    execution_id: wire.handle.execution_id,
+                    generation: wire.handle.generation,
+                    manifest_digest: ready.manifest_digest,
+                    logical_bytes: ready.logical_bytes,
+                },
+            ))
+        }
+        Err(workspace::WorkspaceError::InvalidManifest) => Ok(error_response(
+            400,
+            "invalid_manifest",
+            "workspace manifest is invalid",
+        )),
+        Err(workspace::WorkspaceError::InvalidBlob) => Ok(error_response(
+            409,
+            "missing_blob",
+            "workspace references a missing or corrupt blob",
+        )),
+        Err(workspace::WorkspaceError::BlobSizeMismatch) => Ok(error_response(
+            409,
+            "blob_size_mismatch",
+            "workspace blob size does not match",
+        )),
+        Err(workspace::WorkspaceError::QuotaExceeded) => Ok(error_response(
+            507,
+            "quota_exceeded",
+            "workspace quota exceeded",
+        )),
+        Err(workspace::WorkspaceError::Conflict) => Ok(error_response(
+            409,
+            "workspace_identity_conflict",
+            "workspace identity conflicts",
+        )),
+        Err(_) => Ok(error_response(
+            500,
+            "workspace_error",
+            "workspace materialization failed",
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeriveWorkspaceRequest {
+    schema_version: u16,
+    workspace_id: eggwork_core::WorkspaceId,
+    handle: ExecutionHandle,
+    patch: eggwork_core::WorkspaceManifestPatch,
+}
+
+async fn workspace_derive(
+    state: NodeState,
+    request: Request,
+    principal: NodePrincipal,
+) -> Result<Response, eggserve_core::server::ServiceError> {
+    increment_metric(&state.store, "workspace_derived_requests", 1).await;
+    let (_head, body, _context) = request.into_parts_with_context();
+    let bytes = match read_limited_body(body, MAX_WORKSPACE_REQUEST_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(()) => {
+            return Ok(error_response(
+                413,
+                "request_too_large",
+                "workspace patch exceeds limit",
+            ));
+        }
+    };
+    let wire: DeriveWorkspaceRequest = match serde_json::from_slice(&bytes) {
+        Ok(wire) => wire,
+        Err(_) => {
+            return Ok(error_response(
+                400,
+                "invalid_request",
+                "workspace derive request is invalid",
+            ));
+        }
+    };
+    if wire.schema_version != API_SCHEMA_VERSION {
+        return Ok(error_response(
+            426,
+            "protocol_version",
+            "unsupported schema version",
+        ));
+    }
+    if !authorize_resource(
+        &state,
+        &principal,
+        Operation::WorkspaceCreate,
+        ResourceId::Workspace(wire.workspace_id.clone()),
+    ) {
+        return Ok(error_response(
+            403,
+            "forbidden",
+            "operation is not authorized",
+        ));
+    }
+    if ExecutionGeneration::new(wire.handle.generation.get()).is_err() {
+        increment_metric(&state.store, "rejected_invalid", 1).await;
+        return Ok(error_response(
+            400,
+            "invalid_request",
+            "workspace owner is invalid",
+        ));
+    }
+    let patch_entries = wire.patch.entries.len() as u64;
+    match state
+        .workspaces
+        .materialize_derived(
+            wire.workspace_id.clone(),
+            &wire.handle,
+            &principal.id,
+            wire.patch,
+            &state.blobs,
+        )
+        .await
+    {
+        Ok(ready) => {
+            increment_metric(&state.store, "workspace_derived_hits", 1).await;
+            increment_metric(&state.store, "workspace_manifest_registrations", 1).await;
+            increment_metric(&state.store, "workspace_patch_entries", patch_entries).await;
+            Ok(json_response(
+                201,
+                &WorkspaceReadyResponse {
+                    schema_version: API_SCHEMA_VERSION,
+                    workspace_id: wire.workspace_id,
+                    execution_id: wire.handle.execution_id,
+                    generation: wire.handle.generation,
+                    manifest_digest: ready.manifest_digest,
+                    logical_bytes: ready.logical_bytes,
+                },
+            ))
+        }
+        Err(workspace::WorkspaceError::BaseMissing) => {
+            increment_metric(&state.store, "workspace_base_missing", 1).await;
+            Ok(error_response(
+                409,
+                "base_manifest_missing",
+                "base manifest is missing or expired; retry with a full manifest",
+            ))
+        }
+        Err(workspace::WorkspaceError::InvalidPatch) => Ok(error_response(
+            400,
+            "invalid_patch",
+            "workspace patch is invalid",
         )),
         Err(workspace::WorkspaceError::InvalidManifest) => Ok(error_response(
             400,
@@ -2803,6 +2969,7 @@ mod tests {
                 Operation::BlobRead,
             ),
             ("POST", "/v1/workspaces", Operation::WorkspaceCreate),
+            ("POST", "/v1/workspaces/derive", Operation::WorkspaceCreate),
             (
                 "GET",
                 "/v1/executions/exec-1/artifacts",
@@ -2842,6 +3009,20 @@ mod tests {
         });
         workspace["principal_id"] = serde_json::json!("victim");
         assert!(serde_json::from_value::<WorkspaceCreateRequest>(workspace).is_err());
+
+        let mut derived = serde_json::json!({
+            "schema_version": API_SCHEMA_VERSION,
+            "workspace_id": "forged-derived-workspace",
+            "handle": execution_handle("forged-derived-execution"),
+            "patch": {
+                "schema_version": 1,
+                "base_manifest_digest": eggwork_core::BlobDigest::from_bytes(b"base").as_str(),
+                "entries": []
+            },
+            "principal_id": "victim"
+        });
+        derived["principal_id"] = serde_json::json!("victim");
+        assert!(serde_json::from_value::<DeriveWorkspaceRequest>(derived).is_err());
 
         let mut control = serde_json::to_value(ControlRequest {
             schema_version: API_SCHEMA_VERSION,
@@ -4046,6 +4227,344 @@ mod tests {
             event.kind,
             ExecutionEventKind::State(ExecutionState::Interrupted)
         )));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    async fn upload_test_blob(
+        client: &NodeClient,
+        bytes: &'static [u8],
+    ) -> eggwork_core::BlobDigest {
+        let digest = eggwork_core::BlobDigest::from_bytes(bytes);
+        let chunks = vec![Ok::<_, eggfetch_core::Error>(Bytes::copy_from_slice(bytes))];
+        client
+            .upload_blob(&digest, bytes.len() as u64, Box::pin(stream::iter(chunks)))
+            .await
+            .unwrap();
+        digest
+    }
+
+    #[tokio::test]
+    async fn derived_workspace_materialization_loopback() {
+        init_tls();
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["eggwork derive test CA".into()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let root = ca.der().clone();
+        let server_identity = issue_identity(&ca, &ca_key, vec!["localhost".into()]);
+        let client_a_identity = issue_identity(&ca, &ca_key, vec!["controller-a".into()]);
+        let client_b_identity = issue_identity(&ca, &ca_key, vec!["controller-b".into()]);
+        let principal_a = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let principal_b = eggwork_core::PrincipalId::new("controller-b").unwrap();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([
+            (
+                FingerprintPrincipalResolver::fingerprint(client_a_identity.cert.as_ref()),
+                principal_a.clone(),
+            ),
+            (
+                FingerprintPrincipalResolver::fingerprint(client_b_identity.cert.as_ref()),
+                principal_b.clone(),
+            ),
+        ]));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-derive").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 64 * 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 64 * 1024 * 1024,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(5),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let endpoint = format!("https://localhost:{}", server.local_addr().port());
+        let temp_a = TempDir::new().unwrap();
+        let temp_b = TempDir::new().unwrap();
+        let client_a = NodeClient::new(
+            &endpoint,
+            write_client_config(&temp_a, root.as_ref(), &client_a_identity),
+        )
+        .unwrap();
+        let client_b = NodeClient::new(
+            &endpoint,
+            write_client_config(&temp_b, root.as_ref(), &client_b_identity),
+        )
+        .unwrap();
+
+        // The versioned derive capability is advertised alongside the
+        // existing workspace capabilities; no existing feature is removed.
+        let capabilities = client_a.capabilities().await.unwrap();
+        assert!(
+            capabilities
+                .features
+                .iter()
+                .any(|feature| feature == "workspace.derive.v1"),
+            "node must advertise workspace.derive.v1"
+        );
+        assert!(
+            capabilities
+                .features
+                .iter()
+                .any(|feature| feature == "workspace.materialize.v1")
+        );
+
+        let base_bytes = b"derive base v1";
+        let updated_bytes = b"derive base v2 with more content";
+        let base_digest = upload_test_blob(&client_a, base_bytes).await;
+        let updated_digest = upload_test_blob(&client_a, updated_bytes).await;
+        let base_manifest = eggwork_core::WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![
+                eggwork_core::WorkspaceEntry::Directory {
+                    path: eggwork_core::RelativePath::new("src").unwrap(),
+                },
+                eggwork_core::WorkspaceEntry::File {
+                    path: eggwork_core::RelativePath::new("src/app.txt").unwrap(),
+                    digest: base_digest.clone(),
+                    size_bytes: base_bytes.len() as u64,
+                    executable: false,
+                },
+                eggwork_core::WorkspaceEntry::File {
+                    path: eggwork_core::RelativePath::new("stale.txt").unwrap(),
+                    digest: base_digest.clone(),
+                    size_bytes: base_bytes.len() as u64,
+                    executable: false,
+                },
+            ],
+        };
+        let base_canonical = base_manifest.digest().unwrap();
+        let base_handle = execution_handle("derive-base-execution");
+        client_a
+            .create_workspace(
+                &eggwork_core::WorkspaceId::new("derive-base").unwrap(),
+                &base_handle,
+                &base_manifest,
+            )
+            .await
+            .unwrap();
+
+        // Authenticated full -> derived flow with remove + upsert semantics.
+        let patch = eggwork_core::WorkspaceManifestPatch {
+            schema_version: 1,
+            base_manifest_digest: base_canonical.clone(),
+            entries: vec![
+                eggwork_core::WorkspacePatchEntry::Remove {
+                    path: eggwork_core::RelativePath::new("stale.txt").unwrap(),
+                },
+                eggwork_core::WorkspacePatchEntry::File {
+                    path: eggwork_core::RelativePath::new("src/app.txt").unwrap(),
+                    digest: updated_digest.clone(),
+                    size_bytes: updated_bytes.len() as u64,
+                    executable: true,
+                },
+            ],
+        };
+        let derived_handle = execution_handle("derive-execution");
+        let derived_id = eggwork_core::WorkspaceId::new("derive-target").unwrap();
+        let derived = client_a
+            .create_workspace_derived(&derived_id, &derived_handle, &base_canonical, &patch)
+            .await
+            .unwrap();
+        // The derived response digest equals the locally reconstructed full
+        // manifest digest: the optimization changes no content facts.
+        let expected = eggwork_core::WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![
+                eggwork_core::WorkspaceEntry::Directory {
+                    path: eggwork_core::RelativePath::new("src").unwrap(),
+                },
+                eggwork_core::WorkspaceEntry::File {
+                    path: eggwork_core::RelativePath::new("src/app.txt").unwrap(),
+                    digest: updated_digest,
+                    size_bytes: updated_bytes.len() as u64,
+                    executable: true,
+                },
+            ],
+        };
+        assert_eq!(derived.manifest_digest, expected.digest().unwrap());
+        assert_eq!(derived.logical_bytes, expected.logical_bytes());
+        let resolved = server
+            .state
+            .workspaces
+            .resolve(
+                &derived_id,
+                &derived_handle.execution_id,
+                derived_handle.generation,
+                &principal_a,
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(resolved.root.join("src/app.txt")).unwrap(),
+            updated_bytes
+        );
+        assert!(!resolved.root.join("stale.txt").exists());
+
+        // A full create of the equivalent manifest converges on the same
+        // digest without sharing execution ownership.
+        let converged = client_a
+            .create_workspace(
+                &eggwork_core::WorkspaceId::new("derive-converged").unwrap(),
+                &execution_handle("derive-converged-execution"),
+                &expected,
+            )
+            .await
+            .unwrap();
+        assert_eq!(converged.manifest_digest, derived.manifest_digest);
+
+        // Transport retry: repeating the same derived request is idempotent.
+        let retried = client_a
+            .create_workspace_derived(&derived_id, &derived_handle, &base_canonical, &patch)
+            .await
+            .unwrap();
+        assert_eq!(retried.manifest_digest, derived.manifest_digest);
+
+        // Unknown bases are typed non-destructive misses.
+        let unknown = eggwork_core::BlobDigest::from_bytes(b"never retained");
+        let unknown_patch = eggwork_core::WorkspaceManifestPatch {
+            schema_version: 1,
+            base_manifest_digest: unknown,
+            entries: vec![],
+        };
+        let missing = client_a
+            .create_workspace_derived(
+                &eggwork_core::WorkspaceId::new("derive-unknown-base").unwrap(),
+                &execution_handle("derive-unknown-execution"),
+                &eggwork_core::BlobDigest::from_bytes(b"never retained"),
+                &unknown_patch,
+            )
+            .await;
+        assert!(
+            matches!(missing, Err(eggwork_client::ClientError::Api { status: 409, ref code, .. }) if code == "base_manifest_missing"),
+            "unknown base must be a typed miss, got {missing:?}"
+        );
+
+        // Another principal's retained manifest is unusable and reports the
+        // identical miss: existence is not revealed across principals.
+        let foreign = client_b
+            .create_workspace_derived(
+                &eggwork_core::WorkspaceId::new("derive-foreign").unwrap(),
+                &execution_handle("derive-foreign-execution"),
+                &base_canonical,
+                &patch,
+            )
+            .await;
+        assert!(
+            matches!(foreign, Err(eggwork_client::ClientError::Api { status: 409, ref code, .. }) if code == "base_manifest_missing"),
+            "cross-principal base must look missing, got {foreign:?}"
+        );
+
+        // Malformed patches are rejected without creating a workspace.
+        let duplicate_patch = eggwork_core::WorkspaceManifestPatch {
+            schema_version: 1,
+            base_manifest_digest: base_canonical.clone(),
+            entries: vec![
+                eggwork_core::WorkspacePatchEntry::Remove {
+                    path: eggwork_core::RelativePath::new("stale.txt").unwrap(),
+                },
+                eggwork_core::WorkspacePatchEntry::Remove {
+                    path: eggwork_core::RelativePath::new("stale.txt").unwrap(),
+                },
+            ],
+        };
+        assert!(matches!(
+            client_a
+                .create_workspace_derived(
+                    &eggwork_core::WorkspaceId::new("derive-bad-patch").unwrap(),
+                    &execution_handle("derive-bad-patch-execution"),
+                    &base_canonical,
+                    &duplicate_patch,
+                )
+                .await,
+            Err(eggwork_client::ClientError::Api { status: 400, .. })
+        ));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn derived_workspace_denied_and_oversized_bodies_are_typed() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        struct DenyDerive;
+        impl Authorizer for DenyDerive {
+            fn authorize(&self, _: &NodePrincipal, operation: Operation) -> bool {
+                !matches!(operation, Operation::WorkspaceCreate)
+            }
+        }
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-derive-deny").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(5),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            Arc::new(DenyDerive),
+        )
+        .await
+        .unwrap();
+        let endpoint = format!("https://localhost:{}", server.local_addr().port());
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            &endpoint,
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+        let digest = eggwork_core::BlobDigest::from_bytes(b"denied base");
+        let patch = eggwork_core::WorkspaceManifestPatch {
+            schema_version: 1,
+            base_manifest_digest: digest.clone(),
+            entries: vec![],
+        };
+        assert!(matches!(
+            client
+                .create_workspace_derived(
+                    &eggwork_core::WorkspaceId::new("denied-derive").unwrap(),
+                    &execution_handle("denied-derive-execution"),
+                    &digest,
+                    &patch,
+                )
+                .await,
+            Err(eggwork_client::ClientError::Api { status: 403, .. })
+        ));
+        assert_eq!(
+            post_raw(
+                &format!("{endpoint}/v1/workspaces/derive"),
+                write_client_config(&client_temp, root.as_ref(), &client_identity),
+                vec![b'x'; MAX_WORKSPACE_REQUEST_BYTES + 1],
+            )
+            .await,
+            413
+        );
         server.shutdown().await;
         server.wait().await.unwrap();
     }

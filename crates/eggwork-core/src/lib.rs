@@ -710,6 +710,121 @@ impl WorkspaceManifest {
     }
 }
 
+/// Bounded deterministic patch applied to a retained canonical manifest.
+///
+/// The patch names its content base by digest and carries exact-path
+/// remove/upsert entries. Applying a patch to a base manifest MUST yield the
+/// same canonical manifest (and digest) as submitting the final manifest
+/// directly. Patch ordering never affects the result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceManifestPatch {
+    pub schema_version: u16,
+    pub base_manifest_digest: BlobDigest,
+    pub entries: Vec<WorkspacePatchEntry>,
+}
+
+/// One exact-path patch operation. `Remove` deletes exactly that path;
+/// removing a directory requires explicit descendant removals (no recursive
+/// delete). `Directory`/`File` upsert exactly that path. Rename is
+/// remove + upsert. Symlinks remain unsupported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkspacePatchEntry {
+    Remove {
+        path: RelativePath,
+    },
+    Directory {
+        path: RelativePath,
+    },
+    File {
+        path: RelativePath,
+        digest: BlobDigest,
+        size_bytes: u64,
+        executable: bool,
+    },
+}
+
+impl WorkspacePatchEntry {
+    pub fn path(&self) -> &RelativePath {
+        match self {
+            Self::Remove { path } | Self::Directory { path } | Self::File { path, .. } => path,
+        }
+    }
+}
+
+impl WorkspaceManifestPatch {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.schema_version != 1 {
+            return Err(ValidationError::OutOfRange {
+                field: "workspace patch schema version",
+            });
+        }
+        if self.entries.len() > MAX_WORKSPACE_ENTRIES {
+            return Err(ValidationError::TooMany {
+                field: "workspace patch entries",
+                max: MAX_WORKSPACE_ENTRIES,
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &self.entries {
+            if !seen.insert(entry.path().as_str()) {
+                return Err(ValidationError::InvalidSyntax {
+                    field: "duplicate workspace patch path",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply this patch to a base manifest through a deterministic path map,
+    /// then validate the final manifest with the existing validator. No
+    /// second path validator is introduced: portable path, case-collision,
+    /// parent-directory, symlink, depth, count, and size rules all come from
+    /// [`WorkspaceManifest::validate`].
+    pub fn apply_to(&self, base: &WorkspaceManifest) -> Result<WorkspaceManifest, ValidationError> {
+        self.validate()?;
+        let mut tree = std::collections::BTreeMap::<String, WorkspaceEntry>::new();
+        for entry in &base.entries {
+            tree.insert(entry.path().as_str().to_owned(), entry.clone());
+        }
+        for entry in &self.entries {
+            match entry {
+                WorkspacePatchEntry::Remove { path } => {
+                    tree.remove(path.as_str());
+                }
+                WorkspacePatchEntry::Directory { path } => {
+                    tree.insert(
+                        path.as_str().to_owned(),
+                        WorkspaceEntry::Directory { path: path.clone() },
+                    );
+                }
+                WorkspacePatchEntry::File {
+                    path,
+                    digest,
+                    size_bytes,
+                    executable,
+                } => {
+                    tree.insert(
+                        path.as_str().to_owned(),
+                        WorkspaceEntry::File {
+                            path: path.clone(),
+                            digest: digest.clone(),
+                            size_bytes: *size_bytes,
+                            executable: *executable,
+                        },
+                    );
+                }
+            }
+        }
+        let final_manifest = WorkspaceManifest {
+            schema_version: 1,
+            entries: tree.into_values().collect(),
+        };
+        final_manifest.validate()?;
+        Ok(final_manifest)
+    }
+}
+
 fn validate_portable_workspace_path(path: &str) -> Result<(), ValidationError> {
     if path.is_empty()
         || path.len() > MAX_PATH_BYTES
@@ -1374,5 +1489,183 @@ mod tests {
             .environment
             .push(EnvironmentEntry::new("LANG", "C").unwrap());
         assert!(value.validate().is_err());
+    }
+
+    fn patch_base_manifest() -> WorkspaceManifest {
+        WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![
+                WorkspaceEntry::Directory {
+                    path: RelativePath::new("src").unwrap(),
+                },
+                WorkspaceEntry::File {
+                    path: RelativePath::new("src/main.rs").unwrap(),
+                    digest: BlobDigest::from_bytes(b"v1"),
+                    size_bytes: 2,
+                    executable: false,
+                },
+                WorkspaceEntry::File {
+                    path: RelativePath::new("old.txt").unwrap(),
+                    digest: BlobDigest::from_bytes(b"old"),
+                    size_bytes: 3,
+                    executable: false,
+                },
+            ],
+        }
+    }
+
+    fn patch_for(
+        base_digest: BlobDigest,
+        entries: Vec<WorkspacePatchEntry>,
+    ) -> WorkspaceManifestPatch {
+        WorkspaceManifestPatch {
+            schema_version: 1,
+            base_manifest_digest: base_digest,
+            entries,
+        }
+    }
+
+    #[test]
+    fn workspace_patch_validates_schema_duplicates_and_bounds() {
+        let base = patch_base_manifest().digest().unwrap();
+        assert!(
+            patch_for(
+                base.clone(),
+                vec![WorkspacePatchEntry::Directory {
+                    path: RelativePath::new("extra").unwrap(),
+                }],
+            )
+            .validate()
+            .is_ok()
+        );
+        let mut invalid = patch_for(base.clone(), vec![]);
+        invalid.schema_version = 2;
+        assert!(invalid.validate().is_err());
+        let duplicate = patch_for(
+            base.clone(),
+            vec![
+                WorkspacePatchEntry::Remove {
+                    path: RelativePath::new("old.txt").unwrap(),
+                },
+                WorkspacePatchEntry::Directory {
+                    path: RelativePath::new("old.txt").unwrap(),
+                },
+            ],
+        );
+        assert!(duplicate.validate().is_err());
+        let many = (0..=MAX_WORKSPACE_ENTRIES)
+            .map(|index| WorkspacePatchEntry::Directory {
+                path: RelativePath::new(format!("d{index}")).unwrap(),
+            })
+            .collect();
+        assert!(patch_for(base, many).validate().is_err());
+    }
+
+    #[test]
+    fn workspace_patch_apply_is_order_independent_and_digest_equivalent() {
+        let base = patch_base_manifest();
+        let base_digest = base.digest().unwrap();
+        let new_digest = BlobDigest::from_bytes(b"v2");
+        let entries = vec![
+            WorkspacePatchEntry::Remove {
+                path: RelativePath::new("old.txt").unwrap(),
+            },
+            WorkspacePatchEntry::File {
+                path: RelativePath::new("src/main.rs").unwrap(),
+                digest: new_digest.clone(),
+                size_bytes: 2,
+                executable: true,
+            },
+            WorkspacePatchEntry::File {
+                path: RelativePath::new("added.txt").unwrap(),
+                digest: BlobDigest::from_bytes(b"added"),
+                size_bytes: 5,
+                executable: false,
+            },
+        ];
+        let mut reversed = entries.clone();
+        reversed.reverse();
+        let first = patch_for(base_digest.clone(), entries)
+            .apply_to(&base)
+            .unwrap();
+        let second = patch_for(base_digest, reversed).apply_to(&base).unwrap();
+        assert_eq!(first, second);
+        let expected = WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![
+                WorkspaceEntry::Directory {
+                    path: RelativePath::new("src").unwrap(),
+                },
+                WorkspaceEntry::File {
+                    path: RelativePath::new("src/main.rs").unwrap(),
+                    digest: new_digest,
+                    size_bytes: 2,
+                    executable: true,
+                },
+                WorkspaceEntry::File {
+                    path: RelativePath::new("added.txt").unwrap(),
+                    digest: BlobDigest::from_bytes(b"added"),
+                    size_bytes: 5,
+                    executable: false,
+                },
+            ],
+        };
+        assert!(expected.validate().is_ok());
+        assert_eq!(first.digest().unwrap(), expected.digest().unwrap());
+    }
+
+    #[test]
+    fn workspace_patch_rejects_final_trees_the_full_path_would_reject() {
+        let base = patch_base_manifest();
+        let base_digest = base.digest().unwrap();
+        // Missing parent directory in the final tree.
+        let orphan = patch_for(
+            base_digest.clone(),
+            vec![WorkspacePatchEntry::File {
+                path: RelativePath::new("nodir/file.txt").unwrap(),
+                digest: BlobDigest::from_bytes(b"x"),
+                size_bytes: 1,
+                executable: false,
+            }],
+        );
+        assert!(orphan.apply_to(&base).is_err());
+        // Removing the parent of a retained child breaks parent validation.
+        let orphaned_child = patch_for(
+            base_digest.clone(),
+            vec![WorkspacePatchEntry::Remove {
+                path: RelativePath::new("src").unwrap(),
+            }],
+        );
+        assert!(orphaned_child.apply_to(&base).is_err());
+        // Case collision in the final tree.
+        let collision = patch_for(
+            base_digest.clone(),
+            vec![WorkspacePatchEntry::File {
+                path: RelativePath::new("SRC/MAIN.RS").unwrap(),
+                digest: BlobDigest::from_bytes(b"x"),
+                size_bytes: 1,
+                executable: false,
+            }],
+        );
+        assert!(collision.apply_to(&base).is_err());
+        // A patch cannot smuggle a symlink past the shared validator.
+        let symlink_like = WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![WorkspaceEntry::Symlink {
+                path: RelativePath::new("link").unwrap(),
+                target: "../../etc/passwd".into(),
+            }],
+        };
+        assert!(symlink_like.validate().is_err());
+        // Removing a path that is already absent is a deterministic no-op.
+        let noop = patch_for(
+            base_digest,
+            vec![WorkspacePatchEntry::Remove {
+                path: RelativePath::new("absent.txt").unwrap(),
+            }],
+        )
+        .apply_to(&base)
+        .unwrap();
+        assert_eq!(noop.digest().unwrap(), base.digest().unwrap());
     }
 }

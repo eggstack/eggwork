@@ -278,6 +278,26 @@ impl BlobStore {
         Ok(())
     }
 
+    /// List distinct blob-reference owners for one owner kind, bounded by
+    /// `limit`. Used by restart reconciliation to find orphan references
+    /// without scanning blob bytes.
+    pub fn reference_owners(
+        &self,
+        owner_kind: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, BlobError> {
+        let connection = self.inner.metadata.lock().map_err(|_| BlobError::Worker)?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT owner_id FROM blob_references WHERE owner_kind = ?1 LIMIT ?2",
+        )?;
+        Ok(statement
+            .query_map(
+                params![owner_kind, limit.min(i64::MAX as usize) as i64],
+                |row| row.get(0),
+            )?
+            .collect::<Result<_, _>>()?)
+    }
+
     /// Remove expired references and then a bounded number of unreferenced blobs.
     pub async fn garbage_collect(
         &self,

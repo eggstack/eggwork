@@ -2,8 +2,8 @@
 
 use crate::blob::{BlobStore, MAX_BLOB_BYTES};
 use eggwork_core::{
-    ExecutionGeneration, ExecutionHandle, ExecutionId, PrincipalId, WorkspaceEntry, WorkspaceId,
-    WorkspaceManifest,
+    BlobDigest, ExecutionGeneration, ExecutionHandle, ExecutionId, PrincipalId, WorkspaceEntry,
+    WorkspaceId, WorkspaceManifest, WorkspaceManifestPatch,
 };
 use rusqlite::TransactionBehavior;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -20,6 +20,10 @@ use thiserror::Error;
 pub enum WorkspaceError {
     #[error("workspace manifest is invalid")]
     InvalidManifest,
+    #[error("workspace patch is invalid")]
+    InvalidPatch,
+    #[error("base manifest is missing or expired")]
+    BaseMissing,
     #[error("workspace references a missing or corrupt blob")]
     InvalidBlob,
     #[error("workspace blob size does not match its manifest")]
@@ -85,7 +89,18 @@ impl WorkspaceManager {
                state TEXT NOT NULL,
                created_unix_ms INTEGER NOT NULL,
                expires_unix_ms INTEGER
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS retained_manifests (
+               principal_id TEXT NOT NULL,
+               manifest_digest TEXT NOT NULL,
+               manifest_json BLOB NOT NULL,
+               logical_bytes INTEGER NOT NULL,
+               created_unix_ms INTEGER NOT NULL,
+               expires_unix_ms INTEGER,
+               PRIMARY KEY (principal_id, manifest_digest)
+             );
+             CREATE INDEX IF NOT EXISTS retained_manifests_expiry
+               ON retained_manifests(expires_unix_ms);",
         )?;
         let has_expiry = {
             let mut columns = metadata.prepare("PRAGMA table_info(workspaces)")?;
@@ -205,6 +220,13 @@ impl WorkspaceManager {
             Some(initial_expiry),
         )?;
 
+        // A successful create registers its canonical manifest as a
+        // same-principal derived base before the tree becomes visible. The
+        // registration only pins already-verified blobs for the bounded
+        // retention horizon; a tree failure below leaves a harmless expiring
+        // cache entry, never a ready workspace.
+        self.store_manifest(principal_id, &manifest, &manifest_digest, blobs)?;
+
         let nonce = uuid::Uuid::new_v4().to_string();
         let stage_key = format!(".staging-{nonce}");
         let storage_key = format!("workspace-{nonce}");
@@ -273,6 +295,319 @@ impl WorkspaceManager {
             logical_bytes,
             manifest_digest,
         })
+    }
+
+    /// Create a fresh execution-private workspace from a retained canonical
+    /// base manifest plus a bounded deterministic patch.
+    ///
+    /// The base lookup is scoped to `(principal_id, base_manifest_digest)`,
+    /// so a missing/expired base is indistinguishable from a base retained
+    /// for another principal. A miss has zero ready-workspace side effect.
+    /// The final tree passes through the existing validator and the existing
+    /// materialization path, so the result is byte-identical to submitting
+    /// the equivalent full manifest.
+    pub async fn materialize_derived(
+        &self,
+        workspace_id: WorkspaceId,
+        handle: &ExecutionHandle,
+        principal_id: &PrincipalId,
+        patch: WorkspaceManifestPatch,
+        blobs: &BlobStore,
+    ) -> Result<ReadyWorkspace, WorkspaceError> {
+        patch.validate().map_err(|_| WorkspaceError::InvalidPatch)?;
+        let Some(base) = self.lookup_manifest(principal_id, &patch.base_manifest_digest, blobs)?
+        else {
+            return Err(WorkspaceError::BaseMissing);
+        };
+        let final_manifest = patch
+            .apply_to(&base)
+            .map_err(|_| WorkspaceError::InvalidManifest)?;
+        self.materialize(workspace_id, handle, principal_id, final_manifest, blobs)
+            .await
+    }
+
+    /// Persist a validated canonical manifest as a derived base for later
+    /// same-principal patches, pinning its blobs under a distinct
+    /// `manifest` owner kind for the bounded retention horizon. Re-registration
+    /// extends expiry monotonically; it never shortens it.
+    fn store_manifest(
+        &self,
+        principal_id: &PrincipalId,
+        manifest: &WorkspaceManifest,
+        manifest_digest: &str,
+        blobs: &BlobStore,
+    ) -> Result<(), WorkspaceError> {
+        manifest
+            .validate()
+            .map_err(|_| WorkspaceError::InvalidManifest)?;
+        BlobDigest::parse(manifest_digest.to_owned())
+            .map_err(|_| WorkspaceError::InvalidManifest)?;
+        let encoded = serde_json::to_vec(manifest)?;
+        let logical_bytes = manifest.logical_bytes();
+        let now = crate::artifact::now_unix_ms();
+        let fresh_expiry = now.saturating_add(crate::artifact::DEFAULT_RETENTION_MILLIS);
+        let connection = self
+            .inner
+            .metadata
+            .lock()
+            .map_err(|_| WorkspaceError::Worker)?;
+        let existing: Option<Option<i64>> = connection
+            .query_row(
+                "SELECT expires_unix_ms FROM retained_manifests
+                 WHERE principal_id = ?1 AND manifest_digest = ?2",
+                params![principal_id.as_str(), manifest_digest],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let expires = existing
+            .flatten()
+            .map(|value| (value.max(0) as u64).max(fresh_expiry))
+            .unwrap_or(fresh_expiry);
+        connection.execute(
+            "INSERT INTO retained_manifests(principal_id, manifest_digest, manifest_json,
+               logical_bytes, created_unix_ms, expires_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(principal_id, manifest_digest) DO UPDATE SET
+               manifest_json = excluded.manifest_json,
+               logical_bytes = excluded.logical_bytes,
+               expires_unix_ms = excluded.expires_unix_ms",
+            params![
+                principal_id.as_str(),
+                manifest_digest,
+                encoded,
+                logical_bytes as i64,
+                now as i64,
+                expires as i64,
+            ],
+        )?;
+        drop(connection);
+        let digests = manifest
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                WorkspaceEntry::File { digest, .. } => Some(digest.clone()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        blobs.retain(
+            "manifest",
+            &manifest_owner_id(principal_id, manifest_digest),
+            &digests,
+            Some(expires),
+        )?;
+        Ok(())
+    }
+
+    /// Resolve a retained canonical manifest within one principal's scope.
+    /// Expired bases behave as missing. A record whose blobs are no longer
+    /// available is reaped and reported as missing; it is never usable.
+    pub fn lookup_manifest(
+        &self,
+        principal_id: &PrincipalId,
+        manifest_digest: &BlobDigest,
+        blobs: &BlobStore,
+    ) -> Result<Option<WorkspaceManifest>, WorkspaceError> {
+        let digest = manifest_digest.as_str();
+        let row: Option<(Vec<u8>, Option<i64>)> = self
+            .inner
+            .metadata
+            .lock()
+            .map_err(|_| WorkspaceError::Worker)?
+            .query_row(
+                "SELECT manifest_json, expires_unix_ms FROM retained_manifests
+                 WHERE principal_id = ?1 AND manifest_digest = ?2",
+                params![principal_id.as_str(), digest],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((encoded, expires)) = row else {
+            return Ok(None);
+        };
+        if expires.is_some_and(|value| (value.max(0) as u64) <= crate::artifact::now_unix_ms()) {
+            return Ok(None);
+        }
+        let manifest: WorkspaceManifest =
+            serde_json::from_slice(&encoded).map_err(|_| WorkspaceError::InvalidManifest)?;
+        if manifest.validate().is_err() {
+            self.drop_manifest(principal_id, digest, blobs);
+            return Ok(None);
+        }
+        for entry in &manifest.entries {
+            if let WorkspaceEntry::File {
+                digest: blob_digest,
+                size_bytes,
+                ..
+            } = entry
+            {
+                match blobs.stored_size(blob_digest) {
+                    Ok(size) if size == *size_bytes => {}
+                    _ => {
+                        self.drop_manifest(principal_id, digest, blobs);
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        Ok(Some(manifest))
+    }
+
+    fn drop_manifest(&self, principal_id: &PrincipalId, manifest_digest: &str, blobs: &BlobStore) {
+        if let Ok(connection) = self.inner.metadata.lock() {
+            let _ = connection.execute(
+                "DELETE FROM retained_manifests WHERE principal_id = ?1 AND manifest_digest = ?2",
+                params![principal_id.as_str(), manifest_digest],
+            );
+        }
+        let _ = blobs.release_references(
+            "manifest",
+            &manifest_owner_id(principal_id, manifest_digest),
+        );
+    }
+
+    /// Release expired retained manifests and their blob references. The pass
+    /// is bounded by `limit`; callers repeat it to drain larger backlogs.
+    /// Returns `(expired_candidates, manifests_deleted)`.
+    pub fn manifest_garbage_collect(
+        &self,
+        now_unix_ms: u64,
+        limit: usize,
+        dry_run: bool,
+        blobs: &BlobStore,
+    ) -> Result<(u64, u64), WorkspaceError> {
+        let connection = self
+            .inner
+            .metadata
+            .lock()
+            .map_err(|_| WorkspaceError::Worker)?;
+        let expired: Vec<(String, String)> = {
+            let mut statement = connection.prepare(
+                "SELECT principal_id, manifest_digest FROM retained_manifests
+                 WHERE expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?1
+                 ORDER BY expires_unix_ms ASC LIMIT ?2",
+            )?;
+            statement
+                .query_map(
+                    params![now_unix_ms as i64, limit.min(i64::MAX as usize) as i64],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?
+                .collect::<Result<_, _>>()?
+        };
+        let candidates = expired.len() as u64;
+        if dry_run {
+            return Ok((candidates, 0));
+        }
+        let mut deleted = 0u64;
+        for (principal_id, manifest_digest) in &expired {
+            connection.execute(
+                "DELETE FROM retained_manifests
+                 WHERE principal_id = ?1 AND manifest_digest = ?2
+                   AND expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?3",
+                params![principal_id, manifest_digest, now_unix_ms as i64],
+            )?;
+            let _ =
+                blobs.release_references("manifest", &format!("{principal_id}:{manifest_digest}"));
+            deleted += 1;
+        }
+        Ok((candidates, deleted))
+    }
+
+    /// Crash-safety: manifests created before expiry tracking must still
+    /// expire instead of pinning blobs forever.
+    pub fn recover_manifest_retention(&self, expires_unix_ms: u64) -> Result<(), WorkspaceError> {
+        self.inner
+            .metadata
+            .lock()
+            .map_err(|_| WorkspaceError::Worker)?
+            .execute(
+                "UPDATE retained_manifests SET expires_unix_ms = ?1
+                 WHERE expires_unix_ms IS NULL",
+                [expires_unix_ms as i64],
+            )?;
+        Ok(())
+    }
+
+    /// Restart reconciliation for the manifest cache. Each step is bounded by
+    /// `limit` so a large stale cache cannot stall startup; leftovers are
+    /// reaped by the next restart or GC pass. Never leaves permanent
+    /// unbounded blob references behind.
+    pub fn reconcile_manifests(
+        &self,
+        blobs: &BlobStore,
+        now_unix_ms: u64,
+        limit: usize,
+    ) -> Result<(), WorkspaceError> {
+        let limit = limit.clamp(1, 1024);
+        let rows: Vec<(String, String, Vec<u8>)> = {
+            let connection = self
+                .inner
+                .metadata
+                .lock()
+                .map_err(|_| WorkspaceError::Worker)?;
+            let mut statement = connection.prepare(
+                "SELECT principal_id, manifest_digest, manifest_json FROM retained_manifests
+                 ORDER BY principal_id, manifest_digest LIMIT ?1",
+            )?;
+            statement
+                .query_map([limit.min(i64::MAX as usize) as i64], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<Result<_, _>>()?
+        };
+        for (principal_id, manifest_digest, encoded) in &rows {
+            let principal = PrincipalId::new(principal_id.clone());
+            let digest_valid = BlobDigest::parse(manifest_digest.clone()).is_ok();
+            let body_valid = principal.is_ok()
+                && serde_json::from_slice::<WorkspaceManifest>(encoded)
+                    .is_ok_and(|manifest| manifest.validate().is_ok());
+            if !digest_valid || !body_valid {
+                if let Ok(principal) = principal {
+                    self.drop_manifest(&principal, manifest_digest, blobs);
+                } else if let Ok(connection) = self.inner.metadata.lock() {
+                    let _ = connection.execute(
+                        "DELETE FROM retained_manifests
+                         WHERE principal_id = ?1 AND manifest_digest = ?2",
+                        params![principal_id, manifest_digest],
+                    );
+                    let _ = blobs.release_references(
+                        "manifest",
+                        &format!("{principal_id}:{manifest_digest}"),
+                    );
+                }
+            }
+        }
+        let _ = self.manifest_garbage_collect(now_unix_ms, limit, false, blobs)?;
+        // Orphan `manifest` blob references (no matching cache row, e.g. after
+        // a crash between reference creation and row commit) must expire
+        // instead of pinning bytes indefinitely.
+        let known: HashSet<String> = {
+            let connection = self
+                .inner
+                .metadata
+                .lock()
+                .map_err(|_| WorkspaceError::Worker)?;
+            let mut statement = connection
+                .prepare("SELECT principal_id, manifest_digest FROM retained_manifests")?;
+            statement
+                .query_map([], |row| {
+                    Ok(format!(
+                        "{}:{}",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?
+                    ))
+                })?
+                .collect::<Result<_, _>>()?
+        };
+        let orphans = blobs
+            .reference_owners("manifest", limit)
+            .map_err(WorkspaceError::from)?;
+        for owner in orphans.iter().take(limit) {
+            if !known.contains(owner) {
+                let _ = blobs.release_references("manifest", owner);
+            }
+        }
+        Ok(())
     }
 
     pub fn mark_terminal(
@@ -543,6 +878,10 @@ fn valid_storage_key(key: &str) -> bool {
     key.strip_prefix("workspace-")
         .and_then(|value| uuid::Uuid::parse_str(value).ok())
         .is_some()
+}
+
+fn manifest_owner_id(principal_id: &PrincipalId, manifest_digest: &str) -> String {
+    format!("{}:{manifest_digest}", principal_id.as_str())
 }
 
 fn materialize_tree(
@@ -920,8 +1259,377 @@ mod tests {
         let deleted = manager.garbage_collect(1_000, 1, false).unwrap();
         assert_eq!(deleted.0, 1);
         assert!(!ready.root.exists());
-        let reclaimed = blobs.garbage_collect(1_000, 1, false).await.unwrap();
+        // The retained canonical manifest still pins the blob for its bounded
+        // horizon, so blob reclaim waits for manifest expiry.
+        let retained = blobs.garbage_collect(1_000, 1, false).await.unwrap();
+        assert_eq!(retained.removed_blobs, 0);
+        assert!(blobs.open_verified(&digest).await.is_ok());
+        let manifest_expiry = crate::artifact::now_unix_ms()
+            .saturating_add(crate::artifact::DEFAULT_RETENTION_MILLIS);
+        let (candidates, manifests) = manager
+            .manifest_garbage_collect(manifest_expiry + 1, 8, false, &blobs)
+            .unwrap();
+        assert_eq!((candidates, manifests), (1, 1));
+        let reclaimed = blobs
+            .garbage_collect(manifest_expiry + 1, 1, false)
+            .await
+            .unwrap();
         assert_eq!(reclaimed.removed_blobs, 1);
         assert!(blobs.open_verified(&digest).await.is_err());
+    }
+
+    fn derived_fixture_manifest(digest: eggwork_core::BlobDigest, size: u64) -> WorkspaceManifest {
+        WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![
+                WorkspaceEntry::Directory {
+                    path: eggwork_core::RelativePath::new("src").unwrap(),
+                },
+                WorkspaceEntry::File {
+                    path: eggwork_core::RelativePath::new("src/base.txt").unwrap(),
+                    digest,
+                    size_bytes: size,
+                    executable: false,
+                },
+            ],
+        }
+    }
+
+    fn derived_patch(
+        base: &eggwork_core::BlobDigest,
+        entries: Vec<eggwork_core::WorkspacePatchEntry>,
+    ) -> eggwork_core::WorkspaceManifestPatch {
+        eggwork_core::WorkspaceManifestPatch {
+            schema_version: 1,
+            base_manifest_digest: base.clone(),
+            entries,
+        }
+    }
+
+    #[tokio::test]
+    async fn full_create_registers_base_and_same_principal_derived_hit_matches_full_digest() {
+        let temp = TempDir::new().unwrap();
+        let blobs = BlobStore::open(temp.path().join("blobs"), 1024 * 1024).unwrap();
+        let manager = WorkspaceManager::open(temp.path().join("workspaces"), 1024 * 1024).unwrap();
+        let principal = PrincipalId::new("principal-a").unwrap();
+        let base_bytes = b"base content";
+        let base_digest = upload_blob(&blobs, base_bytes).await;
+        let base_manifest = derived_fixture_manifest(base_digest.clone(), base_bytes.len() as u64);
+        let base_canonical = base_manifest.digest().unwrap();
+        manager
+            .materialize(
+                WorkspaceId::new("ws-base").unwrap(),
+                &owner_handle("exec-base"),
+                &principal,
+                base_manifest,
+                &blobs,
+            )
+            .await
+            .unwrap();
+        // Full create registered the canonical manifest as a derived base.
+        assert!(
+            manager
+                .lookup_manifest(&principal, &base_canonical, &blobs)
+                .unwrap()
+                .is_some()
+        );
+
+        let updated_bytes = b"updated content";
+        let updated_digest = upload_blob(&blobs, updated_bytes).await;
+        let patch = derived_patch(
+            &base_canonical,
+            vec![eggwork_core::WorkspacePatchEntry::File {
+                path: eggwork_core::RelativePath::new("src/base.txt").unwrap(),
+                digest: updated_digest.clone(),
+                size_bytes: updated_bytes.len() as u64,
+                executable: false,
+            }],
+        );
+        let derived = manager
+            .materialize_derived(
+                WorkspaceId::new("ws-derived").unwrap(),
+                &owner_handle("exec-derived"),
+                &principal,
+                patch,
+                &blobs,
+            )
+            .await
+            .unwrap();
+        let expected = derived_fixture_manifest(updated_digest, updated_bytes.len() as u64);
+        assert_eq!(derived.manifest_digest, expected.digest().unwrap().as_str());
+        assert_eq!(
+            fs::read(derived.root.join("src/base.txt")).unwrap(),
+            updated_bytes
+        );
+        // The derived result is itself registered for further derivation.
+        assert!(
+            manager
+                .lookup_manifest(
+                    &principal,
+                    &eggwork_core::BlobDigest::parse(derived.manifest_digest.clone()).unwrap(),
+                    &blobs,
+                )
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_principal_lookup_behaves_as_missing_with_no_side_effect() {
+        let temp = TempDir::new().unwrap();
+        let blobs = BlobStore::open(temp.path().join("blobs"), 1024).unwrap();
+        let manager = WorkspaceManager::open(temp.path().join("workspaces"), 1024).unwrap();
+        let owner = PrincipalId::new("principal-a").unwrap();
+        let other = PrincipalId::new("principal-b").unwrap();
+        let digest = upload_blob(&blobs, b"owned").await;
+        let manifest = derived_fixture_manifest(digest, 5);
+        let canonical = manifest.digest().unwrap();
+        manager
+            .materialize(
+                WorkspaceId::new("ws-owned").unwrap(),
+                &owner_handle("exec-owned"),
+                &owner,
+                manifest,
+                &blobs,
+            )
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .lookup_manifest(&other, &canonical, &blobs)
+                .unwrap()
+                .is_none()
+        );
+        let patch = derived_patch(&canonical, vec![]);
+        assert!(matches!(
+            manager
+                .materialize_derived(
+                    WorkspaceId::new("ws-foreign").unwrap(),
+                    &owner_handle("exec-foreign"),
+                    &other,
+                    patch,
+                    &blobs,
+                )
+                .await,
+            Err(WorkspaceError::BaseMissing)
+        ));
+        // The miss created no workspace directory or metadata row.
+        assert!(
+            manager
+                .resolve(
+                    &WorkspaceId::new("ws-foreign").unwrap(),
+                    &ExecutionId::new("exec-foreign").unwrap(),
+                    ExecutionGeneration::new(1).unwrap(),
+                    &other,
+                )
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_base_behaves_as_missing_and_gc_releases_pinned_blobs() {
+        let temp = TempDir::new().unwrap();
+        let blobs = BlobStore::open(temp.path().join("blobs"), 1024).unwrap();
+        let manager = WorkspaceManager::open(temp.path().join("workspaces"), 1024).unwrap();
+        let principal = PrincipalId::new("principal-a").unwrap();
+        let digest = upload_blob(&blobs, b"pinned bytes").await;
+        let manifest = derived_fixture_manifest(digest.clone(), 12);
+        let canonical = manifest.digest().unwrap();
+        let ready = manager
+            .materialize(
+                WorkspaceId::new("ws-pin").unwrap(),
+                &owner_handle("exec-pin"),
+                &principal,
+                manifest,
+                &blobs,
+            )
+            .await
+            .unwrap();
+        // Terminalize and collect the workspace: the retained manifest must
+        // keep pinning the blob.
+        manager
+            .mark_terminal(&WorkspaceId::new("ws-pin").unwrap(), 1_000, &blobs)
+            .unwrap();
+        manager.garbage_collect(1_000, 8, false).unwrap();
+        assert!(!ready.root.exists());
+        assert!(blobs.open_verified(&digest).await.is_ok());
+        assert!(
+            manager
+                .lookup_manifest(&principal, &canonical, &blobs)
+                .unwrap()
+                .is_some()
+        );
+        // Expire the manifest: lookups miss and GC releases the blob refs.
+        let manifest_expiry = crate::artifact::now_unix_ms()
+            .saturating_add(crate::artifact::DEFAULT_RETENTION_MILLIS);
+        let (candidates, deleted) = manager
+            .manifest_garbage_collect(manifest_expiry + 1, 8, false, &blobs)
+            .unwrap();
+        assert_eq!((candidates, deleted), (1, 1));
+        assert!(
+            manager
+                .lookup_manifest(&principal, &canonical, &blobs)
+                .unwrap()
+                .is_none()
+        );
+        let patch = derived_patch(&canonical, vec![]);
+        assert!(matches!(
+            manager
+                .materialize_derived(
+                    WorkspaceId::new("ws-after-expiry").unwrap(),
+                    &owner_handle("exec-after-expiry"),
+                    &principal,
+                    patch,
+                    &blobs,
+                )
+                .await,
+            Err(WorkspaceError::BaseMissing)
+        ));
+        let reclaimed = blobs
+            .garbage_collect(manifest_expiry + 1, 8, false)
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.removed_blobs, 1);
+        assert!(blobs.open_verified(&digest).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn manifest_missing_blob_is_reaped_and_crash_reopen_reconciles_bounds() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("workspaces");
+        let blobs = BlobStore::open(temp.path().join("blobs"), 1024).unwrap();
+        let manager = WorkspaceManager::open(&root, 1024).unwrap();
+        let principal = PrincipalId::new("principal-a").unwrap();
+        let digest = upload_blob(&blobs, b"vanishing").await;
+        let manifest = derived_fixture_manifest(digest.clone(), 9);
+        let canonical = manifest.digest().unwrap();
+        manager
+            .materialize(
+                WorkspaceId::new("ws-vanish").unwrap(),
+                &owner_handle("exec-vanish"),
+                &principal,
+                manifest,
+                &blobs,
+            )
+            .await
+            .unwrap();
+        // Simulate blob loss beneath a retained manifest: the record must
+        // become unusable and be reaped instead of resurrecting authority.
+        blobs.release_references("workspace", "ws-vanish").unwrap();
+        blobs
+            .release_references(
+                "manifest",
+                &format!("{}:{}", principal.as_str(), canonical.as_str()),
+            )
+            .unwrap();
+        let horizon = crate::artifact::now_unix_ms()
+            .saturating_add(crate::artifact::DEFAULT_RETENTION_MILLIS);
+        blobs.garbage_collect(horizon + 1, 8, false).await.unwrap();
+        assert!(
+            manager
+                .lookup_manifest(&principal, &canonical, &blobs)
+                .unwrap()
+                .is_none()
+        );
+        drop(manager);
+        let reopened = WorkspaceManager::open(&root, 1024).unwrap();
+        reopened
+            .reconcile_manifests(&blobs, crate::artifact::now_unix_ms(), 8)
+            .unwrap();
+        assert!(blobs.reference_owners("manifest", 8).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_derived_materialization_is_idempotent_and_conflicts_fenced() {
+        let temp = TempDir::new().unwrap();
+        let blobs = BlobStore::open(temp.path().join("blobs"), 1024 * 1024).unwrap();
+        let manager = WorkspaceManager::open(temp.path().join("workspaces"), 1024 * 1024).unwrap();
+        let principal = PrincipalId::new("principal-a").unwrap();
+        let digest = upload_blob(&blobs, b"shared base").await;
+        let manifest = derived_fixture_manifest(digest, 11);
+        let canonical = manifest.digest().unwrap();
+        manager
+            .materialize(
+                WorkspaceId::new("ws-shared-base").unwrap(),
+                &owner_handle("exec-shared-base"),
+                &principal,
+                manifest,
+                &blobs,
+            )
+            .await
+            .unwrap();
+        let patch = || derived_patch(&canonical, vec![]);
+        let tasks = (0..12).map(|_| {
+            let manager = manager.clone();
+            let blobs = blobs.clone();
+            let principal = principal.clone();
+            let patch = patch();
+            async move {
+                manager
+                    .materialize_derived(
+                        WorkspaceId::new("ws-derived-race").unwrap(),
+                        &owner_handle("exec-derived-race"),
+                        &principal,
+                        patch,
+                        &blobs,
+                    )
+                    .await
+                    .unwrap()
+            }
+        });
+        let roots = join_all(tasks).await;
+        assert!(
+            roots
+                .iter()
+                .all(|workspace| workspace.root == roots[0].root)
+        );
+        // Same workspace id with a different final digest conflicts.
+        let new_digest = upload_blob(&blobs, b"different!").await;
+        let conflicting = derived_patch(
+            &canonical,
+            vec![eggwork_core::WorkspacePatchEntry::File {
+                path: eggwork_core::RelativePath::new("src/base.txt").unwrap(),
+                digest: new_digest,
+                size_bytes: 10,
+                executable: false,
+            }],
+        );
+        assert!(matches!(
+            manager
+                .materialize_derived(
+                    WorkspaceId::new("ws-derived-race").unwrap(),
+                    &owner_handle("exec-derived-race"),
+                    &principal,
+                    conflicting,
+                    &blobs,
+                )
+                .await,
+            Err(WorkspaceError::Conflict)
+        ));
+        // Malformed patches never create workspaces.
+        let bad = eggwork_core::WorkspaceManifestPatch {
+            schema_version: 1,
+            base_manifest_digest: canonical.clone(),
+            entries: vec![
+                eggwork_core::WorkspacePatchEntry::Remove {
+                    path: eggwork_core::RelativePath::new("src/base.txt").unwrap(),
+                },
+                eggwork_core::WorkspacePatchEntry::Remove {
+                    path: eggwork_core::RelativePath::new("src/base.txt").unwrap(),
+                },
+            ],
+        };
+        assert!(matches!(
+            manager
+                .materialize_derived(
+                    WorkspaceId::new("ws-bad-patch").unwrap(),
+                    &owner_handle("exec-bad-patch"),
+                    &principal,
+                    bad,
+                    &blobs,
+                )
+                .await,
+            Err(WorkspaceError::InvalidPatch)
+        ));
     }
 }

@@ -812,6 +812,9 @@ pub async fn collect_garbage(
     let (workspace_candidates, workspace_logical_bytes, workspaces_deleted) = workspaces
         .garbage_collect(now, limit, dry_run)
         .map_err(|_| OperationsError::Data)?;
+    let (manifest_candidates, manifests_deleted) = workspaces
+        .manifest_garbage_collect(now, limit, dry_run, &blobs)
+        .map_err(|_| OperationsError::Data)?;
     let artifact_report = artifacts
         .garbage_collect(now, limit, dry_run)
         .map_err(|_| OperationsError::Data)?;
@@ -823,6 +826,8 @@ pub async fn collect_garbage(
         workspace_candidates,
         workspace_logical_bytes,
         workspaces_deleted,
+        manifest_candidates,
+        manifests_deleted,
         artifact_candidates: artifact_report.candidate_artifacts,
         artifacts_deleted: artifact_report.deleted_artifacts,
         expired_blob_references: blob_report.expired_references_removed,
@@ -870,6 +875,17 @@ fn dry_run_gc(config: &OperatorConfig, limit: usize) -> Result<NodeGcReport, Ope
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|_| OperationsError::Data)?;
+    // Older stores predate the retained-manifest cache; report zero instead
+    // of failing the whole preview.
+    let manifest_candidates: i64 = workspace_db
+        .query_row(
+            "SELECT COUNT(*) FROM (SELECT manifest_digest FROM retained_manifests
+             WHERE expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?1
+             ORDER BY expires_unix_ms LIMIT ?2)",
+            rusqlite::params![now, limit as i64],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
     let artifact_db = read_only_database(&config.database_path.with_extension("artifacts.sqlite"))?;
     let artifact_candidates: i64 = artifact_db
         .query_row(
@@ -899,6 +915,8 @@ fn dry_run_gc(config: &OperatorConfig, limit: usize) -> Result<NodeGcReport, Ope
         workspace_candidates: workspace_candidates.max(0) as u64,
         workspace_logical_bytes: workspace_logical_bytes.max(0) as u64,
         workspaces_deleted: 0,
+        manifest_candidates: manifest_candidates.max(0) as u64,
+        manifests_deleted: 0,
         artifact_candidates: artifact_candidates.max(0) as u64,
         artifacts_deleted: 0,
         expired_blob_references: expired_blob_references.max(0) as u64,

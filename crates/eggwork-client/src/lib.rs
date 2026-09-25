@@ -9,6 +9,7 @@ use eggfetch_core::{
 use eggwork_core::{
     ApiError, ArtifactId, ArtifactRecord, BlobDigest, ExecutionEvent, ExecutionHandle, ExecutionId,
     ExecutionSnapshot, ExecutionSpec, NodeCapabilities, NodeStatus, WorkspaceId, WorkspaceManifest,
+    WorkspaceManifestPatch,
 };
 use futures_util::{StreamExt, stream};
 use serde::{Serialize, de::DeserializeOwned};
@@ -260,6 +261,42 @@ impl NodeClient {
                     workspace_id,
                     handle,
                     manifest,
+                })
+                .map_err(|_| ClientError::InvalidResponse)?,
+            )
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(api_error(response.status().as_u16(), &mut response).await);
+        }
+        decode_json(&mut response).await
+    }
+
+    /// Create a fresh execution-private workspace from a retained canonical
+    /// base manifest plus a bounded deterministic patch, without resending
+    /// the full manifest. The server never falls back to a different base:
+    /// a missing/expired base surfaces as a typed `base_manifest_missing`
+    /// API error, and the caller may retry with a full-manifest create.
+    pub async fn create_workspace_derived(
+        &self,
+        workspace_id: &WorkspaceId,
+        handle: &ExecutionHandle,
+        base_manifest_digest: &BlobDigest,
+        patch: &WorkspaceManifestPatch,
+    ) -> Result<WorkspaceReady, ClientError> {
+        if patch.base_manifest_digest != *base_manifest_digest {
+            return Err(ClientError::InvalidResponse);
+        }
+        let mut response = self
+            .http
+            .post(&self.url("/v1/workspaces/derive"))?
+            .header("content-type", "application/json")
+            .bytes(
+                serde_json::to_vec(&CreateDerivedWorkspaceRequest {
+                    schema_version: API_SCHEMA_VERSION,
+                    workspace_id,
+                    handle,
+                    patch,
                 })
                 .map_err(|_| ClientError::InvalidResponse)?,
             )
@@ -655,6 +692,14 @@ struct CreateWorkspaceRequest<'a> {
     workspace_id: &'a WorkspaceId,
     handle: &'a ExecutionHandle,
     manifest: &'a WorkspaceManifest,
+}
+
+#[derive(Serialize)]
+struct CreateDerivedWorkspaceRequest<'a> {
+    schema_version: u16,
+    workspace_id: &'a WorkspaceId,
+    handle: &'a ExecutionHandle,
+    patch: &'a WorkspaceManifestPatch,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
