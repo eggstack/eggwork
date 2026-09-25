@@ -33,15 +33,15 @@ Founding ADRs:
 
 ## Current Eggwork implementation baseline
 
-Latest Eggwork implementation/closure head reviewed before this corrective registration:
+Latest Eggwork implementation/closure head reviewed for this planning batch:
 
-- `faaa0b905fa6bc43e46825fdd98530b5533a970f` — CodeGG M001 Eggwork reference-contract closure.
+- `2566e6a54451468011119844824b644aea891b0c` — Security remote-admission corrective C001 closure, including the pinned implementation SHA.
 
 Implemented and closed/qualified at that baseline:
 
 - Foundation M001-M003, plus the post-closure CI enforcement corrective C001;
 - Control Plane M001-M003 plus lease-expiry correction;
-- Workspace/Artifact M001-M003;
+- Workspace/Artifact M001-M003; M004 derived-materialization plan is now registered/ready;
 - Security M001-M003 plus Landlock `/dev/null` corrective;
 - Operations M001.
 
@@ -53,10 +53,10 @@ The repository is no longer planning-only.
 |---|---|---|---|
 | Foundation / execution core | closed | M001-M003 closed; C001 portable ownership-guard CI enforcement closed | `plans/subsystems/foundation-execution-core-roadmap.md`, `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md` |
 | Control-plane protocol | closed | M001-M003 complete | `plans/subsystems/control-plane-protocol-roadmap.md` |
-| Workspace / artifacts | closed | M001-M003 complete | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
+| Workspace / artifacts | active | M001-M003 closed; M004 reusable manifest CAS + derived materialization **ready** | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | C001 closed; M004 blocked on Operations M002 | M002/M003 historical closures remain qualified; remote-admission corrective C001 is closed (`plans/closure/security-isolation-resource-remote-admission-corrective/001-status.md`); M004 waits on Operations M002 | `plans/subsystems/security-isolation-resource-roadmap.md`, `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md` |
 | Operations / distribution | ready | M002 re-opened on qualified Eggup M007 post-commit rollback seam; producer packaging remains separate M003 | `plans/subsystems/operations-distribution-roadmap.md` |
-| CodeGG integration | Eggwork reference closed; downstream M001+C001 closed | CodeGG lease/live-node corrective closed at `d3d390d5`; M002 is registered/ready and M002a waits on M002 + Eggwork remote-admission C001. | `plans/subsystems/codegg-integration-roadmap.md` |
+| CodeGG integration | Eggwork reference closed; downstream M001+C001+M002+M002a closed | CodeGG required-Landlock live qualification closed at `f5f8d96d`; downstream M003 plan is registered and blocked specifically on Eggwork Workspace M004. | `plans/subsystems/codegg-integration-roadmap.md` |
 
 ## Dependency-ready implementation plans
 
@@ -64,8 +64,8 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Operations | M002 Eggup deployment/service integration | **ready** | `plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md` | Eggup M007 closure `2cab1f97` supplies `commit_with_post_commit` and rollback-on-health-failure semantics; historical blocker remains in `plans/closure/operations-distribution/002-status.md`. |
-| CodeGG downstream | C001 lease identity + live-node qualification | **closed in CodeGG** | `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution-corrective/001-status.md` | Closure/current head `d3d390d5`; real mTLS qualification passed and M002 is eligible for planning. The live fixture exposed this repo's remote-admission C001 gap. |
+| Operations | M002 Eggup deployment/service integration | **ready** | `plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md` | Eggup M007 supplies post-commit rollback. Historical blocker remains immutable at `plans/closure/operations-distribution/002-status.md`; resumed implementation must close at `plans/closure/operations-distribution/002-resumed-status.md`. |
+| CodeGG downstream | M001+C001+M002+M002a fixed-target remote execution/policy/live isolation | **closed in CodeGG** | `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution/002a-status.md` | Required-Landlock production mTLS path closed at `f5f8d96d`. Next downstream M003 is registered/blocked on Workspace M004. |
 
 ## Closed and superseded implementation plans
 
@@ -93,14 +93,12 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Work | Status | Blocker / rationale |
 |---|---|---|
-| Security M004 adversarial + cross-platform closure | blocked | wait for Operations M002 so final evidence covers remotely reachable Landlock/resource controls and deployment/update surfaces (Security remote-admission C001 is closed) |
+| Security M004 adversarial + cross-platform closure | blocked; plan registered | `plans/implementation/security-isolation-resource/004-security-closure-and-cross-platform-adversarial-qualification.md`; wait only for Operations M002 so final evidence includes installed helper/service/update surfaces |
 | Operations M003 Eggpack producer packaging | blocked | Eggpack ReleaseManifest M001/M001a is closed; Build/Qualification M001 and downstream release-orchestration interfaces are not yet closed/concrete |
 | Operations M004 operational/release qualification | blocked | Operations M002 + M003 |
 | Operations M005 reverse-connect relay | deferred | no immediate product need; stable identity/lease semantics already exist |
 | Operations M006 PTY extension | deferred | requires a separate interactive ownership/attach design |
-| CodeGG M002 capability/target projection | ready downstream | CodeGG plan `002-target-capability-projection-and-operator-policy.md` is registered/ready and may proceed against this repo's written capability contract |
-| CodeGG M002a restricted-spec live requalification | blocked downstream | requires CodeGG M002 closure (Eggwork Security remote-admission C001 is closed); this is the gate for claiming real required-Landlock execution through CodeGG |
-| CodeGG M003 Git-aware materializer | deferred | optimized Eggwork materializer contract; downstream CodeGG corrective C001 is closed |
+| CodeGG M003 content-aware derived workspace transfer | blocked downstream; plan registered | waits on Eggwork Workspace M004 closure; downstream plan `plans/implementation/eggwork-fixed-target-remote-execution/003-content-aware-derived-workspace-transfer.md` is already registered in CodeGG |
 | CodeGG M004 remote AgentRun worker | deferred | CodeGG M002-M003 + stable worker-entry contract |
 
 Do not author Operations M003 merely to increase plan count. Its producer inputs are still moving in Eggpack.
@@ -112,11 +110,15 @@ Foundation M003 [closed] --+--> Foundation corrective C001 [CLOSED]
 Control Plane M003 [closed]
 Operations M001 [closed] + Eggup M007 ------> Operations M002 [READY]
 
-Eggwork Phases 0-5 [historical] -----------> CodeGG M001 [IMPLEMENTED/HISTORICALLY CLOSED]
+Eggwork Phases 0-5 [historical] -----------> CodeGG M001+C001 [CLOSED]
                                                    |
-                                                   +--> CodeGG C001 lease/live-node corrective [CLOSED]
+                                                   +--> Eggwork remote-admission C001 [CLOSED]
                                                               |
-                                                               +--> exposed Eggwork remote-admission C001 [CLOSED]
+                                                              +--> CodeGG M002+M002a [CLOSED]
+
+Workspace M001-M003 [closed] -------------> Workspace M004 derived materialization [READY]
+                                                              |
+                                                              +--> CodeGG M003 [BLOCKED until M004 closes]
 
 Security remote-admission C001 [CLOSED] --+
 Control M003 [closed] -----------------+--> Security M004 [blocked until Operations M002 closes]
@@ -134,7 +136,7 @@ These are reviewed research baselines, not permanent dependency pins.
 
 | Project | Reviewed baseline | Current relevant state |
 |---|---|---|
-| CodeGG | `d3d390d56620fb5c6f755a5dfb0987e0a1c01651` | M001 + post-closure C001 qualified with real mTLS/live-node evidence; M002 eligible for planning; live restricted-spec test exposed Eggwork's server admission gap |
+| CodeGG | current reviewed `841ad117399c9279e3668828d5d9866983603381`; remote-execution M002a closure `f5f8d96d7b7371c8583196c58d36ef7b3118ed3c` | M001+C001+M002+M002a closed; required Landlock qualified; M003 plan registered and blocked on Eggwork Workspace M004 |
 | Eggfetch | `b90b32541bd5dac6c5256feed141cadfd124debe` / `eggfetch-core 0.2.0` | public advanced-routing `Dialer` and `ClientBuilder::dialer` preserve Eggfetch-owned HTTP/TLS |
 | Eggress | `e141d4082d211cc5f122414c74617fde846ffbae` / 1.0.8 line | listener-free `OutboundConnector::connect_tcp_detailed` returns a Tokio stream and typed route failure facts |
 | EggServe | `dc8ce30e2c9f0a95f73682cea07163e8076995bd` / 0.2.x line | server/TLS service baseline; re-check exact published patch before dependency changes |
