@@ -11,7 +11,8 @@ Canonical authority:
 
 Planning baseline reviewed:
 
-- CodeGG current reviewed head `d3d390d56620fb5c6f755a5dfb0987e0a1c01651`
+- CodeGG current reviewed head `841ad117399c9279e3668828d5d9866983603381`
+- CodeGG remote-execution M002a closure head `f5f8d96d7b7371c8583196c58d36ef7b3118ed3c`
 - CodeGG M001 implementation `67f8f3d33651846bbdbd3e4a3bc239e50a0237a6`
 - CodeGG historical M001 closure `338074062e3e8748ba83708ea3c2a7e33de12f74`
 
@@ -60,7 +61,7 @@ Eggwork should align with these seams rather than create a second CodeGG daemon 
 
 Class: capability/invariant
 
-Status: Eggwork reference contract closed; downstream CodeGG M001 + corrective C001 are closed
+Status: Eggwork reference contract closed; downstream CodeGG M001+C001+M002+M002a are closed
 
 Eggwork integration-contract plan:
 
@@ -70,12 +71,14 @@ Controlling downstream records in CodeGG:
 
 - M001 implementation: `67f8f3d33651846bbdbd3e4a3bc239e50a0237a6`
 - historical closure: `338074062e3e8748ba83708ea3c2a7e33de12f74`
-- CodeGG corrective closure/current head: `d3d390d56620fb5c6f755a5dfb0987e0a1c01651`
+- CodeGG corrective C001 closure: `d3d390d56620fb5c6f755a5dfb0987e0a1c01651`
+- CodeGG M002 closure: `plans/closure/eggwork-fixed-target-remote-execution/002-status.md`
+- CodeGG M002a closure/head: `f5f8d96d7b7371c8583196c58d36ef7b3118ed3c`
 - roadmap: `plans/subsystems/eggwork-fixed-target-remote-execution-roadmap.md`
 - post-closure corrective: `plans/subsystems/eggwork-fixed-target-remote-execution-post-closure-corrective-addendum.md`
 - corrective C001: `plans/implementation/eggwork-fixed-target-remote-execution-corrective/001-lease-identity-and-live-node-qualification.md`
 
-CodeGG corrective C001 closed the lease-identity and real-node mTLS gap. That live qualification then exposed an Eggwork substrate defect: the server currently rejects all remotely requested filesystem isolation even though the runner can enforce Landlock. Eggwork remote-admission corrective C001 now owns that upstream gap. This document remains substrate-side reference authority only. The Eggwork reference-contract milestone itself is closed with contract evidence in `plans/closure/codegg-integration/001-status.md` (reviewed head `4efc91efa53da06663c9bf7d6a948fa240122454`; zero production changes; existing Phases 0-5 closures re-verified). Downstream CodeGG C001 is closed. M002 is registered/ready; M002a is the restricted-spec live gate and waits on CodeGG M002 plus Eggwork remote-admission C001. M003/M004 retain their separate blockers.
+CodeGG corrective C001 closed the lease-identity/mTLS gap; Eggwork remote-admission C001 then closed the restricted-isolation substrate gap; CodeGG M002 and M002a subsequently closed against the corrected immutable Eggwork pin with required-Landlock live qualification. This document remains substrate-side reference authority only. The Eggwork reference-contract milestone itself is closed with contract evidence in `plans/closure/codegg-integration/001-status.md`. M003 is now the next integration line and is blocked specifically on Eggwork Workspace/Artifact M004; M004 remains deferred on M003 plus a stable AgentRun worker-entry contract.
 
 Objective:
 
@@ -94,32 +97,43 @@ Exit conditions:
 
 Class: infrastructure/polish
 
-Status: downstream M002 ready; M002a restricted-spec live requalification blocked on M002 + Eggwork remote-admission corrective C001
+Status: closed downstream, including M002a restricted-spec live requalification
 
-Controlling downstream plans:
+Controlling downstream evidence:
 
-- `dbowm91/codegg: plans/implementation/eggwork-fixed-target-remote-execution/002-target-capability-projection-and-operator-policy.md` — ready.
-- `dbowm91/codegg: plans/implementation/eggwork-fixed-target-remote-execution/002a-restricted-spec-live-requalification.md` — blocked on CodeGG M002 + this repo's Security remote-admission C001.
+- `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution/002-status.md`
+- `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution/002a-status.md`
+- M002a closure/head `f5f8d96d7b7371c8583196c58d36ef7b3118ed3c`.
 
 Objective:
 
 Expose node capability/status facts to CodeGG's own configuration/selection policy, diagnostics, and scheduler executor health without implementing selection inside Eggwork.
 
-### M003 — Git-aware workspace adapter
+### M003 — Content-aware derived workspace transfer
 
 Class: capability/infrastructure
 
-Status: blocked on a separately reviewed Eggwork optimized materializer interface; CodeGG corrective C001 is closed
+Status: downstream implementation plan registered; blocked on Eggwork Workspace/Artifact M004 closure
+
+Eggwork upstream prerequisite:
+
+- `plans/implementation/workspace-artifact-transport/004-reusable-manifest-cas-and-derived-materialization.md`
+- planning commit `ed0fc838bd006103021f1fb4749f579cabc2db87`
+
+CodeGG downstream plan:
+
+- `dbowm91/codegg: plans/implementation/eggwork-fixed-target-remote-execution/003-content-aware-derived-workspace-transfer.md`
+- planning commit `9c96e0779d8092998958bbf7f22fec0f844339cf`
 
 Objective:
 
-Reduce workspace transfer using repository commit/bundle/object/patch evidence while preserving CodeGG worktree identity and dirty state.
+Reduce repeated full-manifest transfer through Eggwork's Git-neutral retained-manifest/patch contract while preserving CodeGG's full local snapshot, exact-source provenance, worktree identity, and dirty-state semantics.
 
 ### M004 — Whole remote AgentRun worker
 
 Class: capability
 
-Status: blocked on M002-M003 and stable CodeGG AgentRun worker-entry contract; CodeGG corrective C001 is closed
+Status: deferred; M001+C001+M002+M002a are closed, but M003 and a stable CodeGG AgentRun worker-entry contract remain unresolved
 
 Objective:
 
