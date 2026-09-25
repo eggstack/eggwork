@@ -21,15 +21,15 @@ Foundation M001-M003, Control Plane M001-M003, Workspace M001-M003, Security M00
 The registry authorizes these Eggwork-local handoffs independently:
 
 - `operations-distribution/002-eggup-deployment-and-service-integration.md` — re-opened after Eggup M007 supplied the required post-commit rollback seam.
-- `security-isolation-resource-remote-admission-corrective/001-remote-enforcement-admission-and-capability-truthfulness.md` — expose runtime-qualified isolation/resource controls through remote execution and unify capability advertisement.
+- `workspace-artifact-transport/004-reusable-manifest-cas-and-derived-materialization.md` — principal-scoped retained manifests + `workspace.derive.v1`; upstream prerequisite for CodeGG M003.
 
 The `foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md` handoff has closed; closure evidence lives in `plans/closure/foundation-execution-core-ci-corrective/001-status.md`.
 
-CodeGG integration implementation authority has moved to the CodeGG repository. Eggwork retains its integration-contract roadmap as architecture/reference material, but downstream CodeGG changes should be planned, implemented, and closed in CodeGG. The Eggwork M001 reference-contract milestone is closed (`plans/closure/codegg-integration/001-status.md`); downstream qualification remains gated by CodeGG corrective C001.
+CodeGG integration implementation authority has moved to the CodeGG repository. Eggwork retains its integration-contract roadmap as architecture/reference material, but downstream CodeGG changes should be planned, implemented, and closed in CodeGG. The Eggwork M001 reference-contract milestone is closed (`plans/closure/codegg-integration/001-status.md`); downstream CodeGG M001+C001+M002+M002a are closed; CodeGG M003 is now blocked specifically on Eggwork Workspace M004.
 
 ## Blocked later work
 
-- Security M004 final adversarial/cross-platform qualification now waits only on Operations M002; ownership-CI enforcement is closed and contributes enforced evidence.
+- Security M004 final adversarial/cross-platform qualification is registered at `security-isolation-resource/004-security-closure-and-cross-platform-adversarial-qualification.md` and waits only on Operations M002.
 - Operations M003 producer packaging waits on Eggpack's concrete build/qualification interfaces.
 - Operations M004 waits on M002 + M003.
 - Reverse-connect and PTY work remain deferred.
