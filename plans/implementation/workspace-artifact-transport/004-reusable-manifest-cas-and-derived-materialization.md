@@ -1,6 +1,8 @@
 # Workspace/Artifact M004 — Reusable Manifest CAS and Derived Materialization
 
-Status: ready for handoff
+Status: closed
+
+Closure record: `plans/closure/workspace-artifact-transport/004-status.md`
 
 Source roadmap:
 

@@ -1,6 +1,6 @@
 # Workspace and Artifact Transport Roadmap
 
-Status: active roadmap; M001-M003 closed, M004 ready
+Status: active roadmap; M001-M004 closed
 
 Canonical authority:
 
@@ -108,11 +108,15 @@ Exit conditions:
 
 Class: infrastructure/capability
 
-Status: ready
+Status: closed
 
 Implementation plan:
 
 - `plans/implementation/workspace-artifact-transport/004-reusable-manifest-cas-and-derived-materialization.md`
+
+Closure record:
+
+- `plans/closure/workspace-artifact-transport/004-status.md`
 
 Objective:
 
