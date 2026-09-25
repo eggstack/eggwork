@@ -63,6 +63,12 @@ Use Eggup for consumer-side verified multi-artifact deployment, rollback, instal
 
 Current interface review confirms Eggup main contains Unix manager mechanics, a native Windows SCM adapter, and Verified Update Core M007's `commit_with_post_commit` + `PostCommitFailurePolicy::{KeepInstalled, RollBack}` seam. The prior blocker remains preserved in `plans/closure/operations-distribution/002-status.md` as historical evidence; M002 is re-opened against the qualified M007 contract.
 
+Current resumed closure target:
+
+- `plans/closure/operations-distribution/002-resumed-status.md`
+
+The historical `002-status.md` blocker record is immutable and MUST NOT be overwritten when this resumed implementation closes.
+
 ### M003 — Eggpack producer packaging integration
 
 Class: infrastructure/capability
