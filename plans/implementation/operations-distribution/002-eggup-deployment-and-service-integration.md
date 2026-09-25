@@ -202,7 +202,9 @@ Stop if:
 
 ## 13. Closure evidence
 
-Create `plans/closure/operations-distribution/002-status.md` containing:
+Create `plans/closure/operations-distribution/002-resumed-status.md` containing:
+
+The existing `plans/closure/operations-distribution/002-status.md` is the immutable historical blocker record for the pre-M007 Eggup interface. Do not overwrite, rename, or rewrite it. The resumed closure record is the current success/blocked disposition for this re-opened milestone.
 
 - exact Eggup revision/version used;
 - dependency publication/pinning disposition;
