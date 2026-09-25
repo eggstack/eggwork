@@ -2,8 +2,8 @@
 
 Source plan: `plans/implementation/workspace-artifact-transport/004-reusable-manifest-cas-and-derived-materialization.md`
 Subsystem roadmap: `plans/subsystems/workspace-artifact-transport-roadmap.md`
-Reviewed implementation commit: `1e89dac`
-Planning/closure commit: *this commit*
+Reviewed implementation commit: `1e89dacd2b2635a9f439547db8b9077b168063ec`
+Planning/closure commit: `5b989c966158e958dfb12fb9020728e4e7cbc92a`
 
 ## Finding
 
