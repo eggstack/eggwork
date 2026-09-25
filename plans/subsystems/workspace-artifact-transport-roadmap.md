@@ -1,6 +1,6 @@
 # Workspace and Artifact Transport Roadmap
 
-Status: active roadmap
+Status: active roadmap; M001-M003 closed, M004 ready
 
 Canonical authority:
 
@@ -104,14 +104,41 @@ Exit conditions:
 - GC never removes live referenced content;
 - quota/GC contention is deterministic.
 
+### M004 — Reusable manifest CAS and derived materialization
+
+Class: infrastructure/capability
+
+Status: ready
+
+Implementation plan:
+
+- `plans/implementation/workspace-artifact-transport/004-reusable-manifest-cas-and-derived-materialization.md`
+
+Objective:
+
+Persist validated canonical manifests in a principal-scoped bounded cache and add a versioned derived-workspace route that applies a deterministic patch to a retained base manifest before using the existing safe materializer.
+
+Exit conditions:
+
+- existing full-manifest workspace creation remains wire-compatible;
+- `workspace.derive.v1` is separately advertised;
+- same-principal derived materialization produces the exact canonical digest of an equivalent full manifest;
+- missing/expired bases are typed, non-destructive misses;
+- retained manifests pin required blobs only for bounded retention;
+- cross-principal manifest reuse is impossible;
+- no Git semantics or shared writable workspace tree enters Eggwork.
+
 ## 4. Future optimized materializers
 
-After core closure, optional adapters may add:
+After M004, optional adapters may add:
 
-- Git commit/bundle/object transfer;
-- delta/chunk transport;
+- filesystem clone/reflink acceleration where safely qualified;
+- chunk transport below the current blob object size;
 - pre-existing trusted node workspace;
-- shared external CAS.
+- shared external CAS;
+- caller-side Git-aware planning that still resolves to Eggwork's Git-neutral manifest/patch contract.
+
+Eggwork itself continues not to own Git commit/bundle/object semantics.
 
 All such adapters must preserve path confinement, digest truthfulness, and caller-owned application semantics.
 
