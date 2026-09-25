@@ -1,6 +1,6 @@
 # Security, Isolation, and Resource Enforcement Roadmap
 
-Status: qualified for the Linux systemd user-manager baseline; remote-admission corrective C001 closed; M004 awaits Operations M002
+Status: qualified through remote-admission C001; M004 plan registered and blocked only on Operations M002
 
 Canonical authority:
 
@@ -135,7 +135,13 @@ This corrective was discovered by real downstream CodeGG qualification and does 
 
 Class: invariant/polish
 
-Status: blocked on Operations M002 closure; remote-admission corrective C001 is closed; Foundation ownership-CI corrective and Control Plane M003 are closed
+Status: blocked on Operations M002 closure
+
+Implementation plan:
+
+- `plans/implementation/security-isolation-resource/004-security-closure-and-cross-platform-adversarial-qualification.md`
+
+Closed prerequisites include remote-admission corrective C001, Foundation ownership-CI corrective C001, and Control Plane M003.
 
 Objective:
 
