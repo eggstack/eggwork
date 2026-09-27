@@ -1,7 +1,9 @@
 # Security M004 — Adversarial and Cross-Platform Closure Qualification
 
-Status: ready for handoff (unblocked by Operations M002 closure
-`plans/closure/operations-distribution/002-resumed-status.md`)
+Status: closed
+
+Closure: `plans/closure/security-isolation-resource/004-status.md`
+(implementation `283f3ea`)
 
 Source roadmap:
 

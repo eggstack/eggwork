@@ -1,6 +1,6 @@
 # Security, Isolation, and Resource Enforcement Roadmap
 
-Status: qualified through remote-admission C001 and Operations M002; M004 plan ready
+Status: closed through M004 (remote-admission C001 and Operations M002 included)
 
 Canonical authority:
 
@@ -135,8 +135,10 @@ This corrective was discovered by real downstream CodeGG qualification and does 
 
 Class: invariant/polish
 
-Status: ready (Operations M002 closed in
-`plans/closure/operations-distribution/002-resumed-status.md`)
+Status: closed
+
+Closure evidence: `plans/closure/security-isolation-resource/004-status.md`
+(implementation `283f3ea`)
 
 Implementation plan:
 
