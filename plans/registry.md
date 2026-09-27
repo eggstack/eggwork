@@ -35,7 +35,8 @@ Founding ADRs:
 
 Latest Eggwork implementation/closure head reviewed for this planning batch:
 
-- `2566e6a54451468011119844824b644aea891b0c` — Security remote-admission corrective C001 closure, including the pinned implementation SHA.
+- `d5722d9` — Operations M002 Eggup deployment/service integration closure,
+  including the pinned implementation SHA.
 
 Implemented and closed/qualified at that baseline:
 
@@ -43,7 +44,8 @@ Implemented and closed/qualified at that baseline:
 - Control Plane M001-M003 plus lease-expiry correction;
 - Workspace/Artifact M001-M004, including derived materialization;
 - Security M001-M003 plus Landlock `/dev/null` corrective;
-- Operations M001.
+- Security remote-admission corrective C001;
+- Operations M001-M002.
 
 The repository is no longer planning-only.
 
@@ -54,8 +56,8 @@ The repository is no longer planning-only.
 | Foundation / execution core | closed | M001-M003 closed; C001 portable ownership-guard CI enforcement closed | `plans/subsystems/foundation-execution-core-roadmap.md`, `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md` |
 | Control-plane protocol | closed | M001-M003 complete | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | closed | M001-M004 closed, including reusable manifest CAS + derived materialization (`plans/closure/workspace-artifact-transport/004-status.md`) | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
-| Security / isolation / resources | C001 closed; M004 blocked on Operations M002 | M002/M003 historical closures remain qualified; remote-admission corrective C001 is closed (`plans/closure/security-isolation-resource-remote-admission-corrective/001-status.md`); M004 waits on Operations M002 | `plans/subsystems/security-isolation-resource-roadmap.md`, `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md` |
-| Operations / distribution | ready | M002 re-opened on qualified Eggup M007 post-commit rollback seam; producer packaging remains separate M003 | `plans/subsystems/operations-distribution-roadmap.md` |
+| Security / isolation / resources | M004 ready (Operations M002 closed) | M002/M003 historical closures remain qualified; remote-admission corrective C001 is closed (`plans/closure/security-isolation-resource-remote-admission-corrective/001-status.md`); M004 is unblocked by Operations M002 closure (`plans/closure/operations-distribution/002-resumed-status.md`) | `plans/subsystems/security-isolation-resource-roadmap.md`, `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md` |
+| Operations / distribution | M002 closed; M003 still blocked | M002 closed on published Eggup 0.1.1 (`plans/closure/operations-distribution/002-resumed-status.md`); producer packaging remains separate M003 | `plans/subsystems/operations-distribution-roadmap.md` |
 | CodeGG integration | Eggwork reference closed; downstream M001+C001+M002+M002a closed | CodeGG required-Landlock live qualification closed at `f5f8d96d`; downstream M003 is unblocked by Eggwork Workspace M004 closure (handoff lives in the CodeGG repository). | `plans/subsystems/codegg-integration-roadmap.md` |
 
 ## Dependency-ready implementation plans
@@ -64,7 +66,7 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Operations | M002 Eggup deployment/service integration | **ready** | `plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md` | Eggup M007 supplies post-commit rollback. Historical blocker remains immutable at `plans/closure/operations-distribution/002-status.md`; resumed implementation must close at `plans/closure/operations-distribution/002-resumed-status.md`. |
+| Security | M004 adversarial + cross-platform closure | **ready** | `plans/implementation/security-isolation-resource/004-security-closure-and-cross-platform-adversarial-qualification.md` | Unblocked by Operations M002 closure (`plans/closure/operations-distribution/002-resumed-status.md`); final evidence must include installed helper/service/update surfaces. |
 | CodeGG downstream | M001+C001+M002+M002a fixed-target remote execution/policy/live isolation | **closed in CodeGG** | `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution/002a-status.md` | Required-Landlock production mTLS path closed at `f5f8d96d`. Next downstream M003 is unblocked by Eggwork Workspace M004 closure (see below). |
 
 ## Closed and superseded implementation plans
@@ -87,6 +89,7 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 | Security | M003 resource enforcement | qualified/closed | `plans/closure/security-isolation-resource/003-status.md` |
 | Security corrective | C001 remote enforcement admission + capability truthfulness | closed | `plans/closure/security-isolation-resource-remote-admission-corrective/001-status.md` |
 | Operations | M001 node operations | closed | `plans/closure/operations-distribution/001-status.md` |
+| Operations | M002 Eggup deployment/service integration | closed (resumed) | `plans/closure/operations-distribution/002-resumed-status.md` (implementation `d5722d9`, published `eggup-core`/`eggup-service` 0.1.1); historical pre-M007 blocker preserved immutably at `plans/closure/operations-distribution/002-status.md` |
 | Operations | former combined M002 packaging/services/Eggup | superseded | `plans/implementation/operations-distribution/002-packaging-services-and-eggup.md`; split because Eggpack now owns producer packaging |
 | CodeGG | M001 fixed-target remote executor (Eggwork reference contract) | closed | `plans/closure/codegg-integration/001-status.md`; downstream CodeGG M001+C001+M002+M002a are now closed, and downstream M003 is unblocked by Eggwork Workspace M004 closure. |
 
@@ -94,9 +97,9 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Work | Status | Blocker / rationale |
 |---|---|---|
-| Security M004 adversarial + cross-platform closure | blocked; plan registered | `plans/implementation/security-isolation-resource/004-security-closure-and-cross-platform-adversarial-qualification.md`; wait only for Operations M002 so final evidence includes installed helper/service/update surfaces |
+| Security M004 adversarial + cross-platform closure | ready; Operations M002 dependency satisfied | `plans/implementation/security-isolation-resource/004-security-closure-and-cross-platform-adversarial-qualification.md`; final evidence must include installed helper/service/update surfaces now closed by Operations M002 |
 | Operations M003 Eggpack producer packaging | blocked | Eggpack ReleaseManifest M001/M001a is closed; Build/Qualification M001 and downstream release-orchestration interfaces are not yet closed/concrete |
-| Operations M004 operational/release qualification | blocked | Operations M002 + M003 |
+| Operations M004 operational/release qualification | blocked | Operations M003 (M002 side now closed) |
 | Operations M005 reverse-connect relay | deferred | no immediate product need; stable identity/lease semantics already exist |
 | Operations M006 PTY extension | deferred | requires a separate interactive ownership/attach design |
 | CodeGG M003 content-aware derived workspace transfer | ready downstream; Eggwork blocker satisfied | Eggwork Workspace M004 is closed (`plans/closure/workspace-artifact-transport/004-status.md`); downstream plan `plans/implementation/eggwork-fixed-target-remote-execution/003-content-aware-derived-workspace-transfer.md` in CodeGG is unblocked and awaits handoff there |
@@ -109,7 +112,7 @@ Do not author Operations M003 merely to increase plan count. Its producer inputs
 ```text
 Foundation M003 [closed] --+--> Foundation corrective C001 [CLOSED]
 Control Plane M003 [closed]
-Operations M001 [closed] + Eggup M007 ------> Operations M002 [READY]
+Operations M001 [closed] + Eggup 0.1.1 (published) ------> Operations M002 [CLOSED]
 
 Eggwork Phases 0-5 [historical] -----------> CodeGG M001+C001 [CLOSED]
                                                    |
@@ -122,8 +125,8 @@ Workspace M001-M003 [closed] -------------> Workspace M004 derived materializati
                                                               +--> CodeGG M003 [READY downstream; Eggwork blocker satisfied]
 
 Security remote-admission C001 [CLOSED] --+
-Control M003 [closed] -----------------+--> Security M004 [blocked until Operations M002 closes]
-Operations M002 -----------------------+
+Control M003 [closed] -----------------+--> Security M004 [READY]
+Operations M002 [CLOSED] --------------+
 
 Eggpack build/qualification + release interfaces -> Operations M003 [blocked]
 Operations M002 + Operations M003 ----------> Operations M004
@@ -162,7 +165,7 @@ Implementation agents MUST re-check current APIs at execution time.
 
 ## Remaining interface gates
 
-1. **Eggup publication:** M002 may qualify against exact immutable Eggup M007 revision `2cab1f97...`/implementation `8d5fc12f...` if crates.io publication still lags; never use a floating branch. Release publication must record its dependency policy explicitly.
+1. **Eggup publication:** satisfied for M002 — published `eggup-core 0.1.1` / `eggup-service 0.1.1` (checksums in `Cargo.lock`) supply the M007 `commit_with_post_commit` seam and manager adapters; no floating branch was used. Release publication of Eggwork itself must still record its dependency policy explicitly (M003/M004 scope).
 2. **Eggpack producer contract:** Operations M003 remains blocked until ReleaseManifest and build/qualification interfaces close.
 3. **Platform qualification:** Linux is the currently exercised execution/security platform. Windows/macOS claims require hosted runtime evidence; cross-compilation is not qualification.
 4. **Eggress feature scope:** SOCKS5 and HTTP CONNECT should be the required deterministic route fixtures. SSH is advertised only if its feature/runtime path is actually exercised.

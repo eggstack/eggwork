@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M002 ready on Eggup M007, producer packaging waits on Eggpack
+Status: active roadmap; M002 closed on published Eggup 0.1.1, producer packaging waits on Eggpack
 
 Canonical authority:
 
@@ -47,7 +47,12 @@ Add configuration, status, doctor, drain/undrain, execution/storage inspection, 
 
 Class: infrastructure/capability
 
-Status: ready
+Status: closed
+
+Closure evidence: `plans/closure/operations-distribution/002-resumed-status.md`
+(implementation `d5722d9` against published `eggup-core`/`eggup-service`
+0.1.1; historical pre-M007 blocker preserved immutably in
+`plans/closure/operations-distribution/002-status.md`)
 
 Implementation plan:
 

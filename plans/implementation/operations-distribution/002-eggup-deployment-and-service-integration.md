@@ -1,6 +1,10 @@
 # Operations M002 — Eggup Deployment and Service Integration
 
-Status: ready for handoff
+Status: closed
+
+Closure: `plans/closure/operations-distribution/002-resumed-status.md`
+(implementation `d5722d9`; historical pre-M007 blocker preserved immutably in
+`plans/closure/operations-distribution/002-status.md`)
 
 Previously blocked: Eggup revision `66813b3b94de3a9b2f270e0000dc339ef6f0b478` did not retain backups through post-start health validation. That blocker is historical and remains recorded in `plans/closure/operations-distribution/002-status.md`.
 
