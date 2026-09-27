@@ -546,6 +546,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "eggup-core"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1b45b44ce742ff059ac4ff34e083168b8c37bd2c91968843b5761076c84c2d6"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "eggup-service"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c631e33dbde6e435a990a4a6a3782f95205d7c28123ff46dbc1820a96f29f162"
+dependencies = [
+ "eggup-core",
+ "windows-args",
+ "windows-service",
+]
+
+[[package]]
 name = "eggwork-client"
 version = "0.1.0"
 dependencies = [
@@ -614,6 +634,8 @@ dependencies = [
  "eggfetch-core",
  "eggress-testkit",
  "eggserve-core",
+ "eggup-core",
+ "eggup-service",
  "eggwork-client",
  "eggwork-core",
  "eggwork-runner",
@@ -2007,6 +2029,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "widestring"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2029,10 +2057,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
+name = "windows-args"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a461b757e38ae4fdf8cb97a017605010589ba4199486ced90a44ab3aade3d7e5"
+dependencies = [
+ "wtf8",
+]
+
+[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-service"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "857224b3b211c6f3616921f081ee54721ee3ad2ace2fac6a6337e032f7b4dcf2"
+dependencies = [
+ "bitflags",
+ "widestring",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "windows-sys"
@@ -2130,6 +2178,12 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+
+[[package]]
+name = "wtf8"
+version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6b9309a86639c488a8eb2b5331cb5127cc9feb0a94a0db4b5d1ab5b84977956"
 
 [[package]]
 name = "yasna"

@@ -47,7 +47,15 @@ mod linux {
 
     fn run() -> Result<i32, ()> {
         let mut args = std::env::args_os().skip(1);
-        if args.next().as_deref() != Some(std::ffi::OsStr::new("--spec")) {
+        let first = args.next();
+        if first.as_deref() == Some(std::ffi::OsStr::new("--version")) {
+            if args.next().is_some() {
+                return Err(());
+            }
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            return Ok(0);
+        }
+        if first.as_deref() != Some(std::ffi::OsStr::new("--spec")) {
             return Err(());
         }
         let spec_path = PathBuf::from(args.next().ok_or(())?);
@@ -376,5 +384,10 @@ fn main() {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() == Some(std::ffi::OsStr::new("--version")) && args.next().is_none() {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
     std::process::exit(125);
 }

@@ -4,6 +4,7 @@
 
 mod artifact;
 mod blob;
+pub mod deployment;
 pub mod operations;
 mod store;
 mod workspace;

@@ -1,3 +1,4 @@
+use eggwork_server::deployment;
 use eggwork_server::operations::{
     OperatorConfig, collect_garbage, doctor, execution_page, execution_show, inspect_artifact,
     inspect_blob, inspect_workspace, is_persistently_draining, metrics_snapshot,
@@ -8,6 +9,11 @@ use std::{env, path::PathBuf, process::ExitCode};
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // The operator CLI validates TLS server identity locally (config
+    // validate/doctor/status/deployment/service) and serves it (run). No
+    // global CryptoProvider is installed by the libraries, so install the
+    // process default once; without it every TLS config reports invalid.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     match run(env::args().skip(1).collect()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -178,8 +184,159 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             server.shutdown().await;
             Ok(())
         }
+        "deployment" => {
+            config
+                .validate()
+                .map_err(|_| "configuration is invalid".to_owned())?;
+            match args.get(index).map(String::as_str) {
+                Some("status") => {
+                    let helper_required = config.sandbox_helper.is_some();
+                    let status = deployment::DeploymentStatus::collect(
+                        config.sandbox_helper.as_deref(),
+                        helper_required,
+                    );
+                    let facts = deployment::platform_support()
+                        .map(|facts| {
+                            serde_json::json!({"os": facts.os, "systemd_available": facts.systemd_available, "launchd_available": facts.launchd_available, "crontab_available": facts.crontab_available, "candidates": deployment::candidate_managers_for(&facts).iter().map(|c| format!("{c:?}")).collect::<Vec<_>>()})
+                        })
+                        .unwrap_or(serde_json::json!({"unavailable": true}));
+                    let executable = std::env::current_exe()
+                        .ok()
+                        .and_then(|path| path.canonicalize().ok())
+                        .map(|path| path.display().to_string());
+                    output(
+                        &serde_json::json!({"schema_version": 1, "deployment": status, "service_id": deployment::SERVICE_ID, "executable": executable, "platform": facts}),
+                    )
+                }
+                _ => Err(usage().into()),
+            }
+        }
+        "service" => {
+            config
+                .validate()
+                .map_err(|_| "configuration is invalid".to_owned())?;
+            service_command(&args[index..]).await
+        }
         _ => Err(usage().into()),
     }
+}
+
+async fn service_command(args: &[String]) -> Result<(), String> {
+    let verb = args.first().map(String::as_str).ok_or_else(usage)?;
+    let executable = match args.iter().position(|arg| arg == "--executable") {
+        Some(position) => std::path::PathBuf::from(
+            args.get(position + 1)
+                .ok_or_else(|| "--executable requires a value".to_owned())?,
+        ),
+        None => std::env::current_exe()
+            .ok()
+            .and_then(|path| path.canonicalize().ok())
+            .ok_or_else(|| "service commands require --executable <absolute-path>".to_owned())?,
+    };
+    if !executable.is_absolute() {
+        return Err("service executable must be absolute".into());
+    }
+    let config_path = match args.iter().position(|arg| arg == "--service-config") {
+        Some(position) => std::path::PathBuf::from(
+            args.get(position + 1)
+                .ok_or_else(|| "--service-config requires a value".to_owned())?,
+        ),
+        // Fail closed: the service identity must name the exact registered
+        // config path, so it is never guessed from the operator config.
+        None => return Err("service commands require --service-config <absolute-path>".into()),
+    };
+    if !config_path.is_absolute() {
+        return Err("service config path must be absolute".into());
+    }
+    let spec = deployment::service_spec_for_install(&executable, Some(&config_path))
+        .map_err(|error| error.to_string())?;
+    match verb {
+        "spec" => output(
+            &serde_json::json!({"schema_version": 1, "service_id": spec.id().as_str(), "executable": spec.executable().display().to_string(), "args": spec.args(), "config": spec.config().map(|p| p.display().to_string())}),
+        ),
+        "status" | "install" | "uninstall" | "start" | "stop" | "restart" => {
+            if verb == "status" {
+                let facts = deployment::platform_support().map_err(|error| error.to_string())?;
+                return output(
+                    &serde_json::json!({"schema_version": 1, "service_id": spec.id().as_str(), "platform": {"os": facts.os, "systemd_available": facts.systemd_available, "launchd_available": facts.launchd_available, "crontab_available": facts.crontab_available}}),
+                );
+            }
+            service_mutation(&spec, args, verb).await
+        }
+        _ => Err(usage().into()),
+    }
+}
+
+/// Destructive service lifecycle through Eggup adapters only.
+///
+/// Linux systemd is the qualified path. Other platforms receive a structured
+/// diagnostic instead of a parallel manager implementation.
+async fn service_mutation(
+    spec: &eggup_service::ServiceSpec,
+    args: &[String],
+    verb: &str,
+) -> Result<(), String> {
+    if std::env::consts::OS != "linux" {
+        return Err(format!(
+            "service {verb} is not qualified on this platform; refusing without hosted evidence"
+        ));
+    }
+    let unit_path = std::path::PathBuf::from(
+        args.iter()
+            .position(|arg| arg == "--unit-path")
+            .and_then(|position| args.get(position + 1))
+            .ok_or_else(|| "service lifecycle requires --unit-path <absolute-path>".to_owned())?,
+    );
+    let scope_text = args
+        .iter()
+        .position(|arg| arg == "--scope")
+        .and_then(|position| args.get(position + 1))
+        .map(String::as_str)
+        .unwrap_or("system");
+    let scope = deployment::parse_systemd_scope(scope_text).map_err(|error| error.to_string())?;
+    let unit_name = unit_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "unit path must name a *.service file".to_owned())?
+        .to_owned();
+    let enable = args.iter().any(|arg| arg == "--enable");
+    let reload = !args.iter().any(|arg| arg == "--no-reload");
+    let mut manager = deployment::systemd_manager(
+        &unit_name,
+        scope,
+        &unit_path,
+        spec.executable(),
+        spec.config()
+            .ok_or_else(|| "service spec requires a config path".to_owned())?,
+        enable,
+        reload,
+        std::time::Duration::from_secs(60),
+    )
+    .map_err(|error| error.to_string())?;
+    let outcome = match verb {
+        "install" => eggup_service::ServiceManager::install(&mut manager, spec),
+        "uninstall" => eggup_service::ServiceManager::uninstall(&mut manager, spec),
+        "start" => eggup_service::ServiceManager::start(
+            &mut manager,
+            spec,
+            std::time::Duration::from_secs(60),
+        ),
+        "stop" => eggup_service::ServiceManager::stop(
+            &mut manager,
+            spec,
+            std::time::Duration::from_secs(60),
+        ),
+        "restart" => eggup_service::ServiceManager::restart(
+            &mut manager,
+            spec,
+            std::time::Duration::from_secs(60),
+        ),
+        _ => return Err(usage().into()),
+    }
+    .map_err(|error| error.to_string())?;
+    output(
+        &serde_json::json!({"schema_version": 1, "service_id": spec.id().as_str(), "operation": verb, "completed": outcome.completed()}),
+    )
 }
 
 fn parse_option<T: std::str::FromStr>(
@@ -206,5 +363,5 @@ fn output(value: &impl Serialize) -> Result<(), String> {
 }
 
 fn usage() -> &'static str {
-    "usage: eggworkd <run|config validate|config print|doctor|status|drain|undrain|executions list|executions show|storage summary|inspect|gc|version> --config <file>"
+    "usage: eggworkd <run|config validate|config print|doctor|status|drain|undrain|executions list|executions show|storage summary|inspect|gc|deployment status|service spec|service status|service install|service uninstall|service start|service stop|service restart|version> --config <file>"
 }
