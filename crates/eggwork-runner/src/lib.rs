@@ -562,6 +562,11 @@ fn probe_landlock_ruleset() -> bool {
         };
         let access = if canonical.is_dir() {
             AccessFs::from_read(abi) | AccessFs::Execute
+        } else if canonical == Path::new("/dev/null") {
+            // Must mirror the helper's null-device rule exactly: the
+            // capability probe proves the kernel supports the precise
+            // rights the sandbox will apply.
+            landlock::make_bitflags!(AccessFs::{ReadFile | WriteFile})
         } else {
             landlock::make_bitflags!(AccessFs::{ReadFile})
         };

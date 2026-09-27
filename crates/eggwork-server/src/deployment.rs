@@ -213,6 +213,15 @@ impl HelperCompatibility {
     }
 }
 
+/// Whether required filesystem isolation may be admitted given helper trust.
+///
+/// Only `Compatible` admits required isolation. Every other outcome —
+/// including `NotConfigured` — fails closed and must surface as
+/// `capability_mismatch` before target spawn, never as best-effort downgrade.
+pub fn helper_satisfies_required_isolation(compatibility: &HelperCompatibility) -> bool {
+    compatibility.compatible()
+}
+
 /// Check helper presence, installation trust, and version coherence.
 ///
 /// Version coherence is established by invoking `<helper> --version` in a
@@ -1138,5 +1147,92 @@ mod tests {
         let adapter_boundary = std::fs::read_to_string("src/deployment.rs").unwrap_or_default();
         assert!(adapter_boundary.contains("eggup_service::ServiceManager"));
         assert!(adapter_boundary.contains("eggup_service::SystemdManager"));
+    }
+
+    #[test]
+    fn only_compatible_helper_admits_required_isolation() {
+        assert!(helper_satisfies_required_isolation(
+            &HelperCompatibility::Compatible {
+                version: env!("CARGO_PKG_VERSION").into(),
+            }
+        ));
+        for denied in [
+            HelperCompatibility::NotConfigured,
+            HelperCompatibility::Missing,
+            HelperCompatibility::Untrusted {
+                reason: "probe failed".into(),
+            },
+            HelperCompatibility::VersionSkew {
+                expected: env!("CARGO_PKG_VERSION").into(),
+                found: "0.0.0".into(),
+            },
+        ] {
+            assert!(
+                !helper_satisfies_required_isolation(&denied),
+                "{denied:?} must fail closed for required isolation, never downgrade"
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_restores_coherent_daemon_helper_pair() {
+        let root = install_root();
+        let inputs = TempDir::new().unwrap();
+        fs::write(root.path().join("bin/eggworkd"), b"prior-daemon").unwrap();
+        fs::write(
+            root.path().join("bin/eggwork-sandbox-helper"),
+            b"prior-helper",
+        )
+        .unwrap();
+        let sources = vec![
+            candidate(&inputs, MEMBER_DAEMON, DEST_DAEMON, b"new-daemon"),
+            candidate(&inputs, MEMBER_HELPER, DEST_HELPER, b"new-helper"),
+        ];
+        let plan = build_install_plan(root.path(), "2026.09.27", &sources).unwrap();
+        let receipt = commit_with_health_check(
+            plan,
+            &eggup_core::ExistingAsOwnedVerifier,
+            eggup_core::AbsentPolicy::AllowCreate,
+            eggup_core::PostCommitFailurePolicy::RollBack,
+            || Err("bounded post-start health probe failed".to_owned()),
+        )
+        .unwrap();
+        assert!(receipt.rollback_performed());
+        assert!(receipt.rollback_verified());
+        // A coherent pair is restored: neither member is left at the new
+        // generation while the other rolls back.
+        assert_eq!(
+            fs::read(root.path().join(DEST_DAEMON)).unwrap(),
+            b"prior-daemon"
+        );
+        assert_eq!(
+            fs::read(root.path().join(DEST_HELPER)).unwrap(),
+            b"prior-helper"
+        );
+    }
+
+    #[test]
+    fn deployment_surfaces_contain_no_secret_material() {
+        let sentinel = "M004-SENTINEL-9f3c-helper-secret";
+        let dir = TempDir::new().unwrap();
+        let helper = dir.path().join(sentinel);
+        fs::write(&helper, b"bytes").unwrap();
+        let status = DeploymentStatus::collect(Some(&helper), true);
+        let encoded = serde_json::to_string(&status).unwrap();
+        assert!(
+            !encoded.contains(sentinel),
+            "deployment status must not embed helper paths"
+        );
+        let error = CandidateSource {
+            member: MEMBER_DAEMON.into(),
+            source: PathBuf::from(format!("/tmp/{sentinel}/candidate")),
+            destination: DEST_DAEMON.into(),
+        }
+        .validate()
+        .unwrap_err();
+        assert!(!error.to_string().contains(sentinel));
+        assert!(error.to_string().len() <= 256 + 32);
+        let hostile = DeploymentError::new("candidate", "x".repeat(10_000));
+        assert!(hostile.to_string().len() <= 256 + 32);
     }
 }

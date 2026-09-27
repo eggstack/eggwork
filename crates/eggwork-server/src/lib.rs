@@ -4835,6 +4835,165 @@ mod tests {
         server.wait().await.unwrap();
     }
 
+    /// M004 adversarial: required Landlock denies outside writes and confines
+    /// descendants, not just the initial target's reads.
+    ///
+    /// The trap script fails closed with distinct exits if (a) the target
+    /// writes outside the workspace, (b) a direct child reads outside the
+    /// workspace, or (c) a background grandchild reads outside after a
+    /// delay. Exit 0 plus `Applied` sandbox evidence proves all three.
+    #[tokio::test]
+    async fn required_landlock_denies_outside_writes_and_confines_descendants() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let helper = match place_trusted_helper() {
+            Some(helper) => helper,
+            None => {
+                eprintln!(
+                    "skipping required_landlock_denies_outside_writes: sandbox-helper binary not located"
+                );
+                return;
+            }
+        };
+        let runner = Arc::new(LocalProcessRunner::new(
+            eggwork_runner::TrustedLandlockSetup::new(helper),
+        ));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-landlock-descendants").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024 * 1024,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(10),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            runner,
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+        if !client
+            .capabilities()
+            .await
+            .unwrap()
+            .features
+            .iter()
+            .any(|feature| feature == "isolation.landlock.workspace-rw.v1")
+        {
+            eprintln!(
+                "skipping required_landlock_denies_outside_writes: kernel does not advertise Landlock capability"
+            );
+            server.shutdown().await;
+            server.wait().await.unwrap();
+            return;
+        }
+        let inside = b"inside-content\n";
+        let inside_digest = eggwork_core::BlobDigest::from_bytes(inside);
+        let chunks = vec![Ok::<_, eggfetch_core::Error>(Bytes::from_static(inside))];
+        client
+            .upload_blob(
+                &inside_digest,
+                inside.len() as u64,
+                Box::pin(stream::iter(chunks)),
+            )
+            .await
+            .unwrap();
+        let escape_target = temp.path().join("landlock-write-escape-target.txt");
+        fs::write(&escape_target, b"outside-content\n").unwrap();
+        let workspace_id = eggwork_core::WorkspaceId::new("remote-landlock-ws2").unwrap();
+        let workspace_handle = execution_handle("remote-landlock-ws2-exec");
+        client
+            .create_workspace(
+                &workspace_id,
+                &workspace_handle,
+                &eggwork_core::WorkspaceManifest {
+                    schema_version: 1,
+                    entries: vec![
+                        eggwork_core::WorkspaceEntry::Directory {
+                            path: eggwork_core::RelativePath::new("src").unwrap(),
+                        },
+                        eggwork_core::WorkspaceEntry::File {
+                            path: eggwork_core::RelativePath::new("src/hello.txt").unwrap(),
+                            digest: inside_digest,
+                            size_bytes: inside.len() as u64,
+                            executable: false,
+                        },
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+        let escape = escape_target.display().to_string();
+        // No `set -e`: every hostile attempt is explicitly branched so the
+        // only way to reach `exit 0` is for all three denials to hold. The
+        // final `wait` reaps the background grandchild, making the marker
+        // check deterministic.
+        let shell_command = format!(
+            "cat hello.txt >/dev/null 2>&1 || exit 70; \
+             if echo evil > '{escape}' 2>/dev/null; then exit 71; fi; \
+             if sh -c \"cat '{escape}'\" >/dev/null 2>&1; then exit 72; fi; \
+             rm -f descendant-marker; \
+             sh -c \"cat '{escape}' > descendant-marker 2>/dev/null\" & \
+             wait; \
+             if [ -s descendant-marker ]; then exit 73; fi; exit 0"
+        );
+        let mut spec = execution_spec(vec!["/bin/sh".into(), "-c".into(), shell_command]);
+        spec.command.isolation = IsolationRequirement::Required;
+        spec.command.cwd = Some(eggwork_core::RelativePath::new("src").unwrap());
+        spec.command.timeout_millis = 20_000;
+        let stream = client
+            .execute_in_workspace(&spec, &workspace_handle, &workspace_id)
+            .await
+            .unwrap();
+        drop(stream);
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(25), async {
+            loop {
+                let snapshot = client
+                    .observe_generation(
+                        &workspace_handle.execution_id,
+                        workspace_handle.generation.get(),
+                    )
+                    .await
+                    .unwrap();
+                if snapshot.result.is_some() {
+                    break snapshot;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("descendant-confinement execution must terminate");
+        let result = snapshot.result.unwrap();
+        assert_eq!(snapshot.state, ExecutionState::Succeeded, "{result:?}");
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert!(matches!(
+            result.sandbox,
+            Some(eggwork_core::SandboxResult::Applied { .. })
+        ));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
     #[tokio::test]
     async fn required_landlock_rejects_with_capability_mismatch_when_helper_is_missing() {
         init_tls();
@@ -5594,5 +5753,528 @@ mod tests {
         assert!(
             !probe.network_supported(&NetworkRequirement::AllowListed(vec!["example.com".into()]))
         );
+    }
+
+    /// M004 adversarial: two authorized principals, one execution.
+    ///
+    /// Proves transport-derived identity fences every remotely reachable
+    /// control surface: cross-principal observe behaves as missing (no
+    /// existence oracle), cross-principal cancel/renew/events are forbidden
+    /// without leaking lease validity, and a wrong lease is
+    /// `invalid_lease` even for the owning principal.
+    #[tokio::test]
+    async fn cross_principal_execution_fencing_without_lease_oracle() {
+        init_tls();
+        let (root, server_identity, client_a, client_b) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal_a = eggwork_core::PrincipalId::new("principal-a").unwrap();
+        let principal_b = eggwork_core::PrincipalId::new("principal-b").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([
+            (
+                FingerprintPrincipalResolver::fingerprint(client_a.cert.as_ref()),
+                principal_a,
+            ),
+            (
+                FingerprintPrincipalResolver::fingerprint(client_b.cert.as_ref()),
+                principal_b,
+            ),
+        ]));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-fence").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 2,
+                lease_ttl: std::time::Duration::from_secs(30),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let endpoint = format!("https://localhost:{}", server.local_addr().port());
+        let temp_a = TempDir::new().unwrap();
+        let temp_b = TempDir::new().unwrap();
+        let owner = NodeClient::new(
+            endpoint.clone(),
+            write_client_config(&temp_a, root.as_ref(), &client_a),
+        )
+        .unwrap();
+        let stranger = NodeClient::new(
+            endpoint,
+            write_client_config(&temp_b, root.as_ref(), &client_b),
+        )
+        .unwrap();
+        let handle = execution_handle("fenced-execution");
+        let stream = owner
+            .execute(
+                &execution_spec(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]),
+                &handle,
+            )
+            .await
+            .unwrap();
+        drop(stream);
+        // Cross-principal observe behaves exactly as missing: no oracle.
+        let foreign_observe = stranger.observe(&handle.execution_id).await;
+        let missing_observe = owner
+            .observe(&ExecutionId::new("no-such-execution").unwrap())
+            .await;
+        assert!(
+            matches!(
+                foreign_observe,
+                Err(eggwork_client::ClientError::Api { status: 404, .. })
+            ),
+            "cross-principal observe must behave as missing, got {foreign_observe:?}"
+        );
+        assert!(matches!(
+            missing_observe,
+            Err(eggwork_client::ClientError::Api { status: 404, .. })
+        ));
+        // Cross-principal cancel/renew/events are forbidden (principal is
+        // checked before lease validity, so no lease oracle leaks).
+        assert!(matches!(
+            stranger.cancel(&handle).await,
+            Err(eggwork_client::ClientError::Api {
+                status: 403,
+                code,
+                ..
+            }) if code == "forbidden"
+        ));
+        assert!(matches!(
+            stranger.renew(&handle, "renew-1").await,
+            Err(eggwork_client::ClientError::Api {
+                status: 403,
+                code,
+                ..
+            }) if code == "forbidden"
+        ));
+        assert!(matches!(
+            stranger.events(&handle, 0).await,
+            Err(eggwork_client::ClientError::Api { status: 403, .. })
+        ));
+        // Owning principal with a wrong lease gets invalid_lease, proving the
+        // lease check still runs after the principal check passes.
+        let wrong_lease = ExecutionHandle {
+            execution_id: handle.execution_id.clone(),
+            generation: handle.generation,
+            lease_id: LeaseId::new(Uuid::new_v4().to_string()).unwrap(),
+        };
+        assert!(matches!(
+            owner.cancel(&wrong_lease).await,
+            Err(eggwork_client::ClientError::Api {
+                status: 403,
+                code,
+                ..
+            }) if code == "invalid_lease"
+        ));
+        // The stranger's attempts left no side effect: the owner still
+        // observes truthful terminal evidence.
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let snapshot = owner
+                    .observe_generation(&handle.execution_id, handle.generation.get())
+                    .await
+                    .unwrap();
+                if snapshot.result.is_some() {
+                    break snapshot;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fenced execution must reach a terminal snapshot");
+        assert_eq!(terminal.state, ExecutionState::Succeeded);
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// M004 adversarial: drain gates admission while retained records survive.
+    ///
+    /// A draining node rejects new executions with typed `503 draining`
+    /// evidence, previously retained terminal records remain observable, and
+    /// admission resumes after undrain with no fabricated completion.
+    #[tokio::test]
+    async fn drain_rejects_new_admission_while_terminal_records_survive() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-drain-gate").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 2,
+                lease_ttl: std::time::Duration::from_secs(30),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+        let first = execution_handle("drain-first");
+        let stream = client
+            .execute(
+                &execution_spec(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]),
+                &first,
+            )
+            .await
+            .unwrap();
+        drop(stream);
+        server.set_draining(true);
+        assert!(server.is_draining());
+        let refused = client
+            .execute(
+                &execution_spec(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]),
+                &execution_handle("drain-refused"),
+            )
+            .await;
+        match &refused {
+            Err(eggwork_client::ClientError::Api {
+                status: 503, code, ..
+            }) => assert_eq!(
+                code, "draining",
+                "draining admission must carry the draining code"
+            ),
+            Err(other) => panic!("draining admission must be typed 503, got {other:?}"),
+            Ok(_) => panic!("draining admission must be rejected while draining"),
+        }
+        // The pre-drain terminal record survives and stays truthful.
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let snapshot = client
+                    .observe_generation(&first.execution_id, first.generation.get())
+                    .await
+                    .unwrap();
+                if snapshot.result.is_some() {
+                    break snapshot;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("pre-drain execution must stay observable");
+        assert_eq!(terminal.state, ExecutionState::Succeeded);
+        assert_eq!(terminal.result.unwrap().exit_code, Some(0));
+        server.set_draining(false);
+        assert!(!server.is_draining());
+        let second = execution_handle("drain-second");
+        let stream = client
+            .execute(
+                &execution_spec(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]),
+                &second,
+            )
+            .await
+            .unwrap();
+        drop(stream);
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// M004 adversarial: hostile workspace manifests over the wire.    ///
+    /// Traversal, absolute, backslash, dot-segment, empty, NUL, and oversized
+    /// paths are rejected at deserialization with typed `400 invalid_request`
+    /// evidence and leave no half-created workspace behind: a valid create
+    /// afterwards still succeeds.
+    #[tokio::test]
+    async fn hostile_workspace_manifests_are_rejected_without_side_effect() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-hostile-ws").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 2,
+                lease_ttl: std::time::Duration::from_secs(30),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let endpoint = format!("https://localhost:{}", server.local_addr().port());
+        let client_temp = TempDir::new().unwrap();
+        let tls = write_client_config(&client_temp, root.as_ref(), &client_identity);
+        let mut hostile_paths: Vec<String> = vec![
+            "../escape".into(),
+            "/absolute".into(),
+            "a\\b".into(),
+            "a/./b".into(),
+            "a//b".into(),
+            ".".into(),
+            "..".into(),
+            String::new(),
+            "nul\u{0}byte".into(),
+        ];
+        hostile_paths.push("a".repeat(5000));
+        for (index, hostile) in hostile_paths.iter().enumerate() {
+            let body = serde_json::json!({
+                "schema_version": 1,
+                "workspace_id": format!("hostile-ws-{index}"),
+                "handle": {
+                    "execution_id": format!("hostile-exec-{index}"),
+                    "generation": 1,
+                    "lease_id": Uuid::new_v4().to_string(),
+                },
+                "manifest": {
+                    "schema_version": 1,
+                    "entries": [{"type": "directory", "path": hostile}],
+                },
+            });
+            let status = post_raw(
+                &format!("{endpoint}/v1/workspaces"),
+                tls.clone(),
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "hostile workspace path {hostile:?} must be rejected with 400"
+            );
+        }
+        // No half-created workspace: a valid create on the same store works.
+        let client = NodeClient::new(endpoint, tls).unwrap();
+        client
+            .create_workspace(
+                &eggwork_core::WorkspaceId::new("honest-ws").unwrap(),
+                &execution_handle("honest-exec"),
+                &eggwork_core::WorkspaceManifest {
+                    schema_version: 1,
+                    entries: vec![eggwork_core::WorkspaceEntry::Directory {
+                        path: eggwork_core::RelativePath::new("src").unwrap(),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// M004 adversarial: recognizable sentinels must not leak through
+    /// ordinary diagnostics, API errors, or Debug rendering.
+    ///
+    /// Only explicitly authorized payload/content channels (event streams,
+    /// artifact bytes) may carry caller-controlled values.
+    #[tokio::test]
+    async fn secret_sentinels_stay_out_of_error_and_debug_surfaces() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-sentinel").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 2,
+                lease_ttl: std::time::Duration::from_secs(30),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+        let sentinel = "M004-SENTINEL-7d2a9c1e-env-secret";
+        // Required isolation is unavailable without a helper on this node
+        // shape, so this execution is rejected before spawn; the rejection
+        // evidence must not echo the sentinel environment value.
+        let mut spec = execution_spec(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]);
+        spec.command.isolation = IsolationRequirement::Required;
+        spec.command
+            .environment
+            .push(eggwork_core::EnvironmentEntry::new("DEPLOY_TOKEN", sentinel).unwrap());
+        match client
+            .execute(&spec, &execution_handle("sentinel-exec"))
+            .await
+        {
+            Err(eggwork_client::ClientError::Api { message, .. }) => {
+                assert!(
+                    !message.contains(sentinel),
+                    "API error evidence must not echo caller secrets"
+                );
+            }
+            Err(other) => panic!("expected typed API rejection, got {other:?}"),
+            Ok(_) => panic!("required isolation without a helper must be rejected"),
+        }
+        // Debug rendering of output and environment types redacts content.
+        let chunk = eggwork_runner::OutputChunk {
+            stderr: false,
+            bytes: sentinel.as_bytes().to_vec(),
+        };
+        assert!(!format!("{chunk:?}").contains(sentinel));
+        let entry = eggwork_core::EnvironmentEntry::new("DEPLOY_TOKEN", sentinel).unwrap();
+        assert!(!format!("{entry:?}").contains(sentinel));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// M004 race review: concurrent admission against a draining flag has a
+    /// closed outcome set — every attempt is either an admitted execution
+    /// with truthful terminal evidence or a typed `503 draining` rejection.
+    /// No outcome may fabricate completion or lose an admission.
+    #[tokio::test]
+    async fn concurrent_drain_admission_outcomes_are_closed() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let server = NodeServer::start(
+            NodeConfig {
+                node_id: NodeId::new("node-drain-race").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 8,
+                lease_ttl: std::time::Duration::from_secs(30),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = Arc::new(
+            NodeClient::new(
+                format!("https://localhost:{}", server.local_addr().port()),
+                write_client_config(&client_temp, root.as_ref(), &client_identity),
+            )
+            .unwrap(),
+        );
+        server.set_draining(true);
+        let attempts: Vec<_> = (0..8)
+            .map(|index| {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let handle = execution_handle(&format!("drain-race-{index}"));
+                    let outcome = client
+                        .execute(
+                            &execution_spec(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]),
+                            &handle,
+                        )
+                        .await;
+                    (handle, outcome)
+                })
+            })
+            .collect();
+        // Release the drain mid-flight: admissions before the release are
+        // typed rejections, admissions after are accepted. The exact split
+        // is timing-dependent; the outcome set is not.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        server.set_draining(false);
+        let mut admitted = 0usize;
+        let mut rejected = 0usize;
+        for attempt in attempts {
+            let (handle, outcome) = attempt.await.unwrap();
+            match outcome {
+                Ok(stream) => {
+                    drop(stream);
+                    admitted += 1;
+                    let terminal =
+                        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                            loop {
+                                let snapshot = client
+                                    .observe_generation(
+                                        &handle.execution_id,
+                                        handle.generation.get(),
+                                    )
+                                    .await
+                                    .unwrap();
+                                if snapshot.result.is_some() {
+                                    break snapshot;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .expect("admitted execution must reach terminal evidence");
+                    assert_eq!(terminal.state, ExecutionState::Succeeded);
+                }
+                Err(eggwork_client::ClientError::Api {
+                    status: 503, code, ..
+                }) if code == "draining" => {
+                    rejected += 1;
+                }
+                Err(other) => panic!("drain race produced an outside outcome: {other:?}"),
+            }
+        }
+        assert_eq!(admitted + rejected, 8, "no admission may be lost");
+        server.shutdown().await;
+        server.wait().await.unwrap();
     }
 }

@@ -205,6 +205,14 @@ mod linux {
             };
             let runtime_read = if canonical.is_dir() {
                 AccessFs::from_read(abi) | AccessFs::Execute
+            } else if canonical == Path::new("/dev/null") {
+                // The null device discards all writes and yields EOF on
+                // reads: granting write is information-neutral, while
+                // denying it breaks ordinary `>/dev/null` redirection and
+                // makes escape-trap fixtures vacuous (redirection setup
+                // fails before the escape attempt runs). No other `/dev`
+                // path is allowed.
+                landlock::make_bitflags!(AccessFs::{ReadFile | WriteFile})
             } else {
                 landlock::make_bitflags!(AccessFs::{ReadFile})
             };

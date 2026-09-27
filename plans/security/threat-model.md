@@ -1,11 +1,14 @@
 # Eggwork Node Threat Model
 
-Status: current implementation baseline after Security M001
+Status: current implementation baseline after Security M004 (includes
+Operations M002 deployment/service surfaces)
 
 Scope: the authenticated fixed-target node API, local execution admission,
-workspace and artifact storage, event/result exposure, and secret-bearing
-request types. Operating-system process isolation and resource enforcement are
-tracked separately in Security M002 and M003.
+workspace and artifact storage, event/result exposure, secret-bearing
+request types, OS process isolation and resource enforcement (Security
+M002/M003, closed), and the installed deployment/service/update surfaces
+(Operations M002, closed). Cross-platform and adversarial qualification is
+recorded in the Security M004 closure.
 
 ## Assets
 
@@ -57,7 +60,10 @@ tracked separately in Security M002 and M003.
 | Unauthenticated peer | Invoke API or enumerate execution state | Required mTLS; absent/unmapped verified identity rejected before route body handling | Certificate issuance and revocation are deployment responsibilities |
 | Authenticated unauthorized principal | Execute, cancel, read, or mutate another principal's resources | Per-operation authorizer; principal fences on execution controls/events, workspace, artifact; observe returns not found for foreign ownership | Broad BlobRead capability permits any known digest unless resource-scoped policy is configured |
 | Malicious/compromised controller | Forge principal fields, reuse identity, submit oversized or malformed values | Identity derives from certificate; wire DTOs reject unknown fields; bounded bodies, core validation, generation/lease/digest fencing | A controller authorized for Execute can request arbitrary commands within currently available host isolation |
-| Malicious executed process | Exfiltrate inherited secrets, flood output, leave descendants | Environment is cleared and rebuilt from a narrow baseline; sensitive runtime variables are denied; output and process-tree controls are bounded; user output is not logged by node | No sandbox or OS resource backend is active in this baseline; M002/M003 must enforce required controls |
+| Malicious executed process | Exfiltrate inherited secrets, flood output, leave descendants | Environment is cleared and rebuilt from a narrow baseline; sensitive runtime variables are denied; output and process-tree controls are bounded; user output is not logged by node; required Landlock `workspace_rw` confinement is enforced on qualified Linux and fails closed elsewhere; systemd/cgroup-v2 memory/CPU/PID controls are enforced where probed and fail closed when required | Network restriction (`Disabled`/`AllowListed`) remains intentionally unsupported and is rejected as `capability_mismatch`; macOS/Windows hard-enforcement backends do not exist and required requests fail closed there |
+| Foreign or tampered local service registration | Stop, replace, or uninstall another deployment's node service | Service ownership is proven by exact installed executable plus critical argv/config (`eggwork-node` spec); `Foreign`/`Unknown` registrations deny all destructive transitions before any mutation; destructive lifecycle flows only through Eggup adapters, never direct manager invocation | The operator must supply the exact registered executable/config paths; guessed paths fail closed by design |
+| Tampered or mismatched helper binary | Bypass filesystem confinement via an untrusted helper | Helper is resolved from installation-owned location with ownership/mode/ancestor checks; required isolation fails closed on trust or version mismatch (`--version` coherence with the daemon release); upgrade transactions replace daemon and helper atomically so the pair cannot drift | Helper trust is re-verified at each setup; a helper replaced between trust check and launch is still confined to the Landlock rules applied at launch for that process |
+| Failed or hostile node update | Fabricate execution completion, lose retained records, leave a mixed daemon/helper pair | Updates enter persistent drain first and wait bounded (or require explicit force); only `bin/` members are transacted so execution recovery state is untouched; bounded post-start health failure rolls back through Eggup while backups are retained (`RollBack` default) | Rollback restores files only; in-memory work active across the restart follows normal cancellation/recovery semantics and is never reported as complete |
 | Hostile workspace input | Traversal, symlink races, malformed names, special files | Portable manifest validation, digest verification, node-owned roots, no-follow descriptor-relative materialization/capture, bounded entries and bytes | Platform coverage is recorded in the workspace closure; unsupported capture fails closed |
 | Malicious proxy/intermediary | Redirect fixed-target client or inject credential-bearing URLs | Client requires HTTPS, rejects URL userinfo/query/fragment, and uses explicit caller TLS configuration; no proxy route is accepted by the node protocol | Caller-selected resolver/network path remains a deployment trust decision |
 | Stale/replayed controller | Reuse an old generation or expired execution lease | Canonical request digest, principal-bound identity reservation, hashed lease token, generation checks, expiry fencing, idempotent renewal | Distributed controller key compromise is outside the node's ability to distinguish |
@@ -100,8 +106,20 @@ workspace deletion, artifact deletion, relay, or PTY in this API version.
 
 The implementation tests cover mapped and unmapped mTLS identities, operation
 denials before process spawn and storage mutation, unknown payload principal
-fields, principal-fenced observe behavior, URL userinfo rejection, resource
-descriptors, and secret-negative debug formatting. M001 does not claim a
-complete host isolation boundary. Landlock/helper trust is M002; enforced
-resource controls are M003; adversarial qualification across those controls is
-the later M004 roadmap item.
+fields, principal-fenced observe behavior (foreign reads behave as missing),
+cross-principal cancel/renew/events fencing without a lease oracle,
+wrong-lease `invalid_lease` evidence, URL userinfo rejection, resource
+descriptors, hostile workspace manifests over the wire (traversal, absolute,
+backslash, dot-segment, empty, NUL, oversized paths rejected at
+deserialization with no half-created state), drain-gated admission with
+surviving terminal records, concurrent drain/admission outcome closure, and
+secret-negative debug/error formatting (including deployment surfaces).
+Required Landlock confinement is physically demonstrated against
+outside-workspace reads/writes and descendants on qualified Linux; required
+resource controls are demonstrated where systemd/cgroup-v2 probes succeed.
+Unsupported platforms fail closed without advertising the capability. The
+Security M004 closure records the full adversarial matrix, hosted runs, race
+review, and residual findings. Network restriction remains explicitly
+unsupported; macOS launchd and Windows SCM lifecycle paths are implemented
+through Eggup adapters but await hosted runtime qualification before any
+production claim.
