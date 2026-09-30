@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M002 closed, M003 ready for handoff, M004 blocked on M003
+Status: active roadmap; M001-M002 closed, M003 conditionally closed, M004 ready for handoff
 
 Canonical authority:
 
@@ -78,7 +78,11 @@ The historical `002-status.md` blocker record is immutable and MUST NOT be overw
 
 Class: infrastructure/capability
 
-Status: ready for handoff
+Status: conditionally closed
+
+Implementation commit: `012383b`
+
+Closure evidence: `plans/closure/operations-distribution/003-status.md`
 
 Implementation plan:
 
@@ -88,24 +92,38 @@ Objective:
 
 Map Eggwork's release target/artifact policy into Eggpack's producer-side contracts, manifests, build/qualification plan, bootstrap installer, and generated release-CI surfaces without recreating producer distribution logic in Eggwork.
 
-The Eggpack producer gate that previously blocked this milestone is satisfied. Current reviewed Eggpack head is `3f95af43f99224755c97161e0c1102a84e713e35`; Build M006 implementation `398cd43bf1597ba49bfc35b5334611aa04b16600` is the current qualified producer pin candidate (hosted run `36484758546`). ReleaseManifest M001/M001a/M002, Build/Qualification M001-M006, CI orchestration through reusable consumer composition, Bootstrap M001/M002/M002a, and the producer-side Eggup manifest contract are closed.
+Landed: `release/eggpack/` is the checked-in producer authority for the five canonical targets — a two-member daemon + Landlock-helper bundle on both Linux targets and the daemon alone on macOS and Windows — with explicit Cargo package/binary bindings, a fixed configuration-free `eggworkd version` core smoke, a bounded Python3 consumer validator for the exact Linux helper candidate, a first-install policy, a static workflow shape, and a GitHub policy pinning Eggpack at `8507fbe`. `.github/workflows/release.yml` is generated from that configuration and is drift-guarded by `eggpack ci check` in ordinary CI. No runtime Eggpack dependency was added, and `eggwork-server` still never parses producer configuration.
 
-The registered M003 plan uses those closed producer APIs directly. It deliberately does not claim Eggpack's separate Eggup Interoperability M003 real-runtime-consumer milestone: Eggwork currently accepts local deployment candidates and owns no duplicated ReleaseManifest-to-update acquisition mapping.
+The registered M003 plan used closed producer APIs directly. It deliberately does not claim Eggpack's separate Eggup Interoperability M003 real-runtime-consumer milestone: Eggwork accepts local deployment candidates and owns no duplicated ReleaseManifest-to-update acquisition mapping. That cross-repo disposition was recorded in Eggpack planning at `b9baa93`/`3d1cb67`/`404f63e`.
 
-Residual constraints to carry into M003 planning, not blockers on authoring it:
+Named outstanding evidence, carried into M004 rather than blocking it:
+
+- Hosted producer build/qualification over all five required targets. Producing it means dispatching the generated workflow against a real existing release tag, which would also perform the M004 draft staging M003 explicitly excludes, so it is a maintainer action. Only `x86_64-unknown-linux-gnu` has executed producer evidence from this repository; macOS, Windows, and AArch64 Linux are **not** qualified. M004 is the milestone that closes this.
+
+Residual constraints carried into M004 planning, not blockers on M003:
 
 - Eggwork is not in Eggpack's ordered Ecosystem Adoption sequence. M003 therefore keeps all Eggwork release configuration in this repository and consumes closed Eggpack producer APIs without assuming an upstream-maintained Eggwork configuration.
-- CI M003b remains conditionally closed pending the byte-identical rerun-reuse receipt, which Eggpack attributes to consumer-side Windows artifact determinism (eggsact M005a). This bounds what M004 release qualification may claim.
+- CI M003b remains conditionally closed pending the byte-identical rerun-reuse receipt, which Eggpack attributes to consumer-side Windows artifact determinism (eggsact M005a). This bounds what M004 release qualification may claim: a rerun against an already-staged Eggwork Windows release will fail closed on digest mismatch rather than reconcile.
+- The Eggpack tool pin `8507fbe` is published on `refs/heads/m003g-live-qualification`, not `main`. Re-pin to the merged `main` head once upstream merges CI M003e/f/g.
 
 ### M004 — Operational and release qualification
 
 Class: polish/invariant
 
-Status: blocked on M003 (M002 side closed)
+Status: ready for handoff
 
 Objective:
 
 Run hosted target/service/update/recovery qualification, verify checksums/provenance and installed-version coherence, exercise drain/update/restart boundaries, and close release-operational findings.
+
+Dependency disposition: M002 is closed and the M003 dependency is satisfied by
+`plans/closure/operations-distribution/003-status.md`. No implementation plan
+document exists for M004 yet; authoring it is the next action and is unblocked.
+
+First obligation, carried from the M003 closure record: dispatch
+`.github/workflows/release.yml` against an exact existing release tag and
+record the hosted five-target build, qualification, and consumer-validation
+run identifiers.
 
 ### M005 — Reverse-connect relay
 

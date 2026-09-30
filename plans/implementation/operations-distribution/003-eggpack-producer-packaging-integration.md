@@ -1,6 +1,15 @@
 # Operations and Distribution M003 — Eggpack Producer Packaging Integration
 
-Status: ready for handoff
+Status: conditionally closed
+
+Implementation commit: `012383b4c19b7c598157381a29a3eec9bfaa5c1b`
+Closure record: `plans/closure/operations-distribution/003-status.md`
+
+The single named outstanding evidence item is the hosted five-target producer
+build/qualification run. It is a maintainer-dispatched `workflow_dispatch`
+against a real existing release tag, which would also perform the M004 draft
+staging this plan deliberately excludes. Operations M004 is unblocked and owns
+discharging it.
 
 Repository baseline reviewed before planning:
 
