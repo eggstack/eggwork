@@ -1,0 +1,979 @@
+name: Eggpack candidate builds
+'on':
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Exact existing tag to stage
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: eggpack-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+  cancel-in-progress: true
+jobs:
+  preflight:
+    runs-on: "ubuntu-latest"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Check Cargo availability
+        shell: bash
+        run: cargo --version
+  resolve:
+    needs: preflight
+    runs-on: "ubuntu-latest"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Validate exact-tag source
+        shell: bash
+        run: "test -n \"${{ inputs.release_tag }}\""
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Create runtime identity directory
+        shell: bash
+        run: "mkdir -p './eggpack-runtime'"
+      - name: Resolve runtime release identity
+        shell: bash
+        run: |
+          head_sha="$(git rev-parse --verify HEAD^{commit})"
+          'eggpack' 'ci' '_resolve-release' '--contract' 'release/eggpack/distribution.toml' '--pack-config' 'release/eggpack/pack.toml' '--build-bindings' 'release/eggpack/build-bindings.toml' '--qualification-bindings' 'release/eggpack/qualification-bindings.toml' '--consumer-validators' 'release/eggpack/consumer-validators.json' '--selected' 'linux-x64,linux-arm64,macos-x64,macos-arm64,windows-x64' '--tag' '${{ inputs.release_tag }}' '--source-revision' "$head_sha" '--template' 'release/eggpack/github-template.json' '--source-root' '${{ github.workspace }}' '--output-plan' './eggpack-runtime/release-plan.json' '--output-ci-plan' './eggpack-runtime/release-ci-plan.json' '--output-github-policy' './eggpack-runtime/github-draft.json'
+      - name: Upload runtime release identity
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+          retention-days: 7
+  build_aarch64_apple_darwin:
+    needs: resolve
+    runs-on: "macos-14"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Set up Rust toolchain
+        uses: "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c"
+        with:
+          toolchain: "1.89.0"
+          targets: "aarch64-apple-darwin"
+      - name: Verify Rust toolchain
+        shell: bash
+        run: cargo +'1.89.0' --version
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Build "aarch64-apple-darwin / eggworkd"
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: "${{ runner.temp }}/eggpack/${{ github.run_id }}-${{ github.run_attempt }}"
+        run: "'cargo' '+1.89.0' 'build' '--release' '--locked' '--target' 'aarch64-apple-darwin' '--package' 'eggwork-server' '--bin' 'eggworkd'"
+      - name: Capture canonical build handoff
+        shell: bash
+        run: "'eggpack' 'ci' '_capture-build' '--release-plan' 'eggpack-runtime/release-plan.json' '--build-bindings' 'release/eggpack/build-bindings.toml' '--target' 'aarch64-apple-darwin' '--cargo-target-dir' '${{ runner.temp }}/eggpack/${{ github.run_id }}-${{ github.run_attempt }}' '--output-dir' './eggpack-build/build_aarch64_apple_darwin'"
+      - name: Upload canonical build handoff
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-build-handoff-aarch64-apple-darwin"
+          path: "./eggpack-build/build_aarch64_apple_darwin"
+          if-no-files-found: error
+          retention-days: 7
+  build_aarch64_unknown_linux_gnu:
+    needs: resolve
+    runs-on: "ubuntu-24.04-arm"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Set up Rust toolchain
+        uses: "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c"
+        with:
+          toolchain: "1.89.0"
+          targets: "aarch64-unknown-linux-gnu"
+      - name: Verify Rust toolchain
+        shell: bash
+        run: cargo +'1.89.0' --version
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Build "aarch64-unknown-linux-gnu / eggworkd"
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: "${{ runner.temp }}/eggpack/${{ github.run_id }}-${{ github.run_attempt }}"
+        run: "'cargo' '+1.89.0' 'build' '--release' '--locked' '--target' 'aarch64-unknown-linux-gnu' '--package' 'eggwork-server' '--bin' 'eggworkd'"
+      - name: Build "aarch64-unknown-linux-gnu / eggwork-sandbox-helper"
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: "${{ runner.temp }}/eggpack/${{ github.run_id }}-${{ github.run_attempt }}"
+        run: "'cargo' '+1.89.0' 'build' '--release' '--locked' '--target' 'aarch64-unknown-linux-gnu' '--package' 'eggwork-sandbox-helper' '--bin' 'eggwork-sandbox-helper'"
+      - name: Capture canonical build handoff
+        shell: bash
+        run: "'eggpack' 'ci' '_capture-build' '--release-plan' 'eggpack-runtime/release-plan.json' '--build-bindings' 'release/eggpack/build-bindings.toml' '--target' 'aarch64-unknown-linux-gnu' '--cargo-target-dir' '${{ runner.temp }}/eggpack/${{ github.run_id }}-${{ github.run_attempt }}' '--output-dir' './eggpack-build/build_aarch64_unknown_linux_gnu'"
+      - name: Upload canonical build handoff
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-build-handoff-aarch64-unknown-linux-gnu"
+          path: "./eggpack-build/build_aarch64_unknown_linux_gnu"
+          if-no-files-found: error
+          retention-days: 7
+  build_x86_64_apple_darwin:
+    needs: resolve
+    runs-on: "macos-15-intel"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Set up Rust toolchain
+        uses: "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c"
+        with:
+          toolchain: "1.89.0"
+          targets: "x86_64-apple-darwin"
+      - name: Verify Rust toolchain
+        shell: bash
+        run: cargo +'1.89.0' --version
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Build "x86_64-apple-darwin / eggworkd"
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: "${{ runner.temp }}/eggpack/${{ github.run_id }}-${{ github.run_attempt }}"
+        run: "'cargo' '+1.89.0' 'build' '--release' '--locked' '--target' 'x86_64-apple-darwin' '--package' 'eggwork-server' '--bin' 'eggworkd'"
+      - name: Capture canonical build handoff
+        shell: bash
+        run: "'eggpack' 'ci' '_capture-build' '--release-plan' 'eggpack-runtime/release-plan.json' '--build-bindings' 'release/eggpack/build-bindings.toml' '--target' 'x86_64-apple-darwin' '--cargo-target-dir' '${{ runner.temp }}/eggpack/${{ github.run_id }}-${{ github.run_attempt }}' '--output-dir' './eggpack-build/build_x86_64_apple_darwin'"
+      - name: Upload canonical build handoff
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-build-handoff-x86_64-apple-darwin"
+          path: "./eggpack-build/build_x86_64_apple_darwin"
+          if-no-files-found: error
+          retention-days: 7
+  build_x86_64_pc_windows_msvc:
+    needs: resolve
+    runs-on: "windows-latest"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Set up Rust toolchain
+        uses: "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c"
+        with:
+          toolchain: "1.89.0"
+          targets: "x86_64-pc-windows-msvc"
+      - name: Verify Rust toolchain
+        shell: bash
+        run: cargo +'1.89.0' --version
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Build "x86_64-pc-windows-msvc / eggworkd"
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: "${{ runner.temp }}/eggpack/${{ github.run_id }}-${{ github.run_attempt }}"
+        run: "'cargo' '+1.89.0' 'build' '--release' '--locked' '--target' 'x86_64-pc-windows-msvc' '--package' 'eggwork-server' '--bin' 'eggworkd'"
+      - name: Capture canonical build handoff
+        shell: bash
+        run: "'eggpack' 'ci' '_capture-build' '--release-plan' 'eggpack-runtime/release-plan.json' '--build-bindings' 'release/eggpack/build-bindings.toml' '--target' 'x86_64-pc-windows-msvc' '--cargo-target-dir' '${{ runner.temp }}/eggpack/${{ github.run_id }}-${{ github.run_attempt }}' '--output-dir' './eggpack-build/build_x86_64_pc_windows_msvc'"
+      - name: Upload canonical build handoff
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-build-handoff-x86_64-pc-windows-msvc"
+          path: "./eggpack-build/build_x86_64_pc_windows_msvc"
+          if-no-files-found: error
+          retention-days: 7
+  build_x86_64_unknown_linux_gnu:
+    needs: resolve
+    runs-on: "ubuntu-latest"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Set up Rust toolchain
+        uses: "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c"
+        with:
+          toolchain: "1.89.0"
+          targets: "x86_64-unknown-linux-gnu"
+      - name: Verify Rust toolchain
+        shell: bash
+        run: cargo +'1.89.0' --version
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Build "x86_64-unknown-linux-gnu / eggworkd"
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: "${{ runner.temp }}/eggpack/${{ github.run_id }}-${{ github.run_attempt }}"
+        run: "'cargo' '+1.89.0' 'build' '--release' '--locked' '--target' 'x86_64-unknown-linux-gnu' '--package' 'eggwork-server' '--bin' 'eggworkd'"
+      - name: Build "x86_64-unknown-linux-gnu / eggwork-sandbox-helper"
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: "${{ runner.temp }}/eggpack/${{ github.run_id }}-${{ github.run_attempt }}"
+        run: "'cargo' '+1.89.0' 'build' '--release' '--locked' '--target' 'x86_64-unknown-linux-gnu' '--package' 'eggwork-sandbox-helper' '--bin' 'eggwork-sandbox-helper'"
+      - name: Capture canonical build handoff
+        shell: bash
+        run: "'eggpack' 'ci' '_capture-build' '--release-plan' 'eggpack-runtime/release-plan.json' '--build-bindings' 'release/eggpack/build-bindings.toml' '--target' 'x86_64-unknown-linux-gnu' '--cargo-target-dir' '${{ runner.temp }}/eggpack/${{ github.run_id }}-${{ github.run_attempt }}' '--output-dir' './eggpack-build/build_x86_64_unknown_linux_gnu'"
+      - name: Upload canonical build handoff
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-build-handoff-x86_64-unknown-linux-gnu"
+          path: "./eggpack-build/build_x86_64_unknown_linux_gnu"
+          if-no-files-found: error
+          retention-days: 7
+  qualify_build_aarch64_apple_darwin:
+    needs: build_aarch64_apple_darwin
+    runs-on: "macos-14"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Download build handoff
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-build-handoff-aarch64-apple-darwin"
+          path: "./eggpack-handoff/build_aarch64_apple_darwin"
+      - name: Qualify target
+        shell: bash
+        run: "'eggpack' 'ci' '_qualify-target' '--contract' 'release/eggpack/distribution.toml' '--release-plan' 'eggpack-runtime/release-plan.json' '--build-bindings' 'release/eggpack/build-bindings.toml' '--qualification-bindings' 'release/eggpack/qualification-bindings.toml' '--target' 'aarch64-apple-darwin' '--candidate-dir' './eggpack-handoff/build_aarch64_apple_darwin/candidates' '--build-handoff' './eggpack-handoff/build_aarch64_apple_darwin/build-handoff.json' '--output-dir' './eggpack-qualification/build_aarch64_apple_darwin'"
+      - name: Upload qualification evidence
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-evidence-aarch64-apple-darwin"
+          path: "./eggpack-qualification/build_aarch64_apple_darwin"
+          if-no-files-found: error
+          retention-days: 7
+  qualify_build_aarch64_unknown_linux_gnu:
+    needs: build_aarch64_unknown_linux_gnu
+    runs-on: "ubuntu-24.04-arm"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Download build handoff
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-build-handoff-aarch64-unknown-linux-gnu"
+          path: "./eggpack-handoff/build_aarch64_unknown_linux_gnu"
+      - name: Qualify target
+        shell: bash
+        run: "'eggpack' 'ci' '_qualify-target' '--contract' 'release/eggpack/distribution.toml' '--release-plan' 'eggpack-runtime/release-plan.json' '--build-bindings' 'release/eggpack/build-bindings.toml' '--qualification-bindings' 'release/eggpack/qualification-bindings.toml' '--target' 'aarch64-unknown-linux-gnu' '--candidate-dir' './eggpack-handoff/build_aarch64_unknown_linux_gnu/candidates' '--build-handoff' './eggpack-handoff/build_aarch64_unknown_linux_gnu/build-handoff.json' '--output-dir' './eggpack-qualification/build_aarch64_unknown_linux_gnu'"
+      - name: Upload qualification evidence
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-evidence-aarch64-unknown-linux-gnu"
+          path: "./eggpack-qualification/build_aarch64_unknown_linux_gnu"
+          if-no-files-found: error
+          retention-days: 7
+  qualify_build_x86_64_apple_darwin:
+    needs: build_x86_64_apple_darwin
+    runs-on: "macos-15-intel"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Download build handoff
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-build-handoff-x86_64-apple-darwin"
+          path: "./eggpack-handoff/build_x86_64_apple_darwin"
+      - name: Qualify target
+        shell: bash
+        run: "'eggpack' 'ci' '_qualify-target' '--contract' 'release/eggpack/distribution.toml' '--release-plan' 'eggpack-runtime/release-plan.json' '--build-bindings' 'release/eggpack/build-bindings.toml' '--qualification-bindings' 'release/eggpack/qualification-bindings.toml' '--target' 'x86_64-apple-darwin' '--candidate-dir' './eggpack-handoff/build_x86_64_apple_darwin/candidates' '--build-handoff' './eggpack-handoff/build_x86_64_apple_darwin/build-handoff.json' '--output-dir' './eggpack-qualification/build_x86_64_apple_darwin'"
+      - name: Upload qualification evidence
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-evidence-x86_64-apple-darwin"
+          path: "./eggpack-qualification/build_x86_64_apple_darwin"
+          if-no-files-found: error
+          retention-days: 7
+  qualify_build_x86_64_pc_windows_msvc:
+    needs: build_x86_64_pc_windows_msvc
+    runs-on: "windows-latest"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Download build handoff
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-build-handoff-x86_64-pc-windows-msvc"
+          path: "./eggpack-handoff/build_x86_64_pc_windows_msvc"
+      - name: Qualify target
+        shell: bash
+        run: "'eggpack' 'ci' '_qualify-target' '--contract' 'release/eggpack/distribution.toml' '--release-plan' 'eggpack-runtime/release-plan.json' '--build-bindings' 'release/eggpack/build-bindings.toml' '--qualification-bindings' 'release/eggpack/qualification-bindings.toml' '--target' 'x86_64-pc-windows-msvc' '--candidate-dir' './eggpack-handoff/build_x86_64_pc_windows_msvc/candidates' '--build-handoff' './eggpack-handoff/build_x86_64_pc_windows_msvc/build-handoff.json' '--output-dir' './eggpack-qualification/build_x86_64_pc_windows_msvc'"
+      - name: Upload qualification evidence
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-evidence-x86_64-pc-windows-msvc"
+          path: "./eggpack-qualification/build_x86_64_pc_windows_msvc"
+          if-no-files-found: error
+          retention-days: 7
+  qualify_build_x86_64_unknown_linux_gnu:
+    needs: build_x86_64_unknown_linux_gnu
+    runs-on: "ubuntu-latest"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Download build handoff
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-build-handoff-x86_64-unknown-linux-gnu"
+          path: "./eggpack-handoff/build_x86_64_unknown_linux_gnu"
+      - name: Qualify target
+        shell: bash
+        run: "'eggpack' 'ci' '_qualify-target' '--contract' 'release/eggpack/distribution.toml' '--release-plan' 'eggpack-runtime/release-plan.json' '--build-bindings' 'release/eggpack/build-bindings.toml' '--qualification-bindings' 'release/eggpack/qualification-bindings.toml' '--target' 'x86_64-unknown-linux-gnu' '--candidate-dir' './eggpack-handoff/build_x86_64_unknown_linux_gnu/candidates' '--build-handoff' './eggpack-handoff/build_x86_64_unknown_linux_gnu/build-handoff.json' '--output-dir' './eggpack-qualification/build_x86_64_unknown_linux_gnu'"
+      - name: Upload qualification evidence
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-evidence-x86_64-unknown-linux-gnu"
+          path: "./eggpack-qualification/build_x86_64_unknown_linux_gnu"
+          if-no-files-found: error
+          retention-days: 7
+  validate_build_aarch64_apple_darwin:
+    needs: qualify_build_aarch64_apple_darwin
+    runs-on: "macos-14"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Download qualification handoff
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-evidence-aarch64-apple-darwin"
+          path: "./eggpack-handoff/build_aarch64_apple_darwin"
+      - name: Create consumer evidence directory
+        shell: bash
+        run: "mkdir -p './eggpack-consumer/build_aarch64_apple_darwin'"
+      - name: Validate exact candidate (consumer)
+        shell: bash
+        run: "'eggpack' 'ci' '_validate-consumer' '--consumer-validators' 'release/eggpack/consumer-validators.json' '--target' 'aarch64-apple-darwin' '--candidate-dir' './eggpack-handoff/build_aarch64_apple_darwin/candidates' '--build-handoff' './eggpack-handoff/build_aarch64_apple_darwin/build-handoff.json' '--evidence' './eggpack-handoff/build_aarch64_apple_darwin/evidence.json' '--source-root' '${{ github.workspace }}' '--output' './eggpack-consumer/build_aarch64_apple_darwin/consumer-evidence.json'"
+      - name: Upload consumer validation evidence
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-consumer-evidence-aarch64-apple-darwin"
+          path: "./eggpack-consumer/build_aarch64_apple_darwin"
+          if-no-files-found: error
+          retention-days: 7
+  validate_build_aarch64_unknown_linux_gnu:
+    needs: qualify_build_aarch64_unknown_linux_gnu
+    runs-on: "ubuntu-24.04-arm"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Download qualification handoff
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-evidence-aarch64-unknown-linux-gnu"
+          path: "./eggpack-handoff/build_aarch64_unknown_linux_gnu"
+      - name: Create consumer evidence directory
+        shell: bash
+        run: "mkdir -p './eggpack-consumer/build_aarch64_unknown_linux_gnu'"
+      - name: Validate exact candidate (consumer)
+        shell: bash
+        run: "'eggpack' 'ci' '_validate-consumer' '--consumer-validators' 'release/eggpack/consumer-validators.json' '--target' 'aarch64-unknown-linux-gnu' '--candidate-dir' './eggpack-handoff/build_aarch64_unknown_linux_gnu/candidates' '--build-handoff' './eggpack-handoff/build_aarch64_unknown_linux_gnu/build-handoff.json' '--evidence' './eggpack-handoff/build_aarch64_unknown_linux_gnu/evidence.json' '--source-root' '${{ github.workspace }}' '--output' './eggpack-consumer/build_aarch64_unknown_linux_gnu/consumer-evidence.json'"
+      - name: Upload consumer validation evidence
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-consumer-evidence-aarch64-unknown-linux-gnu"
+          path: "./eggpack-consumer/build_aarch64_unknown_linux_gnu"
+          if-no-files-found: error
+          retention-days: 7
+  validate_build_x86_64_apple_darwin:
+    needs: qualify_build_x86_64_apple_darwin
+    runs-on: "macos-15-intel"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Download qualification handoff
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-evidence-x86_64-apple-darwin"
+          path: "./eggpack-handoff/build_x86_64_apple_darwin"
+      - name: Create consumer evidence directory
+        shell: bash
+        run: "mkdir -p './eggpack-consumer/build_x86_64_apple_darwin'"
+      - name: Validate exact candidate (consumer)
+        shell: bash
+        run: "'eggpack' 'ci' '_validate-consumer' '--consumer-validators' 'release/eggpack/consumer-validators.json' '--target' 'x86_64-apple-darwin' '--candidate-dir' './eggpack-handoff/build_x86_64_apple_darwin/candidates' '--build-handoff' './eggpack-handoff/build_x86_64_apple_darwin/build-handoff.json' '--evidence' './eggpack-handoff/build_x86_64_apple_darwin/evidence.json' '--source-root' '${{ github.workspace }}' '--output' './eggpack-consumer/build_x86_64_apple_darwin/consumer-evidence.json'"
+      - name: Upload consumer validation evidence
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-consumer-evidence-x86_64-apple-darwin"
+          path: "./eggpack-consumer/build_x86_64_apple_darwin"
+          if-no-files-found: error
+          retention-days: 7
+  validate_build_x86_64_pc_windows_msvc:
+    needs: qualify_build_x86_64_pc_windows_msvc
+    runs-on: "windows-latest"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Download qualification handoff
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-evidence-x86_64-pc-windows-msvc"
+          path: "./eggpack-handoff/build_x86_64_pc_windows_msvc"
+      - name: Create consumer evidence directory
+        shell: bash
+        run: "mkdir -p './eggpack-consumer/build_x86_64_pc_windows_msvc'"
+      - name: Validate exact candidate (consumer)
+        shell: bash
+        run: "'eggpack' 'ci' '_validate-consumer' '--consumer-validators' 'release/eggpack/consumer-validators.json' '--target' 'x86_64-pc-windows-msvc' '--candidate-dir' './eggpack-handoff/build_x86_64_pc_windows_msvc/candidates' '--build-handoff' './eggpack-handoff/build_x86_64_pc_windows_msvc/build-handoff.json' '--evidence' './eggpack-handoff/build_x86_64_pc_windows_msvc/evidence.json' '--source-root' '${{ github.workspace }}' '--output' './eggpack-consumer/build_x86_64_pc_windows_msvc/consumer-evidence.json'"
+      - name: Upload consumer validation evidence
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-consumer-evidence-x86_64-pc-windows-msvc"
+          path: "./eggpack-consumer/build_x86_64_pc_windows_msvc"
+          if-no-files-found: error
+          retention-days: 7
+  validate_build_x86_64_unknown_linux_gnu:
+    needs: qualify_build_x86_64_unknown_linux_gnu
+    runs-on: "ubuntu-latest"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Download qualification handoff
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-evidence-x86_64-unknown-linux-gnu"
+          path: "./eggpack-handoff/build_x86_64_unknown_linux_gnu"
+      - name: Create consumer evidence directory
+        shell: bash
+        run: "mkdir -p './eggpack-consumer/build_x86_64_unknown_linux_gnu'"
+      - name: Validate exact candidate (consumer)
+        shell: bash
+        run: "'eggpack' 'ci' '_validate-consumer' '--consumer-validators' 'release/eggpack/consumer-validators.json' '--target' 'x86_64-unknown-linux-gnu' '--candidate-dir' './eggpack-handoff/build_x86_64_unknown_linux_gnu/candidates' '--build-handoff' './eggpack-handoff/build_x86_64_unknown_linux_gnu/build-handoff.json' '--evidence' './eggpack-handoff/build_x86_64_unknown_linux_gnu/evidence.json' '--source-root' '${{ github.workspace }}' '--output' './eggpack-consumer/build_x86_64_unknown_linux_gnu/consumer-evidence.json'"
+      - name: Upload consumer validation evidence
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-consumer-evidence-x86_64-unknown-linux-gnu"
+          path: "./eggpack-consumer/build_x86_64_unknown_linux_gnu"
+          if-no-files-found: error
+          retention-days: 7
+  required_gate:
+    needs: [validate_build_aarch64_apple_darwin, validate_build_aarch64_unknown_linux_gnu, validate_build_x86_64_apple_darwin, validate_build_x86_64_pc_windows_msvc, validate_build_x86_64_unknown_linux_gnu]
+    runs-on: "ubuntu-latest"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Download qualification "aarch64-apple-darwin"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-evidence-aarch64-apple-darwin"
+          path: "./eggpack-inputs/aarch64-apple-darwin"
+      - name: Download qualification "aarch64-unknown-linux-gnu"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-evidence-aarch64-unknown-linux-gnu"
+          path: "./eggpack-inputs/aarch64-unknown-linux-gnu"
+      - name: Download qualification "x86_64-apple-darwin"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-evidence-x86_64-apple-darwin"
+          path: "./eggpack-inputs/x86_64-apple-darwin"
+      - name: Download qualification "x86_64-pc-windows-msvc"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-evidence-x86_64-pc-windows-msvc"
+          path: "./eggpack-inputs/x86_64-pc-windows-msvc"
+      - name: Download qualification "x86_64-unknown-linux-gnu"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-evidence-x86_64-unknown-linux-gnu"
+          path: "./eggpack-inputs/x86_64-unknown-linux-gnu"
+      - name: Download consumer evidence "aarch64-apple-darwin"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-consumer-evidence-aarch64-apple-darwin"
+          path: "./eggpack-inputs/aarch64-apple-darwin"
+      - name: Download consumer evidence "aarch64-unknown-linux-gnu"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-consumer-evidence-aarch64-unknown-linux-gnu"
+          path: "./eggpack-inputs/aarch64-unknown-linux-gnu"
+      - name: Download consumer evidence "x86_64-apple-darwin"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-consumer-evidence-x86_64-apple-darwin"
+          path: "./eggpack-inputs/x86_64-apple-darwin"
+      - name: Download consumer evidence "x86_64-pc-windows-msvc"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-consumer-evidence-x86_64-pc-windows-msvc"
+          path: "./eggpack-inputs/x86_64-pc-windows-msvc"
+      - name: Download consumer evidence "x86_64-unknown-linux-gnu"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-consumer-evidence-x86_64-unknown-linux-gnu"
+          path: "./eggpack-inputs/x86_64-unknown-linux-gnu"
+      - name: Create gate outcome directory
+        shell: bash
+        run: "mkdir -p './eggpack-gate'"
+      - name: Evaluate required qualification gate
+        shell: bash
+        run: "'eggpack' 'ci' '_evaluate-gate' '--ci-plan' 'eggpack-runtime/release-ci-plan.json' '--inputs-dir' './eggpack-inputs' '--output' './eggpack-gate/gate-outcome.json'"
+  aggregate:
+    needs: required_gate
+    runs-on: "ubuntu-latest"
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Download qualification "aarch64-apple-darwin"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-evidence-aarch64-apple-darwin"
+          path: "./eggpack-inputs/aarch64-apple-darwin"
+      - name: Download qualification "aarch64-unknown-linux-gnu"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-evidence-aarch64-unknown-linux-gnu"
+          path: "./eggpack-inputs/aarch64-unknown-linux-gnu"
+      - name: Download qualification "x86_64-apple-darwin"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-evidence-x86_64-apple-darwin"
+          path: "./eggpack-inputs/x86_64-apple-darwin"
+      - name: Download qualification "x86_64-pc-windows-msvc"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-evidence-x86_64-pc-windows-msvc"
+          path: "./eggpack-inputs/x86_64-pc-windows-msvc"
+      - name: Download qualification "x86_64-unknown-linux-gnu"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-evidence-x86_64-unknown-linux-gnu"
+          path: "./eggpack-inputs/x86_64-unknown-linux-gnu"
+      - name: Download consumer evidence "aarch64-apple-darwin"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-consumer-evidence-aarch64-apple-darwin"
+          path: "./eggpack-inputs/aarch64-apple-darwin"
+      - name: Download consumer evidence "aarch64-unknown-linux-gnu"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-consumer-evidence-aarch64-unknown-linux-gnu"
+          path: "./eggpack-inputs/aarch64-unknown-linux-gnu"
+      - name: Download consumer evidence "x86_64-apple-darwin"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-consumer-evidence-x86_64-apple-darwin"
+          path: "./eggpack-inputs/x86_64-apple-darwin"
+      - name: Download consumer evidence "x86_64-pc-windows-msvc"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-consumer-evidence-x86_64-pc-windows-msvc"
+          path: "./eggpack-inputs/x86_64-pc-windows-msvc"
+      - name: Download consumer evidence "x86_64-unknown-linux-gnu"
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-consumer-evidence-x86_64-unknown-linux-gnu"
+          path: "./eggpack-inputs/x86_64-unknown-linux-gnu"
+      - name: Create finalized release directory
+        shell: bash
+        run: "mkdir -p './eggpack-finalized'"
+      - name: Aggregate and finalize release
+        shell: bash
+        run: "'eggpack' 'ci' '_aggregate' '--contract' 'release/eggpack/distribution.toml' '--release-plan' 'eggpack-runtime/release-plan.json' '--ci-plan' 'eggpack-runtime/release-ci-plan.json' '--inputs-dir' './eggpack-inputs' '--output-root' './eggpack-finalized/root' '--output' './eggpack-finalized/summary.json'"
+      - name: Upload internal finalized release
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-finalized-release"
+          path: ./eggpack-finalized
+          if-no-files-found: error
+          retention-days: 7
+  stage:
+    needs: aggregate
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: "ubuntu-latest"
+    permissions:
+      contents: write
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ inputs.release_tag }}"
+      - name: Download runtime release identity
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-runtime-identity"
+          path: "./eggpack-runtime"
+          if-no-files-found: error
+      - name: Validate exact-tag source
+        shell: bash
+        run: "test -n \"${{ inputs.release_tag }}\""
+      - name: Install pinned Eggpack tool
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo install --git https://github.com/eggstack/eggpack --rev 8507fbeebc6e6a0f8176965d8b21dfc818a03719 --locked eggpack-cli
+          eggpack --version
+      - name: Verify checked-out release source
+        shell: bash
+        run: "'eggpack' 'ci' '_verify-source' '--release-plan' 'eggpack-runtime/release-plan.json'"
+      - name: Download finalized release
+        uses: "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        with:
+          name: "eggpack-finalized-release"
+          path: ./eggpack-finalized
+          if-no-files-found: error
+      - name: Prepare staging payload
+        shell: bash
+        run: "'eggpack' 'ci' '_prepare-stage' '--contract' 'release/eggpack/distribution.toml' '--release-manifest' './eggpack-finalized/release-manifest.json' '--finalized-root' './eggpack-finalized/root' '--github-policy' 'eggpack-runtime/github-draft.json' '--install-policy' 'release/eggpack/install-policy.toml' '--output-dir' './eggpack-staging' '--output-payload' './eggpack-staging-payload.json'"
+      - name: Stage GitHub draft release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: "'eggpack' 'ci' '_stage-github-draft' '--payload' './eggpack-staging-payload.json' '--github-policy' 'eggpack-runtime/github-draft.json' '--staging-dir' './eggpack-staging' '--output-receipt' './eggpack-staging-receipt.json'"
+      - name: Upload staging receipt
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "eggpack-staging-receipt"
+          path: ./eggpack-staging-receipt.json
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "owner": "eggstack",
+  "repository": "eggwork",
+  "title_prefix": "eggwork ",
+  "body": "Draft binary release staged by Eggpack. Maintainer review and publication are required before this release becomes public. The staged assets are a daemon plus, on Linux targets, its Landlock sandbox helper, all built and qualified from one source revision.",
+  "prerelease": false,
+  "token_env": "GITHUB_TOKEN",
+  "request_timeout_secs": 30,
+  "max_metadata_bytes": 1000000,
+  "max_list_pages": 16
+}

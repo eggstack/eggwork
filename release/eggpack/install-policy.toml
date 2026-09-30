@@ -1,0 +1,25 @@
+schema_version = 1
+
+# Bootstrap first-install policy for Eggwork (Operations M003).
+#
+# Only the two Linux targets need a policy because only they are bundles.
+# Every bundle member is installed with POSIX executable mode; no data,
+# config, database, workspace, blob, or artifact member is bundled, so there
+# is nothing to declare as `Data`.
+#
+# macOS and Windows are single direct daemon artifacts, which take Eggpack's
+# M001 direct-release bootstrap behavior and need no policy entry.
+#
+# This policy describes first install only. It never selects a release, never
+# overwrites an existing file, never registers a service, never elevates
+# privileges, and never generates node configuration. Service setup stays
+# explicit operator policy through `eggworkd service ...` and the qualified
+# Eggup adapters; updates stay Eggup-owned.
+
+[targets."aarch64-unknown-linux-gnu".modes]
+eggworkd = "executable"
+eggwork-sandbox-helper = "executable"
+
+[targets."x86_64-unknown-linux-gnu".modes]
+eggworkd = "executable"
+eggwork-sandbox-helper = "executable"

@@ -1,0 +1,24 @@
+schema_version = 1
+
+# Explicit Cargo package/binary bindings for every canonical target.
+#
+# There is no workspace-default binary inference anywhere in this document:
+# each logical contract slot names its exact Cargo package and binary target.
+# Linux bundle entry order is the contract order in `distribution.toml`
+# (entry 0 = daemon, entry 1 = Landlock sandbox helper).
+#
+# TOML note: the schema maps a target triple to a *list* of outputs, so each
+# entry is an inline table rather than a `[[targets...]]` sub-table.
+
+[targets]
+"aarch64-apple-darwin" = [{ selector = { kind = "direct" }, package = "eggwork-server", binary = "eggworkd" }]
+"aarch64-unknown-linux-gnu" = [
+  { selector = { kind = "bundle_entry", index = 0 }, package = "eggwork-server", binary = "eggworkd" },
+  { selector = { kind = "bundle_entry", index = 1 }, package = "eggwork-sandbox-helper", binary = "eggwork-sandbox-helper" },
+]
+"x86_64-apple-darwin" = [{ selector = { kind = "direct" }, package = "eggwork-server", binary = "eggworkd" }]
+"x86_64-pc-windows-msvc" = [{ selector = { kind = "direct" }, package = "eggwork-server", binary = "eggworkd" }]
+"x86_64-unknown-linux-gnu" = [
+  { selector = { kind = "bundle_entry", index = 0 }, package = "eggwork-server", binary = "eggworkd" },
+  { selector = { kind = "bundle_entry", index = 1 }, package = "eggwork-sandbox-helper", binary = "eggwork-sandbox-helper" },
+]

@@ -39,6 +39,7 @@ base64.workspace = true
 eggwork-client = { path = "../eggwork-client", features = ["eggress-route"] }
 eggfetch-core.workspace = true
 eggress-testkit = "1.0.8"
+toml = "0.8"
 
 [lints]
 workspace = true

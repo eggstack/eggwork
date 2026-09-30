@@ -1,0 +1,55 @@
+schema_version = 1
+
+# One bounded core candidate smoke per canonical target.
+#
+# Core qualification always selects the *daemon* candidate and runs
+# `eggworkd version` with a fixed, configuration-free argv. The command emits
+# the package version as JSON, so it needs no node config, no helper, and no
+# network. On the Linux targets the daemon is bundle entry 0; elsewhere it is
+# the direct artifact.
+#
+# The Linux sandbox helper is a second executable in the bundle and is proven
+# by the bounded consumer validator in `consumer-validators.json`, not here.
+# Eggpack core qualification remains the authority for the daemon; the
+# consumer validator is gating release evidence, not a second qualification
+# implementation.
+
+[targets."aarch64-apple-darwin"]
+[targets."aarch64-apple-darwin".smoke]
+selector = { kind = "direct" }
+argv = ["version"]
+timeout_ms = 10000
+stdout_limit = 8192
+stderr_limit = 8192
+
+[targets."aarch64-unknown-linux-gnu"]
+[targets."aarch64-unknown-linux-gnu".smoke]
+selector = { kind = "bundle_entry", index = 0 }
+argv = ["version"]
+timeout_ms = 10000
+stdout_limit = 8192
+stderr_limit = 8192
+
+[targets."x86_64-apple-darwin"]
+[targets."x86_64-apple-darwin".smoke]
+selector = { kind = "direct" }
+argv = ["version"]
+timeout_ms = 10000
+stdout_limit = 8192
+stderr_limit = 8192
+
+[targets."x86_64-pc-windows-msvc"]
+[targets."x86_64-pc-windows-msvc".smoke]
+selector = { kind = "direct" }
+argv = ["version"]
+timeout_ms = 10000
+stdout_limit = 8192
+stderr_limit = 8192
+
+[targets."x86_64-unknown-linux-gnu"]
+[targets."x86_64-unknown-linux-gnu".smoke]
+selector = { kind = "bundle_entry", index = 0 }
+argv = ["version"]
+timeout_ms = 10000
+stdout_limit = 8192
+stderr_limit = 8192

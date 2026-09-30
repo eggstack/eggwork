@@ -1,0 +1,94 @@
+schema_version = 1
+
+# Eggpack producer release contract for eggwork (Operations M003).
+#
+# This file is the sole checked-in authority for the published target set,
+# release asset names, install identities, and checksum sidecar names. It is
+# static: it carries no release tag, no source revision, and no artifact
+# digest or size.
+#
+# Asset forms follow the consumer deployment unit that
+# `eggwork_server::deployment::install_unit_matrix` already defines. The two
+# Linux targets ship one Eggpack *bundle* of exactly two executables so the
+# daemon and its Landlock sandbox helper can never be selected from
+# different release ids. macOS and Windows ship the daemon alone because the
+# Landlock helper is not shipped there.
+#
+# `install` is release/install identity, not service-path authorization. The
+# Operations M002 Linux `CandidateSource` destination policy is unchanged.
+
+[product]
+id = "eggwork"
+display_name = "Eggwork"
+
+[[targets]]
+triple = "aarch64-apple-darwin"
+aliases = ["macos-arm64"]
+
+[targets.asset]
+kind = "direct"
+asset = "{product}-{version}-{target}"
+install = "eggworkd"
+
+[targets.checksum]
+sidecar = "{asset}.sha256"
+
+[[targets]]
+triple = "aarch64-unknown-linux-gnu"
+aliases = ["linux-arm64"]
+
+[targets.asset]
+kind = "bundle"
+
+[[targets.asset.entries]]
+asset = "{product}-{version}-{target}"
+install = "eggworkd"
+
+[[targets.asset.entries]]
+asset = "{product}-sandbox-helper-{version}-{target}"
+install = "eggwork-sandbox-helper"
+
+[targets.checksum]
+sidecar = "{asset}.sha256"
+
+[[targets]]
+triple = "x86_64-apple-darwin"
+aliases = ["macos-x64"]
+
+[targets.asset]
+kind = "direct"
+asset = "{product}-{version}-{target}"
+install = "eggworkd"
+
+[targets.checksum]
+sidecar = "{asset}.sha256"
+
+[[targets]]
+triple = "x86_64-pc-windows-msvc"
+aliases = ["windows-x64"]
+
+[targets.asset]
+kind = "direct"
+asset = "{product}-{version}-{target}.exe"
+install = "eggworkd.exe"
+
+[targets.checksum]
+sidecar = "{asset}.sha256"
+
+[[targets]]
+triple = "x86_64-unknown-linux-gnu"
+aliases = ["linux-x64"]
+
+[targets.asset]
+kind = "bundle"
+
+[[targets.asset.entries]]
+asset = "{product}-{version}-{target}"
+install = "eggworkd"
+
+[[targets.asset.entries]]
+asset = "{product}-sandbox-helper-{version}-{target}"
+install = "eggwork-sandbox-helper"
+
+[targets.checksum]
+sidecar = "{asset}.sha256"

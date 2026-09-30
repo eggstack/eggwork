@@ -2,6 +2,8 @@ name: CI
 on:
   push:
   pull_request:
+permissions:
+  contents: read
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -19,3 +21,30 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-targets
       - run: cargo check --workspace
+      - name: release candidate validator tests
+        run: python3 -m unittest discover --start-directory tests/release --top-level-directory tests/release
+  release-drift:
+    # Eggpack is producer authority for the release matrix: the generated
+    # release workflow must be exactly what the pinned tool renders from the
+    # checked-in static configuration. This job never builds, publishes, or
+    # stages anything; it only fails when the checked-in bytes drift.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - name: install the pinned Eggpack tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="$(python3 -c "import json,sys;sys.stdout.write(json.load(open('release/eggpack/github-policy.json'))['eggpack_tool']['revision'])")"
+          cargo install --git https://github.com/eggstack/eggpack --rev "$revision" --locked eggpack-cli
+          eggpack --version
+      - name: check the generated release workflow against the checked-in configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          eggpack ci check \
+            --workflow-shape release/eggpack/workflow-shape.json \
+            --contract release/eggpack/distribution.toml \
+            --github-policy release/eggpack/github-policy.json \
+            --workflow .github/workflows/release.yml

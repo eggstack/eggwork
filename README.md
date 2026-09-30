@@ -4,7 +4,7 @@ Eggwork is a Rust-native, fixed-target remote execution fabric: a caller selects
 
 Eggwork is deliberately **not another scheduler**. Global queues, worker selection, priorities/fairness, workflow DAGs, and semantic retry remain caller-owned. This makes Eggwork suitable as an execution backend for systems such as CodeGG without competing with their orchestration policy.
 
-The protocol-neutral core, canonical local finite-process runner, authenticated remote control plane, durable leases, workspace transfer, declared artifact capture, bounded retention/garbage collection, authorization/redaction, Linux sandbox/resource controls, the first node operations surface, and Eggup-backed consumer deployment/service lifecycle are implemented. The CodeGG adapter remains planned work.
+The protocol-neutral core, canonical local finite-process runner, authenticated remote control plane, durable leases, workspace transfer, declared artifact capture, bounded retention/garbage collection, authorization/redaction, Linux sandbox/resource controls, the first node operations surface, Eggup-backed consumer deployment/service lifecycle, and the Eggpack-backed producer release surface are implemented. The CodeGG adapter remains planned work.
 
 ## Node operations
 
@@ -32,12 +32,45 @@ eggworkd service install|start|stop|restart|uninstall --config /etc/eggwork/node
 eggworkd version
 ```
 
-Consumer deployment and service lifecycle go through Eggup (`eggup-core`/`eggup-service` 0.1.1): the install unit is `bin/eggworkd` plus `bin/eggwork-sandbox-helper` moved in one transaction, service ownership is proven by exact executable plus critical argv/config before any stop/replace/uninstall, and a bounded post-update health probe runs while Eggup retains backups (`RollBack` is the default). Updates drain first: set persistent drain with `eggworkd drain`, wait for active executions (or pass explicit force policy through the orchestration API), then replace. Service lifecycle mutation is qualified on Linux systemd; other platforms receive a structured refusal until hosted evidence exists. Producer packaging (release manifests, installers, release CI) remains owned by Eggpack and is out of scope here.
+Consumer deployment and service lifecycle go through Eggup (`eggup-core`/`eggup-service` 0.1.1): the install unit is `bin/eggworkd` plus `bin/eggwork-sandbox-helper` moved in one transaction, service ownership is proven by exact executable plus critical argv/config before any stop/replace/uninstall, and a bounded post-update health probe runs while Eggup retains backups (`RollBack` is the default). Updates drain first: set persistent drain with `eggworkd drain`, wait for active executions (or pass explicit force policy through the orchestration API), then replace. Service lifecycle mutation is qualified on Linux systemd; other platforms receive a structured refusal until hosted evidence exists.
 
 Drain is stored beside the execution database and is observed by a running node before it accepts each new execution. Local GC previews are read-only; applying GC is bounded and takes an exclusive state lock, so it fails while the node process is running. A live service can use `NodeServer::collect_garbage`, which operates on its existing stores and preserves active references.
 
+## Releases and installation
+
+Releases are produced by [Eggpack](https://github.com/eggstack/eggpack), which owns the release contract, target matrix, builds, qualification, checksum sidecars, `ReleaseManifest`, bootstrap installers, and the generated release workflow. Eggwork owns the node configuration, service lifecycle, drain/update/rollback policy, and the decision about which binaries constitute one installed node.
+
+There are four distinct authorities, and they do not overlap:
+
+```text
+Eggpack producer -> ReleaseManifest/assets -> human/release channel -> Eggup/Eggwork local deployment
+```
+
+- `release/eggpack/` is the checked-in producer configuration. It is static: no release tag, no source SHA, and no artifact digest is committed.
+- `.github/workflows/release.yml` is **generated** from that configuration by `eggpack ci generate`. Never edit it by hand; `eggpack ci check` in CI fails on any drift.
+- `install.sh` and `install.ps1` in a release are exact-release **first-install** scripts. They install the binaries, never overwrite, never register a service, never elevate privileges, and never select a release. Service setup afterwards is explicit operator policy through `eggworkd service ...` and the qualified Eggup adapters; updates are Eggup-owned and are not routed through the bootstrap script.
+- The staging job prepares a **draft** release only. It creates no tag, moves none, publishes nothing, and refuses to clobber differing assets. Publishing a release remains a maintainer action.
+
+Published targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`. Linux releases ship the daemon and its Landlock sandbox helper as one bundle from one source revision, so the pair can never drift. macOS and Windows ship the daemon only.
+
+```bash
+# after a draft release exists for tag vX.Y.Z
+curl -fsSLO https://github.com/eggstack/eggwork/releases/download/vX.Y.Z/install.sh
+less install.sh   # read it before running it
+sh install.sh /opt/eggwork/bin
+```
+
+Check the staged artifacts before installing them:
+
+```bash
+sha256sum -c eggwork-vX.Y.Z-<target>.sha256
+```
+
+SHA-256 is integrity evidence, not authenticity: it proves the bytes match the staged release, not who published them. Eggup still performs its own ownership and verification checks on the local side.
+
 Start here:
 
+- `architecture/distribution.md` — producer/consumer ownership split
 - `plans/README.md` — planning system and document hierarchy
 - `plans/000-long-term-specification.md` — canonical product/architecture specification
 - `plans/002-long-term-roadmap.md` — dependency-ordered long-term roadmap
