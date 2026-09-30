@@ -1,29 +1,60 @@
 # Operations M003 — Closure (Eggpack Producer Packaging Integration)
 
-Status: **conditionally closed**
+Status: **closed**
 
 Source implementation plan:
 `plans/implementation/operations-distribution/003-eggpack-producer-packaging-integration.md`
-(status now `conditionally closed`; see "Named outstanding evidence" below)
+(status now `closed`)
 
 Roadmap: `plans/subsystems/operations-distribution-roadmap.md`
 
 Reviewed Eggwork baseline before implementation: `b2bf282`
-Implementation commit: `012383b4c19b7c598157381a29a3eec9bfaa5c1b`
-("feat(operations): adopt Eggpack producer packaging (M003)")
+Implementation commits:
+`012383b4c19b7c598157381a29a3eec9bfaa5c1b`
+("feat(operations): adopt Eggpack producer packaging (M003)"),
+`4b954438fbe5162947359af642441a957dc409c4`
+("fix(operations): gate Linux-only deps out of the non-Linux release builds (M003)"),
+`8827ed4812bca3c5a749182e09208e3695549f54`
+("fix(operations): annotate the non-Linux resource-unit binding (M003)")
 
 ## Closure status rationale
 
-Every implementation-side acceptance criterion is satisfied and the required
-local verification is green. The one criterion this record cannot close is
-**acceptance criterion 14**, hosted producer build/qualification over all five
-required targets. That evidence requires a `workflow_dispatch` run of the
-generated `.github/workflows/release.yml` against a real annotated release tag
-in this repository, which this environment cannot perform. The milestone is
-therefore **conditionally closed** with one named, non-critical outstanding
-evidence item, per `plans/003-planning-process.md` §2. The item is a hosted CI
-run, not a code or configuration gap, and the plan explicitly did not require
-a real draft mutation at M003.
+All fifteen acceptance criteria are satisfied with executed evidence,
+including hosted producer build/qualification over all five required targets
+(run `36787942079`, all 20 jobs green, draft `eggwork v0.1.0` staged). The
+milestone was conditionally closed at `cca34c6` with that hosted run named as
+the single outstanding item; the run has since been obtained, so the status is
+now **closed**.
+
+Two hosted failures preceded the green run, and both produced bounded
+Eggwork-side correctives that are part of this closure rather than separate
+corrective records (the milestone was not yet fully closed when they were
+found):
+
+1. Run `36784830178` (tag `v0.1.0` at `cca34c6`): both Linux targets built,
+   qualified, and consumer-validated cleanly, but all three non-Linux builds
+   failed compiling `landlock 0.4.7` (`libc::O_PATH`, `prctl`,
+   `PR_SET_NO_NEW_PRIVS` — Linux-only). Root cause: `eggwork-runner`
+   declared `landlock` unconditionally although every `landlock::` use was
+   already `#[cfg(target_os = "linux")]`-gated. Corrective `4b95443` moved it
+   behind `cfg(target_os = "linux")`, and moved `landlock`/`nix` behind
+   their platform tables in `eggwork-sandbox-helper` for the same latent
+   reason. No behavior changed: required isolation stays required on Linux
+   and fail-closed elsewhere. Regression test
+   `linux_only_dependencies_never_enter_the_non_linux_build_graph` keeps the
+   gates explicit.
+2. Run `36786345079` (tag moved to `4b95443`): Windows built, qualified, and
+   validated, both Linux targets stayed green, but both macOS builds failed
+   with `error[E0282]` at `crates/eggwork-runner/src/lib.rs:1206` — a bare
+   `let resource_unit = None;` in the `not(linux)` branch whose type is only
+   inferable from Linux-only uses. Corrective `8827ed4` annotates it as
+   `Option<String>`, matching `wrap_resource_command`. Verified locally with
+   `cargo check` for `aarch64/x86_64-apple-darwin` and
+   `x86_64-pc-windows-msvc` on the runner and helper crates.
+
+The `v0.1.0` tag was moved twice (from `cca34c6` to `4b95443` to `8827ed4`);
+each move is recorded in the tag message, and no draft was ever staged from
+an earlier position, so no published history was rewritten.
 
 ## Exact dependency disposition
 
@@ -149,7 +180,7 @@ selects `bundle_entry 0`; the others select `direct`.
 | §14 case-insensitive collisions rejected | `expanded_release_names_are_unique_under_case_insensitive_comparison` | Pass |
 | §5 `native_cargo` for all five; no floor | `pack_policy_builds_and_qualifies_every_target_natively`, `toolchain_policy_matches_the_checked_in_rust_toolchain` | Pass |
 | §5 exact package/bin bindings, no default inference | `build_bindings_name_exact_packages_and_binaries`, `build_binding_packages_and_binaries_exist_in_this_workspace` | Pass |
-| §6 native qualification on a matching host | `pack_policy_builds_and_qualifies_every_target_natively`; locally executed on `x86_64-unknown-linux-gnu` (see below) | Pass (configuration); hosted on 4 targets outstanding |
+| §6 native qualification on a matching host | `pack_policy_builds_and_qualifies_every_target_natively`; executed on all five native hosts in run `36787942079` | Pass |
 | §6 core smoke `eggworkd version` per target | `core_qualification_smoke_selects_the_daemon_with_a_fixed_argv`, `the_qualification_selector_always_names_a_bound_build_output`; executed qualification evidence below | Pass |
 | §6 Linux helper exact-candidate validation is gating | `consumer_validation_is_gating_and_selects_the_linux_helper`; executed `ConsumerValidationEvidenceV1` below | Pass |
 | §6 validator is bounded, offline, shell-free, single-argument | `test_probe_never_shells_out`, `test_probe_never_reaches_the_network`, `test_candidate_environment_is_an_allowlist`, `test_validators_take_only_the_candidate_path`, `the_linux_helper_validator_agrees_with_deployment_version_policy` | Pass |
@@ -187,8 +218,49 @@ selects `bundle_entry 0`; the others select `direct`.
 | Acceptance 11 service/drain/update/rollback stays Eggwork/Eggup-owned | no `eggworkd` command, deployment type, or service path changed | Pass |
 | Acceptance 12 no runtime Eggpack dependency | see §11 | Pass |
 | Acceptance 13 Operations M002 / Security M004 green | see §14 | Pass |
-| Acceptance 14 hosted five-target producer run | **not obtained**; named outstanding evidence | **Outstanding** |
+| Acceptance 14 hosted five-target producer run | run `36787942079`: all 20 jobs green (see "Hosted five-target evidence" below) | Pass |
 | Acceptance 15 no unresolved high/medium finding | none; two low-severity findings recorded below | Pass |
+
+## Hosted five-target evidence (run 36787942079)
+
+Dispatched `release.yml` from tag `v0.1.0` (`8827ed4`) with
+`release_tag=v0.1.0`. Completed `2026-09-30T23:12:04Z` with conclusion
+`success`. Job matrix (all `completed/success`):
+
+- `preflight`, `resolve`;
+- `build_*` for all five canonical targets;
+- `qualify_build_*` for all five (each ran the fixed `eggworkd version`
+  smoke on its native host);
+- `validate_build_*` for all five (Linux jobs ran
+  `scripts/validate-sandbox-helper.py` against bundle entry 1; macOS/Windows
+  ran `scripts/validate-daemon-version.py` against the direct daemon);
+- `required_gate`, `aggregate`, `stage`.
+
+The `stage` job ran `prepare-stage: 17 assets` and
+`stage-github-draft: release 400502116 draft staged`. Staging receipt
+(`eggpack-staging-receipt.json`, `github_release_id: 400502116`):
+`draft: true`, `created: true`, `uploaded: 17`, `reused: 0`, bound to
+`release_id: v0.1.0` and `source_revision:
+8827ed4812bca3c5a749182e09208e3695549f54`.
+
+Draft boundary proof:
+
+- `gh release view v0.1.0` reports `isDraft: true`, `isPrerelease: false`,
+  name `eggwork v0.1.0`. Nothing was published.
+- The `v0.1.0` tag still resolves to `8827ed4` (`refs/tags/v0.1.0^{}`); no
+  tag was created, moved, or deleted by the workflow.
+- The draft carries exactly the 17 staged files: 7 release binaries, 7
+  `.sha256` sidecars, `install.sh` (9518 bytes), `install.ps1` (6230 bytes),
+  and `release-manifest.json` (1751 bytes).
+- The staged `ReleaseManifest` binds `product_id: eggwork`,
+  `release_id: v0.1.0`, `source_revision: 8827ed4...`, with both Linux
+  targets as two-entry bundles and macOS/Windows as direct daemon records.
+- Integrity proof: the downloaded `eggwork-v0.1.0-x86_64-unknown-linux-gnu`
+  hashes to `e2e7a230…be16e`, which equals both its `.sha256` sidecar and
+  the manifest's daemon record.
+- The staged `install.sh` pins
+  `origin='https://github.com/eggstack/eggwork/releases/download/v0.1.0'`
+  (exact tag, never latest) and carries one branch per runtime pair.
 
 ## Executed verification (actually run)
 
@@ -311,13 +383,11 @@ milestone. The two names must not be conflated.
 
 ## Named outstanding evidence
 
-1. **Hosted five-target producer run (acceptance 14).** Dispatch
-   `.github/workflows/release.yml` with an exact existing annotated release tag
-   and record the run identifier plus the five build, qualification, and
-   consumer-validation job results. Until then, only
-   `x86_64-unknown-linux-gnu` has executed producer evidence from this
-   repository, and the macOS/Windows/ARM targets are **not** qualified. This is
-   the first obligation of Operations M004.
+None. The hosted five-target producer run named at conditional closure has
+been obtained (run `36787942079`, above). Its natural follow-ups — installed
+first-install smoke, service lifecycle/update/rollback on qualified hosts,
+rerun-reuse behavior, and the final macOS/Windows hosted-support disposition —
+belong to Operations M004, which is ready.
 
 ## Unresolved findings
 
@@ -330,17 +400,17 @@ milestone. The two names must not be conflated.
 ## Registry and roadmap disposition
 
 - `plans/implementation/operations-distribution/003-eggpack-producer-packaging-integration.md`:
-  ready for handoff → conditionally closed.
-- `plans/subsystems/operations-distribution-roadmap.md` M003: ready for handoff
-  → conditionally closed, with the named outstanding hosted evidence.
-- `plans/registry.md`: Operations M003 moves to the closed table with the
-  conditional qualifier; the Operations workstream row is updated.
-- **Operations M004 becomes ready.** Its M002-side dependency was already
-  satisfied and this closure satisfies the M003 dependency. M004 owns live
-  release/draft/rerun evidence, installed first-install smoke, service
-  lifecycle/update/rollback on qualified hosts, the final macOS/Windows hosted
-  support disposition, and — as its first act — the named outstanding hosted
-  five-target producer run above.
+  conditionally closed → closed.
+- `plans/subsystems/operations-distribution-roadmap.md` M003: conditionally
+  closed → closed.
+- `plans/registry.md`: Operations M003 moves to the closed table without
+  qualifier; the Operations workstream baseline advances to `8827ed4`.
+- **Operations M004 is ready** (it already was; nothing about its status
+  changes). It now starts from live evidence instead of a promise: the staged
+  `eggwork v0.1.0` draft, its receipt, and the green five-target run are its
+  inputs for first-install smoke, service lifecycle/update/rollback on
+  qualified hosts, rerun-reuse behavior, publication policy, and the final
+  macOS/Windows hosted-support disposition.
 - No other plan is unblocked by this closure. Operations M005 and M006 remain
   deferred for their own reasons, and CodeGG M004 remains deferred on the
   stable AgentRun worker-entry contract.

@@ -1,15 +1,16 @@
 # Operations and Distribution M003 — Eggpack Producer Packaging Integration
 
-Status: conditionally closed
+Status: closed
 
-Implementation commit: `012383b4c19b7c598157381a29a3eec9bfaa5c1b`
+Implementation commits: `012383b` (producer adoption), `4b95443` and
+`8827ed4` (hosted-run portability correctives)
 Closure record: `plans/closure/operations-distribution/003-status.md`
 
-The single named outstanding evidence item is the hosted five-target producer
-build/qualification run. It is a maintainer-dispatched `workflow_dispatch`
-against a real existing release tag, which would also perform the M004 draft
-staging this plan deliberately excludes. Operations M004 is unblocked and owns
-discharging it.
+Hosted evidence obtained: run `36787942079` built, natively qualified, and
+consumer-validated all five required targets and staged draft `eggwork v0.1.0`
+(release id `400502116`, 17 assets). The `v0.1.0` tag was moved twice during
+evidence gathering (each move recorded in the tag message; no draft was ever
+staged from an earlier position) and now points at `8827ed4`.
 
 Repository baseline reviewed before planning:
 

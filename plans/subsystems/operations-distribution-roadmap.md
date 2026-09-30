@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M001-M002 closed, M003 conditionally closed, M004 ready for handoff
+Status: active roadmap; M001-M003 closed, M004 ready for handoff
 
 Canonical authority:
 
@@ -78,9 +78,9 @@ The historical `002-status.md` blocker record is immutable and MUST NOT be overw
 
 Class: infrastructure/capability
 
-Status: conditionally closed
+Status: closed
 
-Implementation commit: `012383b`
+Implementation commits: `012383b`, `4b95443`, `8827ed4`
 
 Closure evidence: `plans/closure/operations-distribution/003-status.md`
 
@@ -98,7 +98,12 @@ The registered M003 plan used closed producer APIs directly. It deliberately doe
 
 Named outstanding evidence, carried into M004 rather than blocking it:
 
-- Hosted producer build/qualification over all five required targets. Producing it means dispatching the generated workflow against a real existing release tag, which would also perform the M004 draft staging M003 explicitly excludes, so it is a maintainer action. Only `x86_64-unknown-linux-gnu` has executed producer evidence from this repository; macOS, Windows, and AArch64 Linux are **not** qualified. M004 is the milestone that closes this.
+- None from M003's own criteria: the hosted five-target run has been obtained
+  (run `36787942079`, all 20 jobs green, draft `eggwork v0.1.0` with 17
+  assets staged). Only `x86_64-unknown-linux-gnu` had executed producer
+  evidence before that run; all five required targets are now qualified.
+  M004's first-install smoke, service lifecycle/update/rollback evidence, and
+  the final macOS/Windows hosted-support disposition still belong to M004.
 
 Residual constraints carried into M004 planning, not blockers on M003:
 
@@ -120,10 +125,10 @@ Dependency disposition: M002 is closed and the M003 dependency is satisfied by
 `plans/closure/operations-distribution/003-status.md`. No implementation plan
 document exists for M004 yet; authoring it is the next action and is unblocked.
 
-First obligation, carried from the M003 closure record: dispatch
-`.github/workflows/release.yml` against an exact existing release tag and
-record the hosted five-target build, qualification, and consumer-validation
-run identifiers.
+First obligation, carried from the M003 closure record: start from the staged
+`eggwork v0.1.0` draft (release id `400502116`, receipt in run `36787942079`)
+for installed first-install smoke, service lifecycle/update/rollback on
+qualified hosts, rerun-reuse behavior, and publication policy.
 
 ### M005 — Reverse-connect relay
 
