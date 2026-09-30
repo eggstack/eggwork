@@ -11,7 +11,7 @@ Canonical authority:
 
 Planning baseline reviewed:
 
-- CodeGG current reviewed head `ffa1c15e654776c3ebe1022f4ce7de2582bc5d98`
+- CodeGG current reviewed head `0fae5c55051c895061b26b6eb5b0d5d90cd64ebc`
 - CodeGG remote-execution M002a closure head `f5f8d96d7b7371c8583196c58d36ef7b3118ed3c`
 - CodeGG M001 implementation `67f8f3d33651846bbdbd3e4a3bc239e50a0237a6`
 - CodeGG historical M001 closure `338074062e3e8748ba83708ea3c2a7e33de12f74`
@@ -80,7 +80,7 @@ Controlling downstream records in CodeGG:
 - post-closure corrective: `plans/subsystems/eggwork-fixed-target-remote-execution-post-closure-corrective-addendum.md`
 - corrective C001: `plans/implementation/eggwork-fixed-target-remote-execution-corrective/001-lease-identity-and-live-node-qualification.md`
 
-CodeGG corrective C001 closed the lease-identity/mTLS gap; Eggwork remote-admission C001 then closed the restricted-isolation substrate gap; CodeGG M002 and M002a subsequently closed against the corrected immutable Eggwork pin with required-Landlock live qualification. This document remains substrate-side reference authority only. The Eggwork reference-contract milestone itself is closed with contract evidence in `plans/closure/codegg-integration/001-status.md`. M003 is now the next integration line and is blocked specifically on Eggwork Workspace/Artifact M004; M004 remains deferred on M003 plus a stable AgentRun worker-entry contract.
+CodeGG corrective C001 closed the lease-identity/mTLS gap; Eggwork remote-admission C001 then closed the restricted-isolation substrate gap; CodeGG M002 and M002a subsequently closed against the corrected immutable Eggwork pin with required-Landlock live qualification. CodeGG M003 then consumed Eggwork Workspace M004 and closed at `d51afe46` (implementation `1ce377ce`, hosted run `36745285774`). This document remains substrate-side reference authority only. The Eggwork reference-contract milestone itself is closed with contract evidence in `plans/closure/codegg-integration/001-status.md`. M004 is the only remaining downstream milestone and is deferred solely on a stable AgentRun worker-entry contract.
 
 Objective:
 
@@ -121,7 +121,7 @@ Eggwork upstream prerequisite:
 
 - `plans/implementation/workspace-artifact-transport/004-reusable-manifest-cas-and-derived-materialization.md`
 - planning commit `ed0fc838bd006103021f1fb4749f579cabc2db87`
-- closed at `plans/closure/workspace-artifact-transport/004-status.md` (implementation `283f3ea`), which satisfied the `workspace.derive.v1`, principal-scoped retained-manifest, canonical patch-equivalence, and typed `base_manifest_missing` prerequisites M003 was registered against.
+- implementation `1e89dacd2b2635a9f439547db8b9077b168063ec`; closure `5b989c966158e958dfb12fb9020728e4e7cbc92a` at `plans/closure/workspace-artifact-transport/004-status.md`, satisfying the `workspace.derive.v1`, principal-scoped retained-manifest, canonical patch-equivalence, retained-blob, and typed `base_manifest_missing` prerequisites M003 was registered against.
 
 CodeGG downstream plan and closure:
 
@@ -139,7 +139,7 @@ Reduce repeated full-manifest transfer through Eggwork's Git-neutral retained-ma
 
 Class: capability
 
-Status: deferred; M001+C001+M002+M002a are closed, but M003 and a stable CodeGG AgentRun worker-entry contract remain unresolved
+Status: deferred; M001+C001+M002+M002a+M003 are closed. Only a stable CodeGG AgentRun worker-entry contract remains unresolved
 
 Objective:
 
