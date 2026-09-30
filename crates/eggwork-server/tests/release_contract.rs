@@ -1175,3 +1175,62 @@ fn the_deployment_module_never_parses_eggpack_configuration() {
         }
     }
 }
+
+#[test]
+fn linux_only_dependencies_never_enter_the_non_linux_build_graph() {
+    // Run 36784830178 proved this the hard way: `landlock` is Linux-only and
+    // its unconditional declaration broke the macOS and Windows daemon builds.
+    // Every required non-Linux release target builds `eggwork-server`, so a
+    // Linux-only crate in the daemon's unconditional dependency closure is a
+    // release-blocking defect on Linux CI. This test keeps the gates explicit.
+    for (manifest, gated) in [
+        (
+            "crates/eggwork-runner/Cargo.toml",
+            vec![("landlock", "linux")],
+        ),
+        (
+            "crates/eggwork-sandbox-helper/Cargo.toml",
+            vec![("landlock", "linux"), ("nix", "unix")],
+        ),
+    ] {
+        let parsed: Toml =
+            toml::from_str(&read(manifest)).unwrap_or_else(|error| panic!("{manifest}: {error}"));
+        let unconditional = parsed
+            .get("dependencies")
+            .and_then(Toml::as_table)
+            .cloned()
+            .unwrap_or_default();
+        let targets = parsed
+            .get("target")
+            .and_then(Toml::as_table)
+            .cloned()
+            .unwrap_or_default();
+        for (dependency, platform) in gated {
+            assert!(
+                !unconditional.contains_key(dependency),
+                "{manifest} must not depend on {dependency} unconditionally; \
+                 it does not compile on non-{platform} release hosts"
+            );
+            let gated_tables: Vec<&String> = targets
+                .iter()
+                .filter(|(_, table)| {
+                    table
+                        .get("dependencies")
+                        .and_then(Toml::as_table)
+                        .is_some_and(|dependencies| dependencies.contains_key(dependency))
+                })
+                .map(|(key, _)| key)
+                .collect();
+            assert_eq!(
+                gated_tables.len(),
+                1,
+                "{manifest} must gate {dependency} behind exactly one platform table"
+            );
+            assert!(
+                gated_tables[0].contains(platform),
+                "{manifest} gates {dependency} behind {}, not {platform}",
+                gated_tables[0],
+            );
+        }
+    }
+}

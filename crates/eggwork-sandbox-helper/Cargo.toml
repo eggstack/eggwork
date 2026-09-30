@@ -10,9 +10,16 @@ name = "eggwork-sandbox-helper"
 path = "src/main.rs"
 
 [dependencies]
-landlock.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+
+# The helper's Linux-only sandbox machinery (`mod linux`) is the sole user of
+# these crates. Both are Unix/Linux-only and must not enter the build graph on
+# other hosts; the non-Linux entry point uses neither.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock.workspace = true
+
+[target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["user"] }
 
 [dev-dependencies]

@@ -13,11 +13,17 @@ async-trait.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-landlock.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# Landlock is a Linux-only kernel API. The crate is Linux-only and must not
+# enter the build graph on any other host: every required release target that
+# is not Linux builds this crate, and all `landlock::` uses are already
+# `#[cfg(target_os = "linux")]`-gated with fail-closed fallbacks.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["user"] }
