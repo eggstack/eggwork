@@ -1203,7 +1203,7 @@ impl LocalProcessRunner {
             #[cfg(target_os = "linux")]
             let mut sandbox_session = None;
             #[cfg(not(target_os = "linux"))]
-            let resource_unit = None;
+            let resource_unit: Option<String> = None;
             #[cfg(not(target_os = "linux"))]
             let mut command = command;
             command.process_group(0);
