@@ -78,19 +78,23 @@ The historical `002-status.md` blocker record is immutable and MUST NOT be overw
 
 Class: infrastructure/capability
 
-Status: ready to plan
+Status: ready for handoff
+
+Implementation plan:
+
+- `plans/implementation/operations-distribution/003-eggpack-producer-packaging-integration.md`
 
 Objective:
 
 Map Eggwork's release target/artifact policy into Eggpack's producer-side contracts, manifests, build/qualification plan, bootstrap installer, and generated release-CI surfaces without recreating producer distribution logic in Eggwork.
 
-The Eggpack producer gate that previously blocked this milestone is satisfied. At reviewed Eggpack baseline `8507fbee`, ReleaseManifest M001/M001a/M002, Build/Qualification M001-M006, CI orchestration M001-M003g, Bootstrap M001/M002/M002a, and Eggup interoperability M001/M001a are closed, and eggsact `v1.2.7` staged and published a complete release through the generated pipeline (live run 36652731202, producer pin `e5c81f2`).
+The Eggpack producer gate that previously blocked this milestone is satisfied. Current reviewed Eggpack head is `3f95af43f99224755c97161e0c1102a84e713e35`; Build M006 implementation `398cd43bf1597ba49bfc35b5334611aa04b16600` is the current qualified producer pin candidate (hosted run `36484758546`). ReleaseManifest M001/M001a/M002, Build/Qualification M001-M006, CI orchestration through reusable consumer composition, Bootstrap M001/M002/M002a, and the producer-side Eggup manifest contract are closed.
 
-No implementation plan is authored. When one is, it must be written against that reviewed baseline and must re-check current Eggpack producer APIs at planning time.
+The registered M003 plan uses those closed producer APIs directly. It deliberately does not claim Eggpack's separate Eggup Interoperability M003 real-runtime-consumer milestone: Eggwork currently accepts local deployment candidates and owns no duplicated ReleaseManifest-to-update acquisition mapping.
 
 Residual constraints to carry into M003 planning, not blockers on authoring it:
 
-- Eggwork is not a registered Eggpack consumer. Eggpack's second-consumer milestone (Ecosystem M002) targets stegoeggo, so M003 must not assume a producer-side adoption slot or upstream-maintained Eggwork configuration.
+- Eggwork is not in Eggpack's ordered Ecosystem Adoption sequence. M003 therefore keeps all Eggwork release configuration in this repository and consumes closed Eggpack producer APIs without assuming an upstream-maintained Eggwork configuration.
 - CI M003b remains conditionally closed pending the byte-identical rerun-reuse receipt, which Eggpack attributes to consumer-side Windows artifact determinism (eggsact M005a). This bounds what M004 release qualification may claim.
 
 ### M004 — Operational and release qualification
