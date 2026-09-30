@@ -18,25 +18,22 @@ Foundation M001-M003, Control Plane M001-M003, Workspace M001-M003, Security M00
 
 ## Current dependency-ready Eggwork work
 
-The registry authorizes these Eggwork-local handoffs independently:
+The registry currently authorizes one Eggwork-local handoff:
 
-- `operations-distribution/002-eggup-deployment-and-service-integration.md` — re-opened after Eggup M007 supplied the required post-commit rollback seam.
-- `workspace-artifact-transport/004-reusable-manifest-cas-and-derived-materialization.md` — principal-scoped retained manifests + `workspace.derive.v1`; upstream prerequisite for CodeGG M003.
+- `operations-distribution/003-eggpack-producer-packaging-integration.md` — adopt Eggpack as producer authority for the five-target release matrix, ReleaseManifest/checksums, exact-release bootstrap, and generated release workflow while preserving Eggup-owned deployment/update semantics.
+
+Operations M002, Workspace M004, and Security M004 are closed; their implementation plans remain historical handoff evidence rather than current ready work.
 
 The `foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md` handoff has closed; closure evidence lives in `plans/closure/foundation-execution-core-ci-corrective/001-status.md`.
 
-CodeGG integration implementation authority has moved to the CodeGG repository. Eggwork retains its integration-contract roadmap as architecture/reference material, but downstream CodeGG changes should be planned, implemented, and closed in CodeGG. The Eggwork M001 reference-contract milestone is closed (`plans/closure/codegg-integration/001-status.md`); downstream CodeGG M001+C001+M002+M002a are closed; CodeGG M003 is now blocked specifically on Eggwork Workspace M004.
+CodeGG integration implementation authority has moved to the CodeGG repository. Eggwork retains its integration-contract roadmap as architecture/reference material, but downstream CodeGG changes should be planned, implemented, and closed in CodeGG. Downstream CodeGG M001+C001+M002+M002a+M003 are closed; only M004 remains deferred on CodeGG's stable AgentRun worker-entry contract.
 
 ## Blocked later work
 
-- Security M004 final adversarial/cross-platform qualification is registered at `security-isolation-resource/004-security-closure-and-cross-platform-adversarial-qualification.md` and waits only on Operations M002.
-- Operations M003 producer packaging waits on Eggpack's concrete build/qualification interfaces.
-- Operations M004 waits on M002 + M003.
+- Operations M004 waits on Operations M003 closure; Operations M002 and Security M004 are already closed.
 - Reverse-connect and PTY work remain deferred.
+- CodeGG M004 is downstream-owned and waits only on the stable AgentRun worker-entry contract.
 
 The superseded `operations-distribution/002-packaging-services-and-eggup.md` remains historical evidence of the pre-Eggpack ownership split.
 
 
-## Registered blocked handoffs
-
-- `security-isolation-resource/004-security-closure-and-cross-platform-adversarial-qualification.md` — registered but blocked on Operations M002 closure.
