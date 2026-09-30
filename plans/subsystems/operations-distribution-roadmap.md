@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M002 closed on published Eggup 0.1.1, M003 ready to plan against the reviewed Eggpack producer baseline
+Status: active roadmap; M002 closed, M003 ready for handoff, M004 blocked on M003
 
 Canonical authority:
 
