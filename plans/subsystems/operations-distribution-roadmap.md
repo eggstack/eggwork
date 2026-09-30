@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M002 closed on published Eggup 0.1.1, producer packaging waits on Eggpack
+Status: active roadmap; M002 closed on published Eggup 0.1.1, M003 ready to plan against the reviewed Eggpack producer baseline
 
 Canonical authority:
 
@@ -78,19 +78,26 @@ The historical `002-status.md` blocker record is immutable and MUST NOT be overw
 
 Class: infrastructure/capability
 
-Status: blocked on Eggpack build/qualification and release-orchestration interfaces
+Status: ready to plan
 
 Objective:
 
 Map Eggwork's release target/artifact policy into Eggpack's producer-side contracts, manifests, build/qualification plan, bootstrap installer, and generated release-CI surfaces without recreating producer distribution logic in Eggwork.
 
-Eggpack ReleaseManifest M001/M001a is closed. Do not write the implementation handoff until Eggpack closes the concrete build/qualification and downstream release-orchestration interfaces needed by a consumer repository.
+The Eggpack producer gate that previously blocked this milestone is satisfied. At reviewed Eggpack baseline `8507fbee`, ReleaseManifest M001/M001a/M002, Build/Qualification M001-M006, CI orchestration M001-M003g, Bootstrap M001/M002/M002a, and Eggup interoperability M001/M001a are closed, and eggsact `v1.2.7` staged and published a complete release through the generated pipeline (live run 36652731202, producer pin `e5c81f2`).
+
+No implementation plan is authored. When one is, it must be written against that reviewed baseline and must re-check current Eggpack producer APIs at planning time.
+
+Residual constraints to carry into M003 planning, not blockers on authoring it:
+
+- Eggwork is not a registered Eggpack consumer. Eggpack's second-consumer milestone (Ecosystem M002) targets stegoeggo, so M003 must not assume a producer-side adoption slot or upstream-maintained Eggwork configuration.
+- CI M003b remains conditionally closed pending the byte-identical rerun-reuse receipt, which Eggpack attributes to consumer-side Windows artifact determinism (eggsact M005a). This bounds what M004 release qualification may claim.
 
 ### M004 — Operational and release qualification
 
 Class: polish/invariant
 
-Status: blocked on M002 and M003
+Status: blocked on M003 (M002 side closed)
 
 Objective:
 

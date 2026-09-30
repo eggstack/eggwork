@@ -11,10 +11,12 @@ Canonical authority:
 
 Planning baseline reviewed:
 
-- CodeGG current reviewed head `841ad117399c9279e3668828d5d9866983603381`
+- CodeGG current reviewed head `6f78f3b054c400bc0d35328c683e7436efb0642c`
 - CodeGG remote-execution M002a closure head `f5f8d96d7b7371c8583196c58d36ef7b3118ed3c`
 - CodeGG M001 implementation `67f8f3d33651846bbdbd3e4a3bc239e50a0237a6`
 - CodeGG historical M001 closure `338074062e3e8748ba83708ea3c2a7e33de12f74`
+
+The advance from `841ad117` to `6f78f3b0` is planning-only M003 registration; no CodeGG code baseline moved.
 
 Implementation agents MUST re-check the current CodeGG head before coding.
 
@@ -113,17 +115,20 @@ Expose node capability/status facts to CodeGG's own configuration/selection poli
 
 Class: capability/infrastructure
 
-Status: downstream implementation plan registered; blocked on Eggwork Workspace/Artifact M004 closure
+Status: downstream implementation plan registered; Eggwork prerequisite satisfied, ready to hand off in CodeGG
 
 Eggwork upstream prerequisite:
 
 - `plans/implementation/workspace-artifact-transport/004-reusable-manifest-cas-and-derived-materialization.md`
 - planning commit `ed0fc838bd006103021f1fb4749f579cabc2db87`
+- closed at `plans/closure/workspace-artifact-transport/004-status.md` (implementation `283f3ea`), which satisfies the `workspace.derive.v1`, principal-scoped retained-manifest, canonical patch-equivalence, and typed `base_manifest_missing` prerequisites M003 was registered against.
 
 CodeGG downstream plan:
 
 - `dbowm91/codegg: plans/implementation/eggwork-fixed-target-remote-execution/003-content-aware-derived-workspace-transfer.md`
-- planning commit `9c96e0779d8092998958bbf7f22fec0f844339cf`
+- planning commit `9c96e0779d8092998958bbf7f22fec0f844339cf`; registered as blocked at CodeGG head `6f78f3b054c400bc0d35328c683e7436efb0642c`
+
+The downstream plan's own status line still reads "blocked on Eggwork Workspace/Artifact M004 closure". That premise is now false and must be reconciled in the CodeGG repository before the plan is executed there.
 
 Objective:
 
