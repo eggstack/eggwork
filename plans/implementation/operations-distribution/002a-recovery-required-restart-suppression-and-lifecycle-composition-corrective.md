@@ -42,7 +42,7 @@ The current `deployment::orchestrate_update` flow is:
 7. if previously running, unconditionally call `manager.start`;
 8. return the Core `TransactionReceipt`.
 
-The restart in step 7 is not conditioned on the terminal artifact disposition.
+The restart in step 7 is not conditioned on the terminal artifact disposition. In addition, the existing `commit_with_health_check` callback runs inside the Core transaction before Eggwork's step-7 service restart, so it cannot by itself prove post-start service health even though the historical closure described the broader boundary as post-update/post-start health. Historical evidence remains immutable; the corrective uses Eggup's lifecycle seam to put restoration and the post-install check in the correct order.
 
 Eggup Core may return a successful Rust `Ok(TransactionReceipt)` whose
 `TransactionDisposition` is `RecoveryRequired` when rollback cannot be
@@ -104,6 +104,33 @@ The compatibility wrapper MUST NOT reintroduce stop/start calls.
 
 Operations M004 may consume the richer receipt for machine-readable operator
 evidence.
+
+## 3a. Published generic seam compatibility
+
+Published Eggup 0.1.1 declares:
+
+`commit_with_lifecycle<M: ServiceManager, C: PostInstallCheck>(manager: &mut M, ...)`
+
+so `M` is sized by default. Eggwork's existing public compatibility API accepts
+`&mut dyn ServiceManager`.
+
+Preserve that API by using a private sized forwarding adapter around the trait
+object (or an equivalently non-breaking private mechanism) that implements
+`ServiceManager` by delegating exactly:
+
+- `inspect`;
+- `install`;
+- `uninstall`;
+- `start`;
+- `stop`;
+- `restart`.
+
+The adapter owns no policy, parsing, retries, timeouts, state, or manager
+mechanics. It exists only to satisfy the published generic signature.
+
+Do not change the public `orchestrate_update` parameter from a trait object to
+a generic type merely to call Eggup; that would be a source/API compatibility
+change.
 
 ## 4. Preparation ordering
 
@@ -235,7 +262,7 @@ mutation belongs to M004.
 
 1. Eggwork no longer manually decides restart after Core terminal disposition.
 2. `RecoveryRequired` can never trigger automatic service start.
-3. Rolled-back updates restore the prior lifecycle state through Eggup.
+3. Rolled-back updates restore the prior lifecycle state through Eggup, and the post-install check executes only after the success-state lifecycle restoration that Eggup owns.
 4. Successful updates preserve stopped/running intent through
    `RestoreIntent::Preserve`.
 5. Candidate preparation/integrity validation precedes service quiescence.
