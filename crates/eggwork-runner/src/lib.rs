@@ -1321,7 +1321,7 @@ impl LocalProcessRunner {
                 request.capture_limit,
                 request.event_chunk_bytes,
                 output_tx,
-                overflow_tx,
+                overflow_tx.clone(),
                 request.overflow,
             );
             let deadline = request.timeout;
@@ -1930,8 +1930,38 @@ mod tests {
         let result = run(req).await.unwrap();
         assert_eq!(result.exit_code, Some(7));
         assert_eq!(result.termination, TerminationReason::Exited);
+        assert_eq!(result.cleanup.wait_error, None);
         assert_eq!(result.stdout.head, b"input:unset");
         assert_eq!(result.stderr.head, b"err");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_output_readers_do_not_report_monitor_closed_as_cleanup_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        for _ in 0..16 {
+            let req = request(temp.path(), &["/bin/echo", "short-lived-output"]);
+            let result = run(req).await.unwrap();
+            assert_eq!(result.exit_code, Some(0));
+            assert_eq!(result.stdout.head, b"short-lived-output\n");
+            assert_eq!(result.cleanup.wait_error, None);
+        }
+
+        let marker = temp.path().join("target-finished-after-closing-output");
+        let req = request(
+            temp.path(),
+            &[
+                "/bin/sh",
+                "-c",
+                "exec >/dev/null 2>&1; sleep 0.1; printf completed > \"$1\"",
+                "sh",
+                marker.to_str().unwrap(),
+            ],
+        );
+        let result = run(req).await.unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.cleanup.wait_error, None);
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "completed");
     }
 
     #[cfg(unix)]

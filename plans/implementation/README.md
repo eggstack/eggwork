@@ -19,8 +19,9 @@ Foundation M001-M003, Control Plane M001-M003, Workspace M001-M004, Security M00
 ## Current dependency-ready Eggwork work
 
 The last dependency-ready handoff, Operations M002a, is closed. Operations M004
-is registered but blocked on exact-release Windows artifact reuse and native
-platform/runtime qualification; consult the registry and closure record before
+is registered but blocked on exact-release Windows artifact reuse, the
+v0.1.0 runtime warning found during Linux mTLS smoke, and native platform/update
+qualification; consult the registry and closure record before
 starting additional Operations work.
 
 Operations M002-M003 and corrective M002a are closed. Workspace M004 and
@@ -32,9 +33,8 @@ CodeGG integration implementation authority has moved to the CodeGG repository. 
 
 ## Registered blocked and later work
 
-- `operations-distribution/004-operational-and-release-qualification.md` — blocked on eggsact M005a Windows artifact reproducibility for same-tag reuse, plus native service/runtime and update/recovery evidence. It starts from the existing staged `v0.1.0` draft.
+- `operations-distribution/004-operational-and-release-qualification.md` — blocked on eggsact M005a Windows artifact reproducibility for same-tag reuse, a corrected release for the output-monitor warning found in the staged v0.1.0 binary, plus native service/isolation and update/recovery evidence. It starts from the existing staged draft.
 - Reverse-connect and PTY work remain deferred.
 - CodeGG M004 is downstream-owned and waits only on the stable AgentRun worker-entry contract.
 
 The superseded `operations-distribution/002-packaging-services-and-eggup.md` remains historical evidence of the pre-Eggpack ownership split.
-

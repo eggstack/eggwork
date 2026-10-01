@@ -98,10 +98,15 @@ Closure is blocked by qualification evidence:
    blocked by eggsact M005a Windows byte reproducibility. Eggpack failed closed
    before replacing any asset; the draft remains unchanged. Do not retry or
    clobber it until the upstream blocker is cleared.
-2. Native launchd and SCM lifecycle, installed remote execution, required
-   isolation on the claimed host matrix, and the complete update/rollback
-   matrix do not yet have live evidence. Cross-compilation is not
-   qualification.
+2. The exact staged Linux x86-64 v0.1.0 daemon now has live mTLS execution,
+   capability rejection, and persistent-drain evidence. That smoke exposed
+   `cleanup_warning: "output monitor closed"` in the immutable release binary.
+   A runner source correction and regression test remove the race in current
+   source, but the staged artifact/tag do not contain the correction and need
+   a new release input before exact-release qualification can pass. Native
+   launchd and SCM lifecycle, required isolation on the claimed host matrix,
+   and the complete update/rollback matrix also lack live evidence.
+   Cross-compilation is not qualification.
 3. The draft remains unpublished. Public bootstrap evidence requires an
    explicit maintainer publication action and remains outstanding.
 

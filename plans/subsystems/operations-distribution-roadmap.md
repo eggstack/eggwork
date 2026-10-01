@@ -153,7 +153,7 @@ Dependency disposition:
 - Operations M003 is closed at `plans/closure/operations-distribution/003-status.md`;
 - the staged `eggwork v0.1.0` draft (release id `400502116`, run `36787942079`) is the starting release evidence;
 - Operations M002a closed at `plans/closure/operations-distribution/002a-status.md` and its correctness prerequisite is satisfied;
-- M004's same-tag run `36868105194` failed closed because the Windows binary differs from the existing draft, consistent with eggsact M005a byte reproducibility; native macOS/Windows service and installed-runtime qualification is also outstanding (`plans/closure/operations-distribution/004-status.md`).
+- M004's same-tag run `36868105194` failed closed because the Windows binary differs from the existing draft, consistent with eggsact M005a byte reproducibility. Exact staged Linux x86-64 mTLS execution and drain/capability controls are now exercised, but exposed an output-monitor warning in the immutable v0.1.0 binary; the source correction requires a corrected release input. Native macOS/Windows service, required-isolation, and update/recovery qualification remain outstanding (`plans/closure/operations-distribution/004-status.md`).
 
 M004 does not reopen producer packaging. It consumes the existing release assets and keeps publication human-controlled.
 
