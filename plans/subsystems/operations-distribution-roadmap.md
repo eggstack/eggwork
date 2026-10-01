@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M001-M003 and M002a corrective closed, M004 blocked on release and native-platform qualification evidence
+Status: active roadmap; M001-M003 and M002a corrective closed, M004 active on corrected-release and native-platform qualification
 
 Canonical authority:
 
@@ -131,8 +131,8 @@ Named outstanding evidence, carried into M004 rather than blocking it:
 Residual constraints carried into M004 planning, not blockers on M003:
 
 - Eggwork is not in Eggpack's ordered Ecosystem Adoption sequence. M003 therefore keeps all Eggwork release configuration in this repository and consumes closed Eggpack producer APIs without assuming an upstream-maintained Eggwork configuration.
-- CI M003b remains conditionally closed pending the byte-identical rerun-reuse receipt, which Eggpack attributes to consumer-side Windows artifact determinism (eggsact M005a). This bounds what M004 release qualification may claim: a rerun against an already-staged Eggwork Windows release will fail closed on digest mismatch rather than reconcile.
-- The Eggpack tool pin `8507fbe` is published on `refs/heads/m003g-live-qualification`, not `main`. Re-pin to the merged `main` head once upstream merges CI M003e/f/g.
+- Historical same-tag rerun `36868105194` proved Eggpack's fail-closed no-clobber behavior and exposed Eggwork's own Windows MSVC nondeterminism. M004 now owns the deterministic Windows correction and a fresh corrected-candidate rerun.
+- Eggpack pin durability is resolved for current use: Eggwork pins durable main revision `32a0903936fcc283863e0bfb86151b13b4d75ce9`; later Eggpack main movement does not require pin churn without a concrete producer defect.
 
 ### M004 — Operational and release qualification
 
