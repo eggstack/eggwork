@@ -140,7 +140,9 @@ Control M003 [closed] -----------------+--> Security M004 [CLOSED]
 Operations M002 [CLOSED] --------------+
 
 Eggpack producer chain [CLOSED through CI M003g] --> Operations M003 [CLOSED]
-Operations M002 [historically CLOSED] --> Operations M002a [CLOSED corrective]\n                                              |\nOperations M003 [CLOSED] ---------------------+--> Operations M004 [BLOCKED: Windows reproducibility + native qualification]
+Operations M002 [historically CLOSED] --> Operations M002a [CLOSED corrective]
+                                              |
+Operations M003 [CLOSED] ---------------------+--> Operations M004 [ACTIVE: corrected-release qualification]
 ```
 
 Operations M002 is not a dependency of CodeGG M001. The canonical long-term roadmap already defines CodeGG Phase 7 as depending on Eggwork Phases 0-5, not completion of Phase 6 packaging.
