@@ -46,9 +46,9 @@ External baselines:
   `0f791324be406b9a07dd35c1c1121279bc38dcdb`;
 - Eggpack producer pin now checked into Eggwork:
   `32a0903936fcc283863e0bfb86151b13b4d75ce9`;
-- Eggpack main reviewed during planning:
-  `32a0903936fcc283863e0bfb86151b13b4d75ce9`; it contains qualified M003e/f/g
-  behavior and M003h reconciliation.
+- Eggpack current main reviewed during this rebaseline:
+  `56ed7e747fd39e4d6a32a9f1fe3e09dd44355069`; Eggwork intentionally remains
+  pinned to qualified durable revision `32a0903936fcc283863e0bfb86151b13b4d75ce9`.
 
 Source roadmap:
 
@@ -56,21 +56,23 @@ Source roadmap:
 
 Satisfied prerequisite:
 
-- `plans/implementation/operations-distribution/002a-recovery-required-restart-suppression-and-lifecycle-composition-corrective.md`
-  must close with no high/medium finding.
+- Operations M002a is closed at
+  `plans/closure/operations-distribution/002a-status.md` with no unresolved
+  high/medium finding.
 
 Primary class: operational qualification / platform lifecycle / release closure
 
 ## 1. Objective
 
-Close the Operations/Distribution workstream by proving that the artifacts
-already produced by M003 behave as installable, runnable, updateable node
-software on the supported operating systems without importing producer,
-scheduler, or platform-manager authority into Eggwork.
+Close the Operations/Distribution workstream by proving that the M003 producer
+contract can emit a corrected, deterministic release candidate that behaves as
+installable, runnable, updateable node software on the supported operating
+systems without importing producer, scheduler, or platform-manager authority
+into Eggwork.
 
 M004 must establish evidence for:
 
-- exact-release first installation from the M003 release assets;
+- exact-release first installation from the corrected release assets produced through the M003 contract;
 - installed daemon/helper version and digest coherence;
 - product-owned service definition/policy on Linux, macOS, and Windows while
   all manager mechanics remain Eggup-owned;
@@ -678,7 +680,7 @@ hosted harness when useful.
 
 It may:
 
-- download exact existing draft/public assets;
+- download exact corrected draft/public assets;
 - run first-install and service lifecycle;
 - run installed execution smoke;
 - collect bounded receipts/logs.
