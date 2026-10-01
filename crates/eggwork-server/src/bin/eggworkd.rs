@@ -208,6 +208,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
                         &serde_json::json!({"schema_version": 1, "deployment": status, "service_id": deployment::SERVICE_ID, "executable": executable, "platform": facts}),
                     )
                 }
+                Some("apply") => deployment_apply(&args[index..], &config),
                 _ => Err(usage().into()),
             }
         }
@@ -255,12 +256,6 @@ async fn service_command(args: &[String]) -> Result<(), String> {
             &serde_json::json!({"schema_version": 1, "service_id": spec.id().as_str(), "executable": spec.executable().display().to_string(), "args": spec.args(), "config": spec.config().map(|p| p.display().to_string())}),
         ),
         "status" | "install" | "uninstall" | "start" | "stop" | "restart" => {
-            if verb == "status" {
-                let facts = deployment::platform_support().map_err(|error| error.to_string())?;
-                return output(
-                    &serde_json::json!({"schema_version": 1, "service_id": spec.id().as_str(), "platform": {"os": facts.os, "systemd_available": facts.systemd_available, "launchd_available": facts.launchd_available, "crontab_available": facts.crontab_available}}),
-                );
-            }
             service_mutation(&spec, args, verb).await
         }
         _ => Err(usage().into()),
@@ -276,58 +271,289 @@ async fn service_mutation(
     args: &[String],
     verb: &str,
 ) -> Result<(), String> {
-    if std::env::consts::OS != "linux" {
-        return Err(format!(
-            "service {verb} is not qualified on this platform; refusing without hosted evidence"
+    let mut manager = product_service_manager(spec, args)?;
+    apply_service_operation(&mut *manager, spec, verb, service_backend())
+}
+
+fn product_service_manager(
+    spec: &eggup_service::ServiceSpec,
+    args: &[String],
+) -> Result<Box<dyn eggup_service::ServiceManager>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = required_path(args, "--plist-path")?;
+        let domain_text = option_value(args, "--launchd-domain")
+            .ok_or_else(|| "service lifecycle requires --launchd-domain user|system".to_owned())?;
+        let (domain, default_target) = match domain_text {
+            "user" => (eggup_service::LaunchdDomain::UserAgent, None),
+            "system" => (eggup_service::LaunchdDomain::SystemDaemon, Some("system")),
+            _ => return Err("--launchd-domain must be user or system".into()),
+        };
+        let target = match option_value(args, "--launchd-target") {
+            Some(target) => target.to_owned(),
+            None if default_target.is_some() => default_target.unwrap().to_owned(),
+            None => return Err("user launchd requires --launchd-target gui/<uid>".into()),
+        };
+        let manager = deployment::launchd_manager(
+            domain,
+            &target,
+            &plist_path,
+            spec.executable(),
+            spec.config()
+                .ok_or_else(|| "service spec requires a config path".to_owned())?,
+            args.iter().any(|arg| arg == "--bootstrap-on-install"),
+            std::time::Duration::from_secs(60),
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(Box::new(manager));
+    }
+    #[cfg(windows)]
+    {
+        let start_type = match option_value(args, "--windows-start-type").unwrap_or("manual") {
+            "manual" => eggup_service::WindowsStartType::Manual,
+            "automatic" => eggup_service::WindowsStartType::Automatic,
+            "disabled" => eggup_service::WindowsStartType::Disabled,
+            _ => return Err("--windows-start-type must be manual, automatic, or disabled".into()),
+        };
+        let manager =
+            deployment::windows_scm_manager(start_type, std::time::Duration::from_secs(60))
+                .map_err(|error| error.to_string())?;
+        return Ok(Box::new(manager));
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    return Err("service management is unsupported on this platform".into());
+    #[cfg(target_os = "linux")]
+    {
+        let unit_path = std::path::PathBuf::from(
+            args.iter()
+                .position(|arg| arg == "--unit-path")
+                .and_then(|position| args.get(position + 1))
+                .ok_or_else(|| {
+                    "service lifecycle requires --unit-path <absolute-path>".to_owned()
+                })?,
+        );
+        let scope_text = args
+            .iter()
+            .position(|arg| arg == "--scope")
+            .and_then(|position| args.get(position + 1))
+            .map(String::as_str)
+            .unwrap_or("system");
+        let scope =
+            deployment::parse_systemd_scope(scope_text).map_err(|error| error.to_string())?;
+        let unit_name = unit_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "unit path must name a *.service file".to_owned())?
+            .to_owned();
+        let enable = args.iter().any(|arg| arg == "--enable");
+        let reload = !args.iter().any(|arg| arg == "--no-reload");
+        let manager = deployment::systemd_manager(
+            &unit_name,
+            scope,
+            &unit_path,
+            spec.executable(),
+            spec.config()
+                .ok_or_else(|| "service spec requires a config path".to_owned())?,
+            enable,
+            reload,
+            std::time::Duration::from_secs(60),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Box::new(manager))
+    }
+}
+
+fn service_backend() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "systemd"
+    } else if cfg!(target_os = "macos") {
+        "launchd"
+    } else if cfg!(windows) {
+        "windows-scm"
+    } else {
+        "unsupported"
+    }
+}
+
+fn deployment_apply(
+    args: &[String],
+    config: &eggwork_server::operations::OperatorConfig,
+) -> Result<(), String> {
+    let installation_root = absolute_option(args, "--installation-root")?;
+    let release = required_option(args, "--release")?;
+    let daemon_candidate = absolute_option(args, "--daemon")?;
+    let service_config = absolute_option(args, "--service-config")?;
+    let mut sources = vec![deployment::CandidateSource {
+        member: deployment::MEMBER_DAEMON.to_owned(),
+        source: daemon_candidate,
+        destination: deployment::DEST_DAEMON.to_owned(),
+    }];
+    let helper_candidate = option_value(args, "--helper").map(std::path::PathBuf::from);
+    if std::env::consts::OS == "linux" {
+        let helper = helper_candidate.ok_or_else(|| {
+            "Linux release apply requires --helper <absolute-candidate>".to_owned()
+        })?;
+        if !helper.is_absolute() {
+            return Err("--helper must be an absolute path".into());
+        }
+        sources.push(deployment::CandidateSource {
+            member: deployment::MEMBER_HELPER.to_owned(),
+            source: helper,
+            destination: deployment::DEST_HELPER.to_owned(),
+        });
+    } else if helper_candidate.is_some() {
+        return Err("--helper is only valid for Linux release bundles".into());
+    }
+
+    let previous_daemon = option_value(args, "--previous-daemon-sha256");
+    let previous_helper = option_value(args, "--previous-helper-sha256");
+    if (previous_daemon.is_some() || previous_helper.is_some())
+        && (previous_daemon.is_none()
+            || (std::env::consts::OS == "linux" && previous_helper.is_none()))
+    {
+        return Err("replacement requires previous SHA-256 values for every release member".into());
+    }
+    let mut expected = Vec::new();
+    if let Some(digest) = previous_daemon {
+        expected.push((
+            eggup_core::MemberId::new(deployment::MEMBER_DAEMON.to_owned())
+                .map_err(|e| e.to_string())?,
+            parse_sha256(digest)?,
         ));
     }
-    let unit_path = std::path::PathBuf::from(
-        args.iter()
-            .position(|arg| arg == "--unit-path")
-            .and_then(|position| args.get(position + 1))
-            .ok_or_else(|| "service lifecycle requires --unit-path <absolute-path>".to_owned())?,
-    );
-    let scope_text = args
-        .iter()
-        .position(|arg| arg == "--scope")
-        .and_then(|position| args.get(position + 1))
-        .map(String::as_str)
-        .unwrap_or("system");
-    let scope = deployment::parse_systemd_scope(scope_text).map_err(|error| error.to_string())?;
-    let unit_name = unit_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "unit path must name a *.service file".to_owned())?
-        .to_owned();
-    let enable = args.iter().any(|arg| arg == "--enable");
-    let reload = !args.iter().any(|arg| arg == "--no-reload");
-    let mut manager = deployment::systemd_manager(
-        &unit_name,
-        scope,
-        &unit_path,
-        spec.executable(),
-        spec.config()
-            .ok_or_else(|| "service spec requires a config path".to_owned())?,
-        enable,
-        reload,
-        std::time::Duration::from_secs(60),
+    if let Some(digest) = previous_helper {
+        expected.push((
+            eggup_core::MemberId::new(deployment::MEMBER_HELPER.to_owned())
+                .map_err(|e| e.to_string())?,
+            parse_sha256(digest)?,
+        ));
+    }
+    let verifier = eggup_core::ExactDigestVerifier::new(expected);
+    let executable = installation_root.join(deployment::DEST_DAEMON);
+    let spec = deployment::service_spec_for_install(&executable, Some(&service_config))
+        .map_err(|error| error.to_string())?;
+    let mut manager = product_service_manager(&spec, args)?;
+    let drain_marker = config.drain_path();
+    let installed_helper = installation_root.join(deployment::DEST_HELPER);
+    let require_helper = std::env::consts::OS == "linux";
+    let receipt = deployment::orchestrate_update_with_lifecycle_budgeted(
+        &mut *manager,
+        deployment::UpdateRequest {
+            spec: &spec,
+            installation_root: &installation_root,
+            release,
+            sources: &sources,
+            drain_marker: Some(&drain_marker),
+            policy: deployment::UpdatePolicy {
+                force: args.iter().any(|arg| arg == "--force"),
+                ..deployment::UpdatePolicy::default()
+            },
+        },
+        &verifier,
+        || eggwork_server::operations::active_execution_count(config),
+        move |remaining| {
+            let deadline = std::time::Instant::now() + remaining;
+            let timeout = std::cmp::min(remaining, std::time::Duration::from_secs(5));
+            if timeout.is_zero() {
+                return Err("post-install check budget exhausted".into());
+            }
+            let output = eggup_core::run_bounded(
+                &eggup_core::CommandSpec::new(executable.clone())
+                    .arg("version")
+                    .timeout(timeout)
+                    .max_output_bytes(1024),
+            )
+            .map_err(|_| "installed daemon version probe failed".to_owned())?;
+            if !output.success()
+                || String::from_utf8_lossy(output.stdout()).trim() != env!("CARGO_PKG_VERSION")
+            {
+                return Err("installed daemon version does not match this release".into());
+            }
+            #[cfg(target_os = "linux")]
+            if require_helper {
+                let helper_budget = deadline.saturating_duration_since(std::time::Instant::now());
+                if !deployment::check_helper_compatibility_with_timeout(
+                    Some(&installed_helper),
+                    env!("CARGO_PKG_VERSION"),
+                    helper_budget,
+                )
+                .compatible()
+                {
+                    return Err(
+                        "installed sandbox helper is untrusted or version-incoherent".into(),
+                    );
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = (&installed_helper, require_helper);
+            Ok(())
+        },
     )
     .map_err(|error| error.to_string())?;
+    let final_snapshot = receipt.final_snapshot.as_ref();
+    output(&serde_json::json!({
+        "schema_version": 1,
+        "release_id": release,
+        "artifact_disposition": format!("{:?}", receipt.transaction.disposition()),
+        "manual_artifact_recovery_required": receipt.manual_artifact_recovery_required(),
+        "lifecycle_restoration": format!("{:?}", receipt.restoration),
+        "final_ownership": final_snapshot.map(|snapshot| format!("{:?}", snapshot.ownership)),
+        "final_state": final_snapshot.map(|snapshot| format!("{:?}", snapshot.state)),
+        "drain_remains_active": true,
+    }))
+}
+
+fn required_option<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {
+    option_value(args, name).ok_or_else(|| format!("deployment apply requires {name}"))
+}
+
+fn absolute_option(args: &[String], name: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::path::PathBuf::from(required_option(args, name)?);
+    if !path.is_absolute() {
+        return Err(format!("{name} must be an absolute path"));
+    }
+    Ok(path)
+}
+
+fn parse_sha256(text: &str) -> Result<[u8; 32], String> {
+    if text.len() != 64 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("previous SHA-256 value must contain exactly 64 hexadecimal characters".into());
+    }
+    let decoded = hex::decode(text).map_err(|_| "previous SHA-256 value is invalid".to_owned())?;
+    decoded
+        .try_into()
+        .map_err(|_| "previous SHA-256 value is invalid".to_owned())
+}
+
+fn apply_service_operation(
+    manager: &mut dyn eggup_service::ServiceManager,
+    spec: &eggup_service::ServiceSpec,
+    verb: &str,
+    backend: &str,
+) -> Result<(), String> {
+    if verb == "status" {
+        let snapshot = eggup_service::ServiceManager::inspect(manager, spec)
+            .map_err(|error| error.to_string())?;
+        return output(&serde_json::json!({
+            "schema_version": 1,
+            "service_id": spec.id().as_str(),
+            "platform": std::env::consts::OS,
+            "backend": backend,
+            "ownership": format!("{:?}", snapshot.ownership),
+            "state": format!("{:?}", snapshot.state),
+        }));
+    }
     let outcome = match verb {
-        "install" => eggup_service::ServiceManager::install(&mut manager, spec),
-        "uninstall" => eggup_service::ServiceManager::uninstall(&mut manager, spec),
-        "start" => eggup_service::ServiceManager::start(
-            &mut manager,
-            spec,
-            std::time::Duration::from_secs(60),
-        ),
-        "stop" => eggup_service::ServiceManager::stop(
-            &mut manager,
-            spec,
-            std::time::Duration::from_secs(60),
-        ),
+        "install" => eggup_service::ServiceManager::install(manager, spec),
+        "uninstall" => eggup_service::ServiceManager::uninstall(manager, spec),
+        "start" => {
+            eggup_service::ServiceManager::start(manager, spec, std::time::Duration::from_secs(60))
+        }
+        "stop" => {
+            eggup_service::ServiceManager::stop(manager, spec, std::time::Duration::from_secs(60))
+        }
         "restart" => eggup_service::ServiceManager::restart(
-            &mut manager,
+            manager,
             spec,
             std::time::Duration::from_secs(60),
         ),
@@ -335,8 +561,27 @@ async fn service_mutation(
     }
     .map_err(|error| error.to_string())?;
     output(
-        &serde_json::json!({"schema_version": 1, "service_id": spec.id().as_str(), "operation": verb, "completed": outcome.completed()}),
+        &serde_json::json!({"schema_version": 1, "service_id": spec.id().as_str(), "platform": std::env::consts::OS, "backend": backend, "operation": verb, "completed": outcome.completed()}),
     )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn option_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|arg| arg == name)
+        .and_then(|position| args.get(position + 1))
+        .map(String::as_str)
+}
+
+#[cfg(target_os = "macos")]
+fn required_path(args: &[String], name: &str) -> Result<std::path::PathBuf, String> {
+    let path = option_value(args, name)
+        .ok_or_else(|| format!("service lifecycle requires {name} <absolute-path>"))?;
+    let path = std::path::PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(format!("{name} must be absolute"));
+    }
+    Ok(path)
 }
 
 fn parse_option<T: std::str::FromStr>(
@@ -363,5 +608,5 @@ fn output(value: &impl Serialize) -> Result<(), String> {
 }
 
 fn usage() -> &'static str {
-    "usage: eggworkd <run|config validate|config print|doctor|status|drain|undrain|executions list|executions show|storage summary|inspect|gc|deployment status|service spec|service status|service install|service uninstall|service start|service stop|service restart|version> --config <file>"
+    "usage: eggworkd <run|config validate|config print|doctor|status|drain|undrain|executions list|executions show|storage summary|inspect|gc|deployment status|deployment apply|service spec|service status|service install|service uninstall|service start|service stop|service restart|version> --config <file>; deployment apply accepts local --daemon/--helper candidates; service backends require explicit systemd, launchd, or Windows SCM policy"
 }

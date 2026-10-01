@@ -631,6 +631,31 @@ pub async fn execution_page(
     })
 }
 
+/// Return the durable active-execution count for update quiescence. Any
+/// storage or decoding error fails closed as a nonzero count.
+pub fn active_execution_count(config: &OperatorConfig) -> usize {
+    match fs::symlink_metadata(&config.database_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        _ => return usize::MAX,
+    }
+    match load_snapshots(config) {
+        Ok(executions) => executions
+            .iter()
+            .filter(|snapshot| {
+                matches!(
+                    snapshot.state,
+                    eggwork_core::ExecutionState::Accepted
+                        | eggwork_core::ExecutionState::Preparing
+                        | eggwork_core::ExecutionState::Running
+                        | eggwork_core::ExecutionState::Cancelling
+                )
+            })
+            .count(),
+        Err(_) => usize::MAX,
+    }
+}
+
 pub async fn execution_show(
     config: &OperatorConfig,
     id: &str,

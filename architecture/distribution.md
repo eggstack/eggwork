@@ -20,7 +20,9 @@ Eggpack producer -> ReleaseManifest/assets -> human/release channel -> Eggup/Egg
    verification, backup/rollback, and service-manager adapters.
 4. **Eggwork** owns node configuration, service lifecycle, drain/update/restart
    policy, helper trust and version policy, the installation root, and any
-   release selection or acquisition policy added later.
+   release selection or acquisition policy added later. Update orchestration
+   uses Eggup's lifecycle transaction; Eggwork does not manually restart a
+   service after a Core transaction receipt.
 
 ## What Eggpack owns in this repository
 
@@ -75,6 +77,20 @@ drift. There is no second hand-maintained release matrix.
 - Bootstrap installers are first-install only. They do not update, register a
   service, elevate privileges, select a release, or generate node config.
   Updates remain Eggup-owned.
+- A staged draft is not a public bootstrap source. Public first-install
+  qualification requires an explicit maintainer publication action; Eggwork's
+  release workflow never publishes automatically.
+- Platform service policy is selected explicitly: systemd scope and unit path,
+  launchd domain/target and plist path, or the finite Windows SCM start type.
+  Native service support is claimed only for backends with live hosted
+  lifecycle evidence recorded in the Operations closure record.
+- First install and update are distinct operations. First-install installers
+  refuse existing destinations; updates use Eggup's verified local transaction
+  and preserve drain until an operator explicitly clears it. The deployment
+  library accepts local candidates and does not discover releases; M004's
+  command-line `deployment apply` surface accepts only local daemon/helper
+  paths. Replacements require exact previous-generation digest proof for every
+  member; Linux release updates always include both daemon and helper.
 
 See the [operations and distribution roadmap](../plans/subsystems/operations-distribution-roadmap.md)
 for milestone status and the [closure records](../plans/closure/operations-distribution/)

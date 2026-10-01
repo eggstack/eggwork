@@ -182,10 +182,16 @@ pub fn render_systemd_unit(
     }
     for path in [executable, config_path] {
         let text = path.display().to_string();
-        if text.chars().any(char::is_control) || text.contains('\n') {
+        // systemd ExecStart has quoting, escaping, specifier, and variable
+        // expansion rules. Accept only a literal path alphabet so the
+        // rendered command cannot diverge from ServiceSpec argv.
+        if !text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.+".contains(&byte))
+        {
             return Err(DeploymentError::new(
                 "invalid",
-                "unit paths contain control characters",
+                "unit paths contain characters unsupported by ExecStart policy",
             ));
         }
     }
@@ -238,9 +244,23 @@ pub fn check_helper_compatibility(
     helper_path: Option<&Path>,
     expected_version: &str,
 ) -> HelperCompatibility {
+    check_helper_compatibility_with_timeout(helper_path, expected_version, Duration::from_secs(5))
+}
+
+/// Check helper trust/version within a caller-supplied bounded child timeout.
+pub fn check_helper_compatibility_with_timeout(
+    helper_path: Option<&Path>,
+    expected_version: &str,
+    timeout: Duration,
+) -> HelperCompatibility {
     let Some(path) = helper_path else {
         return HelperCompatibility::NotConfigured;
     };
+    if timeout.is_zero() {
+        return HelperCompatibility::Untrusted {
+            reason: "helper version probe budget is exhausted".into(),
+        };
+    }
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -276,7 +296,7 @@ pub fn check_helper_compatibility(
     let program: PathBuf = path.to_path_buf();
     let spec = eggup_core::CommandSpec::new(program)
         .arg("--version")
-        .timeout(Duration::from_secs(5));
+        .timeout(timeout);
     let output = match eggup_core::run_bounded(&spec) {
         Ok(output) => output,
         Err(_) => {
@@ -535,6 +555,24 @@ pub fn orchestrate_update_with_lifecycle(
     active_executions: impl Fn() -> usize,
     health_check: impl FnOnce() -> Result<(), String>,
 ) -> Result<eggup_service::LifecycleUpdateReceipt, DeploymentError> {
+    orchestrate_update_with_lifecycle_budgeted(
+        manager,
+        request,
+        verifier,
+        active_executions,
+        move |_| health_check(),
+    )
+}
+
+/// Lifecycle orchestration with a deadline-aware post-install callback.
+/// Callers with bounded probes should use the supplied remaining budget.
+pub fn orchestrate_update_with_lifecycle_budgeted(
+    manager: &mut dyn eggup_service::ServiceManager,
+    request: UpdateRequest<'_>,
+    verifier: &dyn eggup_core::OwnershipVerifier,
+    active_executions: impl Fn() -> usize,
+    health_check: impl FnOnce(Duration) -> Result<(), String>,
+) -> Result<eggup_service::LifecycleUpdateReceipt, DeploymentError> {
     for source in request.sources {
         source.validate()?;
     }
@@ -629,7 +667,9 @@ impl<F> fmt::Debug for OneShotHealthCheck<F> {
         f.write_str("OneShotHealthCheck")
     }
 }
-impl<F: FnOnce() -> Result<(), String>> eggup_service::PostInstallCheck for OneShotHealthCheck<F> {
+impl<F: FnOnce(Duration) -> Result<(), String>> eggup_service::PostInstallCheck
+    for OneShotHealthCheck<F>
+{
     fn check(
         &self,
         _: &eggup_service::ServiceSpec,
@@ -643,7 +683,7 @@ impl<F: FnOnce() -> Result<(), String>> eggup_service::PostInstallCheck for OneS
         }
         self.0.borrow_mut().take().ok_or_else(|| {
             eggup_service::PostInstallCheckError::new("health check already consumed")
-        })?()
+        })?(remaining)
         .map_err(eggup_service::PostInstallCheckError::new)
     }
 }
@@ -701,6 +741,108 @@ pub fn systemd_manager(
         eggup_service::SystemExecutor::new(),
         install,
     ))
+}
+
+/// Render a deterministic launchd plist with argv represented as an XML
+/// array. Caller paths are XML-escaped and control characters are rejected.
+pub fn render_launchd_plist(
+    label: &str,
+    executable: &Path,
+    config_path: &Path,
+) -> Result<Vec<u8>, DeploymentError> {
+    if label != SERVICE_ID || !executable.is_absolute() || !config_path.is_absolute() {
+        return Err(DeploymentError::new(
+            "invalid",
+            "launchd identity and paths are invalid",
+        ));
+    }
+    let executable = executable
+        .to_str()
+        .ok_or_else(|| DeploymentError::new("invalid", "launchd executable path is not UTF-8"))?;
+    let config = config_path
+        .to_str()
+        .ok_or_else(|| DeploymentError::new("invalid", "launchd config path is not UTF-8"))?;
+    let xml = |value: &str| -> Result<String, DeploymentError> {
+        if value.chars().any(char::is_control) {
+            return Err(DeploymentError::new(
+                "invalid",
+                "launchd path contains control characters",
+            ));
+        }
+        Ok(value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;"))
+    };
+    Ok(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array><string>{}</string><string>run</string><string>--config</string><string>{}</string></array></dict></plist>\n", xml(label)?, xml(executable)?, xml(config)?).into_bytes())
+}
+
+/// Construct Eggup's launchd manager from explicit caller-selected domain,
+/// target, plist path, and bootstrap policy.
+#[allow(clippy::too_many_arguments)]
+pub fn launchd_manager(
+    domain: eggup_service::LaunchdDomain,
+    target: &str,
+    plist_path: &Path,
+    executable: &Path,
+    config_path: &Path,
+    bootstrap_on_install: bool,
+    transition_timeout: Duration,
+) -> Result<eggup_service::LaunchdManager, DeploymentError> {
+    match domain {
+        eggup_service::LaunchdDomain::UserAgent => {
+            let uid = target.strip_prefix("gui/").ok_or_else(|| {
+                DeploymentError::new("invalid", "user launchd target must be gui/<uid>")
+            })?;
+            if uid.is_empty() || !uid.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(DeploymentError::new(
+                    "invalid",
+                    "user launchd target must use a numeric uid",
+                ));
+            }
+        }
+        eggup_service::LaunchdDomain::SystemDaemon if target != "system" => {
+            return Err(DeploymentError::new(
+                "invalid",
+                "system launchd target must be system",
+            ));
+        }
+        eggup_service::LaunchdDomain::SystemDaemon => {}
+    }
+    let definition = render_launchd_plist(SERVICE_ID, executable, config_path)?;
+    let install = eggup_service::LaunchdInstall::new(
+        SERVICE_ID.to_owned(),
+        domain,
+        target.to_owned(),
+        plist_path.to_path_buf(),
+        definition,
+        bootstrap_on_install,
+        transition_timeout,
+    )?;
+    Ok(eggup_service::LaunchdManager::new(
+        eggup_service::SystemExecutor::new(),
+        install,
+    ))
+}
+
+/// Construct the fixed Eggwork SCM product policy through Eggup's typed
+/// Windows adapter. No custom account, dependencies, or elevation are used.
+#[cfg(windows)]
+pub fn windows_scm_manager(
+    start_type: eggup_service::WindowsStartType,
+    transition_timeout: Duration,
+) -> Result<eggup_service::WindowsScmManager, DeploymentError> {
+    let install = eggup_service::WindowsScmInstall::new(
+        SERVICE_ID,
+        "Eggwork Node Daemon",
+        start_type,
+        eggup_service::WindowsErrorControl::Normal,
+        None,
+    )?
+    .with_transition_timeout(transition_timeout)?;
+    Ok(eggup_service::WindowsScmManager::new(install))
 }
 
 /// Candidate managers for the current host (selection policy owned by Eggup).
@@ -1182,6 +1324,67 @@ mod tests {
         assert!(
             render_systemd_unit(Path::new("relative"), Path::new("/etc/eggwork/node.json"))
                 .is_err()
+        );
+        assert!(
+            render_systemd_unit(
+                Path::new("/opt/Egg Work/bin/eggworkd"),
+                Path::new("/etc/eggwork/node.json")
+            )
+            .is_err()
+        );
+        assert!(
+            render_systemd_unit(
+                Path::new("/opt/eggwork/bin/$eggworkd"),
+                Path::new("/etc/eggwork/node.json")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn launchd_policy_uses_literal_argv_and_xml_escapes_paths() {
+        let plist = render_launchd_plist(
+            SERVICE_ID,
+            Path::new("/opt/Egg&Work/eggworkd"),
+            Path::new("/etc/Egg<Work/node.json"),
+        )
+        .unwrap();
+        let text = String::from_utf8(plist).unwrap();
+        assert!(text.contains("<string>/opt/Egg&amp;Work/eggworkd</string>"));
+        assert!(text.contains("<string>/etc/Egg&lt;Work/node.json</string>"));
+        assert!(text.contains("<string>run</string><string>--config</string>"));
+        assert!(!text.contains("<key>KeepAlive</key>"));
+        assert!(
+            render_launchd_plist(
+                SERVICE_ID,
+                Path::new("/opt/eggwork/daemon\nstart"),
+                Path::new("/etc/eggwork/node.json"),
+            )
+            .is_err()
+        );
+        assert!(
+            launchd_manager(
+                eggup_service::LaunchdDomain::UserAgent,
+                "gui/not-a-uid",
+                Path::new("/tmp/eggwork-node.plist"),
+                Path::new("/opt/eggwork/eggworkd"),
+                Path::new("/etc/eggwork/node.json"),
+                false,
+                Duration::from_secs(30),
+            )
+            .is_err()
+        );
+        assert!(
+            launchd_manager(
+                eggup_service::LaunchdDomain::UserAgent,
+                "gui/501",
+                Path::new("/tmp/eggwork-node.plist"),
+                Path::new("/opt/eggwork/eggworkd"),
+                Path::new("/etc/eggwork/node.json"),
+                false,
+                Duration::from_secs(30),
+            )
+            .is_ok()
         );
     }
 
