@@ -95,6 +95,7 @@ and was not moved to consume the new pin.
   release drift but had one `required_memory_limit_is_enforced_and_classified`
   sandbox-status timeout. The focused test passed locally; rerunning the failed
   hosted job passed the complete Rust test, check, and release-drift jobs.
+- Docs-only follow-up CI run `36876704186` — Rust and release-drift jobs passed.
 - Draft `v0.1.0` was rechecked after the new evidence: still draft, exact tag,
   17 assets; neither staging nor publication was attempted again. Eggpack main
   still resolves to the pinned `32a0903936fcc283863e0bfb86151b13b4d75ce9`.
