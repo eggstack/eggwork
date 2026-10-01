@@ -1,6 +1,6 @@
 # Operations M004 — Operational and Release Qualification
 
-Status: blocked; implementation and partial qualification evidence recorded
+Status: active / qualification rebaseline required; implementation and partial evidence recorded
 
 Reviewed Eggwork baseline: `d98dcc352ffa0e948bf62150ccb65e7c437e15b0`
 
@@ -37,6 +37,31 @@ Prerequisite: Operations M002a closed at `c33e9d6fded7a80a377d6e6748cc9cdb2b02ac
 | Platform support matrix | Linux x86-64 user-systemd lifecycle: live-qualified. Linux required Landlock: unqualified on this host. Linux system-scope service: untested. macOS launchd and Windows SCM: implemented but untested. Network Disabled/AllowListed: unsupported. | Partial; no cross-platform support claim |
 | Publication boundary | Release remains draft; no publication or tag/asset mutation was performed. | Pass |
 
+## Qualification rebaseline after partial evidence
+
+Subsequent research changes the ownership/disposition of two blockers without
+invalidating any recorded evidence above.
+
+1. **Windows byte nondeterminism is Eggwork-owned.** eggsact independently saw
+   the same MSVC PE timestamp + CodeView/PDB mechanism and implemented
+   target-scoped `/BREPRO` + `/DEBUG:NONE` at
+   `f1352101dab748066c788e65e21e1bf303cfe995`. That is prior-art evidence,
+   not an Eggwork dependency. Eggwork currently has no `.cargo/config.toml`,
+   so M004 must add and independently qualify its own deterministic Windows
+   release policy. Eggpack remains correct to reject digest mismatches.
+2. **`v0.1.0` is historical evidence, not the success candidate.** Its exact
+   Linux daemon contains the output-monitor warning fixed at `68a6cc2`.
+   Existing tag/release assets must not be moved or repaired. M004 now targets
+   a corrected `v0.1.1` draft after the workspace version bump, Windows
+   determinism preflight, and repository gates are green.
+3. **Service qualification follows evidence.** Native launchd/SCM mutation
+   must either be hosted-qualified or returned to a structured fail-closed
+   unsupported path before M004 closure. Adapter/unit-test presence alone is
+   not enough to leave destructive operations exposed.
+
+This rebaseline means M004 does not need to wait for eggsact M005a closure and
+does not require an Eggpack production change.
+
 ## Windows rerun mismatch analysis
 
 The rerun's `eggwork-v0.1.0-x86_64-pc-windows-msvc.exe` SHA-256 is
@@ -45,20 +70,18 @@ rerun manifest and sidecar agree. The staged executable remains
 `f5a763cd2f298ab0d668817efec74603ac2a37df3379a079e7fdf9f9b475f190`. PE
 inspection found a different COFF timestamp and PDB RSDS signature (`19ab1c9c…`
 staged versus `cd86a174…` rerun); section sizes and image size are unchanged.
-The mismatch is consistent with the known eggsact M005a Windows byte
-reproducibility blocker recorded by current Eggpack planning. Eggpack's staging
-job stopped before replacing the asset. Do not rerun staging or reconcile by
-clobbering until the upstream blocker has a durable resolution.
+The mismatch is consistent with the MSVC mechanism independently documented by eggsact M005a. Eggpack's staging job stopped before replacing the asset, which is the correct behavior. The remaining correction is local to Eggwork: adopt deterministic MSVC link policy, prove two independent Windows builds are byte-identical, then exercise same-tag reuse on the corrected release. Do not rerun or clobber the historical `v0.1.0` draft.
 
 ## Eggpack pin durability
 
 At M004 start, Eggpack main had advanced to
 `32a0903936fcc283863e0bfb86151b13b4d75ce9`, whose registry closes M003h and
-records the qualified M003e/f/g behavior on main. Eggwork now pins that exact
+records the qualified M003e/f/g behavior on main. Eggwork pins that exact
 immutable revision in `release/eggpack/github-policy.json`; the generated
 `.github/workflows/release.yml` was regenerated and `eggpack ci check` reports
-`match (51529 bytes)`. The existing `v0.1.0` tag remains the historical source
-and was not moved to consume the new pin.
+`match (51529 bytes)`. Eggpack main has since advanced further, but no concrete
+producer defect requires churn from the qualified `32a090...` pin. The existing
+`v0.1.0` tag remains historical evidence and was not moved.
 
 ## Verification actually executed
 
@@ -102,25 +125,34 @@ and was not moved to consume the new pin.
 
 ## Unresolved blockers and disposition
 
-- Upstream eggsact M005a Windows byte reproducibility prevents the required
-  byte-identical same-tag rerun/reuse receipt.
-- Native macOS and Windows service lifecycle and installed runtime evidence
-  remain unproven.
-- The immutable staged v0.1.0 Linux daemon retains the observed output-monitor
-  cleanup warning. The source fix is not present in the `v0.1.0` tag or its
-  draft assets and therefore needs a newly authorized release input before an
-  exact-release smoke can qualify the corrected behavior.
-- Required Linux Landlock isolation and the full update/rollback/recovery and
-  state-preservation matrix remain unqualified.
-- Public exact-tag bootstrap smoke remains outstanding while the draft is
-  unpublished. It may only be run after an explicit maintainer publication
-  action; M004 itself did not publish.
-- The live exact-release smoke found an output-reader completion race; a source
-  correction and regression test are now recorded in the follow-up commit.
-  The old release artifact remains affected, so this corrective does not
-  qualify the staged release or satisfy Phase 6 exit.
+M004 can resume immediately; there is no longer a hard external eggsact
+dependency.
 
-M004 is **not closed** and Phase 6 exit criteria are not satisfied. There are
-no newly unblocked Eggwork implementation plans: Operations M005/M006 and
-CodeGG M004 remain deferred. Reopen M004 after the upstream reproducibility
-blocker and the missing native qualification evidence are available.
+Remaining work:
+
+- add Eggwork-local deterministic Windows release flags (`/BREPRO` +
+  `/DEBUG:NONE`) plus a native two-build SHA-256/PE reproducibility guard;
+- bump the workspace/package release version coherently to `0.1.1`, create a
+  new exact annotated tag only after gates pass, stage a fresh corrected draft,
+  and prove byte-identical same-tag reuse of all 17 assets;
+- repeat installed runtime/mTLS qualification against the corrected release
+  bytes so the `v0.1.0` output-monitor warning is absent in the actual staged
+  candidate;
+- obtain native macOS launchd and Windows SCM lifecycle evidence for any
+  service backend left enabled; otherwise restore a structured fail-closed
+  unsupported disposition for that backend;
+- qualify installed Linux helper/Landlock behavior on a suitable host or record
+  the release support claim as explicitly unsupported;
+- execute the full update/rollback/recovery/state-preservation matrix using
+  real installed generations (the historical `v0.1.0` generation may serve as
+  the prior generation where safe, while `v0.1.1` is the corrected candidate);
+- public exact-tag bootstrap smoke remains conditional on explicit maintainer
+  publication authorization.
+
+The historical `v0.1.0` draft, rerun failure, and runner warning remain useful
+failure/discovery evidence and MUST NOT be rewritten as successful
+qualification.
+
+M004 is **not closed** and Phase 6 exit criteria are not yet satisfied.
+Operations M005/M006 and CodeGG M004 remain deferred. Resume M004 through the
+rebaselined implementation plan rather than waiting for upstream eggsact work.
