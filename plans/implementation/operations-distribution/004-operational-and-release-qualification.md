@@ -284,8 +284,12 @@ Rules:
 
 Platform member policy:
 
-- Linux release deployment requires daemon + helper when the node configuration
-  requires Landlock isolation;
+- canonical Linux **release** deployment requires daemon + helper together,
+  matching M003's two-member release bundle even when the current node config
+  does not request Landlock today; this prevents a later helper enablement from
+  discovering a silently stale generation;
+- lower-level library fixtures may still exercise the historical optional-helper
+  matrix where appropriate, but the M004 operator release path is coherent;
 - macOS/Windows deployment accepts daemon only;
 - unexpected helper on non-Linux is rejected rather than silently ignored.
 
