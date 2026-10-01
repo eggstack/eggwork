@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M001-M003 closed historically, M002a corrective ready, M004 registered/blocked on M002a
+Status: active roadmap; M001-M003 and M002a corrective closed, M004 active
 
 Canonical authority:
 
@@ -78,7 +78,7 @@ The historical `002-status.md` blocker record is immutable and MUST NOT be overw
 
 Class: corrective / recovery invariant
 
-Status: ready for handoff
+Status: closed
 
 Implementation plan:
 
@@ -135,7 +135,7 @@ Residual constraints carried into M004 planning, not blockers on M003:
 
 Class: polish/invariant
 
-Status: registered / blocked on Operations M002a closure
+Status: active
 
 Implementation plan:
 

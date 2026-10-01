@@ -1,6 +1,6 @@
 # Operations and Distribution M004 — Operational and Release Qualification
 
-Status: registered / blocked on Operations M002a corrective closure
+Status: active
 
 Reviewed Eggwork baseline:
 
