@@ -14,23 +14,20 @@ Implementation plans are bounded handoff documents derived from canonical direct
 
 ## Closed implementation sequence
 
-Foundation M001-M003, Control Plane M001-M003, Workspace M001-M003, Security M001-M003 plus M002a, and Operations M001 have closure evidence. See `plans/registry.md` for the compact controlling status.
+Foundation M001-M003, Control Plane M001-M003, Workspace M001-M004, Security M001-M004 plus corrective work, and Operations M001-M003 have closure evidence. See `plans/registry.md` for the compact controlling status.
 
 ## Current dependency-ready Eggwork work
 
-The registry currently authorizes one Eggwork-local handoff:
+The registry currently authorizes Operations M004 — operational and release qualification — as the next Eggwork-local milestone. Its detailed implementation plan is not yet registered in this index; the controlling objective and evidence boundary are in `plans/subsystems/operations-distribution-roadmap.md` and `plans/closure/operations-distribution/003-status.md`.
 
-- `operations-distribution/003-eggpack-producer-packaging-integration.md` — adopt Eggpack as producer authority for the five-target release matrix, ReleaseManifest/checksums, exact-release bootstrap, and generated release workflow while preserving Eggup-owned deployment/update semantics.
-
-Operations M002, Workspace M004, and Security M004 are closed; their implementation plans remain historical handoff evidence rather than current ready work.
+Operations M002-M003, Workspace M004, and Security M004 are closed; their implementation plans remain historical handoff evidence rather than current ready work.
 
 The `foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md` handoff has closed; closure evidence lives in `plans/closure/foundation-execution-core-ci-corrective/001-status.md`.
 
 CodeGG integration implementation authority has moved to the CodeGG repository. Eggwork retains its integration-contract roadmap as architecture/reference material, but downstream CodeGG changes should be planned, implemented, and closed in CodeGG. Downstream CodeGG M001+C001+M002+M002a+M003 are closed; only M004 remains deferred on CodeGG's stable AgentRun worker-entry contract.
 
-## Blocked later work
+## Later work
 
-- Operations M004 waits on Operations M003 closure; Operations M002 and Security M004 are already closed.
 - Reverse-connect and PTY work remain deferred.
 - CodeGG M004 is downstream-owned and waits only on the stable AgentRun worker-entry contract.
 
