@@ -76,6 +76,12 @@ impl fmt::Display for DeploymentError {
 
 impl std::error::Error for DeploymentError {}
 
+impl From<eggup_service::LifecycleUpdateError> for DeploymentError {
+    fn from(error: eggup_service::LifecycleUpdateError) -> Self {
+        Self::new("lifecycle", truncate(&error.to_string()))
+    }
+}
+
 impl From<eggup_core::Error> for DeploymentError {
     fn from(error: eggup_core::Error) -> Self {
         Self::new("eggup", truncate(&error.to_string()))
@@ -522,6 +528,46 @@ pub struct UpdateRequest<'a> {
     pub policy: UpdatePolicy,
 }
 
+pub fn orchestrate_update_with_lifecycle(
+    manager: &mut dyn eggup_service::ServiceManager,
+    request: UpdateRequest<'_>,
+    verifier: &dyn eggup_core::OwnershipVerifier,
+    active_executions: impl Fn() -> usize,
+    health_check: impl FnOnce() -> Result<(), String>,
+) -> Result<eggup_service::LifecycleUpdateReceipt, DeploymentError> {
+    for source in request.sources {
+        source.validate()?;
+    }
+    let plan = build_install_plan(request.installation_root, request.release, request.sources)?;
+    let validated = plan
+        .prepare()?
+        .verify_integrity()?
+        .validate(&eggup_core::AllValidators::new())?;
+    if let Some(marker) = request.drain_marker {
+        crate::operations::set_persistent_drain(marker, true).map_err(|_| {
+            DeploymentError::new("draining", "persistent drain marker could not be set")
+        })?;
+    }
+    wait_for_quiescence(active_executions, request.policy)?;
+    let mut adapter = ServiceManagerAdapter(manager);
+    let check = OneShotHealthCheck(std::cell::RefCell::new(Some(health_check)));
+    eggup_service::commit_with_lifecycle(
+        &mut adapter,
+        request.spec,
+        validated,
+        eggup_core::CommitOwnership::new(verifier, eggup_core::AbsentPolicy::AllowCreate),
+        eggup_service::LifecycleUpdatePolicy {
+            restore: eggup_service::RestoreIntent::Preserve,
+            post_commit_failure: request.policy.post_commit,
+            quiesce_timeout: Duration::from_secs(30),
+            post_commit_timeout: request.policy.health_timeout,
+            rollback_restore_timeout: Duration::from_secs(30),
+        },
+        &check,
+    )
+    .map_err(DeploymentError::from)
+}
+
 pub fn orchestrate_update(
     manager: &mut dyn eggup_service::ServiceManager,
     request: UpdateRequest<'_>,
@@ -529,55 +575,77 @@ pub fn orchestrate_update(
     active_executions: impl Fn() -> usize,
     health_check: impl FnOnce() -> Result<(), String>,
 ) -> Result<eggup_core::TransactionReceipt, DeploymentError> {
-    for source in request.sources {
-        source.validate()?;
+    orchestrate_update_with_lifecycle(manager, request, verifier, active_executions, health_check)
+        .map(|receipt| receipt.transaction)
+}
+
+struct ServiceManagerAdapter<'a>(&'a mut dyn eggup_service::ServiceManager);
+
+impl eggup_service::ServiceManager for ServiceManagerAdapter<'_> {
+    fn inspect(
+        &self,
+        s: &eggup_service::ServiceSpec,
+    ) -> Result<eggup_service::LifecycleSnapshot, eggup_service::ServiceError> {
+        self.0.inspect(s)
     }
-    if let Some(marker) = request.drain_marker {
-        crate::operations::set_persistent_drain(marker, true).map_err(|_| {
-            DeploymentError::new("draining", "persistent drain marker could not be set")
-        })?;
+    fn install(
+        &mut self,
+        s: &eggup_service::ServiceSpec,
+    ) -> Result<eggup_service::TransitionResult, eggup_service::ServiceError> {
+        self.0.install(s)
     }
-    let snapshot = manager.inspect(request.spec)?;
-    match snapshot.ownership {
-        eggup_service::Ownership::Owned => {}
-        eggup_service::Ownership::Absent
-        | eggup_service::Ownership::Foreign
-        | eggup_service::Ownership::Unknown => {
-            return Err(DeploymentError::new(
-                "ownership",
-                "update requires an owned service registration",
+    fn start(
+        &mut self,
+        s: &eggup_service::ServiceSpec,
+        t: Duration,
+    ) -> Result<eggup_service::TransitionResult, eggup_service::ServiceError> {
+        self.0.start(s, t)
+    }
+    fn stop(
+        &mut self,
+        s: &eggup_service::ServiceSpec,
+        t: Duration,
+    ) -> Result<eggup_service::TransitionResult, eggup_service::ServiceError> {
+        self.0.stop(s, t)
+    }
+    fn restart(
+        &mut self,
+        s: &eggup_service::ServiceSpec,
+        t: Duration,
+    ) -> Result<eggup_service::TransitionResult, eggup_service::ServiceError> {
+        self.0.restart(s, t)
+    }
+    fn uninstall(
+        &mut self,
+        s: &eggup_service::ServiceSpec,
+    ) -> Result<eggup_service::TransitionResult, eggup_service::ServiceError> {
+        self.0.uninstall(s)
+    }
+}
+
+struct OneShotHealthCheck<F>(std::cell::RefCell<Option<F>>);
+impl<F> fmt::Debug for OneShotHealthCheck<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OneShotHealthCheck")
+    }
+}
+impl<F: FnOnce() -> Result<(), String>> eggup_service::PostInstallCheck for OneShotHealthCheck<F> {
+    fn check(
+        &self,
+        _: &eggup_service::ServiceSpec,
+        _: &eggup_service::LifecycleSnapshot,
+        remaining: Duration,
+    ) -> Result<(), eggup_service::PostInstallCheckError> {
+        if remaining.is_zero() {
+            return Err(eggup_service::PostInstallCheckError::new(
+                "health check time budget exhausted",
             ));
         }
+        self.0.borrow_mut().take().ok_or_else(|| {
+            eggup_service::PostInstallCheckError::new("health check already consumed")
+        })?()
+        .map_err(eggup_service::PostInstallCheckError::new)
     }
-    wait_for_quiescence(active_executions, request.policy)?;
-    let was_running = snapshot.was_running;
-    if was_running {
-        let transition = manager.stop(request.spec, Duration::from_secs(30))?;
-        if !transition.completed() {
-            return Err(DeploymentError::new(
-                "service",
-                "owned service could not be stopped",
-            ));
-        }
-    }
-    let plan = build_install_plan(request.installation_root, request.release, request.sources)?;
-    let receipt = commit_with_health_check(
-        plan,
-        verifier,
-        eggup_core::AbsentPolicy::AllowCreate,
-        request.policy.post_commit,
-        health_check,
-    )?;
-    if was_running {
-        let transition = manager.start(request.spec, Duration::from_secs(30))?;
-        if !transition.completed() {
-            return Err(DeploymentError::new(
-                "service",
-                "owned service could not be restarted after update",
-            ));
-        }
-    }
-    Ok(receipt)
 }
 
 /// Observe host manager facts without choosing policy or mutating anything.
