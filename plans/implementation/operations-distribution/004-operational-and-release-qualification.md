@@ -1,27 +1,43 @@
 # Operations and Distribution M004 — Operational and Release Qualification
 
-Status: blocked
+Status: active / qualification rebaseline required
 
 Reviewed Eggwork baseline:
 
-- planning baseline `0d52435481c09e896fa376dd040fde92a5529685`;
-- Operations M003 implementation `012383b4c19b7c598157381a29a3eec9bfaa5c1b`;
-- hosted portability correctives `4b954438fbe5162947359af642441a957dc409c4`
-  and `8827ed4812bca3c5a749182e09208e3695549f54`;
+- Operations M002a implementation/closure baseline `c33e9d6fded7a80a377d6e6748cc9cdb2b02acbc`;
+- Operations M004 implementation `b760c1a1705bcb2bcb894b78205fbc3befe2211d`;
+- runner output-monitor corrective `68a6cc2b1308060156e3d7af7a94bd61665fbf9c`;
+- latest qualification-evidence head before this rebaseline `1fcd426a4740b5f1018e5b6e1ca4988e023e9f55`;
 - Operations M003 closure `3482e3655d590efe056fefff955317d50ab7b584`;
-- hosted release run `36787942079`.
-- M002a implementation `c33e9d6fded7a80a377d6e6748cc9cdb2b02acbc`;
-- M004 implementation `b760c1a1705bcb2bcb894b78205fbc3befe2211d`;
-- same-tag rerun `36868105194` (producer/qualification success; fail-closed
-  stage due the Windows same-name digest mismatch recorded in the closure).
+- historical release run `36787942079`;
+- historical same-tag rerun `36868105194` (all producer/qualification jobs
+  succeeded; staging failed closed on the Windows digest mismatch).
 
-Live release input:
+Historical release evidence:
 
 - annotated tag `v0.1.0` -> `8827ed4812bca3c5a749182e09208e3695549f54`;
 - GitHub release id `400502116`;
 - state: draft, unpublished;
 - staged inventory: 17 assets;
-- all five producer targets built/qualified in M003.
+- all five producer targets built/qualified in M003;
+- the exact staged Linux daemon exposes the output-monitor warning corrected
+  only in source at `68a6cc2`.
+
+The `v0.1.0` draft is immutable discovery/evidence and is no longer the
+successful M004 qualification candidate.
+
+Corrected qualification release:
+
+- use the next patch release `v0.1.1` (verified unused during this planning
+  pass);
+- bump `[workspace.package].version` and the workspace lockfile package
+  versions to `0.1.1` before tag creation;
+- require daemon/helper version output, Eggpack release id, manifest, sidecars,
+  and asset names to agree on `0.1.1`;
+- create the annotated tag only after repository gates and Windows
+  reproducibility preflight pass;
+- stage a new draft; never move `v0.1.0`, modify release id `400502116`,
+  or replace historical assets.
 
 External baselines:
 
@@ -38,7 +54,7 @@ Source roadmap:
 
 - `plans/subsystems/operations-distribution-roadmap.md`
 
-Hard prerequisite (satisfied):
+Satisfied prerequisite:
 
 - `plans/implementation/operations-distribution/002a-recovery-required-restart-suppression-and-lifecycle-composition-corrective.md`
   must close with no high/medium finding.
@@ -70,49 +86,71 @@ M004 must establish evidence for:
 M004 does not add scheduling, automatic release discovery, a self-updater,
 credentialed auto-publication, or a new sandbox backend.
 
-## 2. Why M004 is blocked today
+## 2. Current qualification blockers and rebaseline
 
-M003 supplied the intended input: a real green five-target producer run and a
-staged `v0.1.0` draft.
+M002a is closed and the principal M004 implementation has landed. The first
+live qualification pass produced evidence that changes the release target but
+not the architecture.
 
-During M004 research, review of the already-closed M002 update wrapper found a
-latent recovery defect: Eggwork can restart a previously running service after
-an Eggup Core receipt whose disposition is `RecoveryRequired`. Published
-`eggup-service 0.1.1` explicitly suppresses that restart through
-`commit_with_lifecycle`.
+### 2.1 Historical `v0.1.0` cannot close M004
 
-M002a closed at implementation `c33e9d6`; that dependency is satisfied. M004
-implementation landed at `b760c1a`. Linux x86-64 draft artifact integrity,
-installed daemon/helper version execution, and native Linux user-systemd
-install/start/restart/stop/uninstall have been exercised. Product policy now
-includes strict systemd argument paths, deterministic launchd XML, typed
-launchd/SCM adapters, manager-specific JSON status, and local-candidate apply.
+The exact staged Linux `v0.1.0` daemon completed a real mTLS execution but
+reported `cleanup_warning: "output monitor closed"`. Current source fixes the
+race at `68a6cc2`, and current-source mTLS smoke completes without the
+warning. Because the existing draft is immutable evidence from the old source
+revision, it cannot be repaired in place.
 
-Closure is blocked by qualification evidence:
+M004 must therefore qualify a new patch release rather than trying to make
+`v0.1.0` pass.
 
-1. Same-tag rerun run `36868105194` rebuilt every asset. Every artifact was
-   byte-identical to the draft except
-   `eggwork-v0.1.0-x86_64-pc-windows-msvc.exe`. The rerun artifact matches its
-   own ReleaseManifest, but its PE COFF timestamp and embedded PDB signature
-   differ from the staged executable. Eggpack main records exact rerun reuse as
-   blocked by eggsact M005a Windows byte reproducibility. Eggpack failed closed
-   before replacing any asset; the draft remains unchanged. Do not retry or
-   clobber it until the upstream blocker is cleared.
-2. The exact staged Linux x86-64 v0.1.0 daemon now has live mTLS execution,
-   capability rejection, and persistent-drain evidence. That smoke exposed
-   `cleanup_warning: "output monitor closed"` in the immutable release binary.
-   A runner source correction and regression test remove the race in current
-   source, but the staged artifact/tag do not contain the correction and need
-   a new release input before exact-release qualification can pass. Native
-   launchd and SCM lifecycle, required isolation on the claimed host matrix,
-   and the complete update/rollback matrix also lack live evidence.
-   Cross-compilation is not qualification.
-3. The draft remains unpublished. Public bootstrap evidence requires an
-   explicit maintainer publication action and remains outstanding.
+### 2.2 Windows reproducibility is Eggwork-owned
 
-No other registered Eggwork implementation plan becomes ready from this
-partial qualification; Operations M005/M006 remain deferred. Historical M002
-and M003 evidence is unchanged.
+The failed `v0.1.0` rerun showed the same MSVC nondeterminism independently
+found by eggsact: wall-clock PE timestamps plus CodeView/PDB identity make a
+fixed-source Windows binary change between builds.
+
+eggsact commit `f1352101dab748066c788e65e21e1bf303cfe995` demonstrates a
+product-side correction using target-scoped linker flags:
+
+- `/BREPRO`;
+- `/DEBUG:NONE`.
+
+That implementation is useful evidence, but it is **not an upstream Eggwork
+dependency**. Eggwork has no `.cargo/config.toml` today and must adopt and
+qualify its own deterministic Windows policy. Eggpack's fail-closed
+same-name/digest behavior remains unchanged.
+
+### 2.3 Native service claims need proof or a fail-closed disposition
+
+macOS launchd and Windows SCM policy/adapter code is implemented, but adapter
+unit tests are not native manager qualification. For each backend M004 must
+choose one truthful closure path:
+
+1. obtain hosted native lifecycle evidence and mark the service backend
+   qualified; or
+2. keep/restore a structured fail-closed mutation refusal for that backend and
+   mark service management unsupported/unqualified while separately qualifying
+   daemon/runtime support.
+
+M004 must not close with an exposed destructive service path described only as
+"implemented but untested."
+
+### 2.4 Remaining evidence
+
+M004 still needs:
+
+- deterministic Windows candidate proof in Eggwork;
+- a corrected `v0.1.1` five-target draft;
+- byte-identical same-tag rerun/reuse on that corrected draft;
+- installed runtime qualification from corrected release bytes;
+- required Linux installed-helper isolation evidence or an explicit unsupported
+  disposition;
+- live update/rollback/recovery/state-preservation evidence;
+- native service-manager evidence for every backend left enabled;
+- public bootstrap evidence only if publication is explicitly authorized.
+
+Historical M002/M003/M002a evidence remains unchanged. Operations M005/M006
+remain deferred.
 
 ## 3. Authority boundaries
 
@@ -423,6 +461,13 @@ qualification.
 No test may use automatic privilege elevation. Runner provisioning may grant
 the job the authority it needs, but Eggwork itself must never obtain it.
 
+If a native manager cannot be safely exercised on the available hosted
+environment, do not leave the mutating CLI enabled merely because the Eggup
+adapter exists. Gate that backend back to a structured unsupported/refusal
+path, retain unit/renderer coverage, and record service management as
+unsupported/unqualified for M004. Binary installation and daemon runtime may
+still be qualified independently.
+
 ## 10. Update, rollback, and recovery qualification
 
 After M002a, exercise the corrected lifecycle path with real installed
@@ -451,60 +496,90 @@ second product generation may combine live service replacement with
 deterministic M002a disposition tests, but MUST state that limitation rather
 than claiming a full cross-version update.
 
-## 11. Existing M003 draft rerun/reuse gate
+## 10a. Eggwork Windows release determinism policy
 
-Before any public publication, rerun the generated M003 release workflow for
-the exact existing annotated `v0.1.0` tag.
+Before creating the corrected release tag, add Eggwork-local deterministic
+MSVC link policy.
 
-Preconditions:
+Create `.cargo/config.toml` with a target-scoped
+`[target.x86_64-pc-windows-msvc]` policy equivalent in effect to:
 
-- tag still resolves to
-  `8827ed4812bca3c5a749182e09208e3695549f54`;
-- existing release id remains `400502116`;
-- release remains draft;
-- existing asset inventory is exactly the recorded 17 assets;
-- no asset has been manually replaced.
+- `-C link-arg=/BREPRO`;
+- `-C link-arg=/DEBUG:NONE`.
 
-Required outcome:
+Requirements:
 
-- workflow succeeds;
-- staging receipt says existing draft reused;
-- byte-identical assets are reused, not clobbered;
+- the policy is scoped only to `x86_64-pc-windows-msvc`;
+- no workflow may set `RUSTFLAGS` or equivalent in a way that replaces the
+  target-scoped Cargo rustflags;
+- the five-target artifact contract is unchanged;
+- Eggpack digest/no-clobber behavior is unchanged;
+- documentation records the deliberate tradeoff that release Windows binaries
+  contain no PDB/CodeView debug directory.
+
+Add a static regression guard that parses the Cargo config and requires both
+link arguments.
+
+Add native Windows reproducibility evidence **before staging**:
+
+1. check out one exact source revision;
+2. build the release Windows daemon twice in independent target directories on
+   the same pinned toolchain;
+3. compare SHA-256 byte-for-byte;
+4. inspect the final PE and require no CodeView/RSDS record;
+5. fail if workflow/environment configuration overrides target rustflags.
+
+This proof is Eggwork-owned. eggsact M005a is prior art only.
+
+## 11. Corrected draft and same-tag rerun/reuse gate
+
+Historical rerun `36868105194` is already valid evidence: Eggpack reused the
+`v0.1.0` draft, preserved all existing assets, and failed closed on the
+nondeterministic Windows candidate. Do **not** rerun or repair that historical
+draft as an M004 success criterion.
+
+After the runner fix, deterministic Windows policy, repository gates, and
+workspace version bump are present:
+
+1. choose the exact reviewed source revision;
+2. require workspace version `0.1.1`;
+3. create annotated tag `v0.1.1` at that exact revision through explicit
+   maintainer action;
+4. dispatch the generated release workflow for exact `v0.1.1`;
+5. require all five targets and validators green;
+6. require a new draft with the expected 17-asset inventory;
+7. leave it unpublished;
+8. rerun the exact same tag with no source/tag/config changes.
+
+Required rerun outcome:
+
+- workflow succeeds end-to-end;
+- staging receipt reuses the same `v0.1.1` draft;
+- all 17 assets are byte-identical/reused;
+- no differing same-name asset exists;
 - no tag mutation;
 - no duplicate release;
 - no publication;
-- no differing same-name asset is overwritten.
+- no clobber path.
 
-If a rebuilt platform artifact differs, the workflow MUST fail closed. Diagnose
-the producing toolchain/product determinism and register a corrective if the
-difference is not expected and bounded. Never delete/replace the existing asset
-merely to make the rerun green.
+If any corrected-candidate asset differs, stop. Do not replace it. Diagnose
+product/toolchain nondeterminism before continuing qualification.
 
 ## 12. Eggpack tool-pin durability
 
-M003 intentionally pinned
-`8507fbeebc6e6a0f8176965d8b21dfc818a03719`, because the then-current Eggpack
-main lacked the M003e/f/g generated-workflow fixes. During this planning pass
-that revision is still reachable from
-`refs/heads/m003g-live-qualification`, while Eggpack main is
-`404f63ec...`.
+This prerequisite is now satisfied.
 
-At M004 implementation start:
+Eggwork pins Eggpack at durable main revision
+`32a0903936fcc283863e0bfb86151b13b4d75ce9`, which contains the qualified
+M003e/f/g workflow behavior plus M003h reconciliation. The generated
+`.github/workflows/release.yml` was regenerated and `eggpack ci check`
+reported zero drift.
 
-1. re-check Eggpack main/tags;
-2. if a durable main/tag revision contains the qualified M003e/f/g behavior,
-   re-pin Eggwork to that exact immutable revision;
-3. regenerate `.github/workflows/release.yml`;
-4. run `eggpack ci check`;
-5. repeat the producer/rerun gates affected by any generated-byte change.
+Before the corrected release run, re-check that this exact revision remains
+reachable and that no newer Eggpack revision is required by a concrete defect.
+Do not churn the pin merely because main has advanced.
 
-Do NOT re-pin backward to a revision known to generate a broken hosted
-workflow.
-
-If no durable merged/tagged revision exists, the branch-only pin remains a
-low-severity operational dependency. Record it explicitly; do not mask it.
-
-## 13. First-install bootstrap qualification
+## 13. Corrected-release first-install bootstrap qualification
 
 ### Pre-publication
 
@@ -516,9 +591,10 @@ publicly reachable.
 
 ### Post-publication
 
-The generated `install.sh` / `install.ps1` hardcode the exact
-`releases/download/v0.1.0` origin. True public bootstrap qualification
-therefore occurs only after an authorized human publishes the draft.
+The corrected release's generated `install.sh` / `install.ps1` hardcode the exact
+`releases/download/v0.1.1` origin. True public bootstrap qualification
+therefore occurs only after an authorized human publishes the corrected draft.
+Historical `v0.1.0` installers are not the M004 success target.
 
 Required native smoke after publication:
 
@@ -527,7 +603,7 @@ Required native smoke after publication:
 - Windows x86-64: `install.ps1` installs daemon only;
 - destination-exists refusal works;
 - installed bytes match sidecar/manifest;
-- installed daemon version is `0.1.0`;
+- installed daemon version is `0.1.1`;
 - Linux helper version matches and has executable mode.
 
 No Cargo/Rust fallback is part of this release contract.
@@ -541,9 +617,9 @@ pre-publication M004 gates pass.
 
 Before a maintainer publishes, record:
 
-- exact annotated tag/source;
-- exact draft release id;
-- exact 17-asset inventory and hashes;
+- exact corrected annotated tag/source (`v0.1.1` unless re-planned before tag creation);
+- exact corrected draft release id;
+- exact corrected 17-asset inventory and hashes;
 - green same-tag rerun/reuse evidence;
 - native service/installed execution qualification disposition;
 - outstanding platform limitations;
@@ -555,10 +631,11 @@ remaining release-publication evidence. Do not fabricate publication evidence.
 
 If publication occurs:
 
-- publish the existing draft only;
-- do not move/recreate `v0.1.0`;
+- publish the corrected, fully qualified draft only;
+- do not publish the historical `v0.1.0` draft as the M004-qualified release;
+- do not move/recreate either tag;
 - do not replace differing assets;
-- verify the public exact-tag asset inventory;
+- verify the corrected public exact-tag asset inventory;
 - run the post-publication bootstrap matrix.
 
 M004 planning authorizes qualification work, not release publication.
@@ -657,8 +734,11 @@ Release gate:
 
 - exact pinned Eggpack `ci generate`;
 - exact pinned Eggpack `ci check`;
-- same-tag `v0.1.0` rerun;
-- staging receipt/no-clobber audit.
+- Eggwork native Windows double-build reproducibility preflight;
+- coherent workspace/package version bump to `0.1.1`;
+- exact corrected `v0.1.1` draft build/qualification;
+- same-tag `v0.1.1` rerun;
+- staging receipt/all-asset reuse/no-clobber audit.
 
 Platform gate:
 
@@ -687,11 +767,11 @@ MSRV remains Rust 1.89.
 9. Unsupported required isolation fails before spawn.
 10. Drain/update/rollback/recovery behavior is truthful; `RecoveryRequired`
     never auto-starts.
-11. Same-tag release rerun reuses the existing draft without clobber.
+11. Eggwork's Windows candidate is independently proven byte-reproducible, and the corrected release same-tag rerun reuses all 17 assets without clobber.
 12. Release workflow/tool pins are immutable and their durability finding is
     resolved or explicitly low-severity.
 13. Publication remains human-controlled.
-14. If published, public exact-release bootstrap passes on all five targets;
+14. If the corrected release is published, public exact-release bootstrap passes on all five targets;
     otherwise M004 closes conditionally with that named evidence outstanding.
 15. Release/update/service ownership documentation matches production.
 16. No unresolved high/medium correctness or security finding remains.
@@ -704,10 +784,10 @@ Stop and register a corrective if:
 - Eggup 0.1.1 cannot express the required launchd/SCM product policy;
 - hosted service mutation requires Eggwork-controlled privilege escalation;
 - a platform can only pass by bypassing ownership checks;
-- release rerun produces a differing same-name asset;
+- corrected-release rerun produces a differing same-name asset;
 - a candidate can execute when a required unsupported capability was requested;
 - update/recovery can auto-start after `RecoveryRequired`;
-- the exact release tag/source or staged draft inventory changes unexpectedly;
+- the corrected release tag/source or staged draft inventory changes unexpectedly;
 - publication would require tag movement or asset clobber;
 - platform claims depend only on cross-compilation or mocks;
 - a new high/medium finding appears.
@@ -724,8 +804,9 @@ Record:
 - M002a closure reference;
 - exact Eggup dependency/tag disposition;
 - exact Eggpack tool pin and durability status;
-- `v0.1.0` tag + release id + asset inventory;
-- same-tag rerun staging receipt;
+- historical `v0.1.0` tag/release evidence and its failure disposition;
+- corrected `v0.1.1` tag + release id + asset inventory;
+- corrected same-tag rerun staging receipt with all-asset reuse;
 - native install matrix;
 - service-manager matrix;
 - installed execution/capability matrix;
