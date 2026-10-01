@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M001-M003 closed, M004 ready for handoff
+Status: active roadmap; M001-M003 closed historically, M002a corrective ready, M004 registered/blocked on M002a
 
 Canonical authority:
 
@@ -47,7 +47,7 @@ Add configuration, status, doctor, drain/undrain, execution/storage inspection, 
 
 Class: infrastructure/capability
 
-Status: closed
+Status: closed historically; post-closure corrective M002a is ready
 
 Closure evidence: `plans/closure/operations-distribution/002-resumed-status.md`
 (implementation `d5722d9` against published `eggup-core`/`eggup-service`
@@ -73,6 +73,26 @@ Current resumed closure target:
 - `plans/closure/operations-distribution/002-resumed-status.md`
 
 The historical `002-status.md` blocker record is immutable and MUST NOT be overwritten when this resumed implementation closes.
+
+### M002a — RecoveryRequired restart suppression and lifecycle composition corrective
+
+Class: corrective / recovery invariant
+
+Status: ready for handoff
+
+Implementation plan:
+
+- `plans/implementation/operations-distribution/002a-recovery-required-restart-suppression-and-lifecycle-composition-corrective.md`
+
+Finding:
+
+M004 research found that the closed M002 `orchestrate_update` wrapper manually restarts a previously running service after any successful Core receipt, including the possible `TransactionDisposition::RecoveryRequired` state. Published `eggup-service 0.1.1` already exposes `commit_with_lifecycle`, whose contract suppresses automatic service restoration when artifact state is uncertain.
+
+Objective:
+
+Replace the duplicate Eggwork stop/restart composition with Eggup's published lifecycle transaction while preserving persistent drain, active-execution quiescence, the existing public compatibility surface, and exact Core recovery evidence. `RecoveryRequired` must never reach an Eggwork start/restart call.
+
+Historical M002 closure records remain immutable. M002a closes as `plans/closure/operations-distribution/002a-status.md` and is the sole hard blocker on M004 execution.
 
 ### M003 — Eggpack producer packaging integration
 
@@ -115,20 +135,23 @@ Residual constraints carried into M004 planning, not blockers on M003:
 
 Class: polish/invariant
 
-Status: ready for handoff
+Status: registered / blocked on Operations M002a closure
+
+Implementation plan:
+
+- `plans/implementation/operations-distribution/004-operational-and-release-qualification.md`
 
 Objective:
 
-Run hosted target/service/update/recovery qualification, verify checksums/provenance and installed-version coherence, exercise drain/update/restart boundaries, and close release-operational findings.
+Qualify the staged M003 release as installed node software: native first-install/runtime smoke, platform service lifecycle, corrected update/rollback/recovery behavior, same-tag draft rerun/reuse, publication boundary, and a truthful cross-platform support matrix.
 
-Dependency disposition: M002 is closed and the M003 dependency is satisfied by
-`plans/closure/operations-distribution/003-status.md`. No implementation plan
-document exists for M004 yet; authoring it is the next action and is unblocked.
+Dependency disposition:
 
-First obligation, carried from the M003 closure record: start from the staged
-`eggwork v0.1.0` draft (release id `400502116`, receipt in run `36787942079`)
-for installed first-install smoke, service lifecycle/update/rollback on
-qualified hosts, rerun-reuse behavior, and publication policy.
+- Operations M003 is closed at `plans/closure/operations-distribution/003-status.md`;
+- the staged `eggwork v0.1.0` draft (release id `400502116`, run `36787942079`) is the starting release evidence;
+- Operations M002a is a newly discovered correctness prerequisite and MUST close before M004 executes update/recovery qualification.
+
+M004 does not reopen producer packaging. It consumes the existing release assets and keeps publication human-controlled.
 
 ### M005 — Reverse-connect relay
 
