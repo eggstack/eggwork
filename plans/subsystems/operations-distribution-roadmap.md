@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M001-M003 and M002a corrective closed, M004 active
+Status: active roadmap; M001-M003 and M002a corrective closed, M004 blocked on release and native-platform qualification evidence
 
 Canonical authority:
 
@@ -92,7 +92,10 @@ Objective:
 
 Replace the duplicate Eggwork stop/restart composition with Eggup's published lifecycle transaction while preserving persistent drain, active-execution quiescence, the existing public compatibility surface, and exact Core recovery evidence. `RecoveryRequired` must never reach an Eggwork start/restart call.
 
-Historical M002 closure records remain immutable. M002a closes as `plans/closure/operations-distribution/002a-status.md` and is the sole hard blocker on M004 execution.
+Historical M002 closure records remain immutable. M002a closed at
+`plans/closure/operations-distribution/002a-status.md` and satisfied M004's
+recovery-safety prerequisite. M004 now has separate release and native-platform
+qualification blockers recorded in its closure evidence.
 
 ### M003 — Eggpack producer packaging integration
 
@@ -135,7 +138,7 @@ Residual constraints carried into M004 planning, not blockers on M003:
 
 Class: polish/invariant
 
-Status: active
+Status: blocked
 
 Implementation plan:
 
@@ -149,7 +152,8 @@ Dependency disposition:
 
 - Operations M003 is closed at `plans/closure/operations-distribution/003-status.md`;
 - the staged `eggwork v0.1.0` draft (release id `400502116`, run `36787942079`) is the starting release evidence;
-- Operations M002a is a newly discovered correctness prerequisite and MUST close before M004 executes update/recovery qualification.
+- Operations M002a closed at `plans/closure/operations-distribution/002a-status.md` and its correctness prerequisite is satisfied;
+- M004's same-tag run `36868105194` failed closed because the Windows binary differs from the existing draft, consistent with eggsact M005a byte reproducibility; native macOS/Windows service and installed-runtime qualification is also outstanding (`plans/closure/operations-distribution/004-status.md`).
 
 M004 does not reopen producer packaging. It consumes the existing release assets and keeps publication human-controlled.
 

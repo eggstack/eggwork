@@ -18,11 +18,13 @@ Foundation M001-M003, Control Plane M001-M003, Workspace M001-M004, Security M00
 
 ## Current dependency-ready Eggwork work
 
-The registry currently authorizes one Eggwork-local handoff:
+The last dependency-ready handoff, Operations M002a, is closed. Operations M004
+is registered but blocked on exact-release Windows artifact reuse and native
+platform/runtime qualification; consult the registry and closure record before
+starting additional Operations work.
 
-- `operations-distribution/002a-recovery-required-restart-suppression-and-lifecycle-composition-corrective.md` — replace Eggwork's duplicate stop/restart update composition with published Eggup 0.1.1 lifecycle orchestration so `RecoveryRequired` can never auto-start uncertain artifacts.
-
-Operations M002-M003 are historically closed, but M002 now has this post-closure corrective. Workspace M004 and Security M004 remain closed.
+Operations M002-M003 and corrective M002a are closed. Workspace M004 and
+Security M004 remain closed.
 
 The `foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md` handoff has closed; closure evidence lives in `plans/closure/foundation-execution-core-ci-corrective/001-status.md`.
 
@@ -30,10 +32,9 @@ CodeGG integration implementation authority has moved to the CodeGG repository. 
 
 ## Registered blocked and later work
 
-- `operations-distribution/004-operational-and-release-qualification.md` — registered and blocked only on Operations M002a closure. It starts from the existing staged `v0.1.0` draft and covers native first-install/runtime, service managers, update/recovery, same-tag rerun/reuse, and publication qualification.
+- `operations-distribution/004-operational-and-release-qualification.md` — blocked on eggsact M005a Windows artifact reproducibility for same-tag reuse, plus native service/runtime and update/recovery evidence. It starts from the existing staged `v0.1.0` draft.
 - Reverse-connect and PTY work remain deferred.
 - CodeGG M004 is downstream-owned and waits only on the stable AgentRun worker-entry contract.
 
 The superseded `operations-distribution/002-packaging-services-and-eggup.md` remains historical evidence of the pre-Eggpack ownership split.
-
 

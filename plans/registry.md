@@ -66,7 +66,7 @@ The repository is no longer planning-only.
 | Control-plane protocol | closed | M001-M003 complete | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | closed | M001-M004 closed, including reusable manifest CAS + derived materialization (`plans/closure/workspace-artifact-transport/004-status.md`) | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | closed | M001-M004 plus remote-admission corrective C001 are closed (`plans/closure/security-isolation-resource/004-status.md`); macOS/Windows hosted qualification remains future Operations M004 work, not a Security defect | `plans/subsystems/security-isolation-resource-roadmap.md`, `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md` |
-| Operations / distribution | active | M001-M003 closed historically; M002a recovery/lifecycle corrective closed; M004 active | `plans/subsystems/operations-distribution-roadmap.md` |
+| Operations / distribution | blocked | M001-M003 and M002a closed; M004 implementation landed, closure blocked on upstream Windows artifact determinism and missing native macOS/Windows/update qualification | `plans/subsystems/operations-distribution-roadmap.md` |
 | CodeGG integration | Eggwork reference closed; downstream M001+C001+M002+M002a+M003 closed | CodeGG required-Landlock live qualification closed at `f5f8d96d`; downstream M003 closed at CodeGG `d51afe46` (implementation `1ce377ce`, hosted `36745285774`) against this repository's Workspace M004 contract; only downstream M004 remains, deferred. | `plans/subsystems/codegg-integration-roadmap.md` |
 
 ## Dependency-ready implementation plans
@@ -101,7 +101,7 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 | Operations | M002 Eggup deployment/service integration | closed (resumed) | `plans/closure/operations-distribution/002-resumed-status.md` (implementation `d5722d9`, published `eggup-core`/`eggup-service` 0.1.1); historical pre-M007 blocker preserved immutably at `plans/closure/operations-distribution/002-status.md` |
 | Operations | M003 Eggpack producer packaging integration | closed | `plans/closure/operations-distribution/003-status.md` (implementation `012383b` plus hosted-run portability correctives `4b95443`/`8827ed4`; `release/eggpack/` producer configuration, generated `.github/workflows/release.yml`, CI drift guard, static release/deployment parity suite). Hosted evidence: run `36787942079`, all 20 jobs green across the five required targets; draft `eggwork v0.1.0` (release id `400502116`, 17 assets) staged, nothing published, tag unmoved by the workflow. |
 | Operations corrective | M002a RecoveryRequired restart suppression + lifecycle composition | closed | `plans/closure/operations-distribution/002a-status.md` (implementation `c33e9d6`; published Eggup 0.1.1 lifecycle composition) |
-| Operations | M004 operational and release qualification | active | `plans/implementation/operations-distribution/004-operational-and-release-qualification.md`; prerequisite M002a closed; existing v0.1.0 tag and draft release revalidated |
+| Operations | M004 operational and release qualification | blocked | `plans/closure/operations-distribution/004-status.md`; same-tag rerun `36868105194` failed closed on the known eggsact M005a Windows reproducibility blocker; native platform/runtime evidence incomplete |
 | Operations | former combined M002 packaging/services/Eggup | superseded | `plans/implementation/operations-distribution/002-packaging-services-and-eggup.md`; split because Eggpack now owns producer packaging |
 | CodeGG | M001 fixed-target remote executor (Eggwork reference contract) | closed | `plans/closure/codegg-integration/001-status.md`; downstream CodeGG M001+C001+M002+M002a+M003 are now closed, and downstream M004 is the only milestone left, deferred on the stable AgentRun worker-entry contract. |
 
@@ -109,13 +109,13 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Work | Status | Blocker / rationale |
 |---|---|---|
-| Operations M004 operational/release qualification | **active** | `plans/implementation/operations-distribution/004-operational-and-release-qualification.md`; M002a closed at `c33e9d6`; native multi-platform and exact-draft qualification evidence is in progress. |
+| Operations M004 operational/release qualification | **blocked** | `plans/implementation/operations-distribution/004-operational-and-release-qualification.md`; same-tag reuse awaits eggsact M005a Windows byte reproducibility; native macOS/Windows service and installed-runtime qualification remain outstanding. Closure evidence: `plans/closure/operations-distribution/004-status.md`. |
 | Operations M005 reverse-connect relay | deferred | no immediate product need; stable identity/lease semantics already exist |
 | Operations M006 PTY extension | deferred | requires a separate interactive ownership/attach design |
 | CodeGG M003 content-aware derived workspace transfer | closed downstream | Closed in CodeGG at `d51afe46` (implementation `1ce377ce`; hosted `36745285774` success, live derived reuse under required isolation) on Eggwork `e6a5d82`; closure record `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution/003-status.md` |
 | CodeGG M004 remote AgentRun worker | deferred | M003 is closed; only the stable AgentRun worker-entry contract remains outstanding |
 
-Operations M003 is implemented and closed. M004 starts from the staged `eggwork v0.1.0` draft after M002a closed at `c33e9d6`. Do not widen either plan into runtime release discovery, service-manager duplication, or Eggpack/Eggup interoperability.
+Operations M003 is implemented and closed. M004 starts from the staged `eggwork v0.1.0` draft after M002a closed at `c33e9d6`; it remains blocked on exact-run mismatch and unproven native qualification. Do not widen either plan into runtime release discovery, service-manager duplication, or Eggpack/Eggup interoperability.
 
 ## Corrected execution graph
 
@@ -139,7 +139,7 @@ Control M003 [closed] -----------------+--> Security M004 [CLOSED]
 Operations M002 [CLOSED] --------------+
 
 Eggpack producer chain [CLOSED through CI M003g] --> Operations M003 [CLOSED]
-Operations M002 [historically CLOSED] --> Operations M002a [CLOSED corrective]\n                                              |\nOperations M003 [CLOSED] ---------------------+--> Operations M004 [ACTIVE]
+Operations M002 [historically CLOSED] --> Operations M002a [CLOSED corrective]\n                                              |\nOperations M003 [CLOSED] ---------------------+--> Operations M004 [BLOCKED: Windows reproducibility + native qualification]
 ```
 
 Operations M002 is not a dependency of CodeGG M001. The canonical long-term roadmap already defines CodeGG Phase 7 as depending on Eggwork Phases 0-5, not completion of Phase 6 packaging.
@@ -155,7 +155,7 @@ These are reviewed research baselines, not permanent dependency pins.
 | Eggress | `e141d4082d211cc5f122414c74617fde846ffbae` / 1.0.8 line | listener-free `OutboundConnector::connect_tcp_detailed` returns a Tokio stream and typed route failure facts |
 | EggServe | `dc8ce30e2c9f0a95f73682cea07163e8076995bd` / 0.2.x line | server/TLS service baseline; re-check exact published patch before dependency changes |
 | Eggup | published `v0.1.1` -> `881c95ff069d3d465a282cb6a495ba6fcb70cb6f`; current main reviewed `0f791324be406b9a07dd35c1c1121279bc38dcdb` | Eggwork remains pinned to registry `eggup-core`/`eggup-service` 0.1.1. That published service crate includes systemd/launchd/Windows SCM plus `commit_with_lifecycle`, whose `RecoveryRequired` contract suppresses automatic restart; newer main service work is not required for M002a/M004. |
-| Eggpack | reviewed head `404f63ec2bae119f7fa1a41a56a34e91bc267b1a` (`main`); Operations M003 tool pin `8507fbeebc6e6a0f8176965d8b21dfc818a03719` | producer authority; `main` still carries only Build M006 plus the Eggwork producer-adoption planning commits, while the CI M003e/f/g execution correctives and Ecosystem M001 are published on `refs/heads/m003g-live-qualification`. Eggwork pins `8507fbe` because it is the only revision with end-to-end hosted evidence for a generated five-target release pipeline. Runtime Eggup-manifest consumer adoption remains a distinct Eggpack milestone that Eggwork does not claim. |
+| Eggpack | reviewed head `32a0903936fcc283863e0bfb86151b13b4d75ce9` (`main`); Eggwork pin updated to this immutable main SHA in M004 | producer authority; main contains the qualified M003e/f/g behavior and M003h reconciliation. Eggwork regenerated `.github/workflows/release.yml`; `eggpack ci check` reports zero drift. Exact Windows artifact reuse remains blocked by the separately-owned eggsact M005a byte reproducibility issue. Runtime Eggup-manifest consumer adoption remains separate. |
 | Gregg | `5b2c7e8c67616f872070e2acdcce90790f750fbf` | telemetry/protocol patterns only; not an execution control plane |
 
 Implementation agents MUST re-check current APIs at execution time.

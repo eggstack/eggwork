@@ -1,6 +1,6 @@
 # Operations and Distribution M004 — Operational and Release Qualification
 
-Status: active
+Status: blocked
 
 Reviewed Eggwork baseline:
 
@@ -10,6 +10,10 @@ Reviewed Eggwork baseline:
   and `8827ed4812bca3c5a749182e09208e3695549f54`;
 - Operations M003 closure `3482e3655d590efe056fefff955317d50ab7b584`;
 - hosted release run `36787942079`.
+- M002a implementation `c33e9d6fded7a80a377d6e6748cc9cdb2b02acbc`;
+- M004 implementation `b760c1a1705bcb2bcb894b78205fbc3befe2211d`;
+- same-tag rerun `36868105194` (producer/qualification success; fail-closed
+  stage due the Windows same-name digest mismatch recorded in the closure).
 
 Live release input:
 
@@ -24,16 +28,17 @@ External baselines:
 - published Eggup `v0.1.1` / `881c95ff069d3d465a282cb6a495ba6fcb70cb6f`;
 - current Eggup main reviewed at
   `0f791324be406b9a07dd35c1c1121279bc38dcdb`;
-- Eggpack producer pin currently checked into Eggwork:
-  `8507fbeebc6e6a0f8176965d8b21dfc818a03719`;
+- Eggpack producer pin now checked into Eggwork:
+  `32a0903936fcc283863e0bfb86151b13b4d75ce9`;
 - Eggpack main reviewed during planning:
-  `404f63ec2bae119f7fa1a41a56a34e91bc267b1a`.
+  `32a0903936fcc283863e0bfb86151b13b4d75ce9`; it contains qualified M003e/f/g
+  behavior and M003h reconciliation.
 
 Source roadmap:
 
 - `plans/subsystems/operations-distribution-roadmap.md`
 
-Hard prerequisite:
+Hard prerequisite (satisfied):
 
 - `plans/implementation/operations-distribution/002a-recovery-required-restart-suppression-and-lifecycle-composition-corrective.md`
   must close with no high/medium finding.
@@ -76,11 +81,33 @@ an Eggup Core receipt whose disposition is `RecoveryRequired`. Published
 `eggup-service 0.1.1` explicitly suppresses that restart through
 `commit_with_lifecycle`.
 
-M004 MUST NOT qualify update/recovery on top of the known unsafe wrapper.
-Operations M002a closes that defect first.
+M002a closed at implementation `c33e9d6`; that dependency is satisfied. M004
+implementation landed at `b760c1a`. Linux x86-64 draft artifact integrity,
+installed daemon/helper version execution, and native Linux user-systemd
+install/start/restart/stop/uninstall have been exercised. Product policy now
+includes strict systemd argument paths, deterministic launchd XML, typed
+launchd/SCM adapters, manager-specific JSON status, and local-candidate apply.
 
-When M002a closes, this plan becomes ready without another architecture
-decision.
+Closure is blocked by qualification evidence:
+
+1. Same-tag rerun run `36868105194` rebuilt every asset. Every artifact was
+   byte-identical to the draft except
+   `eggwork-v0.1.0-x86_64-pc-windows-msvc.exe`. The rerun artifact matches its
+   own ReleaseManifest, but its PE COFF timestamp and embedded PDB signature
+   differ from the staged executable. Eggpack main records exact rerun reuse as
+   blocked by eggsact M005a Windows byte reproducibility. Eggpack failed closed
+   before replacing any asset; the draft remains unchanged. Do not retry or
+   clobber it until the upstream blocker is cleared.
+2. Native launchd and SCM lifecycle, installed remote execution, required
+   isolation on the claimed host matrix, and the complete update/rollback
+   matrix do not yet have live evidence. Cross-compilation is not
+   qualification.
+3. The draft remains unpublished. Public bootstrap evidence requires an
+   explicit maintainer publication action and remains outstanding.
+
+No other registered Eggwork implementation plan becomes ready from this
+partial qualification; Operations M005/M006 remain deferred. Historical M002
+and M003 evidence is unchanged.
 
 ## 3. Authority boundaries
 
