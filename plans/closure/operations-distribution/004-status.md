@@ -91,6 +91,10 @@ and was not moved to consume the new pin.
 - Current source `eggworkd` + standard `NodeClient` loopback mTLS qualification
   — passed exact bounded stdout and terminal-state checks; `executions show`
   reported `Succeeded`, exit code 0, and no cleanup warning after the fix.
+- Hosted CI run `36876251604` — its first attempt passed format, clippy, and
+  release drift but had one `required_memory_limit_is_enforced_and_classified`
+  sandbox-status timeout. The focused test passed locally; rerunning the failed
+  hosted job passed the complete Rust test, check, and release-drift jobs.
 - Draft `v0.1.0` was rechecked after the new evidence: still draft, exact tag,
   17 assets; neither staging nor publication was attempted again. Eggpack main
   still resolves to the pinned `32a0903936fcc283863e0bfb86151b13b4d75ce9`.
