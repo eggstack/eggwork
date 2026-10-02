@@ -45,15 +45,32 @@ def candidate(tmp: Path, name: str, body: str) -> Path:
     return path
 
 
-HELPER_OK = "import sys\nprint('0.1.0')\n"
-HELPER_WRONG_VERSION = "print('9.9.9')\n"
+def _workspace_version() -> str:
+    """Read the version the validators actually compare against.
+
+    Hard-coding it would make this suite a second, stale copy of the release
+    contract: the fixtures must track `[workspace.package].version`, and the
+    wrong-version fixtures must stay different from it for every release.
+    """
+    with (ROOT / "Cargo.toml").open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.startswith("version = "):
+                return line.split('"')[1]
+    raise AssertionError("Cargo.toml has no workspace version")
+
+
+WORKSPACE_VERSION = _workspace_version()
+WRONG_VERSION = "0.0.0-not-the-workspace-version"
+
+HELPER_OK = f"import sys\nprint('{WORKSPACE_VERSION}')\n"
+HELPER_WRONG_VERSION = f"print('{WRONG_VERSION}')\n"
 HELPER_EMPTY = "print('')\n"
-HELPER_TWO_LINES = "print('0.1.0')\nprint('0.1.0')\n"
-HELPER_DAEMON_SHAPED = "import json;print(json.dumps({'version':'0.1.0'}))\n"
-DAEMON_OK = "import json;print(json.dumps({'version':'0.1.0'}))\n"
-DAEMON_WRONG_VERSION = "import json;print(json.dumps({'version':'9.9.9'}))\n"
+HELPER_TWO_LINES = f"print('{WORKSPACE_VERSION}')\nprint('{WORKSPACE_VERSION}')\n"
+HELPER_DAEMON_SHAPED = f"import json;print(json.dumps({{'version':'{WORKSPACE_VERSION}'}}))\n"
+DAEMON_OK = f"import json;print(json.dumps({{'version':'{WORKSPACE_VERSION}'}}))\n"
+DAEMON_WRONG_VERSION = f"import json;print(json.dumps({{'version':'{WRONG_VERSION}'}}))\n"
 DAEMON_NO_FIELD = "import json;print(json.dumps({'schema_version':1}))\n"
-DAEMON_HELPER_SHAPED = "print('0.1.0')\n"
+DAEMON_HELPER_SHAPED = f"print('{WORKSPACE_VERSION}')\n"
 
 
 class ValidatorTest(unittest.TestCase):

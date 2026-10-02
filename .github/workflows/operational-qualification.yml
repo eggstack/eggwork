@@ -1,0 +1,168 @@
+name: Operational qualification
+# Operations M004, product-owned qualification harness.
+#
+# This workflow qualifies the *installed* Eggwork product surface from the exact
+# bytes of one already-staged release. It is not a producer pipeline:
+#
+#   - it never rebuilds a release artifact;
+#   - it never stages, publishes, or mutates a tag;
+#   - it contains no second producer release matrix (the five-target build,
+#     qualification, validation, gate, aggregate, and staging matrix stays
+#     exclusively in the Eggpack-generated `release.yml`);
+#   - it uses only immutable action revisions; and
+#   - it takes `contents: read` plus an artifact-upload-only `contents: read`
+#     for receipts, so no release, tag, or repository content can be changed.
+#
+# The release token is read from the environment by
+# `scripts/qualify_release.py` and never appears in argv, stdout, or a receipt.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Exact release tag whose staged assets are qualified"
+        required: true
+        type: string
+      prior_release_tag:
+        description: "Older release whose daemon exercises the real rollback path"
+        required: false
+        type: string
+      release_id:
+        description: "Opaque release id recorded in the deployment receipt"
+        required: false
+        type: string
+permissions:
+  contents: read
+jobs:
+  installed-execution:
+    name: installed execution (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            platform: macos
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows
+    runs-on: "${{ matrix.runner }}"
+    timeout-minutes: 60
+    steps:
+      - name: Check out the qualification tooling
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+      - name: Set up the pinned Rust toolchain for the client harness
+        uses: "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c"
+        with:
+          toolchain: "1.89.0"
+      - name: Qualify first install from the exact release bytes
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/qualify_release.py install \
+            --release-tag "${{ inputs.release_tag }}" \
+            --target "${{ matrix.target }}" \
+            --installation-root "${{ runner.temp }}/qualification" \
+            --download-dir "${{ runner.temp }}/release" \
+            --receipt "${{ runner.temp }}/receipts/install-${{ matrix.platform }}-${{ matrix.target }}.json"
+      - name: Qualify the generated exact-release installer
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/qualify_release.py installer \
+            --release-tag "${{ inputs.release_tag }}" \
+            --target "${{ matrix.target }}" \
+            --installation-root "${{ runner.temp }}/qualification" \
+            --download-dir "${{ runner.temp }}/release" \
+            --receipt "${{ runner.temp }}/receipts/installer-${{ matrix.platform }}-${{ matrix.target }}.json"
+      - name: Qualify installed execution through the production client
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EGGWORK_QUALIFY_DAEMON: ${{ runner.temp }}/qualification/bin/eggworkd${{ runner.os == 'Windows' && '.exe' || '' }}
+          EGGWORK_QUALIFY_CONFIG: ${{ runner.temp }}/qualification/state/node.json
+          EGGWORK_QUALIFY_TLS_DIR: ${{ runner.temp }}/qualification/state/tls
+          EGGWORK_QUALIFY_RECEIPT: ${{ runner.temp }}/receipts/execution-${{ matrix.platform }}-${{ matrix.target }}.json
+          EGGWORK_QUALIFY_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          cargo test --locked -p eggwork-server --features qualification \
+            --test installed_qualification -- --ignored --nocapture
+      - name: Upload the bounded qualification receipts
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "installed-execution-${{ matrix.platform }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          path: "${{ runner.temp }}/receipts/*.json"
+          retention-days: 7
+          if-no-files-found: error
+  native-service-lifecycle:
+    name: native service lifecycle and update (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            platform: macos
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows
+    runs-on: "${{ matrix.runner }}"
+    timeout-minutes: 90
+    steps:
+      - name: Check out the qualification tooling
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+      - name: Install the exact release bytes
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/qualify_release.py install \
+            --release-tag "${{ inputs.release_tag }}" \
+            --target "${{ matrix.target }}" \
+            --installation-root "${{ runner.temp }}/qualification" \
+            --download-dir "${{ runner.temp }}/release" \
+            --receipt "${{ runner.temp }}/receipts/install-service-${{ matrix.platform }}-${{ matrix.target }}.json"
+      - name: Qualify the native service lifecycle matrix
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/qualify_release.py service \
+            --installation-root "${{ runner.temp }}/qualification" \
+            --receipt "${{ runner.temp }}/receipts/service-${{ matrix.platform }}-${{ matrix.target }}.json"
+      - name: Qualify drain, update, and rollback against real generations
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/qualify_release.py update \
+            --release-tag "${{ inputs.release_tag }}" \
+            --release-id "${{ inputs.release_id || inputs.release_tag }}" \
+            --prior-release-tag "${{ inputs.prior_release_tag }}" \
+            --installation-root "${{ runner.temp }}/qualification" \
+            --download-dir "${{ runner.temp }}/release" \
+            --receipt "${{ runner.temp }}/receipts/update-${{ matrix.platform }}-${{ matrix.target }}.json"
+      - name: Upload the bounded qualification receipts
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "native-service-${{ matrix.platform }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          path: "${{ runner.temp }}/receipts/*.json"
+          retention-days: 7
+          if-no-files-found: error

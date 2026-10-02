@@ -1,0 +1,95 @@
+name: Windows reproducibility preflight
+# Operations M004, product-owned build evidence.
+#
+# The historical `v0.1.0` draft (release id `400502116`) proved that one exact
+# source revision does not produce one exact Windows binary: same-tag rerun
+# `36868105194` produced a different SHA-256, a different PE COFF timestamp, and
+# a different CodeView/PDB RSDS signature than the staged asset. Eggpack
+# correctly refused to replace the same-name asset. This workflow proves
+# Eggwork's own correction before any release tag is created.
+#
+# It is deliberately NOT a second producer release matrix: it builds the Windows
+# daemon only, on one host, twice. It does not stage, publish, or mutate any tag,
+# and it takes `contents: read` only. The five-target producer matrix and its
+# draft staging remain exclusively in the Eggpack-generated `release.yml`.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-reproducibility:
+    runs-on: "windows-latest"
+    timeout-minutes: 90
+    steps:
+      - name: Check out the exact dispatched revision
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        with:
+          ref: "${{ github.sha }}"
+      - name: Record the qualified source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse --verify HEAD^{commit}
+          python3 -c "import tomllib,pathlib;print('workspace_version='+tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version'])"
+      - name: Set up the pinned Rust toolchain
+        uses: "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c"
+        with:
+          toolchain: "1.89.0"
+          targets: "x86_64-pc-windows-msvc"
+      - name: Verify the Rust toolchain
+        shell: bash
+        run: cargo +'1.89.0' --version
+      - name: Require that nothing overrides the target-scoped deterministic link policy
+        # Cargo resolves the environment ahead of `target.*.rustflags`, so any
+        # environment spelling of this variable would silently restore the
+        # wall-clock timestamp and CodeView record instead of failing loudly.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $offenders = Get-ChildItem Env: | Where-Object { $_.Name -match 'RUST.?FLAGS' }
+          if ($offenders) {
+            $offenders | ForEach-Object { Write-Output "unexpected variable: $($_.Name)" }
+            throw 'an environment override would replace the target-scoped deterministic rustflags'
+          }
+          if (-not (Test-Path '.cargo/config.toml')) { throw '.cargo/config.toml is missing' }
+          Select-String -Path '.cargo/config.toml' -Pattern 'BREPRO', 'DEBUG:NONE' -SimpleMatch |
+            ForEach-Object { Write-Output "cargo-policy: $($_.Line.Trim())" }
+      - name: Build the release Windows daemon in two independent target directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          for pass in one two; do
+            export CARGO_TARGET_DIR="${{ runner.temp }}/determinism-$pass"
+            cargo +'1.89.0' build --release --locked --target x86_64-pc-windows-msvc \
+              --package eggwork-server --bin eggworkd
+            unset CARGO_TARGET_DIR
+          done
+      - name: Prove the two builds are byte-identical and carry no CodeView record
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/verify_windows_reproducibility.py \
+            "${{ runner.temp }}/determinism-one/x86_64-pc-windows-msvc/release/eggworkd.exe" \
+            "${{ runner.temp }}/determinism-two/x86_64-pc-windows-msvc/release/eggworkd.exe"
+      - name: Require the reproducible candidate to report the workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(python3 -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version'])")"
+          reported="$("${{ runner.temp }}/determinism-one/x86_64-pc-windows-msvc/release/eggworkd.exe" version)"
+          python3 - "$expected" "$reported" <<'PY'
+          import json, sys
+          expected, reported = sys.argv[1], sys.argv[2]
+          print(f"expected={expected} reported={reported}")
+          if json.loads(reported)["version"] != expected:
+              raise SystemExit("the reproducible Windows candidate does not report the workspace version")
+          PY
+      - name: Upload the bounded reproducibility receipt
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+        with:
+          name: "windows-reproducibility-receipt-${{ github.run_id }}-${{ github.run_attempt }}"
+          path: |
+            .cargo/config.toml
+            scripts/verify_windows_reproducibility.py
+          retention-days: 7
+          if-no-files-found: error

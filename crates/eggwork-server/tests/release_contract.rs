@@ -1234,3 +1234,157 @@ fn linux_only_dependencies_never_enter_the_non_linux_build_graph() {
         }
     }
 }
+
+#[test]
+fn the_windows_msvc_build_policy_is_deterministic_and_target_scoped() {
+    // The `v0.1.0` same-tag rerun (`36868105194`) built the identical source
+    // revision and produced a different Windows SHA-256 than the staged asset:
+    // a different COFF timestamp plus a different CodeView/PDB RSDS signature.
+    // Eggpack correctly refused to replace the same-name asset, so the defect is
+    // Eggwork's own link policy. This test parses the checked-in Cargo config
+    // and requires both correcting link arguments, scoped to the MSVC target
+    // only, and requires that nothing anywhere can replace them.
+    let config: Toml =
+        toml::from_str(&read(".cargo/config.toml")).expect(".cargo/config.toml is valid TOML");
+    let targets = config
+        .get("target")
+        .and_then(Toml::as_table)
+        .cloned()
+        .unwrap_or_default();
+    let windows = targets
+        .get("x86_64-pc-windows-msvc")
+        .and_then(Toml::as_table)
+        .expect("the MSVC target carries a deterministic link policy");
+    let rustflags = windows
+        .get("rustflags")
+        .and_then(Toml::as_array)
+        .expect("the MSVC target declares rustflags")
+        .iter()
+        .filter_map(Toml::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
+    for required in ["-C", "link-arg=/BREPRO", "-C", "link-arg=/DEBUG:NONE"] {
+        assert!(
+            rustflags.contains(required),
+            "the MSVC rustflags must contain {required}; found {rustflags:?}"
+        );
+    }
+    assert_eq!(
+        targets.keys().cloned().collect::<Vec<_>>(),
+        vec!["x86_64-pc-windows-msvc".to_owned()],
+        "the deterministic link policy is scoped to the MSVC target alone; \
+         other release targets must not inherit MSVC link arguments"
+    );
+    for forbidden in ["build", "target.'cfg(target_os = \"windows\")'"] {
+        assert!(
+            !config
+                .as_table()
+                .is_some_and(|table| table.contains_key(forbidden)),
+            ".cargo/config.toml must not carry host-wide rustflags ({forbidden}); \
+             they would apply to the Linux and macOS release targets as well"
+        );
+    }
+}
+
+#[test]
+fn no_workflow_or_environment_can_replace_the_target_scoped_rustflags() {
+    // Cargo resolves `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` *instead of* the
+    // target-scoped `target.<triple>.rustflags`, and the per-target environment
+    // spelling does the same. Any of those would silently restore the
+    // wall-clock timestamp and CodeView record that the deterministic MSVC
+    // policy removes, so the release workflow and every other workflow must be
+    // free of them.
+    let workflows = repo_root().join(".github/workflows");
+    let mut inspected = BTreeSet::new();
+    for entry in std::fs::read_dir(&workflows).expect("workflow directory") {
+        let name = entry
+            .expect("directory entry")
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        let text = std::fs::read_to_string(workflows.join(&name)).expect("workflow text");
+        for forbidden in [
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "{name} sets {forbidden}, which replaces the target-scoped \
+                 deterministic MSVC rustflags instead of extending them"
+            );
+        }
+        inspected.insert(name);
+    }
+    for required in [
+        "ci.yml",
+        "release.yml",
+        "windows-reproducibility.yml",
+        "operational-qualification.yml",
+    ] {
+        assert!(
+            inspected.contains(required),
+            "the guard must inspect {required}; deleting a workflow must not \
+             bypass the deterministic Windows build policy"
+        );
+    }
+}
+
+#[test]
+fn the_release_version_is_one_coherent_workspace_identity() {
+    // The corrected candidate is cut from a coherent workspace version: the
+    // daemon and helper both compile `CARGO_PKG_VERSION`, the producer
+    // validator compares `eggworkd version` against `[workspace.package].version`,
+    // and the release asset names carry the same string. A partial bump would
+    // make the tag, the assets, and the binaries disagree.
+    let workspace: Toml = toml::from_str(&read("Cargo.toml")).expect("workspace manifest");
+    let version = workspace["workspace"]["package"]["version"]
+        .as_str()
+        .expect("workspace package version");
+    let lock = release_lock_versions();
+    assert_eq!(
+        lock.len(),
+        5,
+        "every workspace member is pinned to the same version"
+    );
+    for (member, locked) in &lock {
+        assert_eq!(
+            locked, version,
+            "{member} is {locked} in Cargo.lock but the workspace says {version}"
+        );
+        let manifest = format!("crates/{member}/Cargo.toml");
+        let parsed: Toml =
+            toml::from_str(&read(&manifest)).unwrap_or_else(|error| panic!("{manifest}: {error}"));
+        assert!(
+            parsed["package"]["version"].as_str().is_none(),
+            "{manifest} must inherit the workspace version, not restate it"
+        );
+    }
+    assert!(
+        !version.contains('-'),
+        "a qualified release version must not carry a pre-release suffix"
+    );
+}
+
+fn release_lock_versions() -> BTreeMap<String, String> {
+    let lock = read("Cargo.lock");
+    let mut versions = BTreeMap::new();
+    let mut current = String::new();
+    for line in lock.lines() {
+        if let Some(name) = line
+            .strip_prefix("name = \"")
+            .and_then(|r| r.strip_suffix('"'))
+        {
+            current = name.to_owned();
+        } else if let Some(version) = line
+            .strip_prefix("version = \"")
+            .and_then(|r| r.strip_suffix('"'))
+        {
+            if current.starts_with("eggwork-") {
+                versions.insert(current.clone(), version.to_owned());
+            }
+            current.clear();
+        }
+    }
+    versions
+}

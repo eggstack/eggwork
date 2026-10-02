@@ -27,6 +27,13 @@ fs2 = "0.4"
 eggup-core = "0.1.1"
 eggup-service = "0.1.1"
 
+# The installed-release qualification harness (Operations M004) is opt-in: it
+# drives an installed `eggworkd` through the production client path and must not
+# be compiled into an ordinary build of the shipped daemon.
+[features]
+default = []
+qualification = []
+
 [[bin]]
 name = "eggworkd"
 path = "src/bin/eggworkd.rs"

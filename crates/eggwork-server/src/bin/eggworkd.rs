@@ -461,13 +461,26 @@ fn deployment_apply(
                 &eggup_core::CommandSpec::new(executable.clone())
                     .arg("version")
                     .timeout(timeout)
-                    .max_output_bytes(1024),
+                    .max_output_bytes(deployment::MAX_VERSION_PROBE_BYTES),
             )
             .map_err(|_| "installed daemon version probe failed".to_owned())?;
-            if !output.success()
-                || String::from_utf8_lossy(output.stdout()).trim() != env!("CARGO_PKG_VERSION")
-            {
-                return Err("installed daemon version does not match this release".into());
+            let expected = env!("CARGO_PKG_VERSION");
+            let reported = deployment::check_installed_daemon_version(output.stdout(), expected);
+            if !output.success() {
+                return Err("installed daemon version probe did not succeed".into());
+            }
+            if !reported.matched() {
+                return Err(match &reported {
+                    deployment::InstalledVersionCheck::Mismatch { reported } => {
+                        format!("installed daemon reports version {reported}, not this release")
+                    }
+                    deployment::InstalledVersionCheck::Unreadable { reason } => {
+                        format!("installed daemon version report is unusable: {reason}")
+                    }
+                    deployment::InstalledVersionCheck::Matched { .. } => {
+                        unreachable!("matched version is not a failure")
+                    }
+                });
             }
             #[cfg(target_os = "linux")]
             if require_helper {
@@ -491,6 +504,15 @@ fn deployment_apply(
     )
     .map_err(|error| error.to_string())?;
     let final_snapshot = receipt.final_snapshot.as_ref();
+    let failure = |report: Option<&eggup_core::FailureReport>| {
+        report.map(|report| {
+            serde_json::json!({
+                "phase": format!("{:?}", report.phase()),
+                "category": format!("{:?}", report.category()),
+                "detail": report.detail(),
+            })
+        })
+    };
     output(&serde_json::json!({
         "schema_version": 1,
         "release_id": release,
@@ -500,6 +522,12 @@ fn deployment_apply(
         "final_ownership": final_snapshot.map(|snapshot| format!("{:?}", snapshot.ownership)),
         "final_state": final_snapshot.map(|snapshot| format!("{:?}", snapshot.state)),
         "drain_remains_active": true,
+        // A failed post-install check must be attributable, not just visible as
+        // a rolled-back disposition. Detail is already bounded by Eggup's
+        // failure report, so this never emits unbounded child output.
+        "artifact_failure": failure(receipt.transaction.failure()),
+        "post_commit_failure": failure(receipt.transaction.post_commit_failure()),
+        "rollback_failure": failure(receipt.transaction.rollback_failure()),
     }))
 }
 

@@ -203,6 +203,73 @@ pub fn render_systemd_unit(
     .into_bytes())
 }
 
+/// Outcome of reading the installed daemon's own version report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstalledVersionCheck {
+    /// The installed daemon reports exactly the expected release version.
+    Matched { version: String },
+    /// The probe ran but the reported version is not the expected release.
+    Mismatch { reported: String },
+    /// The probe produced no usable version report.
+    Unreadable { reason: &'static str },
+}
+
+impl InstalledVersionCheck {
+    /// Whether required post-install validation may proceed.
+    pub fn matched(&self) -> bool {
+        matches!(self, Self::Matched { .. })
+    }
+}
+
+/// Maximum bytes accepted from an installed daemon's `version` probe.
+pub const MAX_VERSION_PROBE_BYTES: usize = 1024;
+
+/// Decide whether an installed daemon reports the expected release version.
+///
+/// The daemon answers `version` with a JSON object (`{"version": "..."}`), not a
+/// bare string, so a raw string comparison would fail every real update. This
+/// reads the same bounded, shell-free probe output and requires the reported
+/// version field to equal the expected release exactly.
+///
+/// The comparison is exact on purpose: a build that reports a different version
+/// is a different release generation, and admitting it would let a post-install
+/// check pass for a binary the operator did not stage.
+pub fn check_installed_daemon_version(stdout: &[u8], expected: &str) -> InstalledVersionCheck {
+    if stdout.len() > MAX_VERSION_PROBE_BYTES {
+        return InstalledVersionCheck::Unreadable {
+            reason: "version probe output exceeded its bound",
+        };
+    }
+    let text = match std::str::from_utf8(stdout) {
+        Ok(text) => text.trim(),
+        Err(_) => {
+            return InstalledVersionCheck::Unreadable {
+                reason: "version probe output is not UTF-8",
+            };
+        }
+    };
+    let report: serde_json::Value = match serde_json::from_str(text) {
+        Ok(report) => report,
+        Err(_) => {
+            return InstalledVersionCheck::Unreadable {
+                reason: "version probe output is not a JSON object",
+            };
+        }
+    };
+    let reported = report.get("version").and_then(|value| value.as_str());
+    match reported {
+        Some(reported) if reported == expected => InstalledVersionCheck::Matched {
+            version: reported.to_owned(),
+        },
+        Some(reported) => InstalledVersionCheck::Mismatch {
+            reported: reported.to_owned(),
+        },
+        None => InstalledVersionCheck::Unreadable {
+            reason: "version probe output has no version field",
+        },
+    }
+}
+
 /// Helper compatibility outcome for required sandbox execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HelperCompatibility {
@@ -1277,6 +1344,51 @@ mod tests {
             fs::read(root.path().join("bin/eggworkd")).unwrap(),
             b"new-daemon-keep"
         );
+    }
+
+    #[test]
+    fn installed_daemon_version_is_read_from_its_json_report() {
+        // The post-install check was never exercised end-to-end before M004,
+        // and a raw string comparison silently fails every real update because
+        // the daemon answers `version` with a JSON object, not a bare string.
+        assert_eq!(
+            check_installed_daemon_version(b"{\"version\":\"0.1.1\"}", "0.1.1"),
+            InstalledVersionCheck::Matched {
+                version: "0.1.1".into()
+            }
+        );
+        assert_eq!(
+            check_installed_daemon_version(b"  {\"version\":\"0.1.1\"}\n", "0.1.1"),
+            InstalledVersionCheck::Matched {
+                version: "0.1.1".into()
+            }
+        );
+        assert_eq!(
+            check_installed_daemon_version(b"{\"version\":\"0.1.0\"}", "0.1.1"),
+            InstalledVersionCheck::Mismatch {
+                reported: "0.1.0".into()
+            }
+        );
+        for unreadable in [
+            &b""[..],
+            &b"0.1.1"[..],
+            &b"{\"schema_version\":1}"[..],
+            &b"{\"version\":7}"[..],
+            &b"[]"[..],
+        ] {
+            assert!(
+                matches!(
+                    check_installed_daemon_version(unreadable, "0.1.1"),
+                    InstalledVersionCheck::Unreadable { .. }
+                ),
+                "{unreadable:?} must not be reported as a version"
+            );
+        }
+        let oversized = vec![b'{'; MAX_VERSION_PROBE_BYTES + 1];
+        assert!(matches!(
+            check_installed_daemon_version(&oversized, "0.1.1"),
+            InstalledVersionCheck::Unreadable { .. }
+        ));
     }
 
     #[test]

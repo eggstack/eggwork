@@ -1,0 +1,62 @@
+# Eggwork Cargo build policy (Operations M004).
+#
+# Ownership: this file is Eggwork product build policy, not producer
+# (Eggpack) authority. Eggpack owns the release target set, artifacts,
+# sidecars, manifest, installers, and staging; it cannot remove nondeterminism
+# that is introduced by the product's own link policy.
+#
+# Deterministic MSVC link policy
+# -----------------------------
+#
+# Historical draft `v0.1.0` (release id `400502116`) proved that a fixed source
+# revision does not produce a fixed Windows binary: the same-tag rerun
+# `36868105194` produced `eggwork-v0.1.0-x86_64-pc-windows-msvc.exe` with a
+# different SHA-256 than the staged asset. PE inspection showed identical
+# section sizes and image size but a different COFF timestamp and a different
+# CodeView/PDB RSDS signature (`19ab1c9c...` staged versus `cd86a174...` in the
+# rerun). Eggpack correctly failed closed on the same-name digest mismatch
+# instead of replacing the asset; the nondeterminism is Eggwork's.
+#
+# Two linker behaviours cause it:
+#
+# - MSVC `link.exe` stamps the PE COFF header with the wall-clock time unless
+#   `/Brepro` is given, so two builds minutes apart differ in bytes alone.
+# - Debug information is emitted into a CodeView (RSDS) record whose GUID and
+#   age come from a freshly generated PDB, so the record differs per build even
+#   when the code is identical.
+#
+# `/BREPRO` pins the timestamp to a deterministic value derived from the input
+# and `/DEBUG:NONE` suppresses the CodeView/PDB record entirely. Together they
+# make a fixed source plus a fixed toolchain reproduce byte-identical output.
+#
+# Deliberate tradeoff
+# -------------------
+#
+# Release Windows binaries carry no PDB and no CodeView debug directory. Symbols
+# for a shipped release are therefore unavailable from the release artifact
+# itself; crash triage of a released Windows build must rely on a locally
+# rebuilt binary from the same revision. This is accepted because a release
+# that cannot be reproduced byte-for-byte cannot be reused, verified, or
+# re-staged across a same-tag rerun, which is a stronger distribution property
+# than embedded release symbols.
+#
+# Policy constraints
+# ------------------
+#
+# - The flags are scoped to `x86_64-pc-windows-msvc` only. Linux and macOS
+#   builds are byte-stable under their own toolchains and must not inherit MSVC
+#   link arguments.
+# - No workflow or environment may set `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`,
+#   or `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS`. Cargo gives the
+#   environment precedence over `target.*.rustflags`, so such a setting would
+#   silently replace this policy rather than extend it.
+# - The five-target artifact contract and Eggpack's same-name digest/no-clobber
+#   behavior are unchanged by this policy.
+#
+# `crates/eggwork-server/tests/release_contract.rs` statically guards every
+# constraint above, and
+# `.github/workflows/windows-reproducibility.yml` produces the native two-build
+# byte-identity proof before any release tag is created.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/BREPRO", "-C", "link-arg=/DEBUG:NONE"]

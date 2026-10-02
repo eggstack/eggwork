@@ -19,10 +19,15 @@ Eggpack producer -> ReleaseManifest/assets -> human/release channel -> Eggup/Egg
 3. **Eggup** performs the local verified installation transaction, ownership
    verification, backup/rollback, and service-manager adapters.
 4. **Eggwork** owns node configuration, service lifecycle, drain/update/restart
-   policy, helper trust and version policy, the installation root, and any
-   release selection or acquisition policy added later. Update orchestration
-   uses Eggup's lifecycle transaction; Eggwork does not manually restart a
-   service after a Core transaction receipt.
+   policy, helper trust and version policy, the installation root, its own
+   release *build* determinism policy, and any release selection or acquisition
+   policy added later. Update orchestration uses Eggup's lifecycle transaction;
+   Eggwork does not manually restart a service after a Core transaction receipt.
+
+A fifth, smaller authority is worth naming because it is easy to misplace:
+`.cargo/config.toml` is Eggwork product build policy. Eggpack cannot remove
+nondeterminism that the product's own link flags introduce, and it is right to
+fail closed when two builds of one source revision disagree.
 
 ## What Eggpack owns in this repository
 
@@ -64,6 +69,14 @@ drift. There is no second hand-maintained release matrix.
 - The consumer validator is bounded, offline, shell-free, and reads only the
   exact candidate path Eggpack hands it plus the checked-in workspace version.
   It emits no candidate output into release evidence.
+- The workspace version, the daemon/helper version output, the release id, the
+  asset names, and the `ReleaseManifest` must all agree. A partial bump would
+  make a tag, its assets, and its binaries disagree, which the producer validator
+  and a static parity test both reject.
+- The `x86_64-pc-windows-msvc` link policy is deterministic
+  (`/BREPRO` + `/DEBUG:NONE`), is scoped to that target alone, and cannot be
+  replaced by an environment rustflags setting. A native two-build
+  byte-identity proof runs before a release tag is created.
 
 ## What this milestone deliberately does not do
 
@@ -91,6 +104,16 @@ drift. There is no second hand-maintained release matrix.
   command-line `deployment apply` surface accepts only local daemon/helper
   paths. Replacements require exact previous-generation digest proof for every
   member; Linux release updates always include both daemon and helper.
+
+## Qualifying an installation
+
+`scripts/qualify_release.py` and `crates/eggwork-server/tests/installed_qualification.rs`
+are the product-owned qualification harness. Both consume an already-staged
+release: they verify bytes against that release's own manifest and sidecars, and
+they exercise the installed binary through the ordinary operator surface. Neither
+rebuilds a release artifact, stages or publishes anything, mutates a tag, or adds
+a second producer release matrix. `.github/workflows/operational-qualification.yml`
+runs them on hosted runners and uploads bounded receipts.
 
 See the [operations and distribution roadmap](../plans/subsystems/operations-distribution-roadmap.md)
 for milestone status and the [closure records](../plans/closure/operations-distribution/)

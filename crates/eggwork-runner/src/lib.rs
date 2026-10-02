@@ -583,8 +583,17 @@ fn probe_landlock_ruleset() -> bool {
     false
 }
 
+/// Whether the sandbox helper at `path` is trusted enough to enforce Landlock.
+///
+/// This is the single trust boundary for the Linux sandbox helper: the runner
+/// refuses to enforce a required profile when it returns `Err`. It is public so
+/// operator diagnostics report the same answer the enforcement path will give,
+/// rather than a second, independently drifting copy of the policy. A duplicated
+/// stricter copy denies a user-owned helper that this function would accept,
+/// which makes an unprivileged user-scope installation permanently unable to
+/// advertise required filesystem isolation.
 #[cfg(target_os = "linux")]
-fn verify_trusted_helper(path: &Path) -> Result<(), String> {
+pub fn verify_trusted_helper(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let metadata =
         std::fs::symlink_metadata(path).map_err(|_| "sandbox helper is unavailable".to_owned())?;
@@ -629,7 +638,7 @@ fn verify_trusted_helper(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn verify_trusted_helper(_path: &Path) -> Result<(), String> {
+pub fn verify_trusted_helper(_path: &Path) -> Result<(), String> {
     Err("trusted Landlock is unsupported on this platform".into())
 }
 

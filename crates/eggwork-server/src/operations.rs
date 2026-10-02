@@ -519,22 +519,15 @@ pub async fn doctor(config: &OperatorConfig) -> DoctorReport {
     }
 }
 
-#[cfg(unix)]
+/// Whether the configured sandbox helper passes the runner's trust boundary.
+///
+/// This deliberately delegates instead of restating the policy. A stricter
+/// local copy denies a helper the runner would accept, which turns every
+/// unprivileged user-scope installation into a node that can never advertise
+/// required filesystem isolation, and makes `doctor` contradict the enforcement
+/// path it is meant to describe.
 fn trusted_helper(path: &Path) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    fs::symlink_metadata(path).is_ok_and(|metadata| {
-        metadata.is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.uid() == 0
-            && metadata.permissions().mode() & 0o022 == 0
-            && metadata.permissions().mode() & 0o111 != 0
-    })
-}
-
-#[cfg(not(unix))]
-fn trusted_helper(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+    eggwork_runner::verify_trusted_helper(path).is_ok()
 }
 
 pub fn set_persistent_drain(path: &Path, draining: bool) -> Result<(), OperationsError> {
