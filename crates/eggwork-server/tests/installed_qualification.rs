@@ -248,13 +248,27 @@ fn handle(id: &str) -> ExecutionHandle {
     }
 }
 
+/// The `PATH` a qualified target is allowed to resolve commands against.
+///
+/// A fixed Unix path is a correctness requirement on Linux and macOS, and a
+/// correctness *defect* on Windows, where the system directories have different
+/// names: a Windows target would fail to resolve its own shell and the
+/// execution would be reported as a product failure instead of a harness one.
+fn qualified_path() -> &'static str {
+    if cfg!(windows) {
+        "C:\\Windows\\System32;C:\\Windows"
+    } else {
+        "/usr/bin:/bin"
+    }
+}
+
 fn spec(argv: Vec<String>, isolation: IsolationRequirement) -> ExecutionSpec {
     ExecutionSpec {
         schema_version: 1,
         command: CommandSpec {
             argv,
             cwd: None,
-            environment: vec![EnvironmentEntry::new("PATH", "/usr/bin:/bin").expect("entry")],
+            environment: vec![EnvironmentEntry::new("PATH", qualified_path()).expect("entry")],
             stdin: StdinPolicy::Null,
             timeout_millis: 30_000,
             output: OutputPolicy::default(),

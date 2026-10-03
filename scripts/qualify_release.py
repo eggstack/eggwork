@@ -72,7 +72,11 @@ MAX_MANIFEST_BYTES = 1 << 20
 MAX_PROCESS_OUTPUT_BYTES = 1 << 20
 MAX_TEXT_ASSET_BYTES = 1 << 20
 DEFAULT_PROCESS_TIMEOUT = 180.0
-SERVICE_TRANSITION_TIMEOUT = 90.0
+# A native service transition is bounded by the *product's* own timeout (60s per
+# operation), and Eggup may compose several observations per invocation. The
+# harness bound is deliberately larger so a slow hosted SCM or launchd is
+# reported as a product timeout rather than truncated into a harness error.
+SERVICE_TRANSITION_TIMEOUT = 300.0
 SERVICE_ID = "eggwork-node"
 HELPER_INSTALL_ID = "eggwork-sandbox-helper"
 
@@ -1051,7 +1055,7 @@ def _update_candidates(
     release = fetch_release(args.repository, tag, downloads / tag)
     candidate = release.directory / release.install_identity(triple, daemon_install).name
     helper_candidate = None
-    if helper_candidate_expected:
+    if target_ships_helper(triple):
         helper_candidate = release.directory / release.install_identity(
             triple, HELPER_INSTALL_ID
         ).name
@@ -1076,7 +1080,6 @@ def stage_update(args: argparse.Namespace) -> Receipt:
         raise QualificationFailure(f"{daemon} is not installed; run the install stage first")
     config = qualification_config(root)
     triple = host_target_triple()
-    helper_candidate_expected = target_ships_helper(triple)
     receipt = Receipt(stage=f"update:{args.release_id}:{triple}")
 
     downloads = Path(args.download_dir).resolve()
