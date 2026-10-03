@@ -20,6 +20,7 @@ under *Outstanding evidence*. Nothing in this record is projected to pass.
 | Product defect fixes (pre-tag) | `b760c1a` installed-daemon version parsing; `68a6cc2` trusted-helper trust boundary; `b760c1a` bounded `deployment apply` failure fields |
 | Post-tag harness/hardening commits | `944606c`, `786d5da`, `45d9cfa`, `8b76cb9`, `1b0acc5`, `b6e88de`, `349cfea` |
 | Windows fail-closed + disposition commits | `caa3918` service management fails closed; `202d395` platform-shaped child environment; `ec2b0e2` workflow disposition job |
+| Windows disposition and workflow fix commits | `8d4c0f0` transient release-API retry with tests; `32e4559` Windows disposition step exit handling |
 | Closure head | `main` at closure commit (this file) |
 
 The release tag was **not** moved after the post-tag commits. The candidate's
@@ -150,9 +151,37 @@ asserted per target.
 | `aarch64-apple-darwin` | pass | `0.1.1` | matches | pass | pass |
 | `x86_64-pc-windows-msvc` | pass | `0.1.1` | matches | pass | pass (daemon starts; see §9) |
 
-Receipts: `installed-execution-*` and `native-service-*` artifacts from
-`37095687727`. No Rust toolchain is required on the target host to install or
-run the release; the harness toolchain exists only to build the client driver.
+Receipts: `installed-execution-*`, `native-service-*`, and `windows-disposition-*`
+artifacts from the final green qualification run **`37100047745`** (all six jobs
+`success`). That run produced **179 passing receipt steps** across thirteen
+receipts:
+
+| Receipt | Steps |
+| --- | --- |
+| `install-linux-x86_64-unknown-linux-gnu.json` | 13/13 |
+| `installer-linux-x86_64-unknown-linux-gnu.json` | 7/7 |
+| `install-macos-aarch64-apple-darwin.json` | 9/9 |
+| `installer-macos-aarch64-apple-darwin.json` | 7/7 |
+| `install-macos-x86_64-apple-darwin.json` | 9/9 |
+| `installer-macos-x86_64-apple-darwin.json` | 7/7 |
+| `install-windows.json` | 9/9 |
+| `service-macos-aarch64-apple-darwin.json` | 21/21 |
+| `service-macos-x86_64-apple-darwin.json` | 21/21 |
+| `update-macos-aarch64-apple-darwin.json` | 29/29 |
+| `update-macos-x86_64-apple-darwin.json` | 29/29 |
+| `execution-linux-x86_64-unknown-linux-gnu.json` | (see §10) |
+| `execution-macos-{aarch64,x86_64}-apple-darwin.json` | (see §10) |
+
+No Rust toolchain is required on the target host to install or run the release;
+the harness toolchain exists only to build the client driver and materialise
+the fixture.
+
+A macOS update stage in an earlier run (`37098223811`) aborted with
+`asset download returned HTTP 500` from the release API. A 5xx on a well-formed
+request is not a candidate failure, so the harness now retries 5xx, 429, and
+transport errors with bounded backoff and still fails loudly once exhausted; a
+4xx is deliberately not retried. Seven tests cover that semantics
+(`tests/release/test_qualify_release_harness.py`).
 
 ## 8. Service-manager matrix
 
@@ -162,6 +191,18 @@ run the release; the harness toolchain exists only to build the client driver.
 | `launchd` user agent (`gui/<uid>`) | macOS aarch64 | **service-qualified** | same full matrix, receipts `install-service-macos-aarch64-apple-darwin.json` and `service-macos-aarch64-apple-darwin.json` |
 | `launchd` user agent | macOS x86_64 | **service-qualified** | same full matrix, receipts `install-service-macos-x86_64-apple-darwin.json` and `service-macos-x86_64-apple-darwin.json` |
 | `windows-scm` | Windows x86_64 | **unsupported** | registers, then start fails with Windows error 1053; see §9 |
+
+The Windows service disposition is captured as an artifact rather than a log
+line, in `windows-disposition-x86_64-pc-windows-msvc-*` from `37100047745`:
+
+```
+service install exit=0 output={"backend":"windows-scm","completed":true,
+  "operation":"install","platform":"windows","schema_version":1,
+  "service_id":"eggwork-node"}
+service start exit=2 output=eggworkd: service manager failed: start service
+  failed in Windows SCM (code 1053)
+DISPOSITION: unsupported (registers, then cannot reach Running; no service host)
+```
 
 Every claimed backend was mutated on a real hosted host. Adapter availability
 alone was not treated as a support claim: the Windows adapter successfully
@@ -266,7 +307,19 @@ inheriting the caller's environment.
 The candidate's bytes predate this fix and cannot be re-qualified without a new
 release, so Windows child execution is recorded as **not claimed** for `v0.1.1`
 rather than qualified. The `windows-platform-disposition` job records the
-disposition and fails if the observation changes.
+disposition in `windows-execution.json`:
+
+```json
+{"platform":"windows","target":"x86_64-pc-windows-msvc",
+ "installed_runtime_qualified":true,"child_execution_qualified":false,
+ "required_filesystem_isolation":"unsupported","service_management":"unsupported",
+ "disposition":"not claimed; the candidate builds its child environment for Unix only"}
+```
+
+The job fails if either observation changes, so neither limitation can silently
+rot: a Windows service that reaches `Running` or a Windows child that spawns
+successfully would fail the run and force the support matrix to be re-qualified
+before the capability is claimed.
 
 ## 12. Update, rollback, and recovery matrix
 
@@ -349,8 +402,8 @@ Python release tests: 41 passed (`tests/release/`, including
 `test_windows_reproducibility.py` and `test_release_candidate_probe.py`, which
 derives the workspace version rather than hard-coding it).
 
-Hosted CI: green on `202d395` (run `37097037106`) and on `caa3918`
-(`37096427245`).
+Hosted CI: green on `32e4559` (run `37100033522`), the head carrying the
+closure record.
 
 **Not executed, and not claimed:** public bootstrap of the published release
 (all five targets), because the release was not published (§14).
@@ -475,7 +528,17 @@ Plan §22 applies with one amendment.
 - No capability in §18 or §17's unsupported rows may be claimed as a
   consequence of this closure.
 
-## 22. Verification notes
+## 22. Reproducing this record
+
+Final state, all verified from `main` at `32e4559` or later:
+
+- hosted CI: run `37100033522`, `success`
+- hosted operational qualification: run `37100047745`, `success` (6/6 jobs)
+- hosted Windows reproducibility: run `37067023635`, `success`
+- release build + qualification: runs `37090342717` and `37091624589`, `success`
+- local gates: see §15
+
+## 23. Verification notes
 
 - Code inspection and executed evidence are distinguished throughout: §5.2, §6,
   §7, §8, §10, §12, and §13 cite run ids and artifact names; §9 and §11 cite
