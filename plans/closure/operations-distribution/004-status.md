@@ -402,8 +402,8 @@ Python release tests: 41 passed (`tests/release/`, including
 `test_windows_reproducibility.py` and `test_release_candidate_probe.py`, which
 derives the workspace version rather than hard-coding it).
 
-Hosted CI: green on `32e4559` (run `37100033522`), the head carrying the
-closure record.
+Hosted CI: green on `32e4559` (run `37100033522`) and on the closure head
+`9ba5e20` (run `37100665231`).
 
 **Not executed, and not claimed:** public bootstrap of the published release
 (all five targets), because the release was not published (§14).
@@ -532,7 +532,7 @@ Plan §22 applies with one amendment.
 
 Final state, all verified from `main` at `32e4559` or later:
 
-- hosted CI: run `37100033522`, `success`
+- hosted CI: runs `37100033522` and `37100665231`, `success`
 - hosted operational qualification: run `37100047745`, `success` (6/6 jobs)
 - hosted Windows reproducibility: run `37067023635`, `success`
 - release build + qualification: runs `37090342717` and `37091624589`, `success`
