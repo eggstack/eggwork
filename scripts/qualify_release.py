@@ -801,7 +801,7 @@ def owned_service(
         "mutating-result-shape",
         {"schema_version", "service_id", "platform", "backend", "operation", "completed"}
         <= set(installed),
-        f"mutating JSON is missing required fields: {sorted(installed)}",
+        f"mutating JSON carries {sorted(installed)}",
     )
     receipt.record("service-backend", ok=True, detail=str(installed.get("backend")))
     receipt.record("service-definition", ok=True, detail=str(definition))
@@ -930,7 +930,7 @@ def stage_install(args: argparse.Namespace) -> Receipt:
     receipt.expect(
         "installed-daemon-version",
         reported.get("version") == expected_version,
-        f"expected {expected_version}, got {reported.get('version')!r}",
+        f"daemon reports {reported.get('version')!r}, expected {expected_version}",
     )
     declared = release.install_identity(triple, daemon_install)
     installed_digest = sha256_of(daemon_path(root))
@@ -945,12 +945,13 @@ def stage_install(args: argparse.Namespace) -> Receipt:
         receipt.expect(
             "installed-helper-version",
             helper_reported == expected_version,
-            f"expected {expected_version}, got {helper_reported!r}",
+            f"helper reports {helper_reported!r}, expected {expected_version}",
         )
         receipt.expect(
             "installed-helper-digest-matches-release",
             sha256_of(helper_path(root)) == helper_artifact.sha256,
-            "installed helper digest differs from the release manifest",
+            f"installed helper sha256={sha256_of(helper_path(root))} "
+            f"equals the release manifest {helper_artifact.sha256}",
         )
 
     receipt.record("installation-root", ok=True, detail=str(root))
