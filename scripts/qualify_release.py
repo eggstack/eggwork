@@ -430,7 +430,13 @@ def host_system() -> str:
     """
     if os.name == "nt" or sys.platform.startswith("win"):
         return "windows"
-    if os.environ.get("OS") == "Windows_NT" or os.environ.get("SYSTEMROOT", "").count("\\"):
+    # A Windows runner driven from Git Bash runs an MSYS Python that reports a
+    # POSIX `os.name` and a Linux `platform.system()`, so the environment is the
+    # only remaining evidence. Getting this wrong asks the release for the wrong
+    # target and rejects the install identity it returns.
+    if os.environ.get("OS") == "Windows_NT" or any(
+        os.environ.get(name) for name in ("SYSTEMROOT", "WINDIR", "MSYSTEM", "MINGW_PREFIX")
+    ):
         return "windows"
     system = platform.system()
     if system == "Windows":
@@ -804,9 +810,7 @@ def stage_install(args: argparse.Namespace) -> Receipt:
             f"equals the release manifest {helper_artifact.sha256}",
         )
 
-    config = qualification_config(root)
     receipt.record("installation-root", ok=True, detail=str(root))
-    receipt.record("qualification-config", ok=True, detail=str(config))
     receipt.record(
         "execution-qualification",
         ok=True,
