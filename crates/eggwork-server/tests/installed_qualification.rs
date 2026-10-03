@@ -285,13 +285,30 @@ fn spec(argv: Vec<String>, isolation: IsolationRequirement) -> ExecutionSpec {
     }
 }
 
+/// The shell a qualified target resolves commands against, and one command.
+fn target_shell() -> &'static str {
+    // `COMSPEC` is the authoritative interpreter on Windows; a hard-coded
+    // `cmd.exe` would depend on the declared `PATH` resolving it, which turns a
+    // harness mistake into an apparent product failure.
+    if cfg!(windows) {
+        std::env::var("COMSPEC")
+            .unwrap_or_else(|_| "cmd.exe".to_owned())
+            .leak()
+    } else {
+        "/bin/sh"
+    }
+}
+
+/// A command that prints the qualification marker, or creates a side-effect
+/// marker when `required` asks the sandbox to deny a write.
 fn marker_command(marker: &Path, required: bool) -> Vec<String> {
     if cfg!(windows) {
-        vec![
-            "cmd.exe".to_owned(),
-            "/C".to_owned(),
-            format!("echo negative-control > {}", marker.display()),
-        ]
+        let script = if required {
+            format!("echo negative-control>\"{}\"", marker.display())
+        } else {
+            "echo eggwork-qualification".to_owned()
+        };
+        vec![target_shell().to_owned(), "/C".to_owned(), script]
     } else {
         let script = if required {
             format!("echo negative-control > {}", marker.display())
@@ -624,8 +641,17 @@ async fn installed_release_admits_execution_and_refuses_unsupported_isolation() 
     )
     .await
     .expect("the installed node completes a bounded execution");
-    assert_eq!(success["state"], json!("Succeeded"));
-    assert_eq!(success["stdout"], json!("eggwork-qualification\n"));
+    assert_eq!(
+        success["state"],
+        json!("Succeeded"),
+        "the installed node did not complete a bounded execution: {success}"
+    );
+    let expected_stdout = if cfg!(windows) {
+        "eggwork-qualification\r\n"
+    } else {
+        "eggwork-qualification\n"
+    };
+    assert_eq!(success["stdout"], json!(expected_stdout));
     assert_eq!(
         success["cleanup_warning"],
         Json::Null,

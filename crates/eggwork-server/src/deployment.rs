@@ -896,7 +896,13 @@ pub fn launchd_manager(
 
 /// Construct the fixed Eggwork SCM product policy through Eggup's typed
 /// Windows adapter. No custom account, dependencies, or elevation are used.
+///
+/// This is the recorded SCM *policy*, retained for review and for a future
+/// service-host milestone. The operator surface does not expose it: hosted M004
+/// qualification proved the installed daemon cannot answer an SCM start
+/// request, so the mutating path fails closed before reaching this function.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub fn windows_scm_manager(
     start_type: eggup_service::WindowsStartType,
     transition_timeout: Duration,

@@ -127,6 +127,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Windows is present only to prove the fail-closed disposition: the
+        # installed daemon has no service-control dispatcher, so every mutating
+        # verb must be refused before any mutation happens.
         include:
           - runner: macos-14
             target: aarch64-apple-darwin
@@ -137,6 +140,7 @@ jobs:
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             platform: windows
+            unsupported_service: true
     runs-on: "${{ matrix.runner }}"
     timeout-minutes: 90
     steps:
@@ -172,6 +176,23 @@ jobs:
           RELEASE_QUALIFICATION_TOKEN: ${{ secrets.RELEASE_QUALIFICATION_TOKEN }}
         run: |
           set -euo pipefail
+          if [ "${{ matrix.unsupported_service }}" = "true" ]; then
+            # The product refuses every mutating verb on this platform, so the
+            # expected outcome is a structured refusal before any mutation.
+            output="$(python3 scripts/qualify_release.py service \
+              --installation-root "${{ runner.temp }}/qualification" \
+              --receipt "${{ runner.temp }}/receipts/service-${{ matrix.platform }}-${{ matrix.target }}.json" 2>&1)" && {
+                echo "$output"
+                echo 'expected a structured service refusal on this platform' >&2
+                exit 1
+              }
+            echo "$output"
+            case "$output" in
+              *"unsupported"*) ;;
+              *) echo "the refusal did not name the unsupported backend" >&2; exit 1 ;;
+            esac
+            exit 0
+          fi
           python3 scripts/qualify_release.py service \
             --installation-root "${{ runner.temp }}/qualification" \
             --receipt "${{ runner.temp }}/receipts/service-${{ matrix.platform }}-${{ matrix.target }}.json"
@@ -181,6 +202,12 @@ jobs:
           RELEASE_QUALIFICATION_TOKEN: ${{ secrets.RELEASE_QUALIFICATION_TOKEN }}
         run: |
           set -euo pipefail
+          if [ "${{ matrix.unsupported_service }}" = "true" ]; then
+            # Update orchestration requires an owned, installable service, so it
+            # is unsupported wherever service management is unsupported.
+            echo 'update orchestration is unsupported on this platform because service management is'
+            exit 0
+          fi
           python3 scripts/qualify_release.py update \
             --release-tag "${{ inputs.release_tag }}" \
             --release-id "${{ inputs.release_id || inputs.release_tag }}" \

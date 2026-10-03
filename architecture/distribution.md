@@ -97,6 +97,11 @@ drift. There is no second hand-maintained release matrix.
   launchd domain/target and plist path, or the finite Windows SCM start type.
   Native service support is claimed only for backends with live hosted
   lifecycle evidence recorded in the Operations closure record.
+- A service backend with no live evidence fails closed rather than staying
+  enabled. Windows service management is the current case: the daemon has no
+  service-control dispatcher, so an SCM registration can never reach Running and
+  every mutating verb is refused before any mutation. The adapter and the
+  recorded policy are retained; only the operator surface is closed.
 - First install and update are distinct operations. First-install installers
   refuse existing destinations; updates use Eggup's verified local transaction
   and preserve drain until an operator explicitly clears it. The deployment

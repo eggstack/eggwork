@@ -307,18 +307,30 @@ fn product_service_manager(
         .map_err(|error| error.to_string())?;
         return Ok(Box::new(manager));
     }
+    // Windows service management is refused, not merely unqualified.
+    //
+    // Hosted M004 qualification created the `eggwork-node` SCM registration and
+    // then failed to start it with Windows error 1053, "the service did not
+    // respond to the start request in a timely fashion". The cause is
+    // structural: `eggworkd` has no service-control dispatcher, so the process
+    // the SCM launches never connects back to the manager. The typed adapter
+    // exists and can register the service, which is exactly why leaving the
+    // mutating path enabled would be misleading — it performs a real, partly
+    // successful, ultimately useless mutation.
+    //
+    // Registering the daemon as a Windows service host is a product capability,
+    // not a qualification fix, so it is a separate milestone. Until then this
+    // backend fails closed before any mutation, and Windows service management
+    // is recorded as unsupported. `deployment status` still reports the host
+    // facts, and binary installation plus daemon runtime remain qualified.
     #[cfg(windows)]
     {
-        let start_type = match option_value(args, "--windows-start-type").unwrap_or("manual") {
-            "manual" => eggup_service::WindowsStartType::Manual,
-            "automatic" => eggup_service::WindowsStartType::Automatic,
-            "disabled" => eggup_service::WindowsStartType::Disabled,
-            _ => return Err("--windows-start-type must be manual, automatic, or disabled".into()),
-        };
-        let manager =
-            deployment::windows_scm_manager(start_type, std::time::Duration::from_secs(60))
-                .map_err(|error| error.to_string())?;
-        return Ok(Box::new(manager));
+        let _ = spec;
+        let _ = args;
+        return Err(
+            "Windows service management is unsupported: the installed daemon does not              implement a service control dispatcher, so a registered service can never              reach Running. Registering an external process would be a working              installation with no service behind it."
+                .into(),
+        );
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     return Err("service management is unsupported on this platform".into());
@@ -369,7 +381,9 @@ fn service_backend() -> &'static str {
     } else if cfg!(target_os = "macos") {
         "launchd"
     } else if cfg!(windows) {
-        "windows-scm"
+        // The backend is named for diagnostics; every mutating verb on Windows
+        // is refused before it reaches a manager.
+        "windows-scm-unsupported"
     } else {
         "unsupported"
     }
