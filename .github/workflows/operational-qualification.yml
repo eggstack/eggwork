@@ -224,13 +224,17 @@ jobs:
           toolchain: 1.89.0
       - name: Qualify the Windows installation path that is supported
         shell: pwsh
+        env:
+          RELEASE_QUALIFICATION_TOKEN: ${{ secrets.RELEASE_QUALIFICATION_TOKEN }}
         run: |
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\qualification" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\receipts" | Out-Null
           python scripts/qualify_release.py install `
+            --release-tag "${{ inputs.release_tag }}" `
+            --target x86_64-pc-windows-msvc `
             --installation-root "$env:RUNNER_TEMP\qualification" `
-            --receipt "$env:RUNNER_TEMP\receipts\install-windows.json" `
-            --release-id "${{ inputs.release_id }}" `
-            --release-tag "${{ inputs.release_tag }}"
+            --download-dir "$env:RUNNER_TEMP\release" `
+            --receipt "$env:RUNNER_TEMP\receipts\install-windows.json"
       - name: Record the unsupported service management disposition
         shell: pwsh
         run: |

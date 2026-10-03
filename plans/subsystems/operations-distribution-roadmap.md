@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M001-M003 and M002a corrective closed, M004 active on corrected-release and native-platform qualification
+Status: active roadmap; M001-M003 and M002a corrective closed, M004 conditionally closed on corrected `v0.1.1` with three named outstanding evidence items
 
 Canonical authority:
 
@@ -138,7 +138,9 @@ Residual constraints carried into M004 planning, not blockers on M003:
 
 Class: polish/invariant
 
-Status: active / qualification rebaseline required
+Status: **conditionally closed** — implementation substantially complete; three
+named non-critical evidence items outstanding (see *Closure disposition* below
+and `plans/closure/operations-distribution/004-status.md`)
 
 Implementation plan:
 
@@ -148,7 +150,54 @@ Objective:
 
 Qualify a corrected Eggwork release as installed node software: native first-install/runtime smoke, platform service lifecycle where actually supported, corrected update/rollback/recovery behavior, byte-identical same-tag draft rerun/reuse, publication boundary, and a truthful cross-platform support matrix.
 
-Current disposition:
+Outcome:
+
+- Corrected candidate: annotated `v0.1.1` (`b60c895` -> source `fc67f8d`), draft
+  release `402292969`, 17 assets, `draft=true`, `published_at=null`.
+- Windows candidate proven byte-reproducible independently of the producer:
+  two native MSVC builds, identical SHA-256
+  `c419e9e8ec2d74fa7159a545539021e0ffa62713f1673064347d44e12d78acac`,
+  identical COFF timestamp `2560721357`, no CodeView.
+- Same-tag rerun `37091624589` reused all 17 assets (`created: false`,
+  `uploaded: 0`, `reused: 17`) with unchanged asset ids, so no clobber path
+  exists. The first `v0.1.1` run `37090342717` passed.
+- `systemd` and `launchd` are **service-qualified** on real hosted hosts with
+  full install/start/stop/start/stop/restart/uninstall evidence and adversarial
+  foreign-ownership refusal on every mutating verb.
+- Linux required filesystem isolation is **qualified** through the *installed*
+  sandbox helper: Landlock `workspace_rw` applied, outside-workspace write
+  denied. macOS required filesystem isolation refuses before spawn
+  (`capability_mismatch`, HTTP 409).
+- Update/rollback/recovery evidence collected on Linux and both macOS targets
+  against real `v0.1.0` -> `v0.1.1` generations, including a bounded-quiescence
+  refusal proven to occur *before* artifact replacement, an unreadable-store
+  refusal with byte-identical restore, and a rollback that restores the prior
+  generation and lifecycle state without claiming "updated".
+- Windows service management is dispositioned **unsupported**: the daemon has
+  no service-control dispatcher, so SCM registers the service and then fails to
+  start it with Windows error 1053. Mutating verbs now fail closed before any
+  mutation. Making the daemon a Windows service host is a separate product
+  milestone, not an M004 continuation.
+- Windows child execution is **not claimed** for the `v0.1.1` candidate: the
+  runner declared a Unix-only baseline child environment. Fixed on `main` in
+  `202d395`; re-qualification needs a release containing that fix.
+
+Closure disposition:
+
+`plans/closure/operations-distribution/004-status.md`. Acceptance criterion 5
+("Windows SCM ... is live-qualified") is unmet by the plan's own §15 `unsupported`
+disposition rather than by omission. Outstanding evidence:
+
+1. public publication of draft `402292969` and a post-publication bootstrap
+   matrix on all five targets — a human action under plan §14, never fabricated;
+2. Windows service management qualification — requires a service-host milestone;
+3. Windows child execution qualification — requires a release containing `202d395`.
+
+M004 closure MUST NOT be used to claim macOS/Windows required filesystem
+isolation, network isolation, Windows service management, Windows child
+execution, or aarch64 Linux runtime/service behavior.
+
+Prior disposition (superseded by the outcome above, retained for traceability):
 
 - Operations M003 is closed at `plans/closure/operations-distribution/003-status.md`;
 - Operations M002a is closed at `plans/closure/operations-distribution/002a-status.md`;

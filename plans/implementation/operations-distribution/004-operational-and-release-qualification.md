@@ -1,6 +1,11 @@
 # Operations and Distribution M004 — Operational and Release Qualification
 
-Status: active / qualification rebaseline required
+Status: **conditionally closed** — implementation substantially complete; three
+named non-critical evidence items outstanding (public publication/bootstrap,
+Windows service management, Windows child execution). Closure record:
+`plans/closure/operations-distribution/004-status.md`. Acceptance criterion 5
+is unmet for Windows by the §15 `unsupported` disposition rather than by
+omission; the plan's own §15 anticipates unsupported backends.
 
 Reviewed Eggwork baseline:
 

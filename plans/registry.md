@@ -41,8 +41,14 @@ Latest Eggwork implementation/closure head reviewed for this planning batch:
   staged-release mTLS smoke;
 - `1fcd426` — latest recorded M004 qualification/CI evidence before the
   current planning rebaseline;
+- `fc67f8d` — Operations M004 release-determinism and qualification harness,
+  and the source of the corrected `v0.1.1` candidate;
+- `caa3918` — Windows service management fails closed before any mutation;
+- `202d395` — platform-shaped execution child environment;
+- `ec2b0e2` — Windows platform-disposition qualification job;
 - historical `v0.1.0` producer run `36787942079` and same-tag rerun
-  `36868105194`.
+  `36868105194`; corrected `v0.1.1` runs `37090342717`, `37091624589`, and the
+  operational-qualification runs recorded in the M004 closure record.
 
 Implemented and closed/qualified at that baseline:
 
@@ -51,13 +57,20 @@ Implemented and closed/qualified at that baseline:
 - Workspace/Artifact M001-M004;
 - Security M001-M004 plus the Landlock/null-device and remote-admission
   correctives;
-- Operations M001-M003 plus M002a.
+- Operations M001-M003 plus M002a;
+- Operations M004 **conditionally closed** (see
+  `plans/closure/operations-distribution/004-status.md`).
 
-Operations M004 implementation is landed but not closed. Its historical
-`v0.1.0` release evidence exposed two product-side qualification findings:
-the runner warning fixed at `68a6cc2` and Windows MSVC byte nondeterminism.
-M004 is now rebaselined on an Eggwork-owned deterministic Windows policy and a
-new corrected patch release candidate rather than waiting on eggsact.
+Operations M004 is conditionally closed on an Eggwork-owned deterministic
+Windows policy and a corrected `v0.1.1` draft. Three evidence items remain
+outstanding and are named in the closure record: public publication with a
+post-publication bootstrap matrix (a human action, plan §14), Windows service
+management (dispositioned `unsupported`; the daemon has no service-control
+dispatcher, so registering a service host is a separate product milestone), and
+Windows child execution (the candidate built a Unix-only child environment;
+fixed on `main`, re-qualification needs a release containing `202d395`). The
+historical `v0.1.0` release remains immutable failure/discovery evidence and
+must never be published as the qualified release.
 The repository is no longer planning-only.
 
 ## Active workstreams
@@ -68,7 +81,7 @@ The repository is no longer planning-only.
 | Control-plane protocol | closed | M001-M003 complete | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | closed | M001-M004 closed, including reusable manifest CAS + derived materialization (`plans/closure/workspace-artifact-transport/004-status.md`) | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | closed | M001-M004 plus remote-admission corrective C001 are closed (`plans/closure/security-isolation-resource/004-status.md`); macOS/Windows hosted qualification remains future Operations M004 work, not a Security defect | `plans/subsystems/security-isolation-resource-roadmap.md`, `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md` |
-| Operations / distribution | active | M001-M003 and M002a closed; M004 implementation landed and is rebaselined on Eggwork-local Windows determinism + corrected `v0.1.1` qualification, with native service/isolation/update evidence still required | `plans/subsystems/operations-distribution-roadmap.md` |
+| Operations / distribution | conditionally closed | M001-M003 and M002a closed; M004 conditionally closed on corrected `v0.1.1` (`402292969`, tag `b60c895` -> `fc67f8d`) with systemd and launchd service-qualified, Linux required Landlock isolation qualified, full update/rollback evidence, and all-asset same-tag reuse proven. Outstanding: public publication/bootstrap, Windows service management (`unsupported`), Windows child execution (not claimed for the candidate). | `plans/subsystems/operations-distribution-roadmap.md`, `plans/closure/operations-distribution/004-status.md` |
 | CodeGG integration | Eggwork reference closed; downstream M001+C001+M002+M002a+M003 closed | CodeGG required-Landlock live qualification closed at `f5f8d96d`; downstream M003 closed at CodeGG `d51afe46` (implementation `1ce377ce`, hosted `36745285774`) against this repository's Workspace M004 contract; only downstream M004 remains, deferred. | `plans/subsystems/codegg-integration-roadmap.md` |
 
 ## Dependency-ready implementation plans
@@ -110,13 +123,13 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Work | Status | Blocker / rationale |
 |---|---|---|
-| Operations M004 operational/release qualification | **active / qualification rebaseline** | `plans/implementation/operations-distribution/004-operational-and-release-qualification.md`; implement Eggwork-local deterministic MSVC flags + double-build proof, cut corrected `v0.1.1` candidate after gates, prove all-asset same-tag reuse, then finish native service/isolation/update evidence. Historical `v0.1.0` remains immutable failure/discovery evidence. |
-| Operations M005 reverse-connect relay | deferred | no immediate product need; stable identity/lease semantics already exist |
-| Operations M006 PTY extension | deferred | requires a separate interactive ownership/attach design |
+| Operations M004 operational/release qualification | **conditionally closed** | `plans/closure/operations-distribution/004-status.md`; deterministic MSVC policy and double-build proof landed, corrected `v0.1.1` cut and staged, all 17 assets reused on same-tag rerun without clobber, native service/update evidence collected for systemd and both launchd targets. Acceptance criterion 5 is unmet for Windows by the plan's own §15 `unsupported` disposition, not by omission. |
+| Operations M005 reverse-connect relay | deferred (not unblocked) | M004 neither implements nor claims a remote connect/accept path, so it does not supply the interface M005 relies on. No immediate product need; stable identity/lease semantics already exist. |
+| Operations M006 PTY extension | deferred (not unblocked) | PTY capability streams are out of M004 scope. Requires a separate interactive ownership/attach design. |
 | CodeGG M003 content-aware derived workspace transfer | closed downstream | Closed in CodeGG at `d51afe46` (implementation `1ce377ce`; hosted `36745285774` success, live derived reuse under required isolation) on Eggwork `e6a5d82`; closure record `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution/003-status.md` |
 | CodeGG M004 remote AgentRun worker | deferred | M003 is closed; only the stable AgentRun worker-entry contract remains outstanding |
 
-Operations M003 and M002a are closed. M004 uses the historical `v0.1.0` draft only as discovery evidence; successful closure now targets a corrected `v0.1.1` draft containing the runner fix and Eggwork-owned deterministic Windows link policy. Do not widen M004 into runtime release discovery, service-manager duplication, or Eggpack/Eggup interoperability.
+Operations M003, M002a, and conditionally M004 are closed. M004 used the historical `v0.1.0` draft only as discovery evidence and qualified a corrected `v0.1.1` draft containing the runner fix and an Eggwork-owned deterministic Windows link policy. Do not widen M004 into runtime release discovery, service-manager duplication, or Eggpack/Eggup interoperability. Windows service hosting is a **new** milestone, not an M004 continuation, because it requires a service-control dispatcher that the daemon does not have.
 
 ## Corrected execution graph
 
@@ -142,7 +155,10 @@ Operations M002 [CLOSED] --------------+
 Eggpack producer chain [CLOSED through CI M003g] --> Operations M003 [CLOSED]
 Operations M002 [historically CLOSED] --> Operations M002a [CLOSED corrective]
                                               |
-Operations M003 [CLOSED] ---------------------+--> Operations M004 [ACTIVE: corrected-release qualification]
+Operations M003 [CLOSED] ---------------------+--> Operations M004 [CONDITIONALLY CLOSED]
+                                                                |
+Operations Windows service host [NOT PLANNED: new milestone] <----+--> Windows service management
+Operations release publication  [HUMAN ACTION: §14]       <----+--> public bootstrap evidence
 ```
 
 Operations M002 is not a dependency of CodeGG M001. The canonical long-term roadmap already defines CodeGG Phase 7 as depending on Eggwork Phases 0-5, not completion of Phase 6 packaging.
