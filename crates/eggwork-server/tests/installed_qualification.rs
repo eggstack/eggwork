@@ -262,13 +262,37 @@ fn qualified_path() -> &'static str {
     }
 }
 
+/// The environment a qualified target declares for its child.
+///
+/// Linux and macOS need only a fixed `PATH`, and that narrow declaration is
+/// itself part of what the existing evidence proves. Windows is different: a
+/// process started with only `PATH` cannot initialise, because the loader and
+/// `cmd.exe` both need the system directories. Declaring a Windows child with a
+/// Unix-shaped environment produced an internal spawn failure that looked like a
+/// product defect.
+fn qualified_environment() -> Vec<EnvironmentEntry> {
+    let mut environment =
+        vec![EnvironmentEntry::new("PATH", qualified_path()).expect("path entry")];
+    if cfg!(windows) {
+        for name in ["SystemRoot", "windir", "ComSpec", "TEMP", "TMP"] {
+            let Some(value) = std::env::var_os(name) else {
+                continue;
+            };
+            if let Some(value) = value.to_str() {
+                environment.push(EnvironmentEntry::new(name, value).expect("windows entry"));
+            }
+        }
+    }
+    environment
+}
+
 fn spec(argv: Vec<String>, isolation: IsolationRequirement) -> ExecutionSpec {
     ExecutionSpec {
         schema_version: 1,
         command: CommandSpec {
             argv,
             cwd: None,
-            environment: vec![EnvironmentEntry::new("PATH", qualified_path()).expect("entry")],
+            environment: qualified_environment(),
             stdin: StdinPolicy::Null,
             timeout_millis: 30_000,
             output: OutputPolicy::default(),
