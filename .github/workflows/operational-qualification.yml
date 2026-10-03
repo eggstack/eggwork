@@ -246,11 +246,14 @@ jobs:
         shell: pwsh
         run: |
           $root = "$env:RUNNER_TEMP\qualification"
+          $exe = "$root\bin\eggworkd.exe"
+          $config = "$root\state\node.json"
           # The backend is refused on main and registers-then-fails on the
           # candidate. Both are recorded; neither is a qualified lifecycle.
-          $output = & "$root\bin\eggworkd.exe" service install `
-            --config "$root\state\node.json" `
-            --installation-root "$root" `
+          $output = & $exe service install `
+            --config $config `
+            --executable $exe `
+            --service-config $config `
             --windows-start-type manual 2>&1 | Out-String
           $exit = $LASTEXITCODE
           "service install exit=$exit output=$output" | Out-File -FilePath "$env:RUNNER_TEMP\receipts\windows-service.txt" -Encoding utf8
@@ -262,9 +265,10 @@ jobs:
           }
           if ($exit -ne 0) { throw "unexpected service install failure: $output" }
           # Registration succeeded, so the candidate has no fail-closed refusal.
-          $start = & "$root\bin\eggworkd.exe" service start `
-            --config "$root\state\node.json" `
-            --installation-root "$root" 2>&1 | Out-String
+          $start = & $exe service start `
+            --config $config `
+            --executable $exe `
+            --service-config $config 2>&1 | Out-String
           "service start exit=$LASTEXITCODE output=$start" | Out-File -FilePath "$env:RUNNER_TEMP\receipts\windows-service.txt" -Encoding utf8 -Append
           if ($start -notmatch '1053') {
             # A Windows service that now reaches Running is an improvement, not a

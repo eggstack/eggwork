@@ -9,14 +9,15 @@ direction that matters: it either invents a defect or hides one.
 from __future__ import annotations
 
 import io
-import pathlib
 import sys
+import tempfile
+import unittest
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
+from pathlib import Path
 
-import pytest
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 import qualify_release as harness  # noqa: E402
 
@@ -36,17 +37,15 @@ class _Response:
 
 
 def _http_error(code: int) -> urllib.error.HTTPError:
-    return urllib.error.HTTPError("https://api.github.com", code, "boom", {}, None)  # type: ignore[arg-type]
+    return urllib.error.HTTPError(  # type: ignore[arg-type]
+        "https://api.github.com", code, "boom", {}, None
+    )
 
 
-@pytest.fixture(autouse=True)
-def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(harness.time, "sleep", lambda _: None)
-    monkeypatch.setattr(harness, "api_token", lambda: "token")
-
-
-def _responses(monkeypatch: pytest.MonkeyPatch, script: list[object]) -> list[object]:
-    remaining = list(script)
+@contextmanager
+def _scripted(outcomes: list[object]):
+    """Serve `outcomes` to `urlopen`, failing loudly if the harness over-calls."""
+    remaining = list(outcomes)
 
     def _urlopen(request: urllib.request.Request, timeout: int = 0) -> object:
         if not remaining:
@@ -56,59 +55,76 @@ def _responses(monkeypatch: pytest.MonkeyPatch, script: list[object]) -> list[ob
             raise outcome
         return _Response(outcome if isinstance(outcome, bytes) else b"")
 
-    monkeypatch.setattr(harness.urllib.request, "urlopen", _urlopen)
-    return remaining
+    original_urlopen = harness.urllib.request.urlopen
+    original_sleep = harness.time.sleep
+    original_token = harness.api_token
+    harness.urllib.request.urlopen = _urlopen  # type: ignore[assignment]
+    harness.time.sleep = lambda _: None
+    harness.api_token = lambda: "token"  # type: ignore[assignment]
+    try:
+        yield remaining
+    finally:
+        harness.urllib.request.urlopen = original_urlopen  # type: ignore[assignment]
+        harness.time.sleep = original_sleep
+        harness.api_token = original_token  # type: ignore[assignment]
 
 
-def test_download_writes_the_asset(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _responses(monkeypatch, [b"eggwork-bytes"])
-    destination = tmp_path / "artifact.bin"
-    harness.download_asset("eggstack/eggwork", 1, destination)
-    assert destination.read_bytes() == b"eggwork-bytes"
-    assert not destination.with_name(destination.name + ".partial").exists()
+class AssetDownloadTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.destination = self.root / "artifact.bin"
+
+    def _partial(self) -> Path:
+        return self.destination.with_name(self.destination.name + ".partial")
+
+    def test_download_writes_the_asset(self) -> None:
+        with _scripted([b"eggwork-bytes"]):
+            harness.download_asset("eggstack/eggwork", 1, self.destination)
+        self.assertEqual(self.destination.read_bytes(), b"eggwork-bytes")
+        self.assertFalse(self._partial().exists())
+
+    def test_transient_server_error_is_retried(self) -> None:
+        with _scripted([_http_error(500), _http_error(502), b"payload"]):
+            harness.download_asset("eggstack/eggwork", 1, self.destination)
+        self.assertEqual(self.destination.read_bytes(), b"payload")
+
+    def test_transient_rate_limit_is_retried(self) -> None:
+        with _scripted([_http_error(429), b"payload"]):
+            harness.download_asset("eggstack/eggwork", 1, self.destination)
+        self.assertEqual(self.destination.read_bytes(), b"payload")
+
+    def test_transport_error_is_retried(self) -> None:
+        with _scripted([urllib.error.URLError("connection reset"), b"payload"]):
+            harness.download_asset("eggstack/eggwork", 1, self.destination)
+        self.assertEqual(self.destination.read_bytes(), b"payload")
+
+    def test_client_error_is_not_retried(self) -> None:
+        # A 404 means the request itself is wrong. Retrying it would hide a
+        # harness bug behind a delay instead of reporting it.
+        with _scripted([_http_error(404), b"never"]):
+            with self.assertRaisesRegex(harness.QualificationFailure, "HTTP 404"):
+                harness.download_asset("eggstack/eggwork", 1, self.destination)
+
+    def test_exhausted_retries_fail_loudly(self) -> None:
+        with _scripted([_http_error(500)] * harness.TRANSIENT_ATTEMPTS):
+            with self.assertRaisesRegex(harness.QualificationFailure, "attempts"):
+                harness.download_asset("eggstack/eggwork", 1, self.destination)
+        self.assertFalse(self.destination.exists())
+        self.assertFalse(self._partial().exists())
+
+    def test_oversized_asset_is_refused_without_retrying(self) -> None:
+        original_limit = harness.MAX_ASSET_BYTES
+        harness.MAX_ASSET_BYTES = 4
+        try:
+            with _scripted([b"far too many bytes"]):
+                with self.assertRaisesRegex(harness.QualificationFailure, "bounded size"):
+                    harness.download_asset("eggstack/eggwork", 1, self.destination)
+        finally:
+            harness.MAX_ASSET_BYTES = original_limit
+        self.assertFalse(self.destination.exists())
 
 
-def test_transient_server_error_is_retried(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _responses(monkeypatch, [_http_error(500), _http_error(502), b"payload"])
-    destination = tmp_path / "artifact.bin"
-    harness.download_asset("eggstack/eggwork", 1, destination)
-    assert destination.read_bytes() == b"payload"
-
-
-def test_transient_rate_limit_is_retried(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _responses(monkeypatch, [_http_error(429), b"payload"])
-    destination = tmp_path / "artifact.bin"
-    harness.download_asset("eggstack/eggwork", 1, destination)
-    assert destination.read_bytes() == b"payload"
-
-
-def test_transport_error_is_retried(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _responses(monkeypatch, [urllib.error.URLError("connection reset"), b"payload"])
-    destination = tmp_path / "artifact.bin"
-    harness.download_asset("eggstack/eggwork", 1, destination)
-    assert destination.read_bytes() == b"payload"
-
-
-def test_client_error_is_not_retried(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # A 404 means the request is wrong. Retrying it would hide a harness bug.
-    remaining = _responses(monkeypatch, [_http_error(404), b"never"])
-    with pytest.raises(harness.QualificationFailure, match="HTTP 404"):
-        harness.download_asset("eggstack/eggwork", 1, tmp_path / "artifact.bin")
-    assert remaining == [b"never"]
-
-
-def test_exhausted_retries_fail_loudly(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _responses(monkeypatch, [_http_error(500)] * harness.TRANSIENT_ATTEMPTS)
-    destination = tmp_path / "artifact.bin"
-    with pytest.raises(harness.QualificationFailure, match="attempts"):
-        harness.download_asset("eggstack/eggwork", 1, destination)
-    assert not destination.exists()
-
-
-def test_oversized_asset_is_refused_without_retrying(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(harness, "MAX_ASSET_BYTES", 4)
-    _responses(monkeypatch, [b"far too many bytes"])
-    with pytest.raises(harness.QualificationFailure, match="bounded size"):
-        harness.download_asset("eggstack/eggwork", 1, tmp_path / "artifact.bin")
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()
