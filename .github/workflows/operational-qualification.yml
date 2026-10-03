@@ -52,9 +52,7 @@ jobs:
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             platform: macos
-          - runner: windows-latest
-            target: x86_64-pc-windows-msvc
-            platform: windows
+
     runs-on: "${{ matrix.runner }}"
     timeout-minutes: 60
     steps:
@@ -137,9 +135,7 @@ jobs:
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             platform: macos
-          - runner: windows-latest
-            target: x86_64-pc-windows-msvc
-            platform: windows
+
             unsupported_service: true
     runs-on: "${{ matrix.runner }}"
     timeout-minutes: 90
@@ -176,23 +172,6 @@ jobs:
           RELEASE_QUALIFICATION_TOKEN: ${{ secrets.RELEASE_QUALIFICATION_TOKEN }}
         run: |
           set -euo pipefail
-          if [ "${{ matrix.unsupported_service }}" = "true" ]; then
-            # The product refuses every mutating verb on this platform, so the
-            # expected outcome is a structured refusal before any mutation.
-            output="$(python3 scripts/qualify_release.py service \
-              --installation-root "${{ runner.temp }}/qualification" \
-              --receipt "${{ runner.temp }}/receipts/service-${{ matrix.platform }}-${{ matrix.target }}.json" 2>&1)" && {
-                echo "$output"
-                echo 'expected a structured service refusal on this platform' >&2
-                exit 1
-              }
-            echo "$output"
-            case "$output" in
-              *"unsupported"*) ;;
-              *) echo "the refusal did not name the unsupported backend" >&2; exit 1 ;;
-            esac
-            exit 0
-          fi
           python3 scripts/qualify_release.py service \
             --installation-root "${{ runner.temp }}/qualification" \
             --receipt "${{ runner.temp }}/receipts/service-${{ matrix.platform }}-${{ matrix.target }}.json"
@@ -202,12 +181,6 @@ jobs:
           RELEASE_QUALIFICATION_TOKEN: ${{ secrets.RELEASE_QUALIFICATION_TOKEN }}
         run: |
           set -euo pipefail
-          if [ "${{ matrix.unsupported_service }}" = "true" ]; then
-            # Update orchestration requires an owned, installable service, so it
-            # is unsupported wherever service management is unsupported.
-            echo 'update orchestration is unsupported on this platform because service management is'
-            exit 0
-          fi
           python3 scripts/qualify_release.py update \
             --release-tag "${{ inputs.release_tag }}" \
             --release-id "${{ inputs.release_id || inputs.release_tag }}" \
@@ -222,3 +195,93 @@ jobs:
           path: "${{ runner.temp }}/receipts/*.json"
           retention-days: 7
           if-no-files-found: error
+
+  # Windows is dispositioned, not claimed.
+  #
+  # Hosted qualification found two structural gaps in the Windows candidate, and
+  # neither can be re-qualified without a release that contains the fixes:
+  #
+  # 1. `eggworkd` implements no service-control dispatcher, so SCM registers the
+  #    service and then fails to start it with Windows error 1053.
+  # 2. The runner handed every child a Unix-only baseline environment
+  #    (`PATH=/usr/bin:/bin`, no `SystemRoot`), so a Windows child started and
+  #    exited with no capturable exit code.
+  #
+  # Both are fixed on `main` and neither is in the qualified candidate's bytes.
+  # This job therefore records the candidate's real disposition and fails if the
+  # observation ever diverges from it, so the limitation cannot silently rot.
+  windows-platform-disposition:
+    name: windows platform disposition
+    runs-on: windows-latest
+    steps:
+      - name: Check out the qualification tooling
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Set up the pinned Rust toolchain for the client harness
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+      - name: Qualify the Windows installation path that is supported
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\qualification" | Out-Null
+          python scripts/qualify_release.py install `
+            --installation-root "$env:RUNNER_TEMP\qualification" `
+            --receipt "$env:RUNNER_TEMP\receipts\install-windows.json" `
+            --release-id "${{ inputs.release_id }}" `
+            --release-tag "${{ inputs.release_tag }}"
+      - name: Record the unsupported service management disposition
+        shell: pwsh
+        run: |
+          $root = "$env:RUNNER_TEMP\qualification"
+          # The backend is refused on main and registers-then-fails on the
+          # candidate. Both are recorded; neither is a qualified lifecycle.
+          $output = & "$root\bin\eggworkd.exe" service install `
+            --config "$root\state\node.json" `
+            --installation-root "$root" `
+            --windows-start-type manual 2>&1 | Out-String
+          $exit = $LASTEXITCODE
+          "service install exit=$exit output=$output" | Out-File -FilePath "$env:RUNNER_TEMP\receipts\windows-service.txt" -Encoding utf8
+          $unsupported = $output -match 'unsupported'
+          if ($unsupported) {
+            "DISPOSITION: refused-before-mutation (fail-closed)" | Out-File -FilePath "$env:RUNNER_TEMP\receipts\windows-service.txt" -Encoding utf8 -Append
+            if ($exit -eq 0) { throw "expected a non-zero refusal exit, got $exit" }
+            exit 0
+          }
+          if ($exit -ne 0) { throw "unexpected service install failure: $output" }
+          # Registration succeeded, so the candidate has no fail-closed refusal.
+          $start = & "$root\bin\eggworkd.exe" service start `
+            --config "$root\state\node.json" `
+            --installation-root "$root" 2>&1 | Out-String
+          "service start exit=$LASTEXITCODE output=$start" | Out-File -FilePath "$env:RUNNER_TEMP\receipts\windows-service.txt" -Encoding utf8 -Append
+          if ($start -notmatch '1053') {
+            # A Windows service that now reaches Running is an improvement, not a
+            # failure, but the support matrix must be updated before it is claimed.
+            "DISPOSITION: CHANGED, a service now starts; update the support matrix" | Out-File -FilePath "$env:RUNNER_TEMP\receipts\windows-service.txt" -Encoding utf8 -Append
+            throw "the Windows service disposition changed; re-qualify and update the support matrix"
+          }
+          "DISPOSITION: unsupported (registers, then cannot reach Running; no service host)" | Out-File -FilePath "$env:RUNNER_TEMP\receipts\windows-service.txt" -Encoding utf8 -Append
+      - name: Record the unqualified child execution disposition
+        shell: pwsh
+        run: |
+          # Child execution on Windows is unqualified for this candidate. The
+          # platform-shaped child environment is fixed on main; re-qualification
+          # needs a release that contains it.
+          @"
+          {
+            "platform": "windows",
+            "target": "x86_64-pc-windows-msvc",
+            "installed_runtime_qualified": true,
+            "child_execution_qualified": false,
+            "required_filesystem_isolation": "unsupported",
+            "service_management": "unsupported",
+            "disposition": "not claimed; the candidate builds its child environment for Unix only"
+          }
+          "@ | Out-File -FilePath "$env:RUNNER_TEMP\receipts\windows-execution.json" -Encoding utf8
+      - name: Upload the Windows disposition receipts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-disposition-x86_64-pc-windows-msvc-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/receipts
+          retention-days: 30

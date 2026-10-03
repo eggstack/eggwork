@@ -1482,15 +1482,9 @@ fn direct_command(request: &RunnerRequest, cwd: PathBuf) -> Command {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     command.env_clear();
-    command
-        .env("PATH", "/usr/bin:/bin")
-        .env("LANG", "C.UTF-8")
-        .env("LC_ALL", "C.UTF-8")
-        .env("CI", "1")
-        .env("NO_COLOR", "1")
-        .env("TERM", "dumb")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("PAGER", "cat");
+    for (key, value) in baseline_child_environment() {
+        command.env(key, value);
+    }
     for (key, value) in &request.environment {
         if !denied_environment_key(key) {
             command.env(key, value);
@@ -1503,6 +1497,43 @@ fn direct_command(request: &RunnerRequest, cwd: PathBuf) -> Command {
         command.env("EGGWORK_EXECUTION_GENERATION", generation.get().to_string());
     }
     command
+}
+
+/// The platform-appropriate minimum environment for an execution child.
+///
+/// This baseline is deliberately platform-shaped. It used to declare a
+/// Unix-only environment unconditionally, including `PATH=/usr/bin:/bin`, so a
+/// Windows child was handed a `PATH` that does not exist on Windows and no
+/// `SystemRoot`. Hosted M004 qualification observed exactly that: the Windows
+/// child started and exited with no capturable exit code, which surfaced as
+/// `state: Failed`, `failure: Internal`, `exit_code: null` and was
+/// indistinguishable from a product defect in the execution result itself.
+///
+/// Unix keeps the narrow, deterministic baseline the existing Linux and macOS
+/// evidence was gathered with. Windows gets the system directories its loader
+/// and `cmd.exe` require, without inheriting the caller's full environment.
+fn baseline_child_environment() -> Vec<(&'static str, String)> {
+    let mut baseline: Vec<(&'static str, String)> = vec![
+        ("CI", "1".to_owned()),
+        ("NO_COLOR", "1".to_owned()),
+        ("TERM", "dumb".to_owned()),
+        ("GIT_TERMINAL_PROMPT", "0".to_owned()),
+        ("PAGER", "cat".to_owned()),
+    ];
+    #[cfg(not(windows))]
+    baseline.extend([
+        ("PATH", "/usr/bin:/bin".to_owned()),
+        ("LANG", "C.UTF-8".to_owned()),
+        ("LC_ALL", "C.UTF-8".to_owned()),
+    ]);
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+        baseline.push(("SystemRoot", system_root.clone()));
+        baseline.push(("windir", system_root.clone()));
+        baseline.push(("PATH", format!(r"{system_root}\System32;{system_root}")));
+    }
+    baseline
 }
 
 #[cfg(target_os = "linux")]
