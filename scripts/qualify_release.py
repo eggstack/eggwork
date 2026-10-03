@@ -68,6 +68,10 @@ from typing import Any, Iterator, Sequence
 # Bounds. A qualification harness that can hang, or read an unbounded file, is
 # not a qualification harness.
 MAX_ASSET_BYTES = 256 * 1024 * 1024
+# The release API occasionally answers a well-formed request with a 5xx. Retry
+# only that, so qualification reflects the candidate rather than upstream uptime.
+TRANSIENT_ATTEMPTS = 5
+TRANSIENT_BACKOFF_SECONDS = 30
 MAX_MANIFEST_BYTES = 1 << 20
 MAX_PROCESS_OUTPUT_BYTES = 1 << 20
 MAX_TEXT_ASSET_BYTES = 1 << 20
@@ -304,27 +308,63 @@ def sha256_of(path: Path) -> str:
 
 
 def download_asset(repository: str, asset_id: int, destination: Path) -> None:
-    request = urllib.request.Request(
-        f"https://api.github.com/repos/{repository}/releases/assets/{asset_id}",
-        headers={
-            "Authorization": f"Bearer {api_token()}",
-            "Accept": "application/octet-stream",
-            "User-Agent": "eggwork-operational-qualification",
-        },
-    )
+    """Fetch one release asset, retrying only transient upstream failures.
+
+    The release API is a shared dependency that occasionally answers a
+    well-formed request with a 5xx. Hosted qualification aborted on one such
+    response, which is indistinguishable from a real product failure and would
+    make the qualification record depend on upstream uptime rather than on the
+    candidate's behaviour.
+
+    Only 5xx and 429 are retried. A 4xx means the request itself is wrong, so
+    retrying it would hide a harness bug behind a delay. Every attempt is
+    bounded, and the final failure still names the real status.
+    """
     partial = destination.with_name(destination.name + ".partial")
-    try:
-        with urllib.request.urlopen(request, timeout=300) as response:
-            written = 0
-            with partial.open("wb") as handle:
-                while chunk := response.read(1 << 20):
-                    written += len(chunk)
-                    if written > MAX_ASSET_BYTES:
-                        raise QualificationFailure(f"{destination.name} exceeds the bounded size")
-                    handle.write(chunk)
-    except urllib.error.HTTPError as error:
-        partial.unlink(missing_ok=True)
-        raise QualificationFailure(f"asset download returned HTTP {error.code}") from error
+    last_status: int | None = None
+    for attempt in range(1, TRANSIENT_ATTEMPTS + 1):
+        request = urllib.request.Request(
+            f"https://api.github.com/repos/{repository}/releases/assets/{asset_id}",
+            headers={
+                "Authorization": f"Bearer {api_token()}",
+                "Accept": "application/octet-stream",
+                "User-Agent": "eggwork-operational-qualification",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response:
+                written = 0
+                with partial.open("wb") as handle:
+                    while chunk := response.read(1 << 20):
+                        written += len(chunk)
+                        if written > MAX_ASSET_BYTES:
+                            raise QualificationFailure(
+                                f"{destination.name} exceeds the bounded size"
+                            )
+                        handle.write(chunk)
+        except urllib.error.HTTPError as error:
+            last_status = error.code
+            partial.unlink(missing_ok=True)
+            if error.code < 500 and error.code != 429:
+                raise QualificationFailure(
+                    f"asset download returned HTTP {error.code}"
+                ) from error
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            last_status = error
+            partial.unlink(missing_ok=True)
+        else:
+            partial.replace(destination)
+            return
+        if attempt < TRANSIENT_ATTEMPTS:
+            print(
+                f"  transient asset download failure ({last_status}); "
+                f"retry {attempt}/{TRANSIENT_ATTEMPTS - 1}",
+                file=sys.stderr,
+            )
+            time.sleep(min(2**attempt, TRANSIENT_BACKOFF_SECONDS))
+    raise QualificationFailure(
+        f"asset download failed after {TRANSIENT_ATTEMPTS} attempts ({last_status})"
+    )
     partial.replace(destination)
 
 

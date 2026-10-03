@@ -235,6 +235,13 @@ jobs:
             --installation-root "$env:RUNNER_TEMP\qualification" `
             --download-dir "$env:RUNNER_TEMP\release" `
             --receipt "$env:RUNNER_TEMP\receipts\install-windows.json"
+      - name: Materialise the bounded qualification fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          EGGWORK_QUALIFY_ROOT="${{ runner.temp }}/qualification" \
+            cargo test --locked -p eggwork-server --features qualification \
+              --test installed_qualification -- --ignored --exact qualification_fixture
       - name: Record the unsupported service management disposition
         shell: pwsh
         run: |
