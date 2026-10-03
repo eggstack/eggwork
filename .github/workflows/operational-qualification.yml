@@ -277,6 +277,9 @@ jobs:
             throw "the Windows service disposition changed; re-qualify and update the support matrix"
           }
           "DISPOSITION: unsupported (registers, then cannot reach Running; no service host)" | Out-File -FilePath "$env:RUNNER_TEMP\receipts\windows-service.txt" -Encoding utf8 -Append
+          # The observed 1053 start is the recorded disposition, so the step
+          # must not inherit the daemon's non-zero exit as its own result.
+          exit 0
       - name: Record the unqualified child execution disposition
         shell: pwsh
         run: |
