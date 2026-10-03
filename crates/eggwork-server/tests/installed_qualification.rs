@@ -363,15 +363,21 @@ async fn qualify_execution(
 /// `operator_command` and `doctor` are the product's own synchronous CLI verbs.
 /// They run as blocking children on a dedicated task because
 /// `eggwork-server` must never enable Tokio process creation in production.
-async fn operator_command(daemon: &Path, verb: &str) -> Result<std::process::Output, String> {
+async fn operator_command(
+    daemon: &Path,
+    arguments: &[&str],
+) -> Result<std::process::Output, String> {
     let daemon = daemon.to_path_buf();
-    let label = verb.to_owned();
-    let invocation = label.clone();
+    let label = arguments.join(" ");
+    let invocation = arguments
+        .iter()
+        .map(|part| (*part).to_owned())
+        .collect::<Vec<_>>();
     let config = std::env::var("EGGWORK_QUALIFY_CONFIG")
         .map_err(|_| "EGGWORK_QUALIFY_CONFIG is not set".to_owned())?;
     tokio::task::spawn_blocking(move || {
         Command::new(daemon)
-            .arg(&invocation)
+            .args(&invocation)
             .arg("--config")
             .arg(&config)
             .stdin(Stdio::null())
@@ -379,7 +385,7 @@ async fn operator_command(daemon: &Path, verb: &str) -> Result<std::process::Out
     })
     .await
     .map_err(|error| format!("waiting for the installed operator command failed: {error}"))?
-    .map_err(|error| format!("running the installed {label} command failed: {error}"))
+    .map_err(|error| format!("running `eggworkd {label}` failed: {error}"))
 }
 
 /// The qualified properties of one installed release binary.
@@ -392,13 +398,13 @@ async fn installed_release_admits_execution_and_refuses_unsupported_isolation() 
 
     // The operator-facing configuration must be accepted by the installed
     // binary's own loader, not merely parse as JSON.
-    let validate = operator_command(&subject.daemon, "validate").await?;
+    let validate = operator_command(&subject.daemon, &["config", "validate"]).await?;
     assert!(
         validate.status.success(),
         "installed config validate failed: {}",
         String::from_utf8_lossy(&validate.stderr)
     );
-    let doctor = operator_command(&subject.daemon, "doctor").await?;
+    let doctor = operator_command(&subject.daemon, &["doctor"]).await?;
     let doctor_report: Json = serde_json::from_slice(&doctor.stdout).expect("doctor reported JSON");
     assert_eq!(
         doctor_report.get("ready").and_then(Json::as_bool),
@@ -519,7 +525,7 @@ async fn installed_release_admits_execution_and_refuses_unsupported_isolation() 
 
     // Drain is persistent and operator-controlled: it refuses new work until an
     // explicit clear, and the same node keeps serving afterwards.
-    let drained = operator_command(&subject.daemon, "drain").await?;
+    let drained = operator_command(&subject.daemon, &["drain"]).await?;
     assert!(drained.status.success());
     let refused = client
         .execute(
@@ -531,7 +537,7 @@ async fn installed_release_admits_execution_and_refuses_unsupported_isolation() 
         refused.is_err(),
         "a persistently draining node accepted a new execution"
     );
-    let cleared = operator_command(&subject.daemon, "undrain").await?;
+    let cleared = operator_command(&subject.daemon, &["undrain"]).await?;
     assert!(cleared.status.success());
     let admitted = qualify_execution(
         &client,
