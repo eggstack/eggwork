@@ -52,6 +52,7 @@ import contextlib
 import hashlib
 import json
 import os
+import platform
 import shutil
 import stat
 import subprocess
@@ -419,29 +420,57 @@ def fetch_release(repository: str, tag: str, directory: Path) -> Release:
 # --------------------------------------------------------------------------
 
 
+def host_system() -> str:
+    """The host operating system, as a release target family.
+
+    `os.name` alone is not enough: on a Windows runner driven from Git Bash the
+    interpreter can report a POSIX name while the machine is unambiguously
+    Windows. The install identities and asset suffixes differ per platform, so
+    a wrong answer here silently qualifies the wrong release target.
+    """
+    if os.name == "nt" or sys.platform.startswith("win"):
+        return "windows"
+    if os.environ.get("OS") == "Windows_NT" or os.environ.get("SYSTEMROOT", "").count("\\"):
+        return "windows"
+    system = platform.system()
+    if system == "Windows":
+        return "windows"
+    if system == "Darwin":
+        return "macos"
+    if system == "Linux":
+        return "linux"
+    raise QualificationFailure(f"unsupported host system {system!r}")
+
+
 def is_windows() -> bool:
-    return os.name == "nt" or sys.platform.startswith("win")
+    return host_system() == "windows"
 
 
 def is_linux() -> bool:
-    return sys.platform.startswith("linux")
+    return host_system() == "linux"
+
+
+def is_macos() -> bool:
+    return host_system() == "macos"
+
+
+def host_architecture() -> str:
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64", "x64"):
+        return "x86_64"
+    if machine in ("aarch64", "arm64"):
+        return "aarch64"
+    raise QualificationFailure(f"unsupported host architecture {machine!r}")
 
 
 def host_target_triple() -> str:
-    machine = (os.uname().machine if hasattr(os, "uname") else os.environ.get("PROCESSOR_ARCHITECTURE", "")).lower()
-    if machine in ("x86_64", "amd64", "x64"):
-        architecture = "x86_64"
-    elif machine in ("aarch64", "arm64"):
-        architecture = "aarch64"
-    else:
-        raise QualificationFailure(f"unsupported host architecture {machine!r}")
-    if is_linux():
+    architecture = host_architecture()
+    system = host_system()
+    if system == "linux":
         return f"{architecture}-unknown-linux-gnu"
-    if sys.platform == "darwin":
+    if system == "macos":
         return f"{architecture}-apple-darwin"
-    if is_windows():
-        return f"{architecture}-pc-windows-msvc"
-    raise QualificationFailure(f"unsupported host platform {sys.platform!r}")
+    return f"{architecture}-pc-windows-msvc"
 
 
 def daemon_path(installation_root: Path) -> Path:
@@ -498,7 +527,7 @@ def service_definition_path(root: Path, override: str | None) -> Path:
         # whole descriptor. The file records the qualified policy for the
         # receipt instead of being used as product input.
         return root / "scm-policy.json"
-    if sys.platform == "darwin":
+    if is_macos():
         return root / "LaunchAgents" / f"{SERVICE_ID}.plist"
     return default_systemd_user_unit()
 
@@ -524,7 +553,7 @@ def service_policy_flags(scope: str, definition: Path) -> list[str]:
     definition.parent.mkdir(parents=True, exist_ok=True)
     if is_windows():
         return ["--windows-start-type", "manual"]
-    if sys.platform == "darwin":
+    if is_macos():
         return [
             "--plist-path",
             str(definition),
@@ -542,221 +571,29 @@ def service_policy_flags(scope: str, definition: Path) -> list[str]:
     return flags
 
 
-def openssl_binary() -> str | None:
-    """Locate an OpenSSL CLI for generating the bounded TLS fixture.
-
-    The harness never generates TLS material itself; it uses the host's OpenSSL
-    only to create a throwaway loopback CA, node identity, and controller
-    identity inside the qualification root. A host without OpenSSL cannot run
-    the service or update stages and says so instead of silently degrading.
-    """
-    found = shutil.which("openssl")
-    if found:
-        return found
-    candidates = [
-        r"C:\Program Files\Git\usr\bin\openssl.exe",
-        r"C:\Program Files\OpenSSL-Win64\bin\openssl.exe",
-        "/usr/bin/openssl",
-        "/opt/homebrew/bin/openssl",
-    ]
-    for candidate in candidates:
-        if Path(candidate).is_file():
-            return candidate
-    return None
-
-
-def _openssl(openssl: str, *args: str) -> None:
-    run([openssl, *args], timeout=120)
-
-
-def ensure_tls_fixture(root: Path) -> dict[str, Path]:
-    """Create the bounded loopback TLS fixture the operator config requires.
-
-    `OperatorConfig::validate` requires real, parseable TLS material, so a
-    service or deployment command cannot run without it. Everything created here
-    lives inside the qualification root and is disposable: a CA, a node identity
-    for `localhost`/`127.0.0.1`, and a controller identity whose leaf digest is
-    what the config grants. No secret from the harness environment is involved.
-    """
-    openssl = openssl_binary()
-    if openssl is None:
-        raise QualificationFailure(
-            "OpenSSL is required to build the bounded qualification TLS fixture"
-        )
-    tls = root / "state" / "tls"
-    tls.mkdir(parents=True, exist_ok=True)
-    paths = {
-        "ca": tls / "ca.pem",
-        "ca_key": tls / "ca-key.pem",
-        "node_cert": tls / "node-chain.pem",
-        "node_key": tls / "node-key.pem",
-        "client_cert": tls / "client.pem",
-        "client_key": tls / "client-key.pem",
-    }
-    if paths["client_cert"].is_file() and paths["node_cert"].is_file():
-        return paths
-    _openssl(
-        openssl,
-        "req",
-        "-x509",
-        "-newkey",
-        "rsa:2048",
-        "-sha256",
-        "-days",
-        "2",
-        "-nodes",
-        "-keyout",
-        str(paths["ca_key"]),
-        "-out",
-        str(paths["ca"]),
-        "-subj",
-        "/CN=eggwork-qualification-ca",
-        "-addext",
-        "basicConstraints=critical,CA:TRUE",
-        "-addext",
-        "keyUsage=critical,keyCertSign,cRLSign",
-    )
-    for prefix, subject, alternative in (
-        ("node", "/CN=localhost", "subjectAltName=DNS:localhost,IP:127.0.0.1"),
-        ("client", "/CN=eggwork-controller", "subjectAltName=DNS:eggwork-controller"),
-    ):
-        request = tls / f"{prefix}.csr"
-        _openssl(
-            openssl,
-            "req",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-keyout",
-            str(paths[f"{prefix}_key"]),
-            "-out",
-            str(request),
-            "-subj",
-            subject,
-            "-addext",
-            alternative,
-        )
-        _openssl(
-            openssl,
-            "x509",
-            "-req",
-            "-in",
-            str(request),
-            "-CA",
-            str(paths["ca"]),
-            "-CAkey",
-            str(paths["ca_key"]),
-            "-CAcreateserial",
-            "-out",
-            str(paths[f"{prefix}_cert"]),
-            "-days",
-            "2",
-            "-sha256",
-            "-copy_extensions",
-            "copy",
-        )
-        request.unlink(missing_ok=True)
-    harden_tls_fixture(paths)
-    return paths
-
-
-def harden_tls_fixture(paths: dict[str, Path]) -> None:
-    """Apply the ownership and mode policy the node's own config loader requires.
-
-    The installed daemon refuses a config whose TLS material is group/world
-    accessible or whose state directories are not owner-only. Qualification
-    must satisfy the same policy a real installation does, otherwise it would be
-    testing a configuration the product deliberately rejects.
-    """
-    if is_windows():
-        return
-    for key in ("node_key", "client_key", "ca_key"):
-        paths[key].chmod(0o600)
-    for key in ("node_cert", "client_cert", "ca"):
-        paths[key].chmod(0o644)
-
-
-def client_leaf_digest(cert_pem: Path) -> str:
-    """The lowercase SHA-256 of the controller leaf DER, as the grant requires.
-
-    `openssl x509 -fingerprint` prints the digest of the DER encoding, which is
-    exactly what the node's client-CA verifier hashes when a connection arrives.
-    """
-    result = run(
-        [openssl_binary() or "openssl", "x509", "-in", str(cert_pem), "-noout", "-fingerprint", "-sha256"],
-        timeout=60,
-    )
-    _, _, fingerprint = result.stdout.strip().partition("=")
-    digest = fingerprint.replace(":", "").strip().lower()
-    if len(digest) != 64 or not all(character in "0123456789abcdef" for character in digest):
-        raise QualificationFailure("could not read the controller leaf fingerprint")
-    return digest
-
-
 def qualification_config(root: Path) -> Path:
-    """Write a bounded qualification node configuration inside the install root.
+    """Return the bounded qualification node configuration for this install.
 
-    Every path lives under the qualification root so nothing touches a real
-    node's database, workspaces, blobs, or artifacts. The sandbox helper is
-    declared on Linux only: declaring it on macOS/Windows would advertise a
-    required filesystem-isolation capability that does not exist there.
+    The configuration and its TLS fixture are materialised by the repository's
+    own Rust harness (`crates/eggwork-server/tests/installed_qualification.rs`,
+    the `qualification_fixture` test). Generating a certificate authority with
+    an external CLI would make the fixture depend on whichever OpenSSL or
+    LibreSSL a runner happens to ship, and those disagree about certificate
+    version, extensions, and flags. `rcgen` produces the same valid identity
+    everywhere and is already the library the repository's own mTLS tests use.
+
+    This function therefore never invents TLS material: if the configuration is
+    absent it says exactly which step to run.
     """
-    tls = ensure_tls_fixture(root)
-    state = root / "state"
-    for directory in ("executions", "blobs", "workspaces"):
-        target = state / directory
-        target.mkdir(parents=True, exist_ok=True)
-        # The node refuses a state directory that is not owner-only, exactly as
-        # it would refuse one owned by another user.
-        if not is_windows():
-            target.chmod(0o700)
-    if not is_windows():
-        state.chmod(0o700)
-    configuration: dict[str, Any] = {
-        "schema_version": 1,
-        "node_id": "qualification-node",
-        "bind": "127.0.0.1:0",
-        "execution_root": str(state / "executions"),
-        "database_path": str(state / "executions.sqlite"),
-        "blob_root": str(state / "blobs"),
-        "blob_quota_bytes": 64 * 1024 * 1024,
-        "workspace_root": str(state / "workspaces"),
-        "workspace_quota_bytes": 64 * 1024 * 1024,
-        "max_active_executions": 2,
-        "lease_ttl_seconds": 30,
-        "sandbox_helper": str(helper_path(root)) if is_linux() else None,
-        "tls": {
-            "certificate_chain": str(tls["node_cert"]),
-            "private_key": str(tls["node_key"]),
-            "client_ca": str(tls["ca"]),
-        },
-        "clients": [
-            {
-                "principal_id": "qualification-controller",
-                "certificate_sha256": client_leaf_digest(tls["client_cert"]),
-                "operations": [
-                    "capabilities",
-                    "status",
-                    "execute",
-                    "observe",
-                    "cancel",
-                    "renew",
-                    "events",
-                ],
-            }
-        ],
-    }
-    path = state / "node.json"
-    path.write_text(json.dumps(configuration, indent=2), encoding="utf-8")
-    if not is_windows():
-        # The loader refuses a config any other user can write to.
-        path.chmod(0o644)
+    path = root / "state" / "node.json"
+    if not path.is_file():
+        raise QualificationFailure(
+            f"{path} is missing. Materialise the qualification fixture first:\n"
+            "  EGGWORK_QUALIFY_ROOT="
+            f"{root} cargo test -p eggwork-server --features qualification \\\n"
+            "    --test installed_qualification -- --ignored --exact qualification_fixture"
+        )
     return path
-
-
-# --------------------------------------------------------------------------
-# Product command helpers
-# --------------------------------------------------------------------------
 
 
 def service_argv(
@@ -967,7 +804,9 @@ def stage_install(args: argparse.Namespace) -> Receipt:
             f"equals the release manifest {helper_artifact.sha256}",
         )
 
+    config = qualification_config(root)
     receipt.record("installation-root", ok=True, detail=str(root))
+    receipt.record("qualification-config", ok=True, detail=str(config))
     receipt.record(
         "execution-qualification",
         ok=True,

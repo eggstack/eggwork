@@ -100,7 +100,14 @@ Start here:
 `scripts/qualify_release.py` is the product-owned operational qualification harness. It retrieves the exact bytes of one staged release through the authenticated GitHub API, verifies every artifact against that release's own `release-manifest.json` and `.sha256` sidecars, then drives the *installed* `eggworkd` through the operator commands a human would use:
 
 ```bash
+export RELEASE_QUALIFICATION_TOKEN=...        # a scoped token: a staged candidate is a draft
 python3 scripts/qualify_release.py install  --release-tag v0.1.1 --installation-root /opt/eggwork
+
+# the bounded TLS fixture and node configuration come from rcgen, not an external
+# OpenSSL/LibreSSL, so the identities are identical on every host
+EGGWORK_QUALIFY_ROOT=/opt/eggwork cargo test -p eggwork-server --features qualification \
+  --test installed_qualification -- --ignored --exact qualification_fixture
+
 python3 scripts/qualify_release.py installer --release-tag v0.1.1 --installation-root /opt/eggwork
 python3 scripts/qualify_release.py service  --installation-root /opt/eggwork
 python3 scripts/qualify_release.py update   --release-tag v0.1.1 --release-id v0.1.1 \
@@ -111,10 +118,11 @@ It never rebuilds a release artifact, never stages or publishes, never mutates a
 
 ```bash
 EGGWORK_QUALIFY_DAEMON=/opt/eggwork/bin/eggworkd \
-EGGWORK_QUALIFY_CONFIG=/etc/eggwork/node.json \
-EGGWORK_QUALIFY_TLS_DIR=/etc/eggwork \
+EGGWORK_QUALIFY_CONFIG=/opt/eggwork/state/node.json \
+EGGWORK_QUALIFY_TLS_DIR=/opt/eggwork/state/tls \
 cargo test -p eggwork-server --features qualification \
-  --test installed_qualification -- --ignored --nocapture
+  --test installed_qualification -- --ignored \
+  --exact installed_release_admits_execution_and_refuses_unsupported_isolation --nocapture
 ```
 
 `.github/workflows/operational-qualification.yml` runs both against a named release on hosted Linux, macOS, and Windows runners and uploads the bounded receipts.

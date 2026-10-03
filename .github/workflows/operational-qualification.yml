@@ -88,6 +88,18 @@ jobs:
             --installation-root "${{ runner.temp }}/qualification" \
             --download-dir "${{ runner.temp }}/release" \
             --receipt "${{ runner.temp }}/receipts/installer-${{ matrix.platform }}-${{ matrix.target }}.json"
+      - name: Materialise the bounded qualification fixture
+        # The TLS fixture and node configuration come from the repository's own
+        # `rcgen`-based harness, not from whichever OpenSSL or LibreSSL the
+        # runner ships: those disagree about certificate version, extensions, and
+        # key encodings, and a fixture the installed binary rejects would look
+        # like a product defect.
+        shell: bash
+        run: |
+          set -euo pipefail
+          EGGWORK_QUALIFY_ROOT="${{ runner.temp }}/qualification" \
+            cargo test --locked -p eggwork-server --features qualification \
+              --test installed_qualification -- --ignored --exact qualification_fixture
       - name: Qualify installed execution through the production client
         shell: bash
         env:
@@ -140,6 +152,18 @@ jobs:
             --installation-root "${{ runner.temp }}/qualification" \
             --download-dir "${{ runner.temp }}/release" \
             --receipt "${{ runner.temp }}/receipts/install-service-${{ matrix.platform }}-${{ matrix.target }}.json"
+      - name: Materialise the bounded qualification fixture
+        # The TLS fixture and node configuration come from the repository's own
+        # `rcgen`-based harness, not from whichever OpenSSL or LibreSSL the
+        # runner ships: those disagree about certificate version, extensions, and
+        # key encodings, and a fixture the installed binary rejects would look
+        # like a product defect.
+        shell: bash
+        run: |
+          set -euo pipefail
+          EGGWORK_QUALIFY_ROOT="${{ runner.temp }}/qualification" \
+            cargo test --locked -p eggwork-server --features qualification \
+              --test installed_qualification -- --ignored --exact qualification_fixture
       - name: Qualify the native service lifecycle matrix
         shell: bash
         env:

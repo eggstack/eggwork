@@ -388,6 +388,174 @@ async fn operator_command(
     .map_err(|error| format!("running `eggworkd {label}` failed: {error}"))
 }
 
+/// Materialise the bounded loopback TLS fixture and node configuration.
+///
+/// The qualification harness must not depend on whichever OpenSSL or LibreSSL a
+/// runner happens to ship: those disagree about certificate version, extension
+/// flags, and key encodings, and a fixture the installed binary rejects would
+/// look like a product defect. `rcgen` is already this repository's mTLS fixture
+/// library, so the identities are produced the same way on every host.
+///
+/// The node refuses a config whose TLS material is group/world accessible or
+/// whose state directories are not owner-only, so the fixture is written with
+/// exactly the permissions a real installation uses.
+#[test]
+#[ignore = "materialises the qualification fixture; run with --ignored"]
+fn qualification_fixture() {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+    use std::io::Write;
+
+    let root = PathBuf::from(
+        std::env::var("EGGWORK_QUALIFY_ROOT")
+            .expect("EGGWORK_QUALIFY_ROOT must name the installation root"),
+    );
+    if !root.is_absolute() {
+        panic!("EGGWORK_QUALIFY_ROOT must be an absolute path");
+    }
+    let bind = std::env::var("EGGWORK_QUALIFY_BIND").unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+    let helper = std::env::var("EGGWORK_QUALIFY_HELPER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join("bin").join("eggwork-sandbox-helper"));
+    // Only Linux ships and can enforce the Landlock helper; declaring it
+    // elsewhere would advertise a required capability that does not exist.
+    let helper = if cfg!(target_os = "linux") {
+        Some(helper)
+    } else {
+        None
+    };
+
+    let state = root.join("state");
+    let tls = state.join("tls");
+    for directory in [
+        tls.clone(),
+        state.join("executions"),
+        state.join("blobs"),
+        state.join("workspaces"),
+    ] {
+        std::fs::create_dir_all(&directory).expect("create qualification directory");
+    }
+
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca parameters");
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "eggwork-qualification-ca");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    let ca = ca_params.self_signed(&ca_key).expect("ca certificate");
+
+    let issue = |common_name: &str, sans: Vec<String>| {
+        let key = KeyPair::generate().expect("identity key");
+        let mut params = CertificateParams::new(sans).expect("identity parameters");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name.to_owned());
+        let certificate = params
+            .signed_by(&key, &ca, &ca_key)
+            .expect("signed identity");
+        (certificate, key)
+    };
+
+    let (node, node_key) = issue(
+        "localhost",
+        vec![
+            "localhost".to_owned(),
+            std::net::IpAddr::from([127, 0, 0, 1]).to_string(),
+        ],
+    );
+    let (client, client_key) = issue("eggwork-controller", vec!["eggwork-controller".to_owned()]);
+
+    // The node's client-CA verifier hashes the verified leaf DER, so the grant
+    // must carry the controller certificate's own digest.
+    use sha2::{Digest, Sha256};
+    let fingerprint = hex::encode(Sha256::digest(client.der()));
+
+    let write = |path: &Path, contents: &str, mode: u32| {
+        let mut file = std::fs::File::create(path).expect("create fixture file");
+        file.write_all(contents.as_bytes())
+            .expect("write fixture file");
+        file.sync_all().expect("sync fixture file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .expect("apply fixture mode");
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+    };
+    write(&tls.join("ca.pem"), &ca.pem(), 0o644);
+    write(&tls.join("node-chain.pem"), &node.pem(), 0o644);
+    write(&tls.join("node-key.pem"), &node_key.serialize_pem(), 0o600);
+    write(&tls.join("client.pem"), &client.pem(), 0o644);
+    write(
+        &tls.join("client-key.pem"),
+        &client_key.serialize_pem(),
+        0o600,
+    );
+
+    let configuration = json!({
+        "schema_version": 1,
+        "node_id": "qualification-node",
+        "bind": bind,
+        "execution_root": state.join("executions").display().to_string(),
+        "database_path": state.join("executions.sqlite").display().to_string(),
+        "blob_root": state.join("blobs").display().to_string(),
+        "blob_quota_bytes": 64u64 * 1024 * 1024,
+        "workspace_root": state.join("workspaces").display().to_string(),
+        "workspace_quota_bytes": 64u64 * 1024 * 1024,
+        "max_active_executions": 2,
+        "lease_ttl_seconds": 30,
+        "sandbox_helper": helper.map(|path| path.display().to_string()),
+        "tls": {
+            "certificate_chain": tls.join("node-chain.pem").display().to_string(),
+            "private_key": tls.join("node-key.pem").display().to_string(),
+            "client_ca": tls.join("ca.pem").display().to_string(),
+        },
+        "clients": [{
+            "principal_id": "qualification-controller",
+            "certificate_sha256": fingerprint,
+            "operations": ["capabilities", "status", "execute", "observe", "cancel", "renew", "events"],
+        }],
+    });
+    let config = state.join("node.json");
+    write(
+        &config,
+        &serde_json::to_string_pretty(&configuration).expect("encode configuration"),
+        0o644,
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for directory in [
+            state.clone(),
+            state.join("executions"),
+            state.join("blobs"),
+            state.join("workspaces"),
+            tls.clone(),
+        ] {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .expect("apply owner-only directory mode");
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "stage": "fixture",
+            "installation_root": root.display().to_string(),
+            "config": config.display().to_string(),
+            "tls_dir": tls.display().to_string(),
+            "client_leaf_sha256": fingerprint,
+        }))
+        .unwrap_or_default()
+    );
+}
+
 /// The qualified properties of one installed release binary.
 #[tokio::test]
 #[ignore = "qualifies an installed release binary; run with --ignored"]
