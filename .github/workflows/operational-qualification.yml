@@ -112,7 +112,9 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked -p eggwork-server --features qualification \
-            --test installed_qualification -- --ignored --nocapture
+            --test installed_qualification -- --ignored \
+            --exact installed_release_admits_execution_and_refuses_unsupported_isolation \
+            --nocapture
       - name: Upload the bounded qualification receipts
         uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
         with:

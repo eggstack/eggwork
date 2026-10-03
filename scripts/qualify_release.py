@@ -74,7 +74,6 @@ MAX_TEXT_ASSET_BYTES = 1 << 20
 DEFAULT_PROCESS_TIMEOUT = 180.0
 SERVICE_TRANSITION_TIMEOUT = 90.0
 SERVICE_ID = "eggwork-node"
-DAEMON_INSTALL_IDS = ("eggworkd", "eggworkd.exe")
 HELPER_INSTALL_ID = "eggwork-sandbox-helper"
 
 
@@ -479,6 +478,21 @@ def host_target_triple() -> str:
     return f"{architecture}-pc-windows-msvc"
 
 
+def target_daemon_install(target: str) -> str:
+    """The release install identity of the daemon for one target triple.
+
+    This is a property of the *target*, not of the machine running the
+    qualification. Deriving it from the host misbehaves wherever host detection
+    is uncertain, and a wrong answer rejects the correct asset as unknown.
+    """
+    return "eggworkd.exe" if target.endswith("-pc-windows-msvc") else "eggworkd"
+
+
+def target_ships_helper(target: str) -> bool:
+    """Whether one target triple ships the Linux Landlock sandbox helper."""
+    return target.endswith("-unknown-linux-gnu")
+
+
 def daemon_path(installation_root: Path) -> Path:
     return installation_root / "bin" / ("eggworkd.exe" if is_windows() else "eggworkd")
 
@@ -751,9 +765,10 @@ def stage_install(args: argparse.Namespace) -> Receipt:
         ok=True,
         detail=f"{triple} ships " + ", ".join(f"{a.install}={a.name}" for a in artifacts),
     )
-    daemon_install = DAEMON_INSTALL_IDS[0] if is_windows() else "eggworkd"
+    daemon_install = target_daemon_install(triple)
+    helper_required = target_ships_helper(triple)
     shipped = {artifact.install for artifact in artifacts}
-    required = {daemon_install} | ({HELPER_INSTALL_ID} if is_linux() else set())
+    required = {daemon_install} | ({HELPER_INSTALL_ID} if helper_required else set())
     receipt.expect(
         "target-install-identities",
         required <= shipped,
@@ -761,8 +776,8 @@ def stage_install(args: argparse.Namespace) -> Receipt:
     )
     receipt.expect(
         "helper-not-shipped-off-linux",
-        HELPER_INSTALL_ID not in shipped or is_linux(),
-        f"{triple} ships the Linux-only sandbox helper",
+        (HELPER_INSTALL_ID in shipped) == helper_required,
+        f"{triple} ships {sorted(shipped)}; a Linux target requires the helper: {helper_required}",
     )
 
     for artifact in artifacts:
@@ -773,7 +788,7 @@ def stage_install(args: argparse.Namespace) -> Receipt:
         receipt.record("artifact-installed", ok=True, detail=f"{artifact.name} -> {destination}")
     harden_installation_tree(root)
 
-    if is_linux():
+    if helper_required:
         mode = stat.S_IMODE(helper_path(root).stat().st_mode)
         receipt.expect(
             "helper-executable-mode",
@@ -795,7 +810,7 @@ def stage_install(args: argparse.Namespace) -> Receipt:
         installed_digest == declared.sha256,
         f"installed daemon sha256={installed_digest} release sha256={declared.sha256}",
     )
-    if is_linux():
+    if helper_required:
         helper_artifact = release.install_identity(triple, HELPER_INSTALL_ID)
         helper_reported = run([str(helper_path(root)), "--version"]).stdout.strip()
         receipt.expect(
@@ -1036,8 +1051,10 @@ def _update_candidates(
     release = fetch_release(args.repository, tag, downloads / tag)
     candidate = release.directory / release.install_identity(triple, daemon_install).name
     helper_candidate = None
-    if is_linux():
-        helper_candidate = release.directory / release.install_identity(triple, HELPER_INSTALL_ID).name
+    if helper_candidate_expected:
+        helper_candidate = release.directory / release.install_identity(
+            triple, HELPER_INSTALL_ID
+        ).name
     return candidate, helper_candidate
 
 
@@ -1059,10 +1076,11 @@ def stage_update(args: argparse.Namespace) -> Receipt:
         raise QualificationFailure(f"{daemon} is not installed; run the install stage first")
     config = qualification_config(root)
     triple = host_target_triple()
+    helper_candidate_expected = target_ships_helper(triple)
     receipt = Receipt(stage=f"update:{args.release_id}:{triple}")
 
     downloads = Path(args.download_dir).resolve()
-    daemon_install = DAEMON_INSTALL_IDS[0] if is_windows() else "eggworkd"
+    daemon_install = target_daemon_install(triple)
     candidate, helper_candidate = _update_candidates(
         args, downloads, triple, daemon_install, args.release_tag, args.candidate_daemon
     )
