@@ -13,8 +13,11 @@ name: Operational qualification
 #   - it takes `contents: read` plus an artifact-upload-only `contents: read`
 #     for receipts, so no release, tag, or repository content can be changed.
 #
-# The release token is read from the environment by
-# `scripts/qualify_release.py` and never appears in argv, stdout, or a receipt.
+# A staged candidate is a *draft*, and the REST API does not expose drafts to the
+# default Actions `GITHUB_TOKEN`. The harness therefore reads a scoped repository
+# secret from the environment; it never appears in argv, stdout, or a receipt, and
+# the workflow's own `permissions` remain `contents: read`, so the workflow itself
+# cannot create, move, or publish anything even with a broader token available.
 
 on:
   workflow_dispatch:
@@ -64,7 +67,7 @@ jobs:
       - name: Qualify first install from the exact release bytes
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_QUALIFICATION_TOKEN: ${{ secrets.RELEASE_QUALIFICATION_TOKEN }}
         run: |
           set -euo pipefail
           python3 scripts/qualify_release.py install \
@@ -76,7 +79,7 @@ jobs:
       - name: Qualify the generated exact-release installer
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_QUALIFICATION_TOKEN: ${{ secrets.RELEASE_QUALIFICATION_TOKEN }}
         run: |
           set -euo pipefail
           python3 scripts/qualify_release.py installer \
@@ -88,7 +91,7 @@ jobs:
       - name: Qualify installed execution through the production client
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_QUALIFICATION_TOKEN: ${{ secrets.RELEASE_QUALIFICATION_TOKEN }}
           EGGWORK_QUALIFY_DAEMON: ${{ runner.temp }}/qualification/bin/eggworkd${{ runner.os == 'Windows' && '.exe' || '' }}
           EGGWORK_QUALIFY_CONFIG: ${{ runner.temp }}/qualification/state/node.json
           EGGWORK_QUALIFY_TLS_DIR: ${{ runner.temp }}/qualification/state/tls
@@ -128,7 +131,7 @@ jobs:
       - name: Install the exact release bytes
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_QUALIFICATION_TOKEN: ${{ secrets.RELEASE_QUALIFICATION_TOKEN }}
         run: |
           set -euo pipefail
           python3 scripts/qualify_release.py install \
@@ -140,7 +143,7 @@ jobs:
       - name: Qualify the native service lifecycle matrix
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_QUALIFICATION_TOKEN: ${{ secrets.RELEASE_QUALIFICATION_TOKEN }}
         run: |
           set -euo pipefail
           python3 scripts/qualify_release.py service \
@@ -149,7 +152,7 @@ jobs:
       - name: Qualify drain, update, and rollback against real generations
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_QUALIFICATION_TOKEN: ${{ secrets.RELEASE_QUALIFICATION_TOKEN }}
         run: |
           set -euo pipefail
           python3 scripts/qualify_release.py update \

@@ -229,10 +229,23 @@ class Release:
         raise QualificationFailure(f"{target} does not ship install identity {install!r}")
 
 
+#: Environment variable holding the read token used to reach a draft release.
+#:
+#: A staged candidate is a *draft*, and GitHub's REST API does not expose drafts
+#: to the Actions `GITHUB_TOKEN`: the list endpoint returns them only to a token
+#: with repository scope. Qualification therefore reads a scoped secret from this
+#: variable. The value is never placed in argv, stdout, or a receipt, and the
+#: workflow's own `permissions` stay at `contents: read`.
+TOKEN_VARIABLE = "RELEASE_QUALIFICATION_TOKEN"
+
+
 def api_token() -> str:
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    token = os.environ.get(TOKEN_VARIABLE, "").strip()
     if not token:
-        raise QualificationFailure("GITHUB_TOKEN is required for authenticated draft retrieval")
+        raise QualificationFailure(
+            f"{TOKEN_VARIABLE} is required: a staged candidate is a draft release, "
+            "which the default Actions token cannot read"
+        )
     return token
 
 
