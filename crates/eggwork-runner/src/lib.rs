@@ -1334,18 +1334,33 @@ impl LocalProcessRunner {
                 request.overflow,
             );
             let deadline = request.timeout;
-            let (termination, status, wait_error) = tokio::select! {
+            // `None` as a termination means the wait has to be settled against
+            // the child rather than against the monitor. The `child.wait()`
+            // continuation lives after the `select!` rather than inside one arm
+            // because awaiting it in an arm makes the whole future `!Send`, and
+            // this `select!` runs inside a spawned task.
+            let settled: Option<(
+                TerminationReason,
+                Option<std::process::ExitStatus>,
+                Option<String>,
+            )> = tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => (TerminationReason::Cancelled, None, None),
-                _ = sleep(deadline) => (TerminationReason::TimedOut, None, None),
+                _ = cancellation.cancelled() => Some((TerminationReason::Cancelled, None, None)),
+                _ = sleep(deadline) => Some((TerminationReason::TimedOut, None, None)),
                 changed = overflow_rx.changed() => {
-                    if changed.is_ok() && *overflow_rx.borrow() { (TerminationReason::OutputLimit, None, None) }
-                    else { (TerminationReason::Exited, None, Some("output monitor closed".into())) }
+                    monitor_termination(*overflow_rx.borrow()).map(|t| (t, None, None))
                 }
-                result = child.wait() => match result {
+                result = child.wait() => Some(match result {
                     Ok(status) => (TerminationReason::Exited, Some(status), None),
                     Err(error) => (TerminationReason::Exited, None, Some(error.to_string())),
-                }
+                }),
+            };
+            let (termination, status, wait_error) = match settled {
+                Some(settled) => settled,
+                None => match child.wait().await {
+                    Ok(status) => (TerminationReason::Exited, Some(status), None),
+                    Err(error) => (TerminationReason::Exited, None, Some(error.to_string())),
+                },
             };
             #[cfg(target_os = "linux")]
             let mut resource_limits_exceeded = if matches!(&termination, TerminationReason::Exited)
@@ -1512,6 +1527,25 @@ fn direct_command(request: &RunnerRequest, cwd: PathBuf) -> Command {
 /// Unix keeps the narrow, deterministic baseline the existing Linux and macOS
 /// evidence was gathered with. Windows gets the system directories its loader
 /// and `cmd.exe` require, without inheriting the caller's full environment.
+/// What a settled output monitor means for the running child.
+///
+/// `Some` is a termination reason and ends the wait. `None` means the monitor
+/// settled *without* overflowing, which is not a termination: the readers
+/// simply finished. This distinction is the whole point of the function.
+///
+/// The output monitor closes as soon as every reader has seen EOF, which can
+/// only happen once the child has exited. So a settled monitor always races an
+/// already-settled `child.wait()`. Treating the settled-but-not-overflowed case
+/// as `Exited` with a `None` status discarded the real exit code and surfaced
+/// as `state: Failed, failure: Internal, exit_code: null` -- a shape that reads
+/// as a product execution failure and is not one. The wait below is `biased`
+/// toward the monitor, so which arm wins is pure timing: Windows settles the
+/// monitor first, Linux does not, and the bug was therefore invisible on the
+/// platform most of the existing evidence was gathered on.
+fn monitor_termination(overflowed: bool) -> Option<TerminationReason> {
+    overflowed.then_some(TerminationReason::OutputLimit)
+}
+
 fn baseline_child_environment() -> Vec<(&'static str, String)> {
     let mut baseline: Vec<(&'static str, String)> = vec![
         ("CI", "1".to_owned()),
@@ -1902,6 +1936,66 @@ mod tests {
                 cpu_millis: Requirement::NotRequested,
                 pids: Requirement::NotRequested,
             },
+        }
+    }
+
+    #[test]
+    fn a_settled_output_monitor_is_not_a_termination_reason() {
+        // Overflowing the capture limit ends the execution; the monitor merely
+        // finishing does not. Reporting the second case as an exit discarded the
+        // child's real status.
+        assert_eq!(
+            monitor_termination(true),
+            Some(TerminationReason::OutputLimit)
+        );
+        assert_eq!(monitor_termination(false), None);
+    }
+
+    /// A short-lived child that writes to both pipes.
+    ///
+    /// The runner watches the output monitor with a `biased` select, so a
+    /// reader that finishes before `child.wait()` resolves used to win the race
+    /// and report `Exited` with no exit status. That surfaced as
+    /// `state: Failed, failure: Internal, exit_code: null` -- indistinguishable
+    /// from a genuine execution failure, and the reason Windows child execution
+    /// could not be qualified while the same case passed on Linux. The race is
+    /// timing, so it is exercised repeatedly, and it is not Unix-only.
+    #[tokio::test]
+    async fn a_short_lived_child_that_closes_its_pipes_keeps_its_exit_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let (argv, expected): (Vec<String>, &[u8]) = if cfg!(windows) {
+            let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned());
+            (
+                vec![
+                    shell,
+                    "/C".to_owned(),
+                    "echo qualification-marker".to_owned(),
+                ],
+                b"qualification-marker\r\n",
+            )
+        } else {
+            (
+                vec!["/bin/echo".to_owned(), "qualification-marker".to_owned()],
+                b"qualification-marker\n",
+            )
+        };
+        for _ in 0..32 {
+            let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let mut req = request(temp.path(), &args);
+            req.timeout = Duration::from_secs(10);
+            let result = run(req).await.unwrap();
+            // This assertion does not by itself reproduce the race: on Linux the
+            // child wait usually wins it, and the loop passes either way. The
+            // deterministic guard is `a_settled_output_monitor_is_not_a_
+            // termination_reason`; this is the end-to-end invariant.
+            assert_eq!(
+                result.exit_code,
+                Some(0),
+                "a closed output monitor must not be reported as a missing exit status: {result:?}"
+            );
+            assert_eq!(result.termination, TerminationReason::Exited);
+            assert_eq!(result.stdout.head, expected);
+            assert_eq!(result.cleanup.wait_error, None);
         }
     }
 
