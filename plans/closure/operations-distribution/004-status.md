@@ -472,7 +472,7 @@ Item 1 is a human action that must never be fabricated.
 
 | Severity | Finding | Status |
 | --- | --- | --- |
-| medium | Windows child execution unqualified for the candidate | fixed on `main`; outstanding evidence item 3 |
+| medium | Windows child execution unqualified for the candidate | root cause found, fix not yet chosen; outstanding evidence item 3 |
 | medium | Windows service management unsupported | dispositioned fail-closed; outstanding evidence item 2 |
 | medium | public publication/bootstrap not performed | outstanding evidence item 1 |
 | low | Eggpack git pin durability under upstream history rewrite | unchanged from M003; pin fails loudly, never silently |
@@ -601,9 +601,19 @@ the publication decision should apply to `v0.1.4`.
 | `v0.1.4` | `402861780` | `b31f117` | staged, then refused by its own harness: the version bump was missed, so the staged binaries report `0.1.3` and hosted qualification run `37185169008` failed every install stage with `installed-daemon-version: daemon reports '0.1.3', expected 0.1.4`. That refusal is the version-coherence check working as designed; the failure is real process evidence, not a harness problem. Staging itself was sound — run `37178170560` success, 17 assets, `draft=true`, `published_at=null`; same-tag re-run `37183381984` success with `created=false, uploaded=0, reused=17`; manifest cross-check 17/17 with `source_revision` equal to the tag source. Left as-is; superseded by `v0.1.5`. |
 | `v0.1.5` | staging | `c3ece0c` | same product content as `v0.1.4` with the workspace version the tag names, verified by `scripts/check_release_tag.py` before the tag was created. The tag-to-version link cannot live in CI — the release workflow is Eggpack producer authority and the `release-drift` job rejects hand edits to it — so the check runs at tag time by whoever cuts the tag. |
 
-`v0.1.2` qualification found a **third** Windows execution defect that `v0.1.1`
-could not have found, because the first two prevented the code path from being
-reached. See §19. Each release remains immutable; none is re-tagged or clobbered.
+`v0.1.2` qualification reproduced the same `Internal`/`null` shape, and it was
+attributed to a **third** defect — the output-monitor race — on the theory that
+the first two fixes had finally let the code path be reached. That attribution
+was wrong, and the record corrects it: `v0.1.5` contains the monitor fix and
+reproduces the identical shape on hosted Windows (run `37190674127`), while
+every Unix target passes. The monitor race is real and now pinned by a test,
+but it was never the Windows cause. The actual cause predates all of the
+fixes: `LocalProcessRunner::run` refuses with `UnsupportedPlatform` on
+`not(unix)` before any child exists (`crates/eggwork-runner/src/lib.rs`), and
+the server maps that refusal to `ExecutionFailure::Internal`, which reads as a
+product defect. No Windows child ever existed to be mis-shaped or mis-waited,
+so neither the environment shaping nor the monitor fix could have changed the
+outcome. Each release remains immutable; none is re-tagged or clobbered.
 
 ## 25. Verification notes
 

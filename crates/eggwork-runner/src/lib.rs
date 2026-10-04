@@ -1522,11 +1522,15 @@ fn direct_command(request: &RunnerRequest, cwd: PathBuf) -> Command {
 ///
 /// This baseline is deliberately platform-shaped. It used to declare a
 /// Unix-only environment unconditionally, including `PATH=/usr/bin:/bin`, so a
-/// Windows child was handed a `PATH` that does not exist on Windows and no
-/// `SystemRoot`. Hosted M004 qualification observed exactly that: the Windows
-/// child started and exited with no capturable exit code, which surfaced as
-/// `state: Failed`, `failure: Internal`, `exit_code: null` and was
-/// indistinguishable from a product defect in the execution result itself.
+/// Windows child would have been handed a `PATH` that does not exist on
+/// Windows and no `SystemRoot`. That shaping was written against the M004
+/// qualification symptom of `state: Failed`, `failure: Internal`,
+/// `exit_code: null` -- but on Windows no child ever exists to receive an
+/// environment: `LocalProcessRunner::run` refuses with `UnsupportedPlatform`
+/// before spawn, and the server maps that refusal to `Internal`. The shaping
+/// is still correct for any future Windows execution path, and it is what the
+/// qualified harness declares today, but it did not and could not fix Windows
+/// qualification on its own.
 ///
 /// Unix keeps the narrow, deterministic baseline the existing Linux and macOS
 /// evidence was gathered with. Windows gets the system directories its loader
@@ -1543,9 +1547,15 @@ fn direct_command(request: &RunnerRequest, cwd: PathBuf) -> Command {
 /// as `Exited` with a `None` status discarded the real exit code and surfaced
 /// as `state: Failed, failure: Internal, exit_code: null` -- a shape that reads
 /// as a product execution failure and is not one. The wait below is `biased`
-/// toward the monitor, so which arm wins is pure timing: Windows settles the
-/// monitor first, Linux does not, and the bug was therefore invisible on the
-/// platform most of the existing evidence was gathered on.
+/// toward the monitor, so which arm wins is pure timing, and the race is
+/// invisible in most runs on every platform; the unit test below pins it
+/// deterministically instead of relying on timing.
+///
+/// This race is real but it is NOT the Windows execution cause: on Windows
+/// `LocalProcessRunner::run` refuses with `UnsupportedPlatform` before any
+/// child exists, so the monitor code never runs there. The identical receipt
+/// shape is what sent the diagnosis down the wrong path; see the refusal gate
+/// at the top of `run`.
 fn monitor_termination(overflowed: bool) -> Option<TerminationReason> {
     overflowed.then_some(TerminationReason::OutputLimit)
 }
@@ -1961,9 +1971,14 @@ mod tests {
     /// reader that finishes before `child.wait()` resolves used to win the race
     /// and report `Exited` with no exit status. That surfaced as
     /// `state: Failed, failure: Internal, exit_code: null` -- indistinguishable
-    /// from a genuine execution failure, and the reason Windows child execution
-    /// could not be qualified while the same case passed on Linux. The race is
-    /// timing, so it is exercised repeatedly, and it is not Unix-only.
+    /// from a genuine execution failure. The race is timing, so it is
+    /// exercised repeatedly, and it is not Unix-only.
+    ///
+    /// This test guards the race, not Windows execution: on Windows
+    /// `LocalProcessRunner::run` refuses with `UnsupportedPlatform` before any
+    /// child exists, which produces the same receipt shape for a different
+    /// reason. Do not read a Windows qualification failure as evidence about
+    /// this race.
     #[tokio::test]
     async fn a_short_lived_child_that_closes_its_pipes_keeps_its_exit_status() {
         let temp = tempfile::tempdir().unwrap();
