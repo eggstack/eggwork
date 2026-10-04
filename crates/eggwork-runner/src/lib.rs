@@ -1347,9 +1347,13 @@ impl LocalProcessRunner {
                 biased;
                 _ = cancellation.cancelled() => Some((TerminationReason::Cancelled, None, None)),
                 _ = sleep(deadline) => Some((TerminationReason::TimedOut, None, None)),
-                changed = overflow_rx.changed() => {
-                    monitor_termination(*overflow_rx.borrow()).map(|t| (t, None, None))
-                }
+                    // Whether the monitor changed or merely closed is not the
+                    // question; its current value is. A closed monitor reads as
+                    // `false`, which is the same as a quiet one, and both mean
+                    // "keep waiting for the child".
+                    _ = overflow_rx.changed() => {
+                        monitor_termination(*overflow_rx.borrow()).map(|t| (t, None, None))
+                    }
                 result = child.wait() => Some(match result {
                     Ok(status) => (TerminationReason::Exited, Some(status), None),
                     Err(error) => (TerminationReason::Exited, None, Some(error.to_string())),
