@@ -65,8 +65,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import release_candidate_probe as probe  # noqa: E402
+
 # Bounds. A qualification harness that can hang, or read an unbounded file, is
 # not a qualification harness.
+def log(message: str) -> None:
+    """Emit a harness diagnostic.
+
+    A named seam rather than a bare print so a test can silence retry chatter
+    without reaching into the module's globals.
+    """
+    print(message, file=sys.stderr)
+
+
 MAX_ASSET_BYTES = 256 * 1024 * 1024
 # The release API occasionally answers a well-formed request with a 5xx. Retry
 # only that, so qualification reflects the candidate rather than upstream uptime.
@@ -356,10 +368,9 @@ def download_asset(repository: str, asset_id: int, destination: Path) -> None:
             partial.replace(destination)
             return
         if attempt < TRANSIENT_ATTEMPTS:
-            print(
+            log(
                 f"  transient asset download failure ({last_status}); "
-                f"retry {attempt}/{TRANSIENT_ATTEMPTS - 1}",
-                file=sys.stderr,
+                f"retry {attempt}/{TRANSIENT_ATTEMPTS - 1}"
             )
             time.sleep(min(2**attempt, TRANSIENT_BACKOFF_SECONDS))
     raise QualificationFailure(
@@ -1394,7 +1405,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--repository", default=os.environ.get("GITHUB_REPOSITORY", "eggstack/eggwork")
     )
-    parser.add_argument("--release-tag", default=os.environ.get("EGGWORK_QUALIFY_TAG", "v0.1.1"))
+    # Default to the workspace version rather than a hard-coded tag: a stale
+    # default would silently qualify the previous release instead of failing.
+    parser.add_argument(
+        "--release-tag",
+        default=os.environ.get("EGGWORK_QUALIFY_TAG")
+        or f"v{probe.workspace_version()}",
+    )
     parser.add_argument("--target", default=None, help="release target triple (default: this host)")
     parser.add_argument("--installation-root", required=True)
     parser.add_argument("--download-dir", default=None)

@@ -58,7 +58,9 @@ def _scripted(outcomes: list[object]):
     original_urlopen = harness.urllib.request.urlopen
     original_sleep = harness.time.sleep
     original_token = harness.api_token
+    original_log = harness.log
     harness.urllib.request.urlopen = _urlopen  # type: ignore[assignment]
+    harness.log = lambda _: None
     harness.time.sleep = lambda _: None
     harness.api_token = lambda: "token"  # type: ignore[assignment]
     try:
@@ -67,6 +69,7 @@ def _scripted(outcomes: list[object]):
         harness.urllib.request.urlopen = original_urlopen  # type: ignore[assignment]
         harness.time.sleep = original_sleep
         harness.api_token = original_token  # type: ignore[assignment]
+        harness.log = original_log
 
 
 class AssetDownloadTest(unittest.TestCase):

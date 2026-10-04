@@ -210,19 +210,18 @@ jobs:
   # Both are fixed on `main` and neither is in the qualified candidate's bytes.
   # This job therefore records the candidate's real disposition and fails if the
   # observation ever diverges from it, so the limitation cannot silently rot.
-  windows-platform-disposition:
-    name: windows platform disposition
+  windows-installed-execution:
+    name: windows installed execution and service disposition
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - name: Check out the qualification tooling
-        uses: actions/checkout@v5
-        with:
-          persist-credentials: false
+        uses: "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
       - name: Set up the pinned Rust toolchain for the client harness
-        uses: dtolnay/rust-toolchain@master
+        uses: "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c"
         with:
-          toolchain: 1.89.0
-      - name: Qualify the Windows installation path that is supported
+          toolchain: "1.89.0"
+      - name: Qualify the Windows installation path
         shell: pwsh
         env:
           RELEASE_QUALIFICATION_TOKEN: ${{ secrets.RELEASE_QUALIFICATION_TOKEN }}
@@ -236,70 +235,67 @@ jobs:
             --download-dir "$env:RUNNER_TEMP\release" `
             --receipt "$env:RUNNER_TEMP\receipts\install-windows.json"
       - name: Materialise the bounded qualification fixture
+        # The repository's own rcgen-based fixture, not a runner-provided one:
+        # a certificate the installed binary rejects would look like a product
+        # defect rather than a fixture problem.
         shell: bash
         run: |
           set -euo pipefail
           EGGWORK_QUALIFY_ROOT="${{ runner.temp }}/qualification" \
             cargo test --locked -p eggwork-server --features qualification \
               --test installed_qualification -- --ignored --exact qualification_fixture
-      - name: Record the unsupported service management disposition
+      - name: Qualify installed execution through the production client
+        # This is the step that previously could not be claimed. The candidate
+        # built a Unix-only child environment, so the shell could not resolve;
+        # the runner now supplies a platform-shaped environment. The test also
+        # proves required filesystem isolation is refused *before* the target
+        # runs, which is the truthful Windows disposition.
+        shell: bash
+        env:
+          RELEASE_QUALIFICATION_TOKEN: ${{ secrets.RELEASE_QUALIFICATION_TOKEN }}
+          EGGWORK_QUALIFY_DAEMON: ${{ runner.temp }}/qualification/bin/eggworkd.exe
+          EGGWORK_QUALIFY_CONFIG: ${{ runner.temp }}/qualification/state/node.json
+          EGGWORK_QUALIFY_TLS_DIR: ${{ runner.temp }}/qualification/state/tls
+          EGGWORK_QUALIFY_RECEIPT: ${{ runner.temp }}/receipts/execution-windows.json
+          EGGWORK_QUALIFY_PLATFORM: windows
+        run: |
+          set -euo pipefail
+          cargo test --locked -p eggwork-server --features qualification \
+            --test installed_qualification -- --ignored \
+            --exact installed_release_admits_execution_and_refuses_unsupported_isolation \
+            --nocapture
+      - name: Record the service management disposition
         shell: pwsh
         run: |
           $root = "$env:RUNNER_TEMP\qualification"
           $exe = "$root\bin\eggworkd.exe"
           $config = "$root\state\node.json"
-          # The backend is refused on main and registers-then-fails on the
-          # candidate. Both are recorded; neither is a qualified lifecycle.
+          $receipt = "$env:RUNNER_TEMP\receipts\windows-service.txt"
+          # Service management is still `unsupported`: the daemon is not a
+          # service host. What is qualified here is the *refusal*, which must
+          # happen before any mutation. A release that registers a service has
+          # lost that guarantee, so this is a hard failure, not a note.
           $output = & $exe service install `
             --config $config `
             --executable $exe `
             --service-config $config `
             --windows-start-type manual 2>&1 | Out-String
           $exit = $LASTEXITCODE
-          "service install exit=$exit output=$output" | Out-File -FilePath "$env:RUNNER_TEMP\receipts\windows-service.txt" -Encoding utf8
+          "service install exit=$exit output=$output" | Out-File -FilePath $receipt -Encoding utf8
           $unsupported = $output -match 'unsupported'
-          if ($unsupported) {
-            "DISPOSITION: refused-before-mutation (fail-closed)" | Out-File -FilePath "$env:RUNNER_TEMP\receipts\windows-service.txt" -Encoding utf8 -Append
-            if ($exit -eq 0) { throw "expected a non-zero refusal exit, got $exit" }
-            exit 0
+          if (-not $unsupported) {
+            "DISPOSITION: CHANGED, the service verb mutated state; update the support matrix" | Out-File -FilePath $receipt -Encoding utf8 -Append
+            throw "Windows service install did not refuse; the fail-closed guarantee is gone"
           }
-          if ($exit -ne 0) { throw "unexpected service install failure: $output" }
-          # Registration succeeded, so the candidate has no fail-closed refusal.
-          $start = & $exe service start `
-            --config $config `
-            --executable $exe `
-            --service-config $config 2>&1 | Out-String
-          "service start exit=$LASTEXITCODE output=$start" | Out-File -FilePath "$env:RUNNER_TEMP\receipts\windows-service.txt" -Encoding utf8 -Append
-          if ($start -notmatch '1053') {
-            # A Windows service that now reaches Running is an improvement, not a
-            # failure, but the support matrix must be updated before it is claimed.
-            "DISPOSITION: CHANGED, a service now starts; update the support matrix" | Out-File -FilePath "$env:RUNNER_TEMP\receipts\windows-service.txt" -Encoding utf8 -Append
-            throw "the Windows service disposition changed; re-qualify and update the support matrix"
-          }
-          "DISPOSITION: unsupported (registers, then cannot reach Running; no service host)" | Out-File -FilePath "$env:RUNNER_TEMP\receipts\windows-service.txt" -Encoding utf8 -Append
-          # The observed 1053 start is the recorded disposition, so the step
-          # must not inherit the daemon's non-zero exit as its own result.
+          if ($exit -eq 0) { throw "expected a non-zero refusal exit, got $exit" }
+          "DISPOSITION: unsupported (refused before mutation; no service host)" | Out-File -FilePath $receipt -Encoding utf8 -Append
+          # The refusal is the recorded disposition, so the step must not
+          # inherit the daemon's non-zero exit as its own result.
           exit 0
-      - name: Record the unqualified child execution disposition
-        shell: pwsh
-        run: |
-          # Child execution on Windows is unqualified for this candidate. The
-          # platform-shaped child environment is fixed on main; re-qualification
-          # needs a release that contains it.
-          @"
-          {
-            "platform": "windows",
-            "target": "x86_64-pc-windows-msvc",
-            "installed_runtime_qualified": true,
-            "child_execution_qualified": false,
-            "required_filesystem_isolation": "unsupported",
-            "service_management": "unsupported",
-            "disposition": "not claimed; the candidate builds its child environment for Unix only"
-          }
-          "@ | Out-File -FilePath "$env:RUNNER_TEMP\receipts\windows-execution.json" -Encoding utf8
-      - name: Upload the Windows disposition receipts
-        uses: actions/upload-artifact@v4
+      - name: Upload the Windows qualification receipts
+        uses: "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
         with:
-          name: windows-disposition-x86_64-pc-windows-msvc-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/receipts
-          retention-days: 30
+          name: "installed-execution-windows-x86_64-pc-windows-msvc-${{ github.run_id }}-${{ github.run_attempt }}"
+          path: "${{ runner.temp }}/receipts"
+          retention-days: 7
+          if-no-files-found: error
