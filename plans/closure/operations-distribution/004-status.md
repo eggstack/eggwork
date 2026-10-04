@@ -547,14 +547,15 @@ This section exists so the action is a verified single step rather than a
 judgement call, and so the two facts that must not be assumed — that the draft
 is still a draft, and that the public inventory matches — are both checkable.
 
-**Target.** Draft release `402786764`, tag `v0.1.2`, source
-`f43feb710d21b356d9ae71c86fb5d4adeccd5544`. *Superseded: see §24.*
+**Target.** Draft release `402861780`, tag `v0.1.4`, source
+`b31f117fe4cbb7221aa64014d7e50d67d4113144`. *Supersedes `v0.1.2`: see §24.
+Earlier targets are struck through by the table there, not edited away.*
 
 **Pre-publication, tokened** (records the §14 facts; run against the draft):
 
 ```
 RELEASE_QUALIFICATION_TOKEN=... python3 scripts/qualify_release.py inventory \
-  --release-tag v0.1.2 --receipt receipts/inventory-v0.1.2.json
+  --release-tag v0.1.4 --receipt receipts/inventory-v0.1.4.json
 ```
 
 This asserts the exact tag, `draft=true`, `published_at=null`, 17 assets, no
@@ -566,7 +567,7 @@ consumer needs no credential):
 
 ```
 python3 scripts/qualify_release.py inventory --public \
-  --release-tag v0.1.2 --receipt receipts/public-inventory-v0.1.2.json
+  --release-tag v0.1.4 --receipt receipts/public-inventory-v0.1.4.json
 ```
 
 `--public` refuses to run while `RELEASE_QUALIFICATION_TOKEN` is set, and refuses
@@ -588,13 +589,16 @@ replace a differing asset; publish as a way of fixing a failed check.
 
 `v0.1.2` was cut after the closure record was written, to carry the two fixes
 the `v0.1.1` candidate could not contain. It is a superset of the `v0.1.1`
-evidence, and it is the release the publication decision should apply to.
+evidence. It was itself superseded by `v0.1.4` before publication (see table);
+the publication decision should apply to `v0.1.4`.
 
 | Tag | Draft id | Source | Why it exists |
 | --- | --- | --- | --- |
 | `v0.1.0` | `400502116` | `8827ed5` | historical, immutable, never published |
 | `v0.1.1` | `402292969` | `fc67f8d` | the M004 closure candidate; pre-fix for both Windows gaps |
-| `v0.1.2` | `402786764` | `f43feb7` | adds the platform-shaped child environment and the fail-closed service refusal |
+| `v0.1.2` | `402786764` | `f43feb7` | adds the platform-shaped child environment and the fail-closed service refusal; superseded before publication because its bytes contain the output-monitor defect |
+| `v0.1.3` | — (staging failed) | `5955431` | never staged: the 0.1.3 version bump changed `Cargo.toml` without regenerating `Cargo.lock`, so every `--locked` release build failed closed with "the lock file needs to be updated". CI ran clippy and test without `--locked` and therefore passed the gate that exists to prevent exactly this; both now pass `--locked`. The tag and its failed producer run (`37176445644`) are left exactly as they are. |
+| `v0.1.4` | `402861780` | `b31f117` | same product content as `v0.1.3` plus the corrected lock; the release the publication decision should apply to. Staging run `37178170560` success, 17 assets, `draft=true`, `published_at=null`; same-tag re-run `37183381984` success with `created=false, uploaded=0, reused=17`; manifest cross-check 17/17 with `source_revision` equal to the tag source. |
 
 `v0.1.2` qualification found a **third** Windows execution defect that `v0.1.1`
 could not have found, because the first two prevented the code path from being
