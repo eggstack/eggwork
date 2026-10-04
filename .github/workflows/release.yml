@@ -39,6 +39,23 @@ jobs:
       - name: Validate exact-tag source
         shell: bash
         run: "test -n \"${{ inputs.release_tag }}\""
+      - name: Verify the workspace version matches the staged tag
+        # Hand-maintained guard, not Eggpack-generated. Staging `v0.1.4` built
+        # binaries that reported `0.1.3` because the version bump was missed,
+        # and the mismatch only surfaced in hosted qualification as
+        # `installed-daemon-version: daemon reports '0.1.3', expected 0.1.4`.
+        # Fail here, before any build, while the fix is still cheap.
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${{ inputs.release_tag }}"
+          expected="${expected#v}"
+          actual="$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"/\1/')"
+          if [ "$actual" != "$expected" ]; then
+            echo "workspace version '$actual' does not match staged tag '${{ inputs.release_tag }}'"
+            exit 1
+          fi
+          echo "workspace version '$actual' matches staged tag"
       - name: Install pinned Eggpack tool
         shell: bash
         timeout-minutes: 30
