@@ -18,8 +18,13 @@ jobs:
       - name: execution ownership guard negative-exit proof
         run: python3 scripts/check_execution_ownership.py --prove-negative-exit
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --all-targets
+      # `--locked` is load-bearing. A workspace version bump that does not
+      # update `Cargo.lock` builds fine locally and passes both of these, then
+      # fails every release build at `cargo build --locked`. That cost a full
+      # release attempt: the `v0.1.3` producer run failed closed on it. CI must
+      # catch a stale lock before a release does.
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace --all-targets
       - run: cargo check --workspace
       - name: release candidate validator tests
         run: python3 -m unittest discover --start-directory tests/release --top-level-directory tests/release
