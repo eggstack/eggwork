@@ -477,6 +477,8 @@ Item 1 is a human action that must never be fabricated.
 | medium | public publication/bootstrap not performed | outstanding evidence item 1 |
 | low | Eggpack git pin durability under upstream history rewrite | unchanged from M003; pin fails loudly, never silently |
 | low | `aarch64-unknown-linux-gnu` runtime/service untested | no native host available; staged bytes digest-verified only |
+| low | `tests/release` CI flake: `required_landlock_allows_workspace_and_denies_outside_reads_and_writes` failed once on `33f9a68` with `Spawn("Text file busy (os error 26)")` and passed on an immediate rerun of the same head | **open**. `ETXTBSY` is a test-staging race, not a product defect: every test in that file stages the same shared `target/debug/eggwork-sandbox-helper`. It needs its own corrective rather than a retry, and a rerun is not a fix. |
+| low | `scripts/qualify_release.py` release-API flake | closed by bounded retry with tests |
 | none open | release clobber, tag movement, secret exposure, ownership bypass, auto-start after `RecoveryRequired`, execution of a denied capability, false supported-isolation claim | none observed |
 
 No **high** finding remains. The three medium findings are the declared
@@ -538,7 +540,67 @@ Final state, all verified from `main` at `32e4559` or later:
 - release build + qualification: runs `37090342717` and `37091624589`, `success`
 - local gates: see §15
 
-## 23. Verification notes
+## 23. Publication readiness (item 1, not yet performed)
+
+Publication is a maintainer action under plan §14. Nothing below has been done.
+This section exists so the action is a verified single step rather than a
+judgement call, and so the two facts that must not be assumed — that the draft
+is still a draft, and that the public inventory matches — are both checkable.
+
+**Target.** Draft release `402786764`, tag `v0.1.2`, source
+`f43feb710d21b356d9ae71c86fb5d4adeccd5544`. *Superseded: see §24.*
+
+**Pre-publication, tokened** (records the §14 facts; run against the draft):
+
+```
+RELEASE_QUALIFICATION_TOKEN=... python3 scripts/qualify_release.py inventory \
+  --release-tag v0.1.2 --receipt receipts/inventory-v0.1.2.json
+```
+
+This asserts the exact tag, `draft=true`, `published_at=null`, 17 assets, no
+missing and no unexpected assets, and cross-checks the manifest's declared
+artifacts against the assets that exist.
+
+**Post-publication, anonymous** (verifies the public inventory and that a
+consumer needs no credential):
+
+```
+python3 scripts/qualify_release.py inventory --public \
+  --release-tag v0.1.2 --receipt receipts/public-inventory-v0.1.2.json
+```
+
+`--public` refuses to run while `RELEASE_QUALIFICATION_TOKEN` is set, and refuses
+to run against a draft. That is deliberate: a tokened read reporting "public"
+would make the difference between a consumer installing the release and a
+maintainer installing it with a credential unobservable, which is exactly the
+distinction this evidence exists to establish.
+
+**What publication does not do.** It does not qualify anything. The staged
+assets are already qualified by the hosted runs in §15; publication changes
+their visibility, not their bytes. If the post-publication inventory disagrees
+with the pre-publication one, stop: that is a release-integrity finding, not a
+documentation fix.
+
+**Never**, for this milestone: publish `v0.1.0`; move or recreate any tag;
+replace a differing asset; publish as a way of fixing a failed check.
+
+## 24. Follow-on releases after the closure window
+
+`v0.1.2` was cut after the closure record was written, to carry the two fixes
+the `v0.1.1` candidate could not contain. It is a superset of the `v0.1.1`
+evidence, and it is the release the publication decision should apply to.
+
+| Tag | Draft id | Source | Why it exists |
+| --- | --- | --- | --- |
+| `v0.1.0` | `400502116` | `8827ed5` | historical, immutable, never published |
+| `v0.1.1` | `402292969` | `fc67f8d` | the M004 closure candidate; pre-fix for both Windows gaps |
+| `v0.1.2` | `402786764` | `f43feb7` | adds the platform-shaped child environment and the fail-closed service refusal |
+
+`v0.1.2` qualification found a **third** Windows execution defect that `v0.1.1`
+could not have found, because the first two prevented the code path from being
+reached. See §19. Each release remains immutable; none is re-tagged or clobbered.
+
+## 25. Verification notes
 
 - Code inspection and executed evidence are distinguished throughout: §5.2, §6,
   §7, §8, §10, §12, and §13 cite run ids and artifact names; §9 and §11 cite
