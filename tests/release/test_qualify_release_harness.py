@@ -8,7 +8,9 @@ direction that matters: it either invents a defect or hides one.
 
 from __future__ import annotations
 
+import contextlib
 import io
+import os
 import sys
 import tempfile
 import unittest
@@ -79,6 +81,8 @@ class AssetDownloadTest(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.destination = self.root / "artifact.bin"
 
+
+
     def _partial(self) -> Path:
         return self.destination.with_name(self.destination.name + ".partial")
 
@@ -131,3 +135,63 @@ class AssetDownloadTest(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class PublicReadTest(unittest.TestCase):
+    """The publication boundary has to be reproducible by a consumer.
+
+    The post-publication bootstrap evidence is only meaningful if the read that
+    produced it is anonymous. A tokened run that reported `public` would make
+    the distinction between "a consumer can install this" and "we can install
+    this with a maintainer credential" unobservable, which is exactly the
+    distinction the closure record needs.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self._previous_token = os.environ.get(harness.TOKEN_VARIABLE)
+        self._previous_mode = harness.PUBLIC_MODE
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        harness.PUBLIC_MODE = self._previous_mode
+        if self._previous_token is None:
+            os.environ.pop(harness.TOKEN_VARIABLE, None)
+        else:
+            os.environ[harness.TOKEN_VARIABLE] = self._previous_token
+
+    def test_a_tokened_read_cannot_masquerade_as_public(self) -> None:
+        os.environ[harness.TOKEN_VARIABLE] = "a-token"
+        harness.PUBLIC_MODE = True
+        with self.assertRaisesRegex(harness.QualificationFailure, "not public bootstrap"):
+            harness.api_token()
+
+    def test_a_public_read_needs_no_token(self) -> None:
+        os.environ.pop(harness.TOKEN_VARIABLE, None)
+        harness.PUBLIC_MODE = True
+        self.assertEqual(harness.api_token(), "")
+
+    def test_a_draft_read_still_requires_a_token(self) -> None:
+        os.environ.pop(harness.TOKEN_VARIABLE, None)
+        harness.PUBLIC_MODE = False
+        with self.assertRaisesRegex(harness.QualificationFailure, "draft release"):
+            harness.api_token()
+
+    def test_public_is_rejected_for_the_privileged_stages(self) -> None:
+        # Only the inventory check is a consumer-shaped read. Letting `--public`
+        # qualify an install would quietly downgrade a privileged
+        # pre-publication check to an anonymous one.
+        for stage in ("install", "installer", "service", "update"):
+            with self.subTest(stage=stage):
+                with self.assertRaises(SystemExit):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        harness.main(
+                            [
+                                stage,
+                                "--public",
+                                "--installation-root",
+                                self.root.name,
+                            ]
+                        )

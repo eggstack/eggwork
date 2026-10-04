@@ -79,6 +79,11 @@ def log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+# The qualified inventory, fixed by plan section 14: five targets, a manifest
+# and a sidecar for every binary, both generated installers, and the manifest's
+# own sidecar. A count that differs is a finding, not a formatting change.
+QUALIFIED_ASSET_COUNT = 17
+
 MAX_ASSET_BYTES = 256 * 1024 * 1024
 # The release API occasionally answers a well-formed request with a 5xx. Retry
 # only that, so qualification reflects the candidate rather than upstream uptime.
@@ -258,9 +263,21 @@ class Release:
 #: workflow's own `permissions` stay at `contents: read`.
 TOKEN_VARIABLE = "RELEASE_QUALIFICATION_TOKEN"
 
+# Set by `--public`. Post-publication bootstrap has to be reproducible by an
+# unauthenticated consumer, so that path is deliberately token-free; a tokened
+# run must never be able to masquerade as public evidence.
+PUBLIC_MODE = False
+
 
 def api_token() -> str:
     token = os.environ.get(TOKEN_VARIABLE, "").strip()
+    if PUBLIC_MODE:
+        if token:
+            raise QualificationFailure(
+                f"--public requires an unauthenticated read, but {TOKEN_VARIABLE} is set; "
+                "a tokened fetch is not public bootstrap evidence"
+            )
+        return ""
     if not token:
         raise QualificationFailure(
             f"{TOKEN_VARIABLE} is required: a staged candidate is a draft release, "
@@ -270,14 +287,16 @@ def api_token() -> str:
 
 
 def _api_json(endpoint: str) -> Any:
+    token = api_token()
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "eggwork-operational-qualification",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(
-        f"https://api.github.com/{endpoint}",
-        headers={
-            "Authorization": f"Bearer {api_token()}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "eggwork-operational-qualification",
-        },
+        f"https://api.github.com/{endpoint}", headers=headers
     )
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
@@ -335,13 +354,16 @@ def download_asset(repository: str, asset_id: int, destination: Path) -> None:
     partial = destination.with_name(destination.name + ".partial")
     last_status: int | None = None
     for attempt in range(1, TRANSIENT_ATTEMPTS + 1):
+        token = api_token()
+        headers = {
+            "Accept": "application/octet-stream",
+            "User-Agent": "eggwork-operational-qualification",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         request = urllib.request.Request(
             f"https://api.github.com/repos/{repository}/releases/assets/{asset_id}",
-            headers={
-                "Authorization": f"Bearer {api_token()}",
-                "Accept": "application/octet-stream",
-                "User-Agent": "eggwork-operational-qualification",
-            },
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=300) as response:
@@ -1387,6 +1409,124 @@ def stage_update(args: argparse.Namespace) -> Receipt:
     return receipt
 
 
+def stage_inventory(args: argparse.Namespace) -> Receipt:
+    """Record or verify the exact-tag asset inventory.
+
+    This is the release-publication boundary, and the two uses are deliberately
+    the same command with different reach:
+
+    * before publication it is tokened and reads the *draft*, producing the
+      exact inventory and hashes that a maintainer must record (plan section 14);
+    * after publication it runs with ``--public`` and reads the release
+      anonymously, proving that what a consumer can fetch is byte-for-byte the
+      inventory that was qualified.
+
+    A tokened run must not be able to stand in for the public one, so `--public`
+    refuses to run with a token present.
+    """
+    repository, tag = args.repository, args.release_tag
+    release = _resolve_release(repository, tag)
+    assets = release.get("assets", [])
+    receipt = Receipt(stage="inventory")
+    receipt.record(
+        "release-identity",
+        ok=True,
+        tag=tag,
+        tag_name=release.get("tag_name"),
+        release_id=int(release["id"]),
+        draft=bool(release.get("draft")),
+        prerelease=bool(release.get("prerelease")),
+        published_at=release.get("published_at"),
+        authenticated_read=not PUBLIC_MODE,
+    )
+    receipt.expect(
+        "exact-tag",
+        release.get("tag_name") == tag,
+        f"release {release.get('id')} carries tag {release.get('tag_name')!r}, not {tag!r}",
+    )
+    if PUBLIC_MODE:
+        # A draft is not anonymously readable, so a public read that succeeds
+        # against one would mean the read was not public.
+        receipt.expect(
+            "published",
+            not release.get("draft"),
+            f"release {tag} is still a draft; there is no public bootstrap to verify",
+        )
+        receipt.expect(
+            "published-at",
+            bool(release.get("published_at")),
+            f"release {tag} has no published_at timestamp",
+        )
+
+    # The manifest is the authority on what should exist; the asset list is the
+    # authority on what does. Disagreement in either direction is the finding.
+    directory = Path(args.download_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    names = {asset["name"]: asset for asset in assets}
+    manifest_path = directory / "release-manifest.json"
+    download_asset(repository, names["release-manifest.json"]["id"], manifest_path)
+    # The manifest and the generated installers are the trust anchors: neither
+    # carries a sidecar, because there is nothing above them to compare against.
+    # Their anchor is the immutable tag plus the release API over TLS. Every
+    # *binary* below them is cross-checked against both its sidecar and the
+    # manifest, so an anchor substitution still has to agree on seven binaries.
+    sidecar_path = directory / "release-manifest.json.sha256"
+    manifest_sidecar = "release-manifest.json.sha256" in names
+    if manifest_sidecar:
+        download_asset(repository, names["release-manifest.json.sha256"]["id"], sidecar_path)
+        verify_sidecar(manifest_path, sidecar_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    receipt.expect(
+        "manifest-release",
+        manifest.get("release_id") == tag and manifest.get("product_id") == "eggwork",
+        f"the manifest is not an Eggwork manifest for {tag}",
+    )
+    receipt.record(
+        "source",
+        ok=True,
+        source_revision=str(manifest.get("source_revision", "")),
+        target_count=len(manifest.get("targets", [])),
+        manifest_sidecar=manifest_sidecar,
+        trust_anchor="immutable exact tag over TLS; binaries cross-checked "
+        "against both their sidecar and the manifest",
+    )
+
+    expected: dict[str, int] = {"release-manifest.json": names["release-manifest.json"]["size"]}
+    for entry in manifest.get("targets", []):
+        form = entry["form"]
+        declared = (
+            [form["artifact"]]
+            if form["kind"] == "direct"
+            else [item["artifact"] for item in form["entries"]]
+        )
+        for item in declared:
+            name = str(item["name"])
+            expected[name] = int(item["size"])
+            expected[f"{name}.sha256"] = 0
+    for name in ("install.sh", "install.ps1"):
+        if name in names:
+            expected[name] = int(names[name]["size"])
+
+    missing = sorted(set(expected) - set(names))
+    extra = sorted(set(names) - set(expected))
+    receipt.expect("no-missing-assets", not missing, f"release {tag} is missing {missing}")
+    receipt.expect("no-extra-assets", not extra, f"release {tag} carries unexpected {extra}")
+    receipt.record(
+        "inventory",
+        ok=True,
+        asset_count=len(names),
+        asset_names=sorted(names),
+        sizes={name: int(asset["size"]) for name, asset in sorted(names.items())},
+    )
+    receipt.expect(
+        "asset-count",
+        len(names) == QUALIFIED_ASSET_COUNT,
+        f"release {tag} carries {len(names)} assets; the qualified inventory is "
+        f"{QUALIFIED_ASSET_COUNT}",
+    )
+    return receipt
+
+
 def _json_or_failure(result: ProcessResult) -> dict[str, Any]:
     try:
         return result.json()
@@ -1401,7 +1541,9 @@ def _json_or_failure(result: ProcessResult) -> dict[str, Any]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Eggwork operational qualification harness")
-    parser.add_argument("stage", choices=["install", "installer", "service", "update"])
+    parser.add_argument(
+        "stage", choices=["inventory", "install", "installer", "service", "update"]
+    )
     parser.add_argument(
         "--repository", default=os.environ.get("GITHUB_REPOSITORY", "eggstack/eggwork")
     )
@@ -1413,9 +1555,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         or f"v{probe.workspace_version()}",
     )
     parser.add_argument("--target", default=None, help="release target triple (default: this host)")
-    parser.add_argument("--installation-root", required=True)
+    parser.add_argument(
+        "--installation-root",
+        default=None,
+        help="installation root; required for every stage except `inventory`",
+    )
     parser.add_argument("--download-dir", default=None)
     parser.add_argument("--receipt", default=None)
+    parser.add_argument(
+        "--public",
+        action="store_true",
+        help="read the release anonymously, as a post-publication consumer would",
+    )
     parser.add_argument("--scope", default="user", choices=["user", "system"])
     parser.add_argument(
         "--service-definition",
@@ -1445,13 +1596,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="older release whose daemon is applied to exercise the real rollback path",
     )
     args = parser.parse_args(argv)
+    # Set before any stage runs: a stage that reaches the API must see the mode
+    # even if it does not read it itself.
+    global PUBLIC_MODE
+    PUBLIC_MODE = bool(args.public)
+    if args.public and args.stage != "inventory":
+        # Only the inventory check is a consumer-shaped read. Letting `--public`
+        # qualify an install would quietly downgrade a privileged pre-publication
+        # check to an anonymous one.
+        parser.error("--public applies only to the inventory stage")
 
+    if args.stage != "inventory" and not args.installation_root:
+        parser.error(f"the {args.stage} stage requires --installation-root")
     if args.stage == "update" and not args.release_id:
         parser.error("the update stage requires --release-id")
     if args.download_dir is None:
         args.download_dir = tempfile.mkdtemp(prefix="eggwork-release-")
 
     stages = {
+        "inventory": stage_inventory,
         "install": stage_install,
         "installer": stage_installer,
         "service": stage_service,
