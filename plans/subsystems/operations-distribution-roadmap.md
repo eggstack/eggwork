@@ -210,6 +210,35 @@ Prior disposition (superseded by the outcome above, retained for traceability):
 
 M004 does not reopen producer ownership or authorize publication. It reuses the M003 producer contract to stage a new corrected draft after product-side release determinism and version coherence are proven.
 
+### M007 — Windows service host
+
+Class: corrective capability
+
+Status: **ready**; `plans/implementation/operations-distribution/007-windows-service-host.md`
+
+(Eggwork Operations M007; unrelated to the Eggup M007 referenced elsewhere in
+this document.)
+
+Objective:
+
+Make `eggworkd` an actual Windows service rather than a registrable process.
+`v0.1.1` and `v0.1.2` register through the retained `deployment::windows_scm_manager`
+adapter and then fail to start with Windows error `1053`, because nothing in the
+daemon calls `StartServiceCtrlDispatcherW`. A registered service that cannot
+reach `Running` is not service software.
+
+Non-goals: Windows or macOS required filesystem isolation, network isolation,
+SCM recovery/failure-action configuration, `aarch64` Linux runtime evidence, and
+publication.
+
+Dependencies: none hard. M004's retained fail-closed service refusal is the
+safe interim state and must stay until a release containing a real host has
+hosted evidence on a Windows host.
+
+M007 is the named closure path for M004 closure-record §18 item 2. M004
+closure remains **conditionally closed** until M007 closes and a release
+containing the host is qualified.
+
 ### M005 — Reverse-connect relay
 
 Class: capability
