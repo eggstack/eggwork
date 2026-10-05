@@ -70,7 +70,7 @@ and deliberate. Deep dives:
 
 ## Hard invariants (mechanically enforced — do not weaken)
 
-1. **Process ownership is singular.** Only `eggwork-runner` and `eggwork-sandbox-helper` may create child processes; `eggwork-core`, `eggwork-client`, `eggwork-server` must not. Also banned outright: `command`, `duct`, `process-wrap`, `portable-pty`, `subprocess`. The allowlist lives in `scripts/check_execution_ownership.py`; adding an owner requires an architecture review.
+1. **Process ownership is singular.** Only `eggwork-runner` and `eggwork-sandbox-helper` may create child processes; `eggwork-core`, `eggwork-client`, `eggwork-server` must not. Also banned outright: `command-group`, `duct`, `process-wrap`, `portable-pty`, `subprocess`. The allowlist lives in `scripts/check_execution_ownership.py`; adding an owner requires an architecture review. The guard scans only `crates/*/src/**/*.rs` — `tests/`, `examples/`, `build.rs`, and new top-level dirs are unscanned.
 2. **No direct service-manager invocation for the *node service*.** Eggwork never manages its own service by shelling out — the node service lifecycle goes through Eggup adapters. **Exception, and it is not a violation:** `eggwork-runner` invokes `systemd-run --scope` and `systemctl show`/`stop` for *per-execution transient cgroup units*, which is resource enforcement owned by the process-lifecycle crate, not service lifecycle. A new `systemctl`-shaped call must pick a side and match the code to it. (No dedicated Python guard; the only automated check, `no_direct_service_manager_invocation_exists`, scans three `eggwork-server` files. `eggwork-runner` is not covered — discipline is on you.)
 3. **Crate dependencies stay one-way.** core/helper → nothing; client → core; server → core + runner (`eggwork-client` is dev-only for the server).
 4. **Isolation claims are earned.** Advertise filesystem isolation only when `verify_trusted_helper` accepts the installed helper; the same function backs capability advertisement, `doctor`, and admission.
@@ -102,6 +102,7 @@ and deliberate. Deep dives:
 - Branch from `main`; never push to it directly.
 - Pre-submit gate: ownership guard, fmt, clippy, workspace tests, workspace check, release-harness tests.
 - Planning changes follow `plans/003-planning-process.md`; do not edit `plans/000`-`002` as part of ordinary implementation.
+- Releases: land and tag first, then run the Release workflow with that exact tag (no `latest` fallback); it stages a **draft** only — publishing is a human action. Tag↔version coherence is enforced by `scripts/check_release_tag.py` + `release_contract.rs`.
 - The next piece of ready work is in `plans/registry.md` (currently Operations M007, the Windows service host).
 
 ## Security
