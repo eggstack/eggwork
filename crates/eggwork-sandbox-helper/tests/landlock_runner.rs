@@ -1,3 +1,12 @@
+//! Integration coverage for the Landlock helper, driven through the real runner.
+//!
+//! The whole file is Linux-only, and the gate is at file level on purpose: every
+//! test here needs the `landlock` kernel interface and a cgroup v2 hierarchy, so
+//! the per-test `#[cfg(target_os = "linux")]` this replaces only left the
+//! file's imports and helpers un-gated -- which is exactly what a Windows
+//! `clippy -D warnings` build flagged (Foundation M004).
+#![cfg(target_os = "linux")]
+
 use eggwork_core::{OverflowPolicy, Requirement};
 use eggwork_runner::{
     ExecutionProvenance, ExecutionSetup, LocalProcessRunner, ResourceSetupRequest, RunnerRequest,
@@ -32,7 +41,6 @@ fn request(root: &Path, outside_read: &Path, outside_write: &Path) -> RunnerRequ
     request
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn required_landlock_allows_workspace_and_denies_outside_reads_and_writes() {
     let temp = tempfile::tempdir().unwrap();
@@ -76,7 +84,6 @@ async fn required_landlock_allows_workspace_and_denies_outside_reads_and_writes(
     ));
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn helper_trust_checks_reject_missing_wrong_and_symlinked_helpers() {
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -160,7 +167,6 @@ async fn helper_trust_checks_reject_missing_wrong_and_symlinked_helpers() {
     assert!(!marker.exists());
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn workspace_symlink_cannot_read_outside_workspace() {
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -193,7 +199,6 @@ async fn workspace_symlink_cannot_read_outside_workspace() {
     ));
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn cwd_symlink_outside_workspace_is_rejected_before_launch() {
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -223,7 +228,6 @@ async fn cwd_symlink_outside_workspace_is_rejected_before_launch() {
     ));
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn sandbox_timeout_and_cancellation_reap_the_helper_process_group() {
     use std::os::unix::fs::PermissionsExt;
@@ -302,7 +306,6 @@ async fn sandbox_timeout_and_cancellation_reap_the_helper_process_group() {
     );
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn required_memory_limit_is_enforced_and_classified() {
     use std::os::unix::fs::PermissionsExt;
@@ -340,7 +343,6 @@ async fn required_memory_limit_is_enforced_and_classified() {
     ));
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn required_pid_limit_is_enforced_and_classified() {
     use std::os::unix::fs::PermissionsExt;
@@ -378,7 +380,6 @@ async fn required_pid_limit_is_enforced_and_classified() {
     ));
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn required_cpu_quota_is_verified_before_target_start() {
     use std::os::unix::fs::PermissionsExt;
@@ -413,7 +414,6 @@ async fn required_cpu_quota_is_verified_before_target_start() {
     ));
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn concurrent_resource_scopes_keep_pid_limits_isolated() {
     use std::os::unix::fs::PermissionsExt;
@@ -468,7 +468,6 @@ async fn concurrent_resource_scopes_keep_pid_limits_isolated() {
     ));
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn malformed_private_spec_and_unavailable_status_channel_do_not_launch_target() {
     use std::{io::Read, os::unix::fs::PermissionsExt};
