@@ -10,6 +10,7 @@
 //! members.
 
 use eggwork_runner::{LocalProcessRunner, TrustedLandlockSetup};
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
 // One shared fixture surface, two suites: this one only needs `stage` and
