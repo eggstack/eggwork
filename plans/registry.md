@@ -71,11 +71,11 @@ The repository is no longer planning-only.
 
 | Workstream | Status | Current work | Authority |
 |---|---|---|---|
-| Foundation / execution core | closed | M001-M003 closed; C001 portable ownership-guard CI enforcement closed | `plans/subsystems/foundation-execution-core-roadmap.md`, `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md` |
+| Foundation / execution core | M001-M003 closed; M004 ready | Windows execution is intentionally unsupported in the closed baseline; M004 adds a pre-run Job Object process-tree backend after `v0.1.5` proved the current `UnsupportedPlatform` gate is the real Windows child-execution blocker | `plans/subsystems/foundation-execution-core-roadmap.md`, `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md` |
 | Control-plane protocol | closed | M001-M003 complete | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | closed | M001-M004 closed, including reusable manifest CAS + derived materialization (`plans/closure/workspace-artifact-transport/004-status.md`) | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | closed | M001-M004 plus remote-admission corrective C001 are closed (`plans/closure/security-isolation-resource/004-status.md`); macOS/Windows hosted qualification remains future Operations M004 work, not a Security defect | `plans/subsystems/security-isolation-resource-roadmap.md`, `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md` |
-| Operations / distribution | conditionally closed | M001-M003 and M002a closed; M004 conditionally closed on corrected `v0.1.1` (`402292969`, tag `b60c895` -> `fc67f8d`) with systemd and launchd service-qualified, Linux required Landlock isolation qualified, full update/rollback evidence, and all-asset same-tag reuse proven. Outstanding: public publication/bootstrap, Windows service management (`unsupported`), Windows child execution. Windows child execution is now **diagnosed, not merely unqualified**: `v0.1.5` still reproduces the `Internal`/`null` shape, and the cause is `LocalProcessRunner::run` returning `UnsupportedPlatform` on `not(unix)` before any child exists, not the output-monitor race originally blamed. | `plans/subsystems/operations-distribution-roadmap.md`, `plans/closure/operations-distribution/004-status.md` |
+| Operations / distribution | conditionally closed; M004a + M007 ready | M004 remains conditional. M004a closes the helper-fixture `ETXTBSY` race; M007 adds the actual Windows SCM host. Windows child execution is owned by Foundation M004, not Operations. | `plans/subsystems/operations-distribution-roadmap.md`, `plans/closure/operations-distribution/004-status.md` |
 | CodeGG integration | Eggwork reference closed; downstream M001+C001+M002+M002a+M003 closed | CodeGG required-Landlock live qualification closed at `f5f8d96d`; downstream M003 closed at CodeGG `d51afe46` (implementation `1ce377ce`, hosted `36745285774`) against this repository's Workspace M004 contract; only downstream M004 remains, deferred. | `plans/subsystems/codegg-integration-roadmap.md` |
 
 ## Dependency-ready implementation plans
@@ -84,6 +84,9 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
+| Foundation / execution core | M004 Windows Job Object finite-process backend | **ready** | `plans/implementation/foundation-execution-core/004-windows-job-object-process-tree-backend.md` | Canonical runner work. Prefer exact target-scoped `process-wrap 10.0.1`; preserve pre-run tree ownership and Rust 1.89. May execute in parallel with Operations M007. |
+| Operations corrective | M004a qualification helper fixture isolation | **ready** | `plans/implementation/operations-distribution/004a-release-qualification-fixture-isolation-corrective.md` | Remove shared mutable helper staging; no retry/sleep workaround and no production behavior change. |
+| Operations / distribution | M007 Windows service host | **ready** | `plans/implementation/operations-distribution/007-windows-service-host.md` | Keep Eggup as manager owner; target-scoped `windows-service 0.8.1` hosts the daemon through explicit `service-host`. |
 | CodeGG downstream | M001+C001+M002+M002a fixed-target remote execution/policy/live isolation | **closed in CodeGG** | `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution/002a-status.md` | Required-Landlock production mTLS path closed at `f5f8d96d`. Downstream M003 is also closed (see below). |
 
 ## Closed and superseded implementation plans
@@ -117,12 +120,14 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Work | Status | Blocker / rationale |
 |---|---|---|
+| Foundation M004 Windows finite-process backend | **ready** | `v0.1.5` proved Windows is refused before spawn by the canonical runner. Registered plan adds pre-run Job Object ownership and complete-tree lifecycle semantics. |
+| Operations M004a qualification helper fixture isolation | **ready** | Closes the recorded intermittent Linux `ETXTBSY` test-staging race by making helper installation paths fixture-private. |
 | Operations M004 operational/release qualification | **conditionally closed** | `plans/closure/operations-distribution/004-status.md`; deterministic MSVC policy and double-build proof landed, corrected `v0.1.1` cut and staged, all 17 assets reused on same-tag rerun without clobber, native service/update evidence collected for systemd and both launchd targets. Acceptance criterion 5 is unmet for Windows by the plan's own §15 `unsupported` disposition, not by omission. |
 | Operations M005 reverse-connect relay | deferred (not unblocked) | M004 neither implements nor claims a remote connect/accept path, so it does not supply the interface M005 relies on. No immediate product need; stable identity/lease semantics already exist. |
 | Operations M006 PTY extension | deferred (not unblocked) | PTY capability streams are out of M004 scope. Requires a separate interactive ownership/attach design. |
 | CodeGG M003 content-aware derived workspace transfer | closed downstream | Closed in CodeGG at `d51afe46` (implementation `1ce377ce`; hosted `36745285774` success, live derived reuse under required isolation) on Eggwork `e6a5d82`; closure record `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution/003-status.md` |
 | CodeGG M004 remote AgentRun worker | deferred | M003 is closed; only the stable AgentRun worker-entry contract remains outstanding |
-| Operations M007 Windows service host | **ready** — next ready work | `plans/implementation/operations-distribution/007-windows-service-host.md`. The M004 closure path for Windows service management: the daemon must call `StartServiceCtrlDispatcherW` and report `SERVICE_RUNNING` only once the node is serving, or SCM reports 1053. Interim state is correct and safe — `main` refuses the service verbs before mutating any state — and that refusal must stay until a release containing a real host has hosted Windows evidence. No hard dependency; M005/M006 remain deferred and unrelated. |
+| Operations M007 Windows service host | **ready** | `plans/implementation/operations-distribution/007-windows-service-host.md`. Uses an explicit SCM `service-host` entry and target-scoped `windows-service` host API while Eggup retains registration/manager ownership. Independent of Foundation M004; both feed final M004/Phase-6 closure. |
 
 Operations M003, M002a, and conditionally M004 are closed. M004 used the historical `v0.1.0` draft only as discovery evidence and qualified a corrected `v0.1.1` draft containing the runner fix and an Eggwork-owned deterministic Windows link policy. Do not widen M004 into runtime release discovery, service-manager duplication, or Eggpack/Eggup interoperability. Windows service hosting is a **new** milestone, not an M004 continuation, because it requires a service-control dispatcher that the daemon does not have.
 
@@ -152,7 +157,9 @@ Operations M002 [historically CLOSED] --> Operations M002a [CLOSED corrective]
                                               |
 Operations M003 [CLOSED] ---------------------+--> Operations M004 [CONDITIONALLY CLOSED]
                                                                 |
-Operations Windows service host [NOT PLANNED: new milestone] <----+--> Windows service management
+Foundation M004 Windows Job Object runner [READY] <---------------+--> Windows child execution
+Operations M004a fixture isolation [READY] <----------------------+--> deterministic qualification evidence
+Operations M007 Windows service host [READY] <--------------------+--> Windows service management
 Operations release publication  [HUMAN ACTION: §14]       <----+--> public bootstrap evidence
 ```
 
@@ -164,6 +171,8 @@ These are reviewed research baselines, not permanent dependency pins.
 
 | Project | Reviewed baseline | Current relevant state |
 |---|---|---|
+| process-wrap | 10.0.1, reviewed 2026-10-05 | Preferred Foundation M004 Windows runner seam: Tokio JobObject wrapper assigns the suspended process before resume; MIT OR Apache-2.0; MSRV 1.87. Pin exact because upstream allows MSRV movement without a major bump. |
+| windows-service | 0.8.1, reviewed 2026-10-05 | Preferred Operations M007 service-host seam: dispatcher/control/status APIs; MIT OR Apache-2.0; MSRV 1.71. Eggup remains the manager/registration owner. |
 | CodeGG | current reviewed `0fae5c55051c895061b26b6eb5b0d5d90cd64ebc`; remote-execution M002a closure `f5f8d96d7b7371c8583196c58d36ef7b3118ed3c` | M001+C001+M002+M002a+M003 closed; M003 implemented at `1ce377ce` on Eggwork `e6a5d82` and closed at `d51afe46`; M004 deferred. Stale current-state text reconciled at CodeGG `0fae5c55`. The advance from `841ad117` is planning plus the M003 implementation, which pins this repository at `e6a5d82`. |
 | Eggfetch | `b90b32541bd5dac6c5256feed141cadfd124debe` / `eggfetch-core 0.2.0` | public advanced-routing `Dialer` and `ClientBuilder::dialer` preserve Eggfetch-owned HTTP/TLS |
 | Eggress | `e141d4082d211cc5f122414c74617fde846ffbae` / 1.0.8 line | listener-free `OutboundConnector::connect_tcp_detailed` returns a Tokio stream and typed route failure facts |
