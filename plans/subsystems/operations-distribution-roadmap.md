@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M001-M003 and M002a corrective closed, M004 conditionally closed on corrected `v0.1.1` with three named outstanding evidence items
+Status: active roadmap; M001-M003 and M002a closed, M004 conditionally closed; M004a and M007 ready
 
 Canonical authority:
 
@@ -191,7 +191,7 @@ disposition rather than by omission. Outstanding evidence:
 1. public publication of draft `402292969` and a post-publication bootstrap
    matrix on all five targets — a human action under plan §14, never fabricated;
 2. Windows service management qualification — requires a service-host milestone;
-3. Windows child execution qualification — requires a release containing `202d395`.
+3. Windows child execution qualification — requires Foundation M004 to close and a release containing the qualified Windows process-tree backend.
 
 M004 closure MUST NOT be used to claim macOS/Windows required filesystem
 isolation, network isolation, Windows service management, Windows child
@@ -210,34 +210,39 @@ Prior disposition (superseded by the outcome above, retained for traceability):
 
 M004 does not reopen producer ownership or authorize publication. It reuses the M003 producer contract to stage a new corrected draft after product-side release determinism and version coherence are proven.
 
+### M004a — Qualification helper fixture isolation corrective
+
+Class: corrective / test-infrastructure invariant
+
+Status: **ready**
+
+Implementation plan:
+
+- `plans/implementation/operations-distribution/004a-release-qualification-fixture-isolation-corrective.md`
+
+Objective:
+
+Close the intermittent Linux `ETXTBSY` finding recorded by the M004 closure by giving every concurrently runnable helper fixture its own immutable executable path. Tests must not replace or rewrite a helper binary another test may be executing.
+
+This corrective changes no production behavior and should close before the final Phase-6 release qualification so flaky fixture staging cannot contaminate release evidence.
+
 ### M007 — Windows service host
 
 Class: corrective capability
 
-Status: **ready**; `plans/implementation/operations-distribution/007-windows-service-host.md`
+Status: **ready**
 
-(Eggwork Operations M007; unrelated to the Eggup M007 referenced elsewhere in
-this document.)
+Implementation plan:
+
+- `plans/implementation/operations-distribution/007-windows-service-host.md`
 
 Objective:
 
-Make `eggworkd` an actual Windows service rather than a registrable process.
-`v0.1.1` and `v0.1.2` register through the retained `deployment::windows_scm_manager`
-adapter and then fail to start with Windows error `1053`, because nothing in the
-daemon calls `StartServiceCtrlDispatcherW`. A registered service that cannot
-reach `Running` is not service software.
+Make `eggworkd` a real SCM service host while keeping service registration and lifecycle mutation Eggup-owned. The reviewed implementation seam uses target-scoped `windows-service 0.8.1` for the dispatcher/control/status surface rather than Eggwork-owned raw Win32 FFI.
 
-Non-goals: Windows or macOS required filesystem isolation, network isolation,
-SCM recovery/failure-action configuration, `aarch64` Linux runtime evidence, and
-publication.
+The registered service should invoke an explicit `service-host` entry. It may report `RUNNING` only after the normal NodeServer is ready; STOP/SHUTDOWN must reuse persistent drain and execution convergence before `STOPPED`.
 
-Dependencies: none hard. M004's retained fail-closed service refusal is the
-safe interim state and must stay until a release containing a real host has
-hosted evidence on a Windows host.
-
-M007 is the named closure path for M004 closure-record §18 item 2. M004
-closure remains **conditionally closed** until M007 closes and a release
-containing the host is qualified.
+Dependencies: no hard dependency on Foundation M004. Both are required to remove the two Windows M004 outstanding capability gaps before final Phase-6 closure.
 
 ### M005 — Reverse-connect relay
 
