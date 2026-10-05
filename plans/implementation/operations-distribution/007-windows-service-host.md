@@ -4,258 +4,292 @@ Status: **ready**
 
 Class: corrective capability
 
-Numbering: this is **Eggwork** Operations M007. It is unrelated to Eggup M007,
-which supplied the `commit_with_post_commit` seam and appears in the registry
-under the explicit "Eggup M007" name. The two are kept distinct because they
-are separate projects with separate milestone sequences.
-
 Source references:
 
-- `plans/subsystems/operations-distribution-roadmap.md` — M004 closure
-  disposition and the explicit statement that making the daemon a Windows
-  service host is a separate product milestone;
-- `plans/closure/operations-distribution/004-status.md` §18 item 2 (outstanding
-  evidence) and §17 (Windows service management is `unsupported`);
-- `plans/implementation/operations-distribution/004-operational-and-release-qualification.md`
-  §15 (platform support disposition vocabulary) and §14 (publication boundary);
-- `000-long-term-specification.md` — node software is installed and managed as
-  service software on every platform it claims to support.
+- `plans/subsystems/operations-distribution-roadmap.md`;
+- `plans/closure/operations-distribution/004-status.md` outstanding Windows service-management evidence;
+- `plans/implementation/operations-distribution/004-operational-and-release-qualification.md`;
+- `architecture/distribution.md`;
+- `architecture/execution-ownership.md`.
+
+Numbering: this is **Eggwork** Operations M007, unrelated to milestones in Eggup.
 
 ## 1. Objective
 
-Make `eggworkd` a real Windows service: when the Service Control Manager starts
-the daemon as a service, the daemon must connect to the SCM dispatcher, report
-`SERVICE_RUNNING`, and translate `SERVICE_CONTROL_STOP`/`SHUTDOWN` into the
-existing graceful drain. A registered service that cannot reach `Running` is
-not service software, and Operations M004 proved that the current registration
-produces Windows error `1053` because nothing ever calls the dispatcher.
+Make `eggworkd` an actual Windows SCM service host while preserving Eggup as the sole service-registration/manager owner.
 
-## 2. Baseline / problem statement
+When SCM launches the registered daemon, the process must join the service dispatcher, report `START_PENDING`, start the real Eggwork node, report `RUNNING` only after the node is serving, accept STOP/SHUTDOWN controls, perform the existing drain/shutdown convergence, and report `STOPPED`.
 
-`v0.1.1` and `v0.1.2` register the service through the retained
-`deployment::windows_scm_manager` adapter and then time out:
+A registration that succeeds while the launched process never connects to SCM is not service support.
 
+## 2. Baseline
+
+Operations M004 hosted evidence proved that the retained Windows SCM adapter can register `eggwork-node`, but historical candidates then fail service start with Windows error 1053 because `eggworkd` is only a foreground CLI/server process.
+
+Current `main` correctly fails Windows mutating service verbs closed before mutation. That refusal is the safe interim state and must remain until a real service host has native evidence.
+
+This milestone changes service **hosting**, not service-manager ownership:
+
+- Eggup remains responsible for install/start/stop/restart/uninstall and ownership inspection;
+- Eggwork supplies the process that SCM can actually host.
+
+## 3. Reviewed service-host dependency
+
+Reviewed 2026-10-05:
+
+- `windows-service 0.8.1`;
+- license: MIT OR Apache-2.0;
+- declared MSRV: Rust 1.71;
+- service dispatcher, service-entry macro, control handler, and service-status APIs;
+- transitive `windows-sys 0.61`.
+
+Preferred dependency:
+
+```toml
+[target.'cfg(windows)'.dependencies]
+windows-service = "=0.8.1"
 ```
-service install exit=0 output={"backend":"windows-scm","completed":true,...}
-service start  exit=2 output=eggworkd: service manager failed: start service
-                     failed in Windows SCM (code 1053)
+
+Use the safe Rust-facing crate API. Do not add Eggwork-owned raw `StartServiceCtrlDispatcherW`, `SetServiceStatus`, or service-control FFI.
+
+The implementation agent MUST confirm that using `windows-service` requires no `unsafe` block in Eggwork source and remains compatible with Rust 1.89 before updating the lock file.
+
+## 4. Service entry shape
+
+Use an explicit SCM-only daemon entry, preferably:
+
+```text
+eggworkd service-host --config <file>
 ```
 
-The cause is structural, not a bug in the adapter. `eggup-service` owns
-*registration*; nothing in `eggworkd` owns *hosting*. A service process must:
+The Eggup-owned Windows service specification should register that argv.
 
-1. call `StartServiceCtrlDispatcherW` within a bounded time of service start;
-2. supply a service-type/control callback;
-3. call `SetServiceStatus` with `SERVICE_START_PENDING` and then
-   `SERVICE_RUNNING`, or SCM reports `1053`;
-4. block on its main thread until a stop control arrives.
+Do not auto-detect "service versus console" from incidental process state. Explicit argv keeps foreground `eggworkd run` deterministic and makes ownership inspection exact.
 
-`eggworkd` today has none of this. `crates/eggwork-server/src/bin/eggworkd.rs`
-parses a subcommand, and `run` serves the node until a signal; it has no
-service-entry path at all.
+`service-host` is an internal/operator lifecycle entry, not a second node implementation. Foreground and SCM paths must converge on one shared async node-serving routine.
 
-`v0.1.2` closes the *safety* half of this properly: the service verbs fail
-closed before mutating any state, so a broken service can no longer be
-installed as if it worked. That is the correct interim state and it is what
-makes this milestone safe to schedule. This plan replaces the refusal with a
-real host; the refusal must not be removed before the host is proven.
+## 5. Runtime structure
 
-## 3. Scope
+The current binary uses `#[tokio::main]`. A Windows service dispatcher is a blocking process-level entry and the higher-level service callback runs under SCM's service thread model.
 
-- A `service-host` code path in the daemon that runs the node under the SCM
-  dispatcher on Windows.
-- SCM service status reporting, including `SERVICE_START_PENDING` with a
-  progress hint and a bounded `SERVICE_RUNNING` transition after the node is
-  actually serving.
-- Translation of `SERVICE_CONTROL_STOP` and `SERVICE_CONTROL_SHUTDOWN` into
-  the existing drain-then-exit semantics used by the Unix service paths.
-- `SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN` advertised controls.
-- A service definition whose binary path and arguments invoke that path.
-- Hosted qualification on a real Windows host through the existing
-  `operational-qualification.yml` service stage.
-- Documentation and support-matrix updates.
+Refactor the process entry only as much as needed to keep these responsibilities explicit:
 
-## 4. Invariants and non-goals
+- normal CLI commands use the existing async command implementation;
+- `service-host` invokes the Windows service dispatcher synchronously;
+- the service callback creates/enters the Tokio runtime needed to call the same `start_server`/NodeServer lifecycle as foreground `run`;
+- no second HTTP server or runner stack is introduced.
 
-Invariants that must not change:
+If preserving `#[tokio::main]` would require global runtime handles, hidden cross-thread state, or blocking the only runtime thread, prefer a thin synchronous `main` that constructs the runtime for the selected entry path.
 
-- Linux `systemd` and macOS `launchd` lifecycle, drain, and restart composition
-  stay byte-identical in behaviour. `M002a` suppression of restart after
-  `TransactionDisposition::RecoveryRequired` is untouched.
-- The service path may not weaken any security control. In particular a service
-  must not run with a different isolation or authorisation posture than a
-  foreground daemon, and the sandbox helper must still be the only path to
-  required Landlock isolation.
-- Update and rollback remain Eggup-owned composition. This milestone adds a
-  host, not a new update authority.
-- A denied or unsupported capability must still refuse before mutation. The
-  fail-closed refusal from `caa3918` is the fallback whenever the host is
-  unavailable, and it must remain reachable.
+Unix behavior must remain unchanged.
 
-Non-goals:
+## 6. Required service state machine
 
-- Windows required filesystem isolation (no Landlock equivalent; stays
-  `unsupported`).
-- Network isolation (`Disabled`/`AllowListed` stay `unsupported` everywhere).
-- Automatic service recovery configuration, failure actions, or dependency
-  ordering between services.
-- Replacing the operator CLI, or changing any subcommand's existing meaning.
-- `aarch64-unknown-linux-gnu` runtime evidence, which remains `untested`.
-- Publication. §14 still applies unchanged.
+The service host must have a testable state machine:
 
-## 5. Required production changes
+```text
+START_PENDING
+   |
+   | config valid + node start + EggServe ready
+   v
+RUNNING
+   |
+   | STOP or SHUTDOWN
+   v
+STOP_PENDING
+   |
+   | persistent drain + cancel active work + server wait converges
+   v
+STOPPED
+```
 
-1. **A Windows service-entry path.** `eggworkd` gains a way to be started *as a
-   service* that is distinct from the interactive `run` path. Two acceptable
-   shapes, chosen by what the evidence shows rather than by preference:
-   - a `service-host` subcommand that the SCM `ImagePath` invokes; or
-   - automatic detection at startup (for example `GetConsoleProcessList`
-   reporting no console) with the same code path underneath.
-   Detection is the better long-term shape because it keeps the registered
-   binary path stable across releases, but it must fail closed if detection is
-   ambiguous, and it must never silently convert an interactive session into a
-   service session.
+Rules:
 
-2. **The dispatcher.** `StartServiceCtrlDispatcherW` with a
-   `SERVICE_TABLE_ENTRY`. `windows-sys` 0.61 is already in the lock file as a
-   transitive dependency, so the FFI surface is available without a new crate;
-   a direct dependency must be declared target-scoped for Windows.
+- never report `RUNNING` before `start_server` has returned a ready NodeServer;
+- node/config/bind/TLS startup failure reports `STOPPED` with a non-success service exit disposition;
+- STOP and SHUTDOWN are idempotent;
+- INTERROGATE returns the current state;
+- advertise only controls actually handled;
+- callbacks signal bounded async work and return promptly; do not perform long blocking cleanup inside the control callback;
+- a stop racing startup must not leave `START_PENDING` indefinitely.
 
-3. **Status reporting.** `SetServiceStatus` before and after the node is
-   serving. `SERVICE_RUNNING` must be reported only after `start_server`
-   succeeds, so a node that fails to bind is reported `SERVICE_STOPPED` with a
-   non-zero exit rather than a service that claims to be running.
+## 7. Drain and execution convergence
 
-4. **Control handling.** `STOP` and `SHUTDOWN` trigger the same drain the Unix
-   paths use, then report `SERVICE_STOPPED`. `INTERROGATE` must be answered
-   with the current status; it is what SCM and `sc query` use.
+STOP/SHUTDOWN must reuse Eggwork's existing shutdown semantics:
 
-5. **A blocking main thread.** `#[tokio::main]` owns the main thread, and
-   `StartServiceCtrlDispatcherW` requires the calling thread to stay alive and
-   to not return early. If the dispatcher call has to happen on a dedicated
-   thread, the main thread must then block on the control signal rather than
-   returning from `main`. This is the most likely place to get the design wrong
-   and must be settled by a testable seam, not by inspection.
+1. set persistent drain / make admission stop;
+2. cancel/converge active executions through NodeServer ownership;
+3. shut down the HTTP server;
+4. wait until active execution cleanup is complete;
+5. report `STOPPED`.
 
-6. **Service definition.** The installed definition must point at the real host
-   path. Today `--windows-start-type manual` is honoured; the binary path and
-   arguments must now be correct enough to reach the dispatcher.
+Do not route service stop through a shell command or recursively invoke the CLI.
 
-7. **Bounded timeouts everywhere.** SCM's start timeout is external; the daemon
-   must not be able to hang inside a control callback.
+M002a's `RecoveryRequired` semantics remain untouched. Update/rollback composition remains Eggup-owned.
 
-## 6. Failure, cancellation, restart, and contention semantics
+## 8. Service specification and ownership
 
-- If the dispatcher returns `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT` while not
-  started by SCM, the daemon is being run interactively; it must say so and
-  exit non-zero rather than serving.
-- If the node fails to start under the service, the service reports
-  `SERVICE_STOPPED` and the process exits non-zero. A service that reports
-  `RUNNING` without a serving node is the exact failure M004 must not produce.
-- Stop must be idempotent: a second stop control after a completed stop is
-  acknowledged, not an error.
-- Stop racing an in-flight execution must produce the same outcome as the Unix
-  paths, including `RecoveryRequired` handling owned by Eggup.
-- A stop control arriving during start must not leave the status handle in
-  `START_PENDING` forever.
+Update the Windows service spec so the registered executable/arguments name the real host entry.
 
-## 7. Compatibility and migration
+Ownership inspection must continue to prove:
 
-- Additive: no protocol, schema, wire, or storage change. No capability
-  negotiation change.
-- Windows service management moves from `unsupported` to `service-qualified`
-  only when hosted evidence exists. Until then it stays `unsupported`, and the
-  fail-closed refusal stays in the code as the no-SCM fallback.
-- `v0.1.0`, `v0.1.1`, and `v0.1.2` remain immutable. A new patch release
-  carries this host; none of the earlier releases is re-tagged.
-- An installation that already refused service mutation on `v0.1.2` needs no
-  repair step: nothing was mutated.
+- exact executable;
+- critical argv including `service-host` and the exact config path;
+- expected service identity/start type.
 
-## 8. Required tests
+The M004 fail-closed refusal must not be removed before native hosted evidence demonstrates the service reaches `RUNNING`. Stage the implementation so an incomplete host cannot silently re-enable mutation.
 
-- A unit-level test of the status-state machine: `START_PENDING` before serving,
-  `RUNNING` only after, `STOPPED` on start failure, and no transition that skips
-  a state. This is the piece that is cheap to get wrong and impossible to see
-  from a passing build.
-- A test that `SERVICE_RUNNING` is not reported when `start_server` fails.
-- A test that the control callback is `Send`/`Sync`-safe and cannot be called
-  re-entrantly into the runtime in a way that deadlocks.
-- A test that the interactive `run` path is unchanged and still serves without
-  SCM present.
-- The existing ownership guards must continue to pass, and the service path must
-  not acquire an execution-authority dependency.
+## 9. Security boundaries
 
-## 9. Required verification
+Service mode must not weaken:
 
-- `cargo fmt --all -- --check`
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --locked --workspace --all-targets`
-- `python3 scripts/check_execution_ownership.py`
-- `python3 -m unittest discover -s tests/release`
-- A release that contains the host, cut through the normal immutable process.
-- Hosted `operational-qualification.yml` on a real Windows host, with the
-  Windows service stage asserting: install succeeds, start reaches `Running`,
-  the node serves, stop reaches `Stopped`, and an update while the service is
-  running completes with the documented lifecycle.
+- mTLS/client authorization;
+- execution admission;
+- runner ownership;
+- workspace/artifact roots;
+- capability truthfulness;
+- helper/isolation policy;
+- secret redaction.
 
-## 10. Documentation updates
+Windows required filesystem isolation remains unsupported. Operations M007 does not add an isolation backend.
 
-- `README.md` platform support table: Windows service management moves from
-  `unsupported` to `service-qualified`, citing the run.
-- `architecture/distribution.md`: the service host's ownership boundary, and the
-  retained refusal as the no-SCM fallback.
-- Support matrix in the closure record, with the exact run and receipts.
+No direct `sc.exe`, PowerShell service-manager implementation, registry mutation, or duplicate Windows manager is allowed in Eggwork.
 
-## 11. Acceptance criteria
+## 10. Required tests
 
-1. `eggworkd` started by SCM reaches `SERVICE_RUNNING` and serves.
-2. `SERVICE_CONTROL_STOP` and `SHUTDOWN` drain and reach `SERVICE_STOPPED`.
-3. `SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN` are advertised; `INTERROGATE`
-   is answered.
-4. A node that cannot start is reported `SERVICE_STOPPED` with a non-zero exit,
-   never `RUNNING`.
-5. No regression in the systemd or launchd lifecycle, update, or rollback
-   evidence.
-6. Windows service management is claimed as `service-qualified` only with hosted
-   evidence, and required filesystem isolation remains `unsupported`.
-7. The fail-closed refusal remains reachable and is exercised when no SCM is
-   available.
+### Platform-independent state-machine seam
 
-## 12. Stop conditions
+Test without SCM where possible:
 
-Stop and re-plan rather than continuing if:
+- START_PENDING -> RUNNING only after node-ready signal;
+- start failure -> STOPPED, never RUNNING;
+- STOP during START_PENDING converges;
+- repeated STOP is idempotent;
+- SHUTDOWN uses the same convergence path;
+- INTERROGATE reports current state;
+- no callback performs unbounded/blocking node cleanup.
 
-- Implementing the host requires a new global queue, worker selection, or any
-  other mechanism listed in `plans/003-planning-process.md` §8.
-- The host cannot be made to report `RUNNING` only after the node is serving
-  without a race that cannot be tested.
-- A new crate is required whose maintenance or licence posture has not been
-  reviewed, rather than the already-locked `windows-sys`.
-- The dispatcher turns out to require changing the `start_server` signature in
-  a way that affects the Unix paths; that is an architecture change, not an
-  implementation detail.
-- The hosted Windows service stage cannot be made to observe `Running` and
-  `Stopped` from outside the process, in which case there is no evidence and
-  the milestone must not close.
+### Windows-native
 
-## 13. Closure evidence required
+Hosted Windows evidence must prove:
 
-- Implementation commit(s) and reviewed head.
-- Requirement-to-evidence matrix over §11.
-- Hosted run id with the Windows service stage green, and the receipts.
-- Negative evidence: the refusal path, and the start-failure path that must not
-  report `Running`.
-- Confirmation that `v0.1.0`/`v0.1.1`/`v0.1.2` were not moved or clobbered.
-- Security and compatibility review, including the unchanged isolation posture.
-- Registry and roadmap disposition.
+1. Eggup service install succeeds;
+2. SCM start reaches `Running`;
+3. the mTLS node actually serves while SCM reports Running;
+4. service status/ownership reports `Owned` and the expected argv;
+5. STOP reaches `Stopped`;
+6. START after STOP works;
+7. RESTART works;
+8. uninstall removes the registration;
+9. a foreign same-name registration still causes every mutating verb to refuse;
+10. node startup failure never reports Running;
+11. stop while a bounded execution is active drains/cancels and leaves truthful terminal evidence;
+12. running-service update/rollback preserves the M002a lifecycle contract.
 
-## 14. Handoff notes
+## 11. Release qualification
 
-- This plan closes Operations M004 closure-record §18 item 2. It does not close
-  item 1 (publication is a maintainer action) or item 3 (Windows child execution,
-  which `v0.1.2` addresses separately).
-- The interim fail-closed behaviour is correct and should stay until §11.1
-  through §11.4 have hosted evidence. Do not remove the refusal in the same
-  change that adds the host.
-- Do not widen this milestone to macOS or Linux service work. Both are already
-  `service-qualified`.
+A source-tree unit test is not sufficient to change the support matrix.
+
+Closure requires a new immutable release candidate containing the host and an `operational-qualification.yml` Windows service stage that observes service state from outside the process.
+
+Only after that evidence may Windows move from `unsupported` to `service-qualified`.
+
+Foundation M004 Windows child execution is independent. M007 may close service hosting even if ordinary child execution is still separately tracked, provided the service can start and serve the node and the support matrix remains explicit.
+
+## 12. Verification
+
+At minimum:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets
+cargo check --locked --workspace
+python3 scripts/check_execution_ownership.py
+python3 scripts/check_execution_ownership.py --prove-negative-exit
+python3 -m unittest discover -s tests/release
+git diff --check
+```
+
+Also record native Windows service qualification and `cargo tree` evidence showing `windows-service` is Windows-target-scoped.
+
+No Eggwork source file may add an `unsafe` block.
+
+## 13. Documentation
+
+Update on implementation/closure:
+
+- README Windows service support;
+- `architecture/distribution.md`;
+- `architecture/execution-ownership.md` if process-entry ownership text needs clarification;
+- Operations roadmap;
+- registry;
+- operational-qualification workflow comments/stages;
+- Operations M004 outstanding-evidence matrix.
+
+Earlier releases remain immutable failure evidence.
+
+## 14. Compatibility
+
+Additive service capability only.
+
+Do not change:
+
+- protocol schemas;
+- `eggworkd run` meaning;
+- systemd or launchd product policy;
+- Eggup service-manager ownership;
+- installation/update transaction ownership;
+- CodeGG integration.
+
+An existing Windows installation that previously refused service mutation requires no repair; no service was installed by the fail-closed path.
+
+## 15. Acceptance criteria
+
+1. SCM-launched `eggworkd service-host` reaches `RUNNING` only after the node is ready.
+2. The node serves the normal authenticated control plane while Running.
+3. STOP and SHUTDOWN drain/converge and reach `STOPPED`.
+4. Startup failure never claims Running.
+5. INTERROGATE and advertised accepted controls are correct.
+6. Service registration/manager operations still flow only through Eggup.
+7. Foreground CLI/run behavior and Unix service qualification do not regress.
+8. The fail-closed Windows refusal remains until hosted native evidence exists.
+9. No Eggwork-owned unsafe Win32 FFI is introduced.
+10. A release containing the host passes the native Windows service lifecycle/update qualification.
+
+## 16. Stop conditions
+
+Stop and re-plan if:
+
+- service hosting requires duplicating Eggup's manager/registration logic;
+- `windows-service` cannot support the required dispatcher/status/control path without Eggwork-owned unsafe code;
+- the service callback cannot share the existing NodeServer lifecycle cleanly;
+- the implementation requires a second daemon/server stack;
+- RUNNING cannot be ordered after actual node readiness;
+- stop cannot converge active executions without changing core execution ownership;
+- Unix service behavior would require a semantic change rather than a mechanical process-entry refactor.
+
+## 17. Closure evidence
+
+Create:
+
+- `plans/closure/operations-distribution/007-status.md`.
+
+Record:
+
+- dependency/version review;
+- process-entry/state-machine design;
+- implementation commit(s);
+- state-machine tests;
+- hosted Windows run id and receipts;
+- install/start/serve/stop/restart/uninstall evidence;
+- foreign-registration negative evidence;
+- start-failure negative evidence;
+- update/rollback evidence;
+- unsafe/source ownership audit;
+- unchanged Unix service evidence;
+- Operations M004 item-2 disposition.
+
+## 18. Handoff
+
+M007 and Foundation M004 are independently ready and may be implemented in parallel. The next immutable release candidate should be cut only after the product capabilities intended for that candidate are complete; do not publish `v0.1.5` as the Phase-6 closure release.
