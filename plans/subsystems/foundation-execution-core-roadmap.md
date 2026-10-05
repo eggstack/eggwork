@@ -1,6 +1,6 @@
 # Foundation and Execution Core Roadmap
 
-Status: roadmap milestones closed; C001 post-closure CI corrective closed
+Status: M001-M003 closed; C001 post-closure CI corrective closed; M004 Windows process-tree backend ready
 
 Canonical authority:
 
@@ -109,6 +109,34 @@ Exit conditions:
 - server/client crates cannot bypass runner ownership by dependency direction or approved guard;
 - public runner types expose no scheduler policy;
 - focused benchmarks characterize output/drain overhead without creating CI performance gates.
+
+### M004 — Windows Job Object finite-process backend
+
+Class: capability/invariant
+
+Status: **ready**
+
+Implementation plan:
+
+- `plans/implementation/foundation-execution-core/004-windows-job-object-process-tree-backend.md`
+
+Objective:
+
+Complete the canonical runner on Windows with pre-run Job Object ownership and full-tree wait/termination semantics. Hosted `v0.1.5` evidence proved the current non-Unix path refuses with `UnsupportedPlatform` before child creation; this milestone replaces that explicit refusal for Windows without weakening timeout/cancellation/descendant-cleanup invariants.
+
+Exit conditions:
+
+- ordinary Windows argv execution succeeds through `LocalProcessRunner`;
+- the target is Job Object-owned before it runs;
+- timeout/cancel/output-limit and leader-exit cases converge the complete tree;
+- unsupported required isolation/resource controls still reject before spawn;
+- no second production spawn owner or Eggwork-owned unsafe Win32 FFI is introduced;
+- native Windows and installed production-path qualification are green.
+
+Dependencies:
+
+- no hard implementation dependency;
+- Operations M004 remains conditionally closed until a release containing M004 is hosted-qualified.
 
 ## 4. CodeGG reuse strategy
 
