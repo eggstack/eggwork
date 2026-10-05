@@ -15,10 +15,12 @@ use eggwork_core::{
     MAX_ENV_VALUE_BYTES, MAX_EVENT_CHUNK_BYTES, OverflowPolicy as CoreOverflowPolicy, RelativePath,
     Requirement, StdinPolicy as CoreStdinPolicy,
 };
+#[cfg(target_os = "linux")]
 use serde::Serialize;
+#[cfg(target_os = "linux")]
+use std::io::Write;
 use std::{
     collections::VecDeque,
-    io::Write,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -31,9 +33,13 @@ use tokio::{
     process::Command,
     sync::{mpsc, watch},
     task::JoinHandle,
-    time::{sleep, timeout},
+    time::sleep,
 };
 use tokio_util::sync::CancellationToken;
+
+mod process_tree;
+
+use process_tree::{ProcessTree, TreeConvergence};
 
 const READ_BUFFER: usize = 8192;
 const TERMINATION_GRACE: Duration = Duration::from_millis(300);
@@ -138,6 +144,9 @@ impl ResourceSetupRequest {
             || matches!(self.pids, Requirement::Required(_))
     }
 
+    /// systemd transient-unit properties for the requested limits. Only the Linux
+    /// helper handshake builds them, so the method is Linux-shaped.
+    #[cfg(target_os = "linux")]
     fn properties(&self) -> Vec<(String, String)> {
         let mut properties = Vec::new();
         if let Requirement::BestEffort(value) | Requirement::Required(value) = self.memory_bytes {
@@ -209,7 +218,7 @@ impl SystemdCgroupBackend {
         let mut child = command
             .spawn()
             .map_err(|_| "systemd transient resource backend is unavailable".to_owned())?;
-        match timeout(Duration::from_secs(5), child.wait()).await {
+        match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
             Ok(Ok(status)) if status.success() => Ok(()),
             Ok(_) => Err("systemd could not establish the requested cgroup limits".into()),
             Err(_) => {
@@ -286,7 +295,7 @@ impl SystemdCgroupBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let output = timeout(Duration::from_secs(1), command.output())
+        let output = tokio::time::timeout(Duration::from_secs(1), command.output())
             .await
             .ok()?
             .ok()?;
@@ -311,7 +320,7 @@ impl SystemdCgroupBackend {
         let mut child = command
             .spawn()
             .map_err(|_| "systemd scope cleanup failed".to_owned())?;
-        match timeout(Duration::from_secs(2), child.wait()).await {
+        match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
             Ok(Ok(status)) if status.success() => Ok(()),
             Ok(_) => Err("systemd scope cleanup failed".into()),
             Err(_) => {
@@ -1150,315 +1159,303 @@ impl LocalProcessRunner {
             return Err(RunnerError::CancelledBeforeSpawn);
         }
         let cwd = request.validate()?;
-        #[cfg(not(unix))]
-        {
-            let _ = (cwd, request, output_tx);
-            return Err(RunnerError::UnsupportedPlatform);
-        }
-        #[cfg(unix)]
-        {
-            let mut setup = self
-                .setup
-                .prepare(&request.sandbox, &request.resources, &request.root)
-                .await?;
-            #[cfg(target_os = "linux")]
-            let use_helper = ((!matches!(request.sandbox, SandboxRequest::None)
-                && matches!(setup.sandbox, SandboxOutcome::Applied { .. }))
-                || matches!(setup.resources, ResourceSetupOutcome::Applied { .. }))
-                && self.setup.sandbox_helper_path().is_some();
-            #[cfg(target_os = "linux")]
-            let mut channel = if use_helper {
-                match SandboxChannel::new(
-                    self.setup.sandbox_helper_path().expect("checked above"),
-                    &request,
-                    cwd.clone(),
-                    matches!(setup.resources, ResourceSetupOutcome::Applied { .. }),
-                ) {
-                    Ok(channel) => Some(channel),
-                    Err(error)
-                        if !matches!(request.sandbox, SandboxRequest::Required { .. })
-                            && !request.resources.has_required() =>
-                    {
-                        if !matches!(request.sandbox, SandboxRequest::None) {
-                            setup.sandbox = SandboxOutcome::NotApplied {
-                                reason: error.to_string(),
-                            };
-                        }
-                        if matches!(setup.resources, ResourceSetupOutcome::Applied { .. }) {
-                            setup.resources = ResourceSetupOutcome::NotApplied {
-                                reason: error.to_string(),
-                            };
-                        }
-                        None
+        // Process-tree ownership is platform specific and lives in
+        // `process_tree::ProcessTree`; the lifecycle below is shared. Validation,
+        // setup, command construction, pipe readers, bounded capture, timeout and
+        // cancellation selection, terminal conversion, and provenance are
+        // identical on every platform that has a tree owner, so there is one
+        // runner with two tree backends rather than two runners. `ProcessTree::
+        // spawn_platform` is the typed refusal point (`UnsupportedPlatform`) for
+        // compile targets with no tree story at all.
+        // Only the Linux helper handshake rewrites the prepared outcome, so the
+        // binding is immutable everywhere else.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut setup = self
+            .setup
+            .prepare(&request.sandbox, &request.resources, &request.root)
+            .await?;
+        #[cfg(target_os = "linux")]
+        let use_helper = ((!matches!(request.sandbox, SandboxRequest::None)
+            && matches!(setup.sandbox, SandboxOutcome::Applied { .. }))
+            || matches!(setup.resources, ResourceSetupOutcome::Applied { .. }))
+            && self.setup.sandbox_helper_path().is_some();
+        #[cfg(target_os = "linux")]
+        let mut channel = if use_helper {
+            match SandboxChannel::new(
+                self.setup.sandbox_helper_path().expect("checked above"),
+                &request,
+                cwd.clone(),
+                matches!(setup.resources, ResourceSetupOutcome::Applied { .. }),
+            ) {
+                Ok(channel) => Some(channel),
+                Err(error)
+                    if !matches!(request.sandbox, SandboxRequest::Required { .. })
+                        && !request.resources.has_required() =>
+                {
+                    if !matches!(request.sandbox, SandboxRequest::None) {
+                        setup.sandbox = SandboxOutcome::NotApplied {
+                            reason: error.to_string(),
+                        };
                     }
-                    Err(error) => return Err(error),
-                }
-            } else {
-                None
-            };
-            #[cfg(not(target_os = "linux"))]
-            let channel: Option<()> = None;
-            #[cfg(target_os = "linux")]
-            let command = if let Some(channel) = channel.as_ref() {
-                channel.command()
-            } else {
-                direct_command(&request, cwd.clone())
-            };
-            #[cfg(not(target_os = "linux"))]
-            let mut command = direct_command(&request, cwd.clone());
-            #[cfg(target_os = "linux")]
-            let (mut command, mut resource_unit) =
-                wrap_resource_command(command, &request.resources, &setup.resources)?;
-            #[cfg(target_os = "linux")]
-            let mut sandbox_session = None;
-            #[cfg(not(target_os = "linux"))]
-            let resource_unit: Option<String> = None;
-            #[cfg(not(target_os = "linux"))]
-            let mut command = command;
-            command.process_group(0);
-            let mut child = command
-                .spawn()
-                .map_err(|e| RunnerError::Spawn(e.to_string()))?;
-            #[cfg(target_os = "linux")]
-            if let Some(sandbox_channel) = channel.take() {
-                let handshake = sandbox_channel.wait(&mut child, cancellation.clone()).await;
-                match handshake {
-                    Ok(Some(session)) => sandbox_session = Some(session),
-                    Ok(None)
-                        if !matches!(request.sandbox, SandboxRequest::Required { .. })
-                            && !request.resources.has_required() =>
-                    {
-                        let _ = child.wait().await;
-                        if !matches!(request.sandbox, SandboxRequest::None) {
-                            setup.sandbox = SandboxOutcome::NotApplied {
-                                reason: "Landlock helper could not enforce the requested profile"
-                                    .into(),
-                            };
-                        }
-                        if matches!(setup.resources, ResourceSetupOutcome::Applied { .. }) {
-                            setup.resources = ResourceSetupOutcome::NotApplied {
-                                reason: "resource helper could not verify the cgroup limits".into(),
-                            };
-                        }
-                        let direct = direct_command(&request, cwd.clone());
-                        let (mut direct, unit) =
-                            wrap_resource_command(direct, &request.resources, &setup.resources)?;
-                        resource_unit = unit;
-                        direct.process_group(0);
-                        child = direct
-                            .spawn()
-                            .map_err(|error| RunnerError::Spawn(error.to_string()))?;
+                    if matches!(setup.resources, ResourceSetupOutcome::Applied { .. }) {
+                        setup.resources = ResourceSetupOutcome::NotApplied {
+                            reason: error.to_string(),
+                        };
                     }
-                    Ok(None) => {
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        return Err(RunnerError::RequiredSetupUnavailable);
-                    }
-                    Err(SandboxWaitError::BeforeTarget(error))
-                        if !matches!(request.sandbox, SandboxRequest::Required { .. })
-                            && !request.resources.has_required()
-                            && !matches!(error, RunnerError::CancelledBeforeSpawn) =>
-                    {
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        if !matches!(request.sandbox, SandboxRequest::None) {
-                            setup.sandbox = SandboxOutcome::NotApplied {
-                                reason: error.to_string(),
-                            };
-                        }
-                        if matches!(setup.resources, ResourceSetupOutcome::Applied { .. }) {
-                            setup.resources = ResourceSetupOutcome::NotApplied {
-                                reason: error.to_string(),
-                            };
-                        }
-                        let direct = direct_command(&request, cwd.clone());
-                        let (mut direct, unit) =
-                            wrap_resource_command(direct, &request.resources, &setup.resources)?;
-                        resource_unit = unit;
-                        direct.process_group(0);
-                        child = direct
-                            .spawn()
-                            .map_err(|spawn_error| RunnerError::Spawn(spawn_error.to_string()))?;
-                    }
-                    Err(error) => {
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        return Err(error.into_runner_error());
-                    }
-                }
-            }
-            let process_group = child.id();
-            let stdin_task = match (child.stdin.take(), &request.stdin) {
-                (Some(mut stdin), StdinPolicy::Bytes(bytes)) => {
-                    let bytes = bytes.clone();
-                    Some(tokio::spawn(async move {
-                        let result = stdin.write_all(&bytes).await;
-                        drop(stdin);
-                        result
-                    }))
-                }
-                (stdin, StdinPolicy::Null) => {
-                    drop(stdin);
                     None
                 }
-                (stdin, StdinPolicy::Bytes(_)) => {
-                    drop(stdin);
-                    None
-                }
-            };
-            let (overflow_tx, mut overflow_rx) = watch::channel(false);
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| RunnerError::Io("stdout pipe missing".into()))?;
-            let stderr = child
-                .stderr
-                .take()
-                .ok_or_else(|| RunnerError::Io("stderr pipe missing".into()))?;
-            let stdout_task = spawn_reader(
-                stdout,
-                false,
-                request.capture_limit,
-                request.event_chunk_bytes,
-                output_tx.clone(),
-                overflow_tx.clone(),
-                request.overflow.clone(),
-            );
-            let stderr_task = spawn_reader(
-                stderr,
-                true,
-                request.capture_limit,
-                request.event_chunk_bytes,
-                output_tx,
-                overflow_tx.clone(),
-                request.overflow,
-            );
-            let deadline = request.timeout;
-            // `None` as a termination means the wait has to be settled against
-            // the child rather than against the monitor. The `child.wait()`
-            // continuation lives after the `select!` rather than inside one arm
-            // because awaiting it in an arm makes the whole future `!Send`, and
-            // this `select!` runs inside a spawned task.
-            let settled: Option<(
-                TerminationReason,
-                Option<std::process::ExitStatus>,
-                Option<String>,
-            )> = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => Some((TerminationReason::Cancelled, None, None)),
-                _ = sleep(deadline) => Some((TerminationReason::TimedOut, None, None)),
-                    // Whether the monitor changed or merely closed is not the
-                    // question; its current value is. A closed monitor reads as
-                    // `false`, which is the same as a quiet one, and both mean
-                    // "keep waiting for the child".
-                    _ = overflow_rx.changed() => {
-                        monitor_termination(*overflow_rx.borrow()).map(|t| (t, None, None))
-                    }
-                result = child.wait() => Some(match result {
-                    Ok(status) => (TerminationReason::Exited, Some(status), None),
-                    Err(error) => (TerminationReason::Exited, None, Some(error.to_string())),
-                }),
-            };
-            let (termination, status, wait_error) = match settled {
-                Some(settled) => settled,
-                None => match child.wait().await {
-                    Ok(status) => (TerminationReason::Exited, Some(status), None),
-                    Err(error) => (TerminationReason::Exited, None, Some(error.to_string())),
-                },
-            };
-            #[cfg(target_os = "linux")]
-            let mut resource_limits_exceeded = if matches!(&termination, TerminationReason::Exited)
-                && let Some(session) = sandbox_session.take()
-            {
-                session.resource_limits_exceeded().await
-            } else {
-                Vec::new()
-            };
-            #[cfg(target_os = "linux")]
-            if let Some(unit) = resource_unit.as_deref()
-                && let Ok(backend) = SystemdCgroupBackend::discover()
-                && backend.unit_result(unit).await.as_deref() == Some("oom-kill")
-                && !resource_limits_exceeded.contains(&eggwork_core::ResourceDimension::Memory)
-            {
-                resource_limits_exceeded.push(eggwork_core::ResourceDimension::Memory);
+                Err(error) => return Err(error),
             }
-            #[cfg(not(target_os = "linux"))]
-            let resource_limits_exceeded: Vec<eggwork_core::ResourceDimension> = Vec::new();
-            #[cfg(target_os = "linux")]
-            let resource_cleanup_warning = if let Some(unit) = resource_unit.as_deref() {
-                match SystemdCgroupBackend::discover() {
-                    Ok(backend) => backend.stop_unit(unit).await.err(),
-                    Err(_) => Some("systemd scope cleanup was unavailable".into()),
-                }
-            } else {
-                None
-            };
-            #[cfg(not(target_os = "linux"))]
-            let resource_cleanup_warning: Option<String> = None;
-            let mut cleanup = CleanupDiagnostics {
-                process_group_signal_error: resource_cleanup_warning,
-                wait_error,
-                stdin_error: None,
-            };
-            let status = if let Some(status) = status {
-                // A command can leave background descendants behind and exit
-                // while they still hold the output pipes. Reap that process
-                // group before returning, without changing the leader's
-                // already-known exit classification.
-                match terminate_group(process_group) {
-                    Ok(true) => {
-                        sleep(TERMINATION_GRACE).await;
-                        if let Err(error) = kill_group(process_group) {
-                            cleanup.process_group_signal_error = Some(error);
-                        }
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _channel: Option<()> = None;
+        #[cfg(target_os = "linux")]
+        let command = if let Some(channel) = channel.as_ref() {
+            channel.command()
+        } else {
+            direct_command(&request, cwd.clone())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let command = direct_command(&request, cwd.clone());
+        #[cfg(target_os = "linux")]
+        let (command, mut resource_unit) =
+            wrap_resource_command(command, &request.resources, &setup.resources)?;
+        #[cfg(target_os = "linux")]
+        let mut sandbox_session = None;
+        #[cfg(not(target_os = "linux"))]
+        let _resource_unit: Option<String> = None;
+        // On Linux this is the sandbox helper when isolation or resource
+        // enforcement is configured, and the target itself otherwise. On
+        // Windows there is no helper, so it is always the target. Either way
+        // the tree owner holds the whole tree for the rest of the lifecycle.
+        let mut tree = ProcessTree::spawn_platform(command)?;
+        #[cfg(target_os = "linux")]
+        if let Some(sandbox_channel) = channel.take() {
+            let handshake = sandbox_channel
+                .wait(tree.child_mut(), cancellation.clone())
+                .await;
+            match handshake {
+                Ok(Some(session)) => sandbox_session = Some(session),
+                Ok(None)
+                    if !matches!(request.sandbox, SandboxRequest::Required { .. })
+                        && !request.resources.has_required() =>
+                {
+                    let _ = tree.wait().await;
+                    if !matches!(request.sandbox, SandboxRequest::None) {
+                        setup.sandbox = SandboxOutcome::NotApplied {
+                            reason: "Landlock helper could not enforce the requested profile"
+                                .into(),
+                        };
                     }
-                    Ok(false) => {}
-                    Err(error) => cleanup.process_group_signal_error = Some(error),
-                }
-                Some(status)
-            } else {
-                match terminate_group(process_group) {
-                    Ok(true) => sleep(TERMINATION_GRACE).await,
-                    Ok(false) => {}
-                    Err(error) => cleanup.process_group_signal_error = Some(error),
-                }
-                if let Err(error) = kill_group(process_group) {
-                    cleanup.process_group_signal_error.get_or_insert(error);
-                }
-                match timeout(TERMINATION_GRACE, child.wait()).await {
-                    Ok(Ok(status)) => Some(status),
-                    Ok(Err(error)) => {
-                        cleanup.wait_error = Some(error.to_string());
-                        None
+                    if matches!(setup.resources, ResourceSetupOutcome::Applied { .. }) {
+                        setup.resources = ResourceSetupOutcome::NotApplied {
+                            reason: "resource helper could not verify the cgroup limits".into(),
+                        };
                     }
-                    Err(_) => {
-                        cleanup.wait_error = Some("child did not exit after SIGKILL".into());
-                        None
-                    }
+                    let direct = direct_command(&request, cwd.clone());
+                    let (direct, unit) =
+                        wrap_resource_command(direct, &request.resources, &setup.resources)?;
+                    resource_unit = unit;
+                    tree = ProcessTree::spawn_platform(direct)?;
                 }
-            };
-            if let Some(task) = stdin_task {
-                match task.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => cleanup.stdin_error = Some(error.to_string()),
-                    Err(error) => cleanup.stdin_error = Some(error.to_string()),
+                Ok(None) => {
+                    let _ = tree.start_kill();
+                    let _ = tree.wait().await;
+                    return Err(RunnerError::RequiredSetupUnavailable);
+                }
+                Err(SandboxWaitError::BeforeTarget(error))
+                    if !matches!(request.sandbox, SandboxRequest::Required { .. })
+                        && !request.resources.has_required()
+                        && !matches!(error, RunnerError::CancelledBeforeSpawn) =>
+                {
+                    let _ = tree.start_kill();
+                    let _ = tree.wait().await;
+                    if !matches!(request.sandbox, SandboxRequest::None) {
+                        setup.sandbox = SandboxOutcome::NotApplied {
+                            reason: error.to_string(),
+                        };
+                    }
+                    if matches!(setup.resources, ResourceSetupOutcome::Applied { .. }) {
+                        setup.resources = ResourceSetupOutcome::NotApplied {
+                            reason: error.to_string(),
+                        };
+                    }
+                    let direct = direct_command(&request, cwd.clone());
+                    let (direct, unit) =
+                        wrap_resource_command(direct, &request.resources, &setup.resources)?;
+                    resource_unit = unit;
+                    tree = ProcessTree::spawn_platform(direct)?;
+                }
+                Err(error) => {
+                    let _ = tree.start_kill();
+                    let _ = tree.wait().await;
+                    return Err(error.into_runner_error());
                 }
             }
-            let (stdout, dropped_out) = join_reader(stdout_task).await?;
-            let (stderr, dropped_err) = join_reader(stderr_task).await?;
-            Ok(RunnerResult {
-                termination,
-                exit_code: status.and_then(|s| s.code()),
-                stdout,
-                stderr,
-                cleanup,
-                setup,
-                resource_request: request.resources,
-                resource_limits_exceeded,
-                stream_chunks_dropped: dropped_out + dropped_err,
-                provenance: request.provenance,
-            })
         }
+        let stdin_task = match (tree.take_stdin(), &request.stdin) {
+            (Some(mut stdin), StdinPolicy::Bytes(bytes)) => {
+                let bytes = bytes.clone();
+                Some(tokio::spawn(async move {
+                    let result = stdin.write_all(&bytes).await;
+                    drop(stdin);
+                    result
+                }))
+            }
+            (stdin, StdinPolicy::Null) => {
+                drop(stdin);
+                None
+            }
+            (stdin, StdinPolicy::Bytes(_)) => {
+                drop(stdin);
+                None
+            }
+        };
+        let (overflow_tx, mut overflow_rx) = watch::channel(false);
+        let stdout = tree
+            .take_stdout()
+            .ok_or_else(|| RunnerError::Io("stdout pipe missing".into()))?;
+        let stderr = tree
+            .take_stderr()
+            .ok_or_else(|| RunnerError::Io("stderr pipe missing".into()))?;
+        let stdout_task = spawn_reader(
+            stdout,
+            false,
+            request.capture_limit,
+            request.event_chunk_bytes,
+            output_tx.clone(),
+            overflow_tx.clone(),
+            request.overflow.clone(),
+        );
+        let stderr_task = spawn_reader(
+            stderr,
+            true,
+            request.capture_limit,
+            request.event_chunk_bytes,
+            output_tx,
+            overflow_tx.clone(),
+            request.overflow,
+        );
+        let deadline = request.timeout;
+        // `None` as a termination means the wait has to be settled against
+        // the child rather than against the monitor. The `tree.wait()`
+        // continuation lives after the `select!` rather than inside one arm
+        // because awaiting it in an arm makes the whole future `!Send`, and
+        // this `select!` runs inside a spawned task.
+        let settled: Option<(
+            TerminationReason,
+            Option<std::process::ExitStatus>,
+            Option<String>,
+        )> = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Some((TerminationReason::Cancelled, None, None)),
+            _ = sleep(deadline) => Some((TerminationReason::TimedOut, None, None)),
+                // Whether the monitor changed or merely closed is not the
+                // question; its current value is. A closed monitor reads as
+                // `false`, which is the same as a quiet one, and both mean
+                // "keep waiting for the child".
+                _ = overflow_rx.changed() => {
+                    monitor_termination(*overflow_rx.borrow()).map(|t| (t, None, None))
+                }
+            result = tree.wait() => Some(match result {
+                Ok(status) => (TerminationReason::Exited, Some(status), None),
+                Err(error) => (TerminationReason::Exited, None, Some(error.to_string())),
+            }),
+        };
+        let (termination, status, wait_error) = match settled {
+            Some(settled) => settled,
+            None => match tree.wait().await {
+                Ok(status) => (TerminationReason::Exited, Some(status), None),
+                Err(error) => (TerminationReason::Exited, None, Some(error.to_string())),
+            },
+        };
+        #[cfg(target_os = "linux")]
+        let mut resource_limits_exceeded = if matches!(&termination, TerminationReason::Exited)
+            && let Some(session) = sandbox_session.take()
+        {
+            session.resource_limits_exceeded().await
+        } else {
+            Vec::new()
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(unit) = resource_unit.as_deref()
+            && let Ok(backend) = SystemdCgroupBackend::discover()
+            && backend.unit_result(unit).await.as_deref() == Some("oom-kill")
+            && !resource_limits_exceeded.contains(&eggwork_core::ResourceDimension::Memory)
+        {
+            resource_limits_exceeded.push(eggwork_core::ResourceDimension::Memory);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let resource_limits_exceeded: Vec<eggwork_core::ResourceDimension> = Vec::new();
+        #[cfg(target_os = "linux")]
+        let resource_cleanup_warning = if let Some(unit) = resource_unit.as_deref() {
+            match SystemdCgroupBackend::discover() {
+                Ok(backend) => backend.stop_unit(unit).await.err(),
+                Err(_) => Some("systemd scope cleanup was unavailable".into()),
+            }
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let resource_cleanup_warning: Option<String> = None;
+        let mut cleanup = CleanupDiagnostics {
+            process_group_signal_error: resource_cleanup_warning,
+            wait_error,
+            stdin_error: None,
+        };
+        // Tree convergence is the platform's job: on Unix this is
+        // SIGTERM to the process group, a grace period, then SIGKILL and a
+        // bounded reap of the leader; on Windows it is one
+        // `TerminateJobObject` over a Job Object that already owns every
+        // descendant. Both return the same three facts, so no shared
+        // decision below has to know which backend it is talking to.
+        let convergence = if let Some(status) = status {
+            // A command can leave background descendants behind and exit
+            // while they still hold the output pipes. Reap that process tree
+            // before returning, without changing the leader's already-known
+            // exit classification.
+            let convergence = tree.converge_after_leader_exit().await;
+            // Convergence never revokes a status the leader already reported.
+            // Dropping it here would turn every successful Windows execution
+            // into `Failed`/`Internal` with `exit_code: null`, because the
+            // tree owner has nothing left to reap.
+            TreeConvergence {
+                status: Some(status),
+                ..convergence
+            }
+        } else {
+            tree.terminate_and_reap(TERMINATION_GRACE).await
+        };
+        if let Some(error) = convergence.signal_error {
+            cleanup.process_group_signal_error.get_or_insert(error);
+        }
+        if let Some(error) = convergence.wait_error {
+            cleanup.wait_error = Some(error);
+        }
+        let status = convergence.status;
+        if let Some(task) = stdin_task {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => cleanup.stdin_error = Some(error.to_string()),
+                Err(error) => cleanup.stdin_error = Some(error.to_string()),
+            }
+        }
+        let (stdout, dropped_out) = join_reader(stdout_task).await?;
+        let (stderr, dropped_err) = join_reader(stderr_task).await?;
+        Ok(RunnerResult {
+            termination,
+            exit_code: status.and_then(|s| s.code()),
+            stdout,
+            stderr,
+            cleanup,
+            setup,
+            resource_request: request.resources,
+            resource_limits_exceeded,
+            stream_chunks_dropped: dropped_out + dropped_err,
+            provenance: request.provenance,
+        })
     }
 }
 
@@ -1525,12 +1522,11 @@ fn direct_command(request: &RunnerRequest, cwd: PathBuf) -> Command {
 /// Windows child would have been handed a `PATH` that does not exist on
 /// Windows and no `SystemRoot`. That shaping was written against the M004
 /// qualification symptom of `state: Failed`, `failure: Internal`,
-/// `exit_code: null` -- but on Windows no child ever exists to receive an
-/// environment: `LocalProcessRunner::run` refuses with `UnsupportedPlatform`
-/// before spawn, and the server maps that refusal to `Internal`. The shaping
-/// is still correct for any future Windows execution path, and it is what the
-/// qualified harness declares today, but it did not and could not fix Windows
-/// qualification on its own.
+/// `exit_code: null` -- and it could not have fixed Windows qualification,
+/// because at that time no Windows child existed at all: `run` refused with
+/// `UnsupportedPlatform` before spawn and the server mapped that refusal to
+/// `Internal`. Foundation M004 removed the refusal, which makes this shaping
+/// load-bearing instead of merely aspirational.
 ///
 /// Unix keeps the narrow, deterministic baseline the existing Linux and macOS
 /// evidence was gathered with. Windows gets the system directories its loader
@@ -1551,11 +1547,12 @@ fn direct_command(request: &RunnerRequest, cwd: PathBuf) -> Command {
 /// invisible in most runs on every platform; the unit test below pins it
 /// deterministically instead of relying on timing.
 ///
-/// This race is real but it is NOT the Windows execution cause: on Windows
-/// `LocalProcessRunner::run` refuses with `UnsupportedPlatform` before any
-/// child exists, so the monitor code never runs there. The identical receipt
-/// shape is what sent the diagnosis down the wrong path; see the refusal gate
-/// at the top of `run`.
+/// This race is real but it was NOT the Windows execution cause. At the time it
+/// was diagnosed, `run` refused with `UnsupportedPlatform` before any child
+/// existed on Windows, so the monitor code never ran there; the identical
+/// receipt shape is what sent the diagnosis down the wrong path. Foundation
+/// M004 removed that refusal, so this monitor now runs on every platform and
+/// is covered by `windows_process_tree.rs` as well as the Unix suite.
 fn monitor_termination(overflowed: bool) -> Option<TerminationReason> {
     overflowed.then_some(TerminationReason::OutputLimit)
 }
@@ -1633,7 +1630,7 @@ impl SandboxSession {
     async fn resource_limits_exceeded(mut self) -> Vec<eggwork_core::ResourceDimension> {
         let mut status = [0u8; 1];
         if !matches!(
-            timeout(Duration::from_secs(2), self.stream.read_exact(&mut status)).await,
+            tokio::time::timeout(Duration::from_secs(2), self.stream.read_exact(&mut status)).await,
             Ok(Ok(_))
         ) {
             return Vec::new();
@@ -1841,35 +1838,6 @@ impl SandboxChannel {
     }
 }
 
-#[cfg(unix)]
-fn terminate_group(pid: Option<u32>) -> Result<bool, String> {
-    let pid = pid.ok_or_else(|| "child pid is unavailable".to_owned())?;
-    match nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(pid as i32),
-        nix::sys::signal::Signal::SIGTERM,
-    ) {
-        Ok(()) => Ok(true),
-        Err(nix::errno::Errno::ESRCH) => Ok(false),
-        Err(error) => Err(error.to_string()),
-    }
-}
-#[cfg(unix)]
-fn kill_group(pid: Option<u32>) -> Result<(), String> {
-    let pid = pid.ok_or_else(|| "child pid is unavailable".to_owned())?;
-    nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(pid as i32),
-        nix::sys::signal::Signal::SIGKILL,
-    )
-    .or_else(|error| {
-        if error == nix::errno::Errno::ESRCH {
-            Ok(())
-        } else {
-            Err(error)
-        }
-    })
-    .map_err(|e| e.to_string())
-}
-
 fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
     mut reader: R,
     stderr: bool,
@@ -1930,6 +1898,7 @@ impl From<RunnerResult> for ExecutionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::sync::Arc;
 
     fn request(root: &Path, args: &[&str]) -> RunnerRequest {
@@ -2022,7 +1991,36 @@ mod tests {
     async fn unsupported_resource_limits_are_reported_or_rejected_before_spawn() {
         let temp = tempfile::tempdir().unwrap();
         let runner = LocalProcessRunner::new(NoExecutionSetup);
-        let mut best_effort = request(temp.path(), &["/bin/true"]);
+        let marker = temp.path().join("required-limit-target-ran");
+        // The required case must be refused *before* spawn, so the target is a
+        // command whose only job is to leave the marker behind. If the refusal
+        // ever moved after spawn, this file would exist.
+        let (succeeds, leaves_marker): (Vec<String>, Vec<String>) = if cfg!(windows) {
+            (
+                vec![
+                    std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned()),
+                    "/C".to_owned(),
+                    "exit 0".to_owned(),
+                ],
+                vec![
+                    std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned()),
+                    "/C".to_owned(),
+                    format!("type nul > {}", marker.display()),
+                ],
+            )
+        } else {
+            (
+                vec!["/bin/true".to_owned()],
+                vec![
+                    "/usr/bin/touch".to_owned(),
+                    marker.to_str().unwrap().to_owned(),
+                ],
+            )
+        };
+
+        let succeeds: Vec<&str> = succeeds.iter().map(String::as_str).collect();
+        let leaves_marker: Vec<&str> = leaves_marker.iter().map(String::as_str).collect();
+        let mut best_effort = request(temp.path(), &succeeds);
         best_effort.resources.memory_bytes = Requirement::BestEffort(1024 * 1024);
         let (tx, _rx) = mpsc::channel(4);
         let result = runner
@@ -2035,8 +2033,7 @@ mod tests {
             eggwork_core::ResourceDimensionResult::NotApplied { .. }
         ));
 
-        let marker = temp.path().join("required-limit-target-ran");
-        let mut required = request(temp.path(), &["/usr/bin/touch", marker.to_str().unwrap()]);
+        let mut required = request(temp.path(), &leaves_marker);
         required.resources.pids = Requirement::Required(4);
         let (tx, _rx) = mpsc::channel(4);
         assert!(matches!(
@@ -2191,7 +2188,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_before_spawn_and_spawn_failure_are_typed() {
         let temp = tempfile::tempdir().unwrap();
@@ -2205,12 +2201,18 @@ mod tests {
                 .await,
             Err(RunnerError::CancelledBeforeSpawn)
         ));
+        // A program that cannot be created must fail as a typed spawn error on
+        // every platform, and it must fail before a tree owner exists: there is
+        // no job, no process group, and nothing to clean up. A missing
+        // executable is the cheapest way to prove that the platform's
+        // create-then-own sequence has no partial state to leak.
+        let missing = if cfg!(windows) {
+            r"definitely-missing-eggwork-command.exe"
+        } else {
+            "/definitely/missing/eggwork-command"
+        };
         assert!(matches!(
-            run(request(
-                temp.path(),
-                &["/definitely/missing/eggwork-command"]
-            ))
-            .await,
+            run(request(temp.path(), &[missing])).await,
             Err(RunnerError::Spawn(_))
         ));
     }

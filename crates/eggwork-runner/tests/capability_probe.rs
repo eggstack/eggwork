@@ -1,6 +1,7 @@
 use eggwork_runner::{LocalProcessRunner, TrustedLandlockSetup};
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 
+#[cfg(target_os = "linux")]
 fn helper_in_target_dir() -> Option<PathBuf> {
     let target = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
@@ -13,7 +14,9 @@ fn helper_in_target_dir() -> Option<PathBuf> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn place_trusted_helper() -> Option<PathBuf> {
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
     let source = helper_in_target_dir()?;
     let helper_dir = tempfile::tempdir().unwrap();

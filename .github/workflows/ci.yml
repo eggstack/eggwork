@@ -28,6 +28,29 @@ jobs:
       - run: cargo check --workspace
       - name: release candidate validator tests
         run: python3 -m unittest discover --start-directory tests/release --top-level-directory tests/release
+  windows-runner:
+    # The Windows process-tree backend cannot be observed from Linux: Job Object
+    # ownership, descendant convergence, and pipe inheritance only mean something
+    # on a real Windows kernel. This job is the native evidence for Foundation
+    # M004, so a green Linux run must never be read as Windows coverage.
+    #
+    # Scope is deliberately narrow. `eggwork-runner` runs its full suite on
+    # Windows; the server's own tests are `/bin/sh`-shaped and stay Linux-only
+    # until a separate milestone reshapes them. The installed production path
+    # (installed release bytes, not a build tree) is qualified by the
+    # `operational-qualification` workflow, not here.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Windows process-tree lifecycle suite
+        run: cargo test --locked -p eggwork-runner --all-targets -- --nocapture
   release-drift:
     # Eggpack is producer authority for the release matrix: the generated
     # release workflow must be exactly what the pinned tool renders from the

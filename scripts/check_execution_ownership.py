@@ -28,6 +28,54 @@ FORBIDDEN_PROCESS_DEPS = {
     "subprocess",
 }
 
+# The denylist is the default for every crate. These are the reviewed exceptions,
+# and each one has to name the crate, the dependency, and why an approved owner
+# needs it -- an exception nobody has to re-justify is indistinguishable from a
+# hole. Foundation M004 added `process-wrap` to `eggwork-runner` because Windows
+# needs a Job Object assigned before the target's first instruction, and that
+# ownership cannot be expressed through a bare `tokio::process::Child`.
+#
+# Adding an entry is an architecture review, not a convenience: the boundary this
+# protects is singular process ownership.
+APPROVED_PROCESS_DEP_EXCEPTIONS = {
+    ("eggwork-runner", "process-wrap"): (
+        "Windows Job Object process-tree ownership, target-scoped to cfg(windows)"
+    ),
+}
+
+
+def process_dep_errors(crate: str, crate_deps: dict[str, dict]) -> list[str]:
+    """Denylist process-owner dependencies for every crate, minus reviewed exceptions."""
+    errors = []
+    for dep in sorted(FORBIDDEN_PROCESS_DEPS.intersection(crate_deps)):
+        if (crate, dep) in APPROVED_PROCESS_DEP_EXCEPTIONS:
+            continue
+        errors.append(f"{crate} adds process-owner dependencies: {dep}")
+    return errors
+
+
+def unexplained_process_dep_exceptions() -> list[str]:
+    """Every recorded exception must name a real crate and a real dependency."""
+    package_names = {
+        package["name"]
+        for package in json.loads(
+            subprocess.run(
+                ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )["packages"]
+    }
+    errors = []
+    for crate, dep in sorted(APPROVED_PROCESS_DEP_EXCEPTIONS):
+        if crate not in package_names:
+            errors.append(f"exception names unknown crate: {crate}")
+        if dep not in FORBIDDEN_PROCESS_DEPS:
+            errors.append(f"exception is not on the denylist: {crate} -> {dep}")
+    return errors
+
 
 def strip_comments_and_literals(source: str) -> str:
     """Blank Rust comments and literals while preserving newlines/positions."""
@@ -190,16 +238,18 @@ def check_dependencies() -> list[str]:
         overlap = forbidden.intersection(deps(crate))
         if overlap:
             errors.append(f"{crate} must not depend on {', '.join(sorted(overlap))}")
+        errors.extend(process_dep_errors(crate, deps(crate)))
 
     server_deps = deps("eggwork-server")
     tokio = server_deps.get("tokio")
     if tokio and "process" in tokio.get("features", []):
         errors.append("eggwork-server enables Tokio process creation; use eggwork-runner")
-    extra = FORBIDDEN_PROCESS_DEPS.intersection(server_deps)
-    if extra:
-        errors.append(f"eggwork-server adds process-owner dependencies: {', '.join(sorted(extra))}")
+    errors.extend(process_dep_errors("eggwork-server", server_deps))
+    errors.extend(process_dep_errors("eggwork-runner", deps("eggwork-runner")))
+    errors.extend(process_dep_errors("eggwork-sandbox-helper", deps("eggwork-sandbox-helper")))
     if "eggwork-runner" not in server_deps:
         errors.append("eggwork-server must depend on the canonical eggwork-runner")
+    errors.extend(unexplained_process_dep_exceptions())
     return errors
 
 
