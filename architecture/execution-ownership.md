@@ -9,3 +9,5 @@ Run `python3 scripts/check_execution_ownership.py` before submitting Rust change
 On non-Unix hosts the runner returns an explicit unsupported-platform error until a process-tree backend is implemented and host-qualified. Linux was exercised for this milestone. The server performs immediate local admission in a later plan and retains its permit until runner cleanup completes. It does not maintain a queue or select another node. The caller retains global scheduling, placement, and retry authority.
 
 These boundaries follow [ADR-0005](../plans/adrs/ADR-0005-runner-service-separation-and-local-admission.md) and the [foundation roadmap](../plans/subsystems/foundation-execution-core-roadmap.md). Network listeners remain deferred to later milestones.
+
+Component deep dives: [runner-execution.md](runner-execution.md), [sandbox-helper.md](sandbox-helper.md), and [ci-guardrails.md](ci-guardrails.md) (the guard that enforces this rule). Overview: [overview.md](overview.md).

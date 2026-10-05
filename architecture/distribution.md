@@ -123,3 +123,7 @@ runs them on hosted runners and uploads bounded receipts.
 See the [operations and distribution roadmap](../plans/subsystems/operations-distribution-roadmap.md)
 for milestone status and the [closure records](../plans/closure/operations-distribution/)
 for evidence.
+
+Component deep dives: [release-qualification.md](release-qualification.md),
+[deployment-lifecycle.md](deployment-lifecycle.md), and
+[operations-cli.md](operations-cli.md). Overview: [overview.md](overview.md).
