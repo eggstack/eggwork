@@ -162,6 +162,7 @@ Eggwork's deployment install unit (`install_unit_matrix` in `deployment.rs`).
 ## Reference
 
 - [CONTRIBUTING.md](../../CONTRIBUTING.md) — cutting a release
+- [docs/releases.md](../../docs/releases.md) — the operator-facing view of the same material
 - [architecture/release-qualification.md](../../architecture/release-qualification.md) — the full failure history
 - [architecture/ci-guardrails.md](../../architecture/ci-guardrails.md) — `--locked` and the ownership guard
 - [architecture/distribution.md](../../architecture/distribution.md) — authority split

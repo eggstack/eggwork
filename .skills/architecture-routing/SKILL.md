@@ -13,6 +13,9 @@ understand a boundary. Read the index; do not grep the whole tree.
 
 | Question | Read |
 |---|---|
+| I am an operator — how do I install, run, or update a node? | [docs/quickstart.md](../../docs/quickstart.md), then [docs/operations.md](../../docs/operations.md) |
+| I am an operator — how do I install it as a service or update it? | [docs/deployment.md](../../docs/deployment.md) |
+| I am consuming a published release | [docs/releases.md](../../docs/releases.md) |
 | What is the product, and what is it deliberately not? | [README](../../README.md), [overview.md](../../architecture/overview.md) |
 | How do I know what a term means? | [domain.md](../../architecture/domain.md) |
 | What is decided vs still open at the wire level? | [protocol.md](../../architecture/protocol.md) |

@@ -240,6 +240,7 @@ None of these are presented as bugs already judged to be bugs. They are the plac
 
 **Normative sources elsewhere in the repository**
 
+- [`docs/`](../docs/README.md) — user/operator-facing documentation, starting at `docs/quickstart.md`. This directory is the internal design record; where they differ, this one wins.
 - [`plans/000-long-term-specification.md`](../plans/000-long-term-specification.md) — canonical product/architecture specification
 - [`plans/registry.md`](../plans/registry.md) — current ready/blocked work
 - [`plans/adrs/`](../plans/adrs/) — decision records

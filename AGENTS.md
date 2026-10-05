@@ -23,6 +23,7 @@ Rust-native, fixed-target remote execution fabric: a caller selects one node, su
 - `crates/eggwork-client/` — explicit single-node client (feature: `eggress-route`)
 - `crates/eggwork-server/` — node service, mTLS control plane, stores, `eggworkd` operator CLI, deployment
 - `architecture/` — deep-dive design docs; start at `architecture/overview.md`
+- `docs/` — user/operator-facing docs; start at `docs/quickstart.md` (see [below](#documentation))
 - `plans/` — planning system (`plans/README.md`, `003-planning-process.md`, `registry.md` = current handoff)
 - `scripts/` — Python guardrails and qualification harness
 - `release/eggpack/` — static, identity-free producer config (Eggpack owns releases)
@@ -43,6 +44,27 @@ what gets fixed.
 | `.skills/cut-a-release/` | Bumping a version, cutting/tagging a release, or diagnosing a failed release run |
 | `.skills/architecture-routing/` | Before reading source — which deep dive is normative, which code owns which boundary, and whether a suspected bug is an already-documented divergence |
 | `.skills/isolation-and-trust/` | Touching Landlock/cgroups, helper trust, capability advertisement, or admission |
+
+## Documentation
+
+`docs/` is **user- and operator-facing**; `architecture/` is the internal design
+record. They do not duplicate each other, and where they disagree `architecture/`
+wins. Keep the split: a change an operator would feel goes in `docs/`; the
+reasoning and boundary evidence goes in `architecture/`.
+
+| Document | Covers |
+|---|---|
+| [docs/quickstart.md](docs/quickstart.md) | Build a node, real TLS material, prove a confined execution |
+| [docs/operations.md](docs/operations.md) | `eggworkd` verb reference: readiness, drain, GC, inspection |
+| [docs/deployment.md](docs/deployment.md) | Install/update a node as service software via Eggup |
+| [docs/releases.md](docs/releases.md) | Consume a published release; release identity, Windows reproducibility |
+
+Quickstart commands in `docs/` are **executed and verified**, not illustrative.
+The config loader's strictness (owner-only state directories `0700`, private key
+`0600`, nothing group/world writable, and a sandbox helper outside world-writable
+ancestors) is undocumented anywhere else and produces a single unhelpful
+`configuration is invalid or unreadable` — if that message ever appears, check
+permissions first.
 
 ## Architecture index
 
