@@ -56,7 +56,9 @@ APPROVED_PROCESS_OWNERS = {
 }
 ```
 
-Each entry carries its rationale in the value, and the comment above the dict is explicit about the intent: "These are ownership boundaries, not filename-based exceptions. A new owner requires an architecture review and a named entry here with its reason." A file in an approved crate is *counted*, not rejected: `approved_hits[crate] += len(hits)`, and the passing summary line reports the census — `execution ownership guard passed; approved process owners: eggwork-runner (N spawn sites), eggwork-sandbox-helper (M spawn sites)`. That census is a review signal in its own right; a sudden jump in an approved owner's count is a change in who actually owns processes.
+Each entry carries its rationale in the value, and the comment above the dict is explicit about the intent: "These are ownership boundaries, not filename-based exceptions. A new owner requires an architecture review and a named entry here with its reason." A file in an approved crate is *counted*, not rejected: `approved_hits[crate] += len(hits)`, and the passing summary line reports it as `execution ownership guard passed; approved process owners: eggwork-runner (2 spawn sites), eggwork-sandbox-helper (1 spawn sites)`.
+
+Read that number carefully: it counts **matched patterns per file**, not actual spawn call sites. `eggwork-runner` has five `Command::new` sites but matches only two distinct patterns across one file, so it reports `2`. The count is a coarse signal that a crate is still an approved owner, not a census of child processes and not something that moves when you add a spawn inside an already-matching file. Do not treat a stable number as evidence that no new process was added.
 
 Any hit outside the allowlist is an error, phrased as `process creation outside approved owners (<patterns>)` prefixed with the repo-relative path.
 

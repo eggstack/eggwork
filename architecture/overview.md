@@ -4,7 +4,7 @@ Eggwork is a **fixed-target execution fabric**. A caller selects exactly one nod
 
 Eggwork is deliberately **not a scheduler**. Global queues, worker selection, priorities, fairness, workflow DAGs, and semantic retry all remain caller-owned. That boundary is the product's defining constraint and is what makes Eggwork usable as an execution backend for orchestrators such as CodeGG without competing with their policy. See [ADR-0001](../plans/adrs/ADR-0001-fixed-target-scheduler-free-execution.md).
 
-This page is the **bird's-eye view**: what each module owns, how they compose, and where to go for a full read. Each component links to a dedicated deep-dive file.
+This page is the **bird's-eye view**: what each module owns, how they compose, and where to go for a full read. Each component links to a dedicated deep-dive file. For task-shaped agent guidance, see [`.skills/`](../.skills/README.md) — those skills route here rather than restating anything here.
 
 ---
 
@@ -32,7 +32,7 @@ This page is the **bird's-eye view**: what each module owns, how they compose, a
 | `eggwork-runner` | The single owner of finite process lifecycle; resource/isolation setup abstraction | core | 2,336 LOC |
 | `eggwork-sandbox-helper` | Standalone binary that applies Landlock confinement, verifies the cgroup resource limits, then spawns and supervises the target | — | 401 LOC |
 | `eggwork-client` | Explicit single-node client; all HTTP via Eggfetch, optional egress routing | core | 880 LOC |
-| `eggwork-server` | Node service, mTLS admission, control plane, stores, operator surface, deployment | core, runner | ~12,300 LOC |
+| `eggwork-server` | Node service, mTLS admission, control plane, stores, operator surface, deployment | core, runner | 14,104 LOC |
 
 The dependency graph is intentionally **one-way**. `eggwork-core` and `eggwork-sandbox-helper` have no production dependency on any other workspace crate. `eggwork-client` depends only on `eggwork-core`. `eggwork-server` depends on `eggwork-core` and `eggwork-runner` only; its dependency on `eggwork-client` is a `dev-dependency` used by the qualification harness. Direction is machine-checked — see [CI and guardrails](ci-guardrails.md).
 
@@ -76,7 +76,7 @@ Linux-only machinery is `#[cfg]`-gated so the crate compiles everywhere; a non-L
 
 ### 5. `eggwork-server` — the node
 
-The largest surface, split into five modules:
+The largest surface, split into seven library modules plus the `eggworkd` binary:
 
 - **`lib.rs` (6,280 LOC)** — node configuration, `NodeServer`, the mTLS-authenticated HTTP service, operation dispatch, local admission, lease enforcement, and the full execution lifecycle (`execute`, `monitor_lease`, `run_execution`, `publish`, `publish_terminal`). Authorization is two traits: `PeerPrincipalResolver` (verified TLS leaf → `NodePrincipal`, resolved by SHA-256 fingerprint) and `Authorizer` (operation grant, with a resource-aware `authorize_request` hook for scoped policies).
 - **`store.rs`** — the durable SQLite execution and event journal, including idempotency reservation, lease records, and paginated event reads.
@@ -144,7 +144,7 @@ The one deliberate exception is worth stating precisely, because it is easy to o
 These are the load-bearing rules. Each is mechanically enforced somewhere, not merely documented.
 
 1. **Process ownership is singular.** Only `eggwork-runner` creates OS children. `eggwork-server`, `eggwork-client`, and `eggwork-core` must not. The one exception is the helper, which spawns the target solely to confine it and then supervises it long enough to report the resource outcome; plus a bounded `--version` version-coherence probe that owns no lifecycle. Enforced by `scripts/check_execution_ownership.py`.
-2. **No service-manager invocation.** No direct `systemctl`, `launchctl`, SCM, or `crontab` calls anywhere. All service lifecycle flows through Eggup adapters.
+2. **No direct service-manager invocation of the node service.** Eggwork never manages its own service by shelling out; all *node service* lifecycle flows through Eggup adapters. The one sanctioned exception is `eggwork-runner`'s use of `systemd-run --scope` and `systemctl show`/`stop` for per-execution transient cgroup units — that is resource enforcement owned by the process-lifecycle crate, not service lifecycle, and it is documented in [runner-execution.md](runner-execution.md). No dedicated mechanical guard covers this (see divergence 6).
 3. **Fixed target.** The client names its target explicitly. No queue, no worker selection, no "latest" release resolution, no implicit placement.
 4. **Isolation claims are earned, never assumed.** A node advertises filesystem isolation exactly when `verify_trusted_helper` accepts the installed helper. Advisory availability and enforcement agree by construction because they call the same function.
 5. **Fail closed on uncertainty — for guarantees the caller actually demanded.** Untrusted helper, version skew, missing previous-generation digest proof, unsupported service backend, and Windows SCM registration are all refusals, not fallbacks to a weaker mode. A `Required` isolation or resource dimension that cannot be enforced fails the execution. Only explicitly optional or best-effort requirements degrade, and they degrade with a recorded `NotApplied` reason rather than silently.
@@ -174,7 +174,7 @@ None of these are presented as bugs already judged to be bugs. They are the plac
 |---|---|---|
 | 4 | `GrantAuthorizer` implements only `Authorizer::authorize`, **not** the resource-aware `authorize_request` hook. Resource-scoped authorization is therefore inert on the real deployment path; ownership is enforced only in the store, by `principal_id` comparison. | [operations-cli.md](operations-cli.md) · [server-node.md](server-node.md) |
 | 5 | `deployment::check_helper_compatibility_with_timeout` checks the helper **file** only, while `eggwork_runner::verify_trusted_helper` also walks every ancestor directory. The deployment trust path is the weaker subset plus version coherence. | [deployment-lifecycle.md](deployment-lifecycle.md) · [runner-execution.md](runner-execution.md) |
-| 6 | Invariant 2 (no direct service-manager invocation) has **no dedicated mechanical guard**. The ownership guard covers process creation, not `systemctl`/`launchctl`/SCM invocation. | [ci-guardrails.md](ci-guardrails.md) |
+| 6 | Invariant 2 (no direct node-service manager invocation) has **no dedicated mechanical guard**. The only automated check is the Rust test `no_direct_service_manager_invocation_exists` in `deployment.rs`, and it scans just three files (`src/deployment.rs`, `src/operations.rs`, `src/bin/eggworkd.rs`) for manager *string literals*. `eggwork-runner` is outside that scope entirely. | [ci-guardrails.md](ci-guardrails.md) |
 | 7 | The ownership guard globs only `crates/*/src/**/*.rs`. `tests/`, `examples/`, and `build.rs` are unscanned, and the allowlist is keyed by crate name rather than path. | [ci-guardrails.md](ci-guardrails.md) |
 | 8 | `--prove-negative-exit` is **narrower than its name**: in that mode the guard runs its self-test and then proves the negative exit, but never runs `scan_sources()` or `check_dependencies()`. It proves the scanner detects, not that the full guard path fails correctly. | [ci-guardrails.md](ci-guardrails.md) |
 | 9 | `blob_download` takes **no reference lease**, unlike `artifact_download`. A concurrent GC can unlink the file mid-transfer; this is safe only because Unix keeps the open descriptor alive. | [data-plane.md](data-plane.md) |

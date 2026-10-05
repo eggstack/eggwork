@@ -41,6 +41,7 @@ Closure records and archive
 
 - `adrs/` — durable architecture decisions. Accepted decisions are superseded, not rewritten.
 - `subsystems/` — subsystem specifications and dependency-ordered roadmaps.
+- `security/` — the standing threat model: actors, assets, boundaries, and residual limits.
 - `implementation/` — bounded milestone plans handed to implementation agents.
 - `closure/` — verification, evidence, residual-risk, and completion records.
 - `archive/` — completed or superseded interim planning retained for traceability.

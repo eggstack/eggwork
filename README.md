@@ -49,11 +49,20 @@ Drain is stored beside the execution database and is observed by a running node 
 
 Releases are produced by [Eggpack](https://github.com/eggstack/eggpack), which owns the release contract, target matrix, builds, qualification, checksum sidecars, `ReleaseManifest`, bootstrap installers, and the generated release workflow. Eggwork owns the node configuration, service lifecycle, drain/update/rollback policy, and the decision about which binaries constitute one installed node.
 
-There are four distinct authorities, and they do not overlap:
+Four distinct authorities, and they do not overlap:
 
 ```text
 Eggpack producer -> ReleaseManifest/assets -> human/release channel -> Eggup/Eggwork local deployment
 ```
+
+1. **Eggpack** builds the release: target and artifact naming, builds, qualification, checksum sidecars, the `ReleaseManifest`, bootstrap installers, and the generated release workflow.
+2. **The release channel** is a published GitHub draft turned public by a human. Eggwork never publishes, never creates or moves a tag, and never resolves "latest".
+3. **Eggup** performs the local verified installation transaction, ownership verification, backup/rollback, and service-manager adapters.
+4. **Eggwork** owns node configuration, service lifecycle, drain/update/restart policy, helper trust, and the installation root.
+
+A fifth, smaller authority is easy to misplace: `.cargo/config.toml` is Eggwork's own build policy (see [Reproducible Windows release binaries](#reproducible-windows-release-binaries)). Eggpack cannot remove nondeterminism the product's own link flags introduce, and it is right to fail closed when two builds of one source revision disagree.
+
+Concretely, within this repository:
 
 - `release/eggpack/` is the checked-in producer configuration. It is static: no release tag, no source SHA, and no artifact digest is committed.
 - `.github/workflows/release.yml` is **generated** from that configuration by `eggpack ci generate`. Never edit it by hand; `eggpack ci check` in CI fails on any drift.
@@ -90,7 +99,9 @@ Without both flags a fixed source revision produced two different Windows binari
 
 Start here:
 
+- `architecture/overview.md` — module map, request flow, and the **divergences table** of known open questions
 - `architecture/distribution.md` — producer/consumer ownership split
+- `.skills/README.md` — task-shaped agent guidance (pre-submit gate, cutting a release, architecture routing, isolation and trust)
 - `plans/README.md` — planning system and document hierarchy
 - `plans/000-long-term-specification.md` — canonical product/architecture specification
 - `plans/002-long-term-roadmap.md` — dependency-ordered long-term roadmap

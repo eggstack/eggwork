@@ -542,7 +542,7 @@ mutation. Test `linux_host_reports_manager_facts_without_mutation`
 | --- | --- | --- |
 | Linux | `--unit-path` (absolute), `--scope` `system`\|`user` | `systemd_manager(unit_name, scope, unit_path, exe, config, enable, reload, timeout)` |
 | macOS | `--plist-path`, `--launchd-domain` `user`\|`system`, `--launchd-target` | `launchd_manager(domain, target, plist_path, exe, config, bootstrap_on_install, timeout)` |
-| Windows | `--windows-start-type` (typed policy exists; mutating path refused) | `windows_scm_manager(start_type, timeout)` — retained, not reachable |
+| Windows | `--windows-start-type` (accepted by the qualification harness, but **no code parses it**; mutating path refused) | `windows_scm_manager(start_type, timeout)` — `#[cfg(windows)]` + `#[allow(dead_code)]`, unreachable |
 
 `parse_systemd_scope` accepts only the literal strings `system` and `user`; the
 doc comment says "scope is never guessed from EUID." `systemd_manager` requires an

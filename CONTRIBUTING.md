@@ -1,6 +1,10 @@
 # Contributing
 
-Changes must preserve the scheduler-free fixed-target boundary and crate ownership described in `architecture/`. Run formatting, Clippy, workspace tests, workspace check, and `python3 scripts/check_execution_ownership.py` before submitting Rust changes. Production process creation belongs only to `eggwork-runner`, with the documented sandbox-helper exception. Planning changes must follow `plans/003-planning-process.md`.
+Changes must preserve the scheduler-free fixed-target boundary and crate ownership described in `architecture/`. Run formatting, Clippy, workspace tests, workspace check, and `python3 scripts/check_execution_ownership.py` before submitting Rust changes. Production process creation belongs only to `eggwork-runner`, with the documented sandbox-helper exception. The *node service* lifecycle must reach service managers only through Eggup adapters — `eggwork-runner`'s use of `systemd-run --scope`/`systemctl` for per-execution transient cgroup units is resource enforcement, not service lifecycle, and is the sanctioned exception. Planning changes must follow `plans/003-planning-process.md`.
+
+Task-shaped guidance for common work lives in [`.skills/`](.skills/README.md):
+the pre-submit gate, cutting a release, routing into `architecture/`, and
+isolation/trust boundaries.
 
 ## Pre-submit commands
 
@@ -8,12 +12,22 @@ Changes must preserve the scheduler-free fixed-target boundary and crate ownersh
 python3 scripts/check_execution_ownership.py
 python3 scripts/check_execution_ownership.py --prove-negative-exit
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets
 cargo check --workspace
 python3 -m unittest discover --start-directory tests/release --top-level-directory tests/release
 git diff --check
 ```
+
+`--locked` on the clippy and test steps is load-bearing. A workspace version bump
+that does not update `Cargo.lock` builds fine locally and passes both without it,
+then fails every release build at `cargo build --locked`. That cost a full
+release attempt — the `v0.1.3` producer run failed closed on it. `--locked`
+converts a release-time discovery into a push-time one.
+
+Note that `--prove-negative-exit` is narrower than its name: it proves the
+scanner detects a forbidden spawn, not that the full guard path fails correctly.
+The plain invocation above is the one that does the real work; run both.
 
 ## Release configuration changes
 
