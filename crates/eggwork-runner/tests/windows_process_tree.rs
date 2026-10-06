@@ -210,6 +210,17 @@ fn assert_no_cleanup_warning(result: &RunnerResult, context: &str) {
     );
 }
 
+/// Windows has two spellings of the same path: `fs::canonicalize` returns the
+/// verbatim `\\?\` form and a shell prints the plain one. Comparing raw strings
+/// would fail on spelling, not on behaviour.
+fn normalise_path(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches(r#"\\?\"#)
+        .trim_end_matches(['\\', '/'])
+        .to_lowercase()
+}
+
 fn stdout_of(result: &RunnerResult) -> String {
     String::from_utf8_lossy(&result.stdout.head).into_owned()
 }
@@ -326,7 +337,10 @@ async fn output_limit_terminates_the_whole_tree() {
     .expect("write leader");
 
     let mut request = fixture.request(Fixture::batch_argv(&leader));
-    request.set_output_policy(16 * 1024, 512, OverflowPolicy::Truncate);
+    // `Terminate`, not `Truncate`: a truncating overflow is *supposed* to keep
+    // the target running, so asking it to truncate and then expecting
+    // `OutputLimit` would have been testing the fixture's wish, not the runner.
+    request.set_output_policy(16 * 1024, 512, OverflowPolicy::Terminate);
     let result = run(request).await.expect("execution ran");
     assert_eq!(result.termination, TerminationReason::OutputLimit);
     assert_no_cleanup_warning(&result, "output limit");
@@ -400,12 +414,10 @@ async fn working_directory_is_honoured_and_no_isolation_is_claimed() {
 
     let reported = stdout_of(&result);
     let expected = fs::canonicalize(&work).expect("canonical work dir");
-    // `cmd` prints the working directory with the drive letter it used, which
-    // can be the short form, so compare the final component plus the tail.
+    // `fs::canonicalize` returns the verbatim `\\?\` form on Windows and `cmd`
+    // prints the plain form, so both sides are normalised before comparing.
     assert!(
-        reported
-            .to_ascii_lowercase()
-            .contains(&expected.to_string_lossy().to_ascii_lowercase()),
+        normalise_path(&reported) == normalise_path(&expected.to_string_lossy()),
         "target ran somewhere other than the requested working directory: {reported:?}"
     );
     assert!(
@@ -517,6 +529,12 @@ async fn environment_is_the_documented_baseline_and_leaks_nothing() {
         .filter_map(|line| line.split_once('=').map(|(key, _)| key.trim()))
         .filter(|key| !key.is_empty())
         .collect();
+    // Anything outside this set came from the ambient environment, which is the
+    // thing under test. `cmd.exe` synthesises its own variables at startup, so
+    // they are expected and are not leaks: the previous version of this test
+    // failed on exactly `COMSPEC`, `PATHEXT`, and `PROMPT`, which is the
+    // interpreter talking, not the runner leaking.
+    let synthesised_by_cmd: [&str; 3] = ["COMSPEC", "PATHEXT", "PROMPT"];
 
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
     for key in BASELINE_KEYS {
@@ -539,6 +557,7 @@ async fn environment_is_the_documented_baseline_and_leaks_nothing() {
         .copied()
         .filter(|key| std::env::var_os(key).is_some())
         .filter(|key| !BASELINE_KEYS.contains(key))
+        .filter(|key| !synthesised_by_cmd.contains(key))
         .collect();
     assert!(
         leaked.is_empty(),
