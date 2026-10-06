@@ -81,7 +81,7 @@ The repository is no longer planning-only.
 
 ## Dependency-ready implementation plans
 
-These plans are independent enough to execute in parallel. Closure must reconcile any shared-file conflicts.
+M007 is the current ready Eggwork implementation handoff. Closed downstream CodeGG rows are retained only for dependency history.
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
@@ -127,7 +127,7 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 | Operations M006 PTY extension | deferred (not unblocked) | PTY capability streams are out of M004 scope. Requires a separate interactive ownership/attach design. |
 | CodeGG M003 content-aware derived workspace transfer | closed downstream | Closed in CodeGG at `d51afe46` (implementation `1ce377ce`; hosted `36745285774` success, live derived reuse under required isolation) on Eggwork `e6a5d82`; closure record `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution/003-status.md` |
 | CodeGG M004 remote AgentRun worker | deferred | M003 is closed; only the stable AgentRun worker-entry contract remains outstanding |
-| Operations M007 Windows service host | **ready** | `plans/implementation/operations-distribution/007-windows-service-host.md`. Uses an explicit SCM `service-host` entry and target-scoped `windows-service` host API while Eggup retains registration/manager ownership. Independent of Foundation M004; both feed final M004/Phase-6 closure. |
+| Operations M007 Windows service host | **ready** | `plans/implementation/operations-distribution/007-windows-service-host.md`. Explicit `service-host --config` entry, shared shutdown+wait convergence, normal STOP does not create persistent drain, dedicated native Windows contract/SCM evidence, Eggup remains manager owner. Foundation M004 is already conditionally closed; the next immutable candidate should contain both for final M004 qualification. |
 
 Operations M003, M002a, and conditionally M004 are closed. Foundation M004 has since implemented and native-qualified the Windows process-tree backend, but no immutable candidate contains it yet. M004 used the historical `v0.1.0` draft only as discovery evidence and qualified a corrected `v0.1.1` draft with the then-current support matrix. Do not widen M004 into runtime release discovery, service-manager duplication, or Eggpack/Eggup interoperability. Windows service hosting is a **new** milestone, not an M004 continuation, because it requires a service-control dispatcher that the daemon does not have.
 
