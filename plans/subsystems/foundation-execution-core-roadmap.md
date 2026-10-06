@@ -1,6 +1,6 @@
 # Foundation and Execution Core Roadmap
 
-Status: M001-M003 closed; C001 post-closure CI corrective closed; M004 Windows process-tree backend ready
+Status: M001-M004 closed (M004 conditional on a release containing it); C001 post-closure CI corrective closed
 
 Canonical authority:
 
@@ -114,7 +114,7 @@ Exit conditions:
 
 Class: capability/invariant
 
-Status: **ready**
+Status: **conditionally closed** — `plans/closure/foundation-execution-core/004-status.md`
 
 Implementation plan:
 
@@ -123,6 +123,19 @@ Implementation plan:
 Objective:
 
 Complete the canonical runner on Windows with pre-run Job Object ownership and full-tree wait/termination semantics. Hosted `v0.1.5` evidence proved the current non-Unix path refuses with `UnsupportedPlatform` before child creation; this milestone replaces that explicit refusal for Windows without weakening timeout/cancellation/descendant-cleanup invariants.
+
+Closure summary:
+
+- Implemented at `f41a8ae`: `crates/eggwork-runner/src/process_tree.rs` is the single
+  platform tree seam, with Unix keeping process-group escalation and Windows owning
+  the tree with `process-wrap` `=10.0.1` (`tokio1`, `job-object`, `kill-on-drop`).
+- `run` is no longer Unix-gated; `UnsupportedPlatform` is now the typed refusal only
+  for compile targets with no tree story at all.
+- Hosted `windows-latest` job `windows-runner` in `.github/workflows/ci.yml` runs a
+  `#![cfg(windows)]` tree-lifecycle suite; the closure evidence is green.
+- Remaining: the installed-release receipt (acceptance criterion 10) needs a release
+  that contains M004. Cutting that release is a maintainer decision, and plan §16
+  forbids cutting one merely to test an incomplete backend.
 
 Exit conditions:
 

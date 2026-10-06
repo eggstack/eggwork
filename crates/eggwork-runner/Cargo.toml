@@ -17,6 +17,12 @@ tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The Windows tree-lifecycle suite drives the runner through its public API and
+# needs the same protocol types the crate itself validates against. `tokio` and
+# `tokio-util` are regular dependencies, which an integration test cannot see.
+eggwork-core = { path = "../eggwork-core" }
+tokio = { workspace = true, features = ["macros", "process", "rt", "sync", "time"] }
+tokio-util.workspace = true
 
 # Landlock is a Linux-only kernel API. The crate is Linux-only and must not
 # enter the build graph on any other host: every required release target that
@@ -27,6 +33,19 @@ landlock.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["user"] }
+
+# Windows needs pre-run process-tree ownership, not a bare `tokio::process::Child`:
+# the target must not be able to run — or create descendants — before Eggwork owns
+# the tree. `process-wrap` assigns the Job Object while the process is still
+# suspended and resumes it afterwards, and terminates the whole tree through the
+# Job Object. The exact pin is deliberate: upstream raises its MSRV without a major
+# version bump, so "10" is not a stable lower bound (Foundation M004).
+[target.'cfg(windows)'.dependencies]
+process-wrap = { version = "=10.0.1", default-features = false, features = [
+    "tokio1",
+    "job-object",
+    "kill-on-drop",
+] }
 
 [lints]
 workspace = true

@@ -198,18 +198,33 @@ jobs:
 
   # Windows is dispositioned, not claimed.
   #
-  # Hosted qualification found two structural gaps in the Windows candidate, and
-  # neither can be re-qualified without a release that contains the fixes:
+  # Corrected after Foundation M004. The original diagnosis here was wrong, and
+  # the comment said so before the cause was found; keeping the correction
+  # visible matters more than tidiness.
+  #
+  # The earlier text blamed the runner's Unix-only baseline environment
+  # (`PATH=/usr/bin:/bin`, no `SystemRoot`) for a Windows child exiting with no
+  # capturable exit code. That shaping was a real defect and it is fixed, but it
+  # was never the blocker: on Windows `LocalProcessRunner::run` refused with
+  # `UnsupportedPlatform` *before* creating any child, so no child ever received
+  # an environment. The `Failed / Internal / exit_code: null` receipt proved
+  # exactly that, which is what the M004 plan's baseline section records.
+  #
+  # The two genuine gaps in the qualified candidate are:
   #
   # 1. `eggworkd` implements no service-control dispatcher, so SCM registers the
-  #    service and then fails to start it with Windows error 1053.
-  # 2. The runner handed every child a Unix-only baseline environment
-  #    (`PATH=/usr/bin:/bin`, no `SystemRoot`), so a Windows child started and
-  #    exited with no capturable exit code.
+  #    service and then fails to start it with Windows error 1053. This is
+  #    Operations M007, and it is still open.
+  # 2. Windows child execution itself: there was no process-tree owner at all.
+  #    Foundation M004 adds a Job Object backend (`plans/closure/foundation-execution-core/004-status.md`)
+  #    and has qualified its tree lifecycle on hosted `windows-latest`.
   #
-  # Both are fixed on `main` and neither is in the qualified candidate's bytes.
-  # This job therefore records the candidate's real disposition and fails if the
-  # observation ever diverges from it, so the limitation cannot silently rot.
+  # Neither fix is in the qualified candidate's bytes: M004 needs a release cut
+  # first, and M007 is not implemented. This job therefore records the
+  # candidate's real disposition and fails if the observation ever diverges from
+  # it, so the limitation cannot silently rot. When a release containing M004 is
+  # cut, run this workflow with that exact tag to replace this disposition with a
+  # claim.
   windows-installed-execution:
     name: windows installed execution and service disposition
     runs-on: windows-latest
@@ -245,10 +260,15 @@ jobs:
             cargo test --locked -p eggwork-server --features qualification \
               --test installed_qualification -- --ignored --exact qualification_fixture
       - name: Qualify installed execution through the production client
-        # This is the step that previously could not be claimed. The candidate
-        # built a Unix-only child environment, so the shell could not resolve;
-        # the runner now supplies a platform-shaped environment. The test also
-        # proves required filesystem isolation is refused *before* the target
+        # This is the step that previously could not be claimed. For the current
+        # candidate the blocker is that the runner refuses Windows outright, not
+        # the child environment: `run` returned `UnsupportedPlatform` before any
+        # process existed, so the receipt was `Failed / Internal / exit_code: null`
+        # with nothing to blame on the environment. The runner now supplies a
+        # platform-shaped environment *and* owns the process tree, so this step
+        # becomes a real claim once the candidate's bytes contain Foundation M004.
+        # The test also proves required filesystem isolation is refused *before*
+        # the target
         # runs, which is the truthful Windows disposition.
         shell: bash
         env:

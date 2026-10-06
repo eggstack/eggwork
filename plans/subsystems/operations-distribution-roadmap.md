@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M001-M003 and M002a closed, M004 conditionally closed; M004a and M007 ready
+Status: active roadmap; M001-M003, M002a and M004a closed, M004 conditionally closed; M007 ready
 
 Canonical authority:
 
@@ -214,7 +214,7 @@ M004 does not reopen producer ownership or authorize publication. It reuses the 
 
 Class: corrective / test-infrastructure invariant
 
-Status: **ready**
+Status: **closed** — `plans/closure/operations-distribution/004a-status.md`
 
 Implementation plan:
 
@@ -225,6 +225,23 @@ Objective:
 Close the intermittent Linux `ETXTBSY` finding recorded by the M004 closure by giving every concurrently runnable helper fixture its own immutable executable path. Tests must not replace or rewrite a helper binary another test may be executing.
 
 This corrective changes no production behavior and should close before the final Phase-6 release qualification so flaky fixture staging cannot contaminate release evidence.
+
+Closure summary:
+
+- One reusable staging path, `crates/eggwork-sandbox-helper/tests/support/helper_fixture.rs`,
+  used by both suites that need a trust-passing helper. Ten duplicated inline blocks
+  became one implementation.
+- Staging is atomic (write under a staging name, `rename` into place), every fixture
+  owns a private `0700` directory and its own bytes, and the Cargo-built helper is
+  only ever read. Five new tests prove those properties, including that mutating one
+  fixture's mode or bytes cannot reach another.
+- No retry, no sleep, no suite serialisation, no trust-rule change.
+- **The recorded flake did not fully disappear, and the closure record says so.** The
+  residual was reproduced and measured: the failing path is provably staged once, has
+  no writer at failure time, and the window closes immediately — a host-level,
+  load-dependent kernel window around executing a just-written executable, reproducible
+  outside Eggwork's spawn path. The finding is re-dispositioned there rather than
+  closed by assertion.
 
 ### M007 — Windows service host
 

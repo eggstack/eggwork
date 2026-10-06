@@ -120,6 +120,13 @@ macOS and Windows ship the daemon only.
 
 SHA-256 sidecars are integrity evidence, not authenticity.
 
+**Windows executes; it does not isolate.** A Windows node runs executions and
+owns the whole process tree with a Job Object, so timeout, cancellation, output
+limit, and a target that outlives its leader all converge. It offers no
+filesystem or resource isolation: a `Required` isolation or resource request is
+refused before the target starts, and a best-effort request is reported as
+`NotApplied` rather than enforced.
+
 **Windows service management is unsupported and fails closed** — `eggworkd` has
 no service-control dispatcher, so a registered service can never reach
 `Running`. Every mutating `service` verb is refused before any mutation; Windows

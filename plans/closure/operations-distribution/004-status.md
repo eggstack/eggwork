@@ -462,22 +462,22 @@ Named, non-critical, and the reason closure is conditional.
 | --- | --- | --- | --- |
 | 1 | **Public publication and post-publication bootstrap matrix on all five targets** | §14 makes publication an explicit maintainer action; it did not occur. Both `v0.1.0` and `v0.1.1` remain `draft=true`, `published_at=null`. | A maintainer publishes draft `402292969`; then verify the public exact-tag asset inventory and run the public bootstrap matrix on all five targets. |
 | 2 | **Windows service management qualification** | The daemon has no service-control dispatcher, so the backend is dispositioned `unsupported` rather than live-qualified (plan §15). Implementing service hosting is a separate product milestone. | A service-host milestone lands a dispatcher, then a release containing it is qualified on a real Windows host. |
-| 3 | **Windows child execution qualification** | The candidate's runner built a Unix-only child environment. Fixed on `main`; the candidate's immutable bytes cannot be re-qualified. | A release containing `202d395` passes the Windows installed-execution qualification. |
+| 3 | **Windows child execution qualification** | Corrected after the fact: this record's stated cause was wrong. The candidate's runner did not build a Unix-only child environment and then run it — on Windows `LocalProcessRunner::run` refused with `UnsupportedPlatform` before creating any child, which is exactly what the `Failed / Internal / exit_code: null` receipt proved. Foundation M004 replaced that refusal with a Job Object process-tree backend and qualified its tree lifecycle on hosted `windows-latest`. The candidate's immutable bytes still cannot execute on Windows. | A release containing Foundation M004 (`plans/closure/foundation-execution-core/004-status.md`) passes the Windows installed-execution qualification in this workflow. |
 
 Item 2 is a deliberate §15 disposition of a capability, not a hidden gap.
-Item 3 is a known-and-fixed defect awaiting the next release.
+Item 3 is a corrected and implemented gap awaiting the next release.
 Item 1 is a human action that must never be fabricated.
 
 ## 19. Unresolved findings by severity
 
 | Severity | Finding | Status |
 | --- | --- | --- |
-| medium | Windows child execution unqualified for the candidate | root cause found, fix not yet chosen; outstanding evidence item 3 |
+| medium | Windows child execution unqualified for the candidate | root cause corrected: there was no Windows process-tree owner at all, not a malformed child environment. Foundation M004 implemented and hosted-qualified one; outstanding evidence item 3 now needs only a release containing it |
 | medium | Windows service management unsupported | dispositioned fail-closed; outstanding evidence item 2 |
 | medium | public publication/bootstrap not performed | outstanding evidence item 1 |
 | low | Eggpack git pin durability under upstream history rewrite | unchanged from M003; pin fails loudly, never silently |
 | low | `aarch64-unknown-linux-gnu` runtime/service untested | no native host available; staged bytes digest-verified only |
-| low | `tests/release` CI flake: `required_landlock_allows_workspace_and_denies_outside_reads_and_writes` failed once on `33f9a68` with `Spawn("Text file busy (os error 26)")` and passed on an immediate rerun of the same head | **open**. `ETXTBSY` is a test-staging race, not a product defect: every test in that file stages the same shared `target/debug/eggwork-sandbox-helper`. It needs its own corrective rather than a retry, and a rerun is not a fix. |
+| low | `tests/release` CI flake: `required_landlock_allows_workspace_and_denies_outside_reads_and_writes` failed once on `33f9a68` with `Spawn("Text file busy (os error 26)")` and passed on an immediate rerun of the same head | **closed and re-dispositioned** by Operations M004a (`plans/closure/operations-distribution/004a-status.md`). Two corrections to this row: the stated cause was wrong — each test already staged its own private copy, so nothing was shared — and the failure did not disappear. What M004a removed is the real class (mutable or shared helper installation paths, in-place staging); what remains is a host-level, load-dependent kernel window around executing a just-written executable, measured to occur on a path with no writer and to close immediately, reproducible outside Eggwork's spawn path. Recorded there as a low–medium test-environment finding with a named next step. |
 | low | `scripts/qualify_release.py` release-API flake | closed by bounded retry with tests |
 | none open | release clobber, tag movement, secret exposure, ownership bypass, auto-start after `RecoveryRequired`, execution of a denied capability, false supported-isolation claim | none observed |
 

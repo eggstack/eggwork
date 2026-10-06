@@ -71,11 +71,11 @@ The repository is no longer planning-only.
 
 | Workstream | Status | Current work | Authority |
 |---|---|---|---|
-| Foundation / execution core | M001-M003 closed; M004 ready | Windows execution is intentionally unsupported in the closed baseline; M004 adds a pre-run Job Object process-tree backend after `v0.1.5` proved the current `UnsupportedPlatform` gate is the real Windows child-execution blocker | `plans/subsystems/foundation-execution-core-roadmap.md`, `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md` |
+| Foundation / execution core | M001-M004 closed (M004 conditional); no ready work | Windows execution is implemented: M004 replaced the `UnsupportedPlatform` gate with a Job Object process-tree backend and qualified the tree lifecycle on hosted `windows-latest`. What remains is the installed-release receipt, which needs a release containing M004 | `plans/subsystems/foundation-execution-core-roadmap.md`, `plans/closure/foundation-execution-core/004-status.md`, `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md` |
 | Control-plane protocol | closed | M001-M003 complete | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | closed | M001-M004 closed, including reusable manifest CAS + derived materialization (`plans/closure/workspace-artifact-transport/004-status.md`) | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | closed | M001-M004 plus remote-admission corrective C001 are closed (`plans/closure/security-isolation-resource/004-status.md`); macOS/Windows hosted qualification remains future Operations M004 work, not a Security defect | `plans/subsystems/security-isolation-resource-roadmap.md`, `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md` |
-| Operations / distribution | conditionally closed; M004a + M007 ready | M004 remains conditional. M004a closes the helper-fixture `ETXTBSY` race; M007 adds the actual Windows SCM host. Windows child execution is owned by Foundation M004, not Operations. | `plans/subsystems/operations-distribution-roadmap.md`, `plans/closure/operations-distribution/004-status.md` |
+| Operations / distribution | conditionally closed; M004a closed; M007 ready | M004 remains conditional on a release containing Foundation M004. M004a closed the helper-fixture isolation defect and characterised the residual host-level `ETXTBSY` window. M007 adds the actual Windows SCM host | `plans/subsystems/operations-distribution-roadmap.md`, `plans/closure/operations-distribution/004-status.md`, `plans/closure/operations-distribution/004a-status.md` |
 | CodeGG integration | Eggwork reference closed; downstream M001+C001+M002+M002a+M003 closed | CodeGG required-Landlock live qualification closed at `f5f8d96d`; downstream M003 closed at CodeGG `d51afe46` (implementation `1ce377ce`, hosted `36745285774`) against this repository's Workspace M004 contract; only downstream M004 remains, deferred. | `plans/subsystems/codegg-integration-roadmap.md` |
 
 ## Dependency-ready implementation plans
@@ -84,9 +84,7 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Foundation / execution core | M004 Windows Job Object finite-process backend | **ready** | `plans/implementation/foundation-execution-core/004-windows-job-object-process-tree-backend.md` | Canonical runner work. Prefer exact target-scoped `process-wrap 10.0.1`; preserve pre-run tree ownership and Rust 1.89. May execute in parallel with Operations M007. |
-| Operations corrective | M004a qualification helper fixture isolation | **ready** | `plans/implementation/operations-distribution/004a-release-qualification-fixture-isolation-corrective.md` | Remove shared mutable helper staging; no retry/sleep workaround and no production behavior change. |
-| Operations / distribution | M007 Windows service host | **ready** | `plans/implementation/operations-distribution/007-windows-service-host.md` | Keep Eggup as manager owner; target-scoped `windows-service 0.8.1` hosts the daemon through explicit `service-host`. |
+| Operations / distribution | M007 Windows service host | **ready** | `plans/implementation/operations-distribution/007-windows-service-host.md` | Keep Eggup as manager owner; target-scoped `windows-service 0.8.1` hosts the daemon through explicit `service-host`. No dependency on Foundation M004; both close the two Windows gaps Operations M004 left open. |
 | CodeGG downstream | M001+C001+M002+M002a fixed-target remote execution/policy/live isolation | **closed in CodeGG** | `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution/002a-status.md` | Required-Landlock production mTLS path closed at `f5f8d96d`. Downstream M003 is also closed (see below). |
 
 ## Closed and superseded implementation plans
@@ -96,6 +94,7 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 | Foundation | M001 domain/bootstrap | closed | `plans/closure/foundation-execution-core/001-status.md` |
 | Foundation | M002 local runner | closed | `plans/closure/foundation-execution-core/002-status.md` |
 | Foundation | M003 execution-ownership guards + runner API hardening | closed | `plans/closure/foundation-execution-core/003-status.md` |
+| Foundation | M004 Windows Job Object finite-process backend | conditionally closed | `plans/closure/foundation-execution-core/004-status.md` — tree lifecycle qualified on hosted `windows-latest`; the installed-release receipt still needs a release containing M004 |
 | Foundation corrective | C001 portable ownership guard + CI enforcement | closed | `plans/closure/foundation-execution-core-ci-corrective/001-status.md` |
 | Control plane | M001 authenticated execution | closed | `plans/closure/control-plane-protocol/001-status.md` |
 | Control plane | M002 idempotency/leases/events/recovery | closed | `plans/closure/control-plane-protocol/002-status.md` + lease-expiry correction |
@@ -120,8 +119,8 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Work | Status | Blocker / rationale |
 |---|---|---|
-| Foundation M004 Windows finite-process backend | **ready** | `v0.1.5` proved Windows is refused before spawn by the canonical runner. Registered plan adds pre-run Job Object ownership and complete-tree lifecycle semantics. |
-| Operations M004a qualification helper fixture isolation | **ready** | Closes the recorded intermittent Linux `ETXTBSY` test-staging race by making helper installation paths fixture-private. |
+| Foundation M004 Windows finite-process backend | **conditionally closed** | Implemented at `f41a8ae`; tree lifecycle qualified on hosted `windows-latest` (`plans/closure/foundation-execution-core/004-status.md`). Remaining evidence is the installed-release receipt, which needs a release containing M004 — a release-lineage action reserved for the maintainer. |
+| Operations M004a qualification helper fixture isolation | **closed** | `plans/closure/operations-distribution/004a-status.md`. The fixture-isolation invariant is implemented and proven; the recorded `ETXTBSY` finding is re-dispositioned there as a host-level kernel window with measurements, not as a fixture defect. |
 | Operations M004 operational/release qualification | **conditionally closed** | `plans/closure/operations-distribution/004-status.md`; deterministic MSVC policy and double-build proof landed, corrected `v0.1.1` cut and staged, all 17 assets reused on same-tag rerun without clobber, native service/update evidence collected for systemd and both launchd targets. Acceptance criterion 5 is unmet for Windows by the plan's own §15 `unsupported` disposition, not by omission. |
 | Operations M005 reverse-connect relay | deferred (not unblocked) | M004 neither implements nor claims a remote connect/accept path, so it does not supply the interface M005 relies on. No immediate product need; stable identity/lease semantics already exist. |
 | Operations M006 PTY extension | deferred (not unblocked) | PTY capability streams are out of M004 scope. Requires a separate interactive ownership/attach design. |

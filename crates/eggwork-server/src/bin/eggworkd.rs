@@ -327,10 +327,10 @@ fn product_service_manager(
     {
         let _ = spec;
         let _ = args;
-        return Err(
+        Err(
             "Windows service management is unsupported: the installed daemon does not              implement a service control dispatcher, so a registered service can never              reach Running. Registering an external process would be a working              installation with no service behind it."
                 .into(),
-        );
+        )
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     return Err("service management is unsupported on this platform".into());
@@ -466,7 +466,6 @@ fn deployment_apply(
         &verifier,
         || eggwork_server::operations::active_execution_count(config),
         move |remaining| {
-            let deadline = std::time::Instant::now() + remaining;
             let timeout = std::cmp::min(remaining, std::time::Duration::from_secs(5));
             if timeout.is_zero() {
                 return Err("post-install check budget exhausted".into());
@@ -498,6 +497,10 @@ fn deployment_apply(
             }
             #[cfg(target_os = "linux")]
             if require_helper {
+                // Only the Linux path still spends the remaining budget on the
+                // helper compatibility check, so the deadline is computed here
+                // rather than being an unused binding on every other target.
+                let deadline = std::time::Instant::now() + remaining;
                 let helper_budget = deadline.saturating_duration_since(std::time::Instant::now());
                 if !deployment::check_helper_compatibility_with_timeout(
                     Some(&installed_helper),

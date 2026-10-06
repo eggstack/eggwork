@@ -20,6 +20,7 @@ Every invariant in [overview.md](overview.md) is stated as a rule that *is enfor
 | **1b. The ownership guard itself still fails when it should.** | `--prove-negative-exit` step, plus the in-process `self_test()` that runs on *every* invocation | A scanner regression (a dropped spawn pattern) makes the proof step exit 1 with `scanner regression — synthetic forbidden spawn was not detected`. |
 | **1c. Crate dependency direction.** `eggwork-server` owns no process machinery and must route through `eggwork-runner`. | `check_execution_ownership.py::check_dependencies()` over `cargo metadata --no-deps --format-version 1` | Nonzero exit naming the offending crate, e.g. `eggwork-core must not depend on eggwork-client`, `eggwork-server enables Tokio process creation; use eggwork-runner`, or `eggwork-server must depend on the canonical eggwork-runner`. |
 | **2. No direct service-manager invocation** (`systemctl`, `launchctl`, SCM, `crontab`). | Not machine-checked by a dedicated guard. The one hand-written enforcement is `operational-qualification.yml`'s `windows-installed-execution` job, which fails hard if the Windows service verb *does* mutate. Normatively owned by `execution-ownership.md`. | See [Test coverage and gaps](#test-coverage-and-gaps) — this is the weakest-enforced invariant in the set. |
+| **Windows owns the whole process tree, and that is checked where it happens.** | The `windows-runner` CI job on `windows-latest` running `cargo test --locked -p eggwork-runner --all-targets`, which compiles the `#![cfg(windows)]` tree-lifecycle suite; plus `cargo clippy --locked --workspace --all-targets -- -D warnings` on the same host | Nonzero exit on any Windows-path regression, and the Linux job's silence no longer reads as Windows coverage. |
 | **3. Fixed target.** The client names its target explicitly. | Structural: `eggwork-client` is denied a dependency on the node crates by `check_dependencies()`; no workflow resolves a "latest" release. | Nonzero exit from the ownership guard if `eggwork-client` ever gains a `eggwork-runner`/`eggwork-server` edge. |
 | **4. Isolation claims are earned, never assumed.** | Exercised, not enforced statically: `installed_release_admits_execution_and_refuses_unsupported_isolation` in `crates/eggwork-server/tests/installed_qualification.rs`, driven from the qualification workflow on three hosted targets. | That ignored integration test fails; the hosted job goes red and its receipts are not uploaded. |
 | **5. Fail closed on uncertainty** for guarantees the caller demanded. | Same installed-execution test asserts required isolation is *refused* before the target runs; the Windows job records the service disposition and `throw`s if the refusal ever disappears (`the fail-closed guarantee is gone`). | Hard job failure. The Windows step deliberately ends `exit 0` only *after* recording the refusal, so the daemon's non-zero refusal exit is not inherited as the step's result. |
@@ -46,6 +47,22 @@ for path in sorted((ROOT / "crates").glob("*/src/**/*.rs")):
 ```
 
 Only `.rs` files under `crates/<crate>/src/`, at any nesting depth, are scanned. `crate_for_source()` maps a path to a crate by taking the second path component (`rel.parts[1]`) and returning `None` for anything else, so the crate identity is positional, not read from a manifest. Consequence: integration tests (`crates/*/tests/*.rs`), `examples/`, `benches/`, and `build.rs` are **not** scanned. That is the intended production boundary — a test that spawns a process is not a product that owns one — but it is a boundary a reviewer should confirm rather than assume.
+
+### The dependency denylist and its one recorded exception
+
+`FORBIDDEN_PROCESS_DEPS = {command-group, duct, process-wrap, portable-pty, subprocess}` is the named set of libraries whose entire purpose is process ownership, so re-introducing one is a hard failure rather than a review question. It used to be applied to `eggwork-server` alone, which left every other crate unchecked; it is now applied to **all five crates** through `process_dep_errors()`, minus the entries in `APPROVED_PROCESS_DEP_EXCEPTIONS`.
+
+There is exactly one entry today:
+
+```python
+APPROVED_PROCESS_DEP_EXCEPTIONS = {
+    ("eggwork-runner", "process-wrap"): (
+        "Windows Job Object process-tree ownership, target-scoped to cfg(windows)"
+    ),
+}
+```
+
+`eggwork-runner` is already an approved *source* owner, so this is not a widening of who may create processes — it is the narrowest possible way to let an existing owner express Windows tree ownership. `unexplained_process_dep_exceptions()` is the other half of the trade: it fails the guard if an exception names a crate that does not exist or a dependency that is not on the denylist, so the table cannot rot into a blanket waiver.
 
 ### The approved-owner allowlist
 
@@ -174,6 +191,49 @@ The workflow comment is the shortest true statement of the failure mode:
 Concretely: bump `version` in `[workspace.package]` to `0.1.6`, forget to run `cargo update`/`cargo generate-lockfile`. `cargo build` locally is perfectly happy — it just rewrites the lock. `cargo clippy` passes. `cargo test` passes. The tree is green everywhere, and the release workflow, which runs `cargo +1.89.0 build --release --locked …`, fails closed on *every one of the five targets*, after preflight and resolve have already spent their time. The v0.1.3 producer run is the receipt for that cost. `--locked` on the clippy and test steps converts a release-time discovery into a push-time one.
 
 The related failure has the same shape and is why `check_release_tag.py` exists: v0.1.4 staged binaries that reported `0.1.3` because the version bump was missed entirely, which hosted qualification correctly refused with `installed-daemon-version: daemon reports '0.1.3', expected 0.1.4`.
+
+## The `windows-runner` CI job
+
+A second job in the same workflow, on `windows-latest`, added by Foundation M004:
+
+```yaml
+  windows-runner:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc
+      - run: cargo clippy --locked --workspace --lib --bins --all-features -- -D warnings
+      - name: eggwork-runner test targets
+        run: cargo clippy --locked -p eggwork-runner --all-targets --all-features -- -D warnings
+      - name: Windows process-tree lifecycle suite
+        run: cargo test --locked -p eggwork-runner --all-targets -- --nocapture
+```
+
+**Why it exists.** The Windows process-tree backend cannot be observed from Linux. Job Object ownership, descendant convergence after leader exit, and pipe inheritance across a process tree only mean something on a real Windows kernel, and a green Linux run must never be readable as Windows coverage. Foundation M004's `runner` tests are `#![cfg(windows)]`, so without this job the entire suite would silently not exist in CI.
+
+**What it deliberately does not run.** `cargo test --workspace` is not used, and test-target clippy is scoped to `eggwork-runner`. The server's and client's unit tests are Linux-shaped: they spawn `/bin/sh` and set `0700`/`0600` modes through `std::os::unix::fs`, so several test helpers do not even *compile* for Windows (`place_trusted_helper` in `crates/eggwork-server/src/lib.rs`, the `PermissionsExt` uses in `artifact.rs`, `blob.rs`, `operations.rs`, and `deployment.rs`). Making them portable is its own milestone.
+
+That gap is stated rather than papered over, and the split is deliberate:
+
+- `cargo clippy --locked --workspace --lib --bins --all-features -- -D warnings`
+  covers production code on the Windows target, which is the surface a release
+  binary is built from and the place a Windows-only regression actually matters.
+- `cargo clippy --locked -p eggwork-runner --all-targets --all-features -- -D warnings`
+  covers test targets for the crate Foundation M004 changed.
+
+This job is still earning its keep: it found three real Windows-only lints that
+Linux can never see — an un-gated `landlock_runner.rs` header, a Linux-only
+`deadline` binding plus a needless `return` in the Windows SCM refusal path, and
+an ungated `PathBuf` import in the capability probe. The installed production
+path stays qualified by `operational-qualification.yml` from a staged release's
+own bytes; a build-tree job could not prove release identity.
+
+**Cross-check against the local guard.** Before pushing, `cargo check --locked -p eggwork-runner --all-targets --target x86_64-pc-windows-msvc` compiles the Windows-only code paths on a Linux host. It catches types, imports, and lints; it does not catch kernel behaviour, which is the entire point of the hosted job. (A full `--workspace --target x86_64-pc-windows-msvc` check does not work on Linux: `cc-rs` needs MSVC's `lib.exe` for a transitive C dependency.)
 
 ## The `release-drift` job
 
