@@ -178,9 +178,12 @@ Outcome:
   start it with Windows error 1053. Mutating verbs now fail closed before any
   mutation. Making the daemon a Windows service host is a separate product
   milestone, not an M004 continuation.
-- Windows child execution is **not claimed** for the `v0.1.1` candidate: the
-  runner declared a Unix-only baseline child environment. Fixed on `main` in
-  `202d395`; re-qualification needs a release containing that fix.
+- Windows child execution is **not claimed** for the immutable `v0.1.1`
+  candidate. Later investigation corrected the diagnosis: that runner returned
+  `UnsupportedPlatform` before creating any child. Foundation M004 has since
+  replaced the refusal with a Job Object process-tree backend and qualified its
+  native lifecycle on hosted Windows; exact installed-release evidence still
+  requires a new candidate containing that implementation.
 
 Closure disposition:
 
@@ -257,9 +260,11 @@ Objective:
 
 Make `eggworkd` a real SCM service host while keeping service registration and lifecycle mutation Eggup-owned. The reviewed implementation seam uses target-scoped `windows-service 0.8.1` for the dispatcher/control/status surface rather than Eggwork-owned raw Win32 FFI.
 
-The registered service should invoke an explicit `service-host` entry. It may report `RUNNING` only after the normal NodeServer is ready; STOP/SHUTDOWN must reuse persistent drain and execution convergence before `STOPPED`.
+The registered service invokes an explicit `service-host --config ...` entry. It may report `RUNNING` only after the normal NodeServer is ready. STOP/SHUTDOWN must use the shared NodeServer shutdown-and-wait path so active work converges before `STOPPED`.
 
-Dependencies: no hard dependency on Foundation M004. Both are required to remove the two Windows M004 outstanding capability gaps before final Phase-6 closure.
+A routine service STOP must not create a new persistent drain marker; persistent drain remains explicit operator/update policy and an existing marker is preserved across service restart.
+
+Verification is deliberately split: state/contract tests plus source-built hosted SCM lifecycle evidence close the implementation side; immutable installed-release evidence remains Operations M004 authority. Foundation M004 is already conditionally closed and is not an implementation dependency. No additional M007 prerequisite plan is required.
 
 ### M005 — Reverse-connect relay
 
