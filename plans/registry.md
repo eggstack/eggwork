@@ -35,6 +35,7 @@ Founding ADRs:
 
 Latest Eggwork implementation/closure head reviewed for this planning batch:
 
+- `d4db4e72` — merged Foundation M004 + Operations M004a line: Windows Job Object process-tree execution is native-qualified, helper fixture isolation is closed, and current CI is green;
 - `d992ca5` — architecture deep dives: module overview plus systematic
   per-component documents, including the cross-cutting divergences table;
 - `926e06a` — corrected the Windows execution diagnosis
@@ -71,11 +72,11 @@ The repository is no longer planning-only.
 
 | Workstream | Status | Current work | Authority |
 |---|---|---|---|
-| Foundation / execution core | M001-M004 closed (M004 conditional); no ready work | Windows execution is implemented: M004 replaced the `UnsupportedPlatform` gate with a Job Object process-tree backend and qualified the tree lifecycle on hosted `windows-latest`. What remains is the installed-release receipt, which needs a release containing M004 | `plans/subsystems/foundation-execution-core-roadmap.md`, `plans/closure/foundation-execution-core/004-status.md`, `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md` |
+| Foundation / execution core | M001-M003 closed; M004 conditionally closed; no ready implementation work | Windows execution is implemented: M004 replaced the `UnsupportedPlatform` gate with a Job Object process-tree backend and qualified the tree lifecycle on hosted `windows-latest`. What remains is the installed-release receipt, which needs a release containing M004 | `plans/subsystems/foundation-execution-core-roadmap.md`, `plans/closure/foundation-execution-core/004-status.md`, `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md` |
 | Control-plane protocol | closed | M001-M003 complete | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | closed | M001-M004 closed, including reusable manifest CAS + derived materialization (`plans/closure/workspace-artifact-transport/004-status.md`) | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | closed | M001-M004 plus remote-admission corrective C001 are closed (`plans/closure/security-isolation-resource/004-status.md`); macOS/Windows hosted qualification remains future Operations M004 work, not a Security defect | `plans/subsystems/security-isolation-resource-roadmap.md`, `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md` |
-| Operations / distribution | conditionally closed; M004a closed; M007 ready | M004 remains conditional on a release containing Foundation M004. M004a closed the helper-fixture isolation defect and characterised the residual host-level `ETXTBSY` window. M007 adds the actual Windows SCM host | `plans/subsystems/operations-distribution-roadmap.md`, `plans/closure/operations-distribution/004-status.md`, `plans/closure/operations-distribution/004a-status.md` |
+| Operations / distribution | M004 conditionally closed; M004a closed; M007 ready | Foundation M004's Windows runner is implemented/native-qualified; M004 still needs immutable installed-release evidence and Windows SCM service qualification. M004a closed the fixture-ownership defect. M007 is the only substantive Phase-6 implementation capability still ready. | `plans/subsystems/operations-distribution-roadmap.md`, `plans/closure/operations-distribution/004-status.md`, `plans/closure/operations-distribution/004a-status.md` |
 | CodeGG integration | Eggwork reference closed; downstream M001+C001+M002+M002a+M003 closed | CodeGG required-Landlock live qualification closed at `f5f8d96d`; downstream M003 closed at CodeGG `d51afe46` (implementation `1ce377ce`, hosted `36745285774`) against this repository's Workspace M004 contract; only downstream M004 remains, deferred. | `plans/subsystems/codegg-integration-roadmap.md` |
 
 ## Dependency-ready implementation plans
@@ -84,7 +85,7 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
-| Operations / distribution | M007 Windows service host | **ready** | `plans/implementation/operations-distribution/007-windows-service-host.md` | Keep Eggup as manager owner; target-scoped `windows-service 0.8.1` hosts the daemon through explicit `service-host`. No dependency on Foundation M004; both close the two Windows gaps Operations M004 left open. |
+| Operations / distribution | M007 Windows service host | **ready** | `plans/implementation/operations-distribution/007-windows-service-host.md` | Keep Eggup as manager owner; explicit `service-host` plus shared shutdown/wait lifecycle; dedicated Windows test/SCM qualification surface. Foundation M004 is already conditionally closed, so M007 is independently implementable and should ride the same next immutable candidate for final M004 qualification. |
 | CodeGG downstream | M001+C001+M002+M002a fixed-target remote execution/policy/live isolation | **closed in CodeGG** | `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution/002a-status.md` | Required-Landlock production mTLS path closed at `f5f8d96d`. Downstream M003 is also closed (see below). |
 
 ## Closed and superseded implementation plans
@@ -121,14 +122,14 @@ These plans are independent enough to execute in parallel. Closure must reconcil
 |---|---|---|
 | Foundation M004 Windows finite-process backend | **conditionally closed** | Implemented at `f41a8ae`; tree lifecycle qualified on hosted `windows-latest` (`plans/closure/foundation-execution-core/004-status.md`). Remaining evidence is the installed-release receipt, which needs a release containing M004 — a release-lineage action reserved for the maintainer. |
 | Operations M004a qualification helper fixture isolation | **closed** | `plans/closure/operations-distribution/004a-status.md`. The fixture-isolation invariant is implemented and proven; the recorded `ETXTBSY` finding is re-dispositioned there as a host-level kernel window with measurements, not as a fixture defect. |
-| Operations M004 operational/release qualification | **conditionally closed** | `plans/closure/operations-distribution/004-status.md`; deterministic MSVC policy and double-build proof landed, corrected `v0.1.1` cut and staged, all 17 assets reused on same-tag rerun without clobber, native service/update evidence collected for systemd and both launchd targets. Acceptance criterion 5 is unmet for Windows by the plan's own §15 `unsupported` disposition, not by omission. |
+| Operations M004 operational/release qualification | **conditionally closed** | `plans/closure/operations-distribution/004-status.md`. Foundation M004 has now implemented/native-qualified Windows child execution, but immutable installed-release evidence still needs a new candidate containing it. Windows SCM service hosting remains the substantive implementation gap under M007; public publication/bootstrap remains a maintainer action. |
 | Operations M005 reverse-connect relay | deferred (not unblocked) | M004 neither implements nor claims a remote connect/accept path, so it does not supply the interface M005 relies on. No immediate product need; stable identity/lease semantics already exist. |
 | Operations M006 PTY extension | deferred (not unblocked) | PTY capability streams are out of M004 scope. Requires a separate interactive ownership/attach design. |
 | CodeGG M003 content-aware derived workspace transfer | closed downstream | Closed in CodeGG at `d51afe46` (implementation `1ce377ce`; hosted `36745285774` success, live derived reuse under required isolation) on Eggwork `e6a5d82`; closure record `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution/003-status.md` |
 | CodeGG M004 remote AgentRun worker | deferred | M003 is closed; only the stable AgentRun worker-entry contract remains outstanding |
 | Operations M007 Windows service host | **ready** | `plans/implementation/operations-distribution/007-windows-service-host.md`. Uses an explicit SCM `service-host` entry and target-scoped `windows-service` host API while Eggup retains registration/manager ownership. Independent of Foundation M004; both feed final M004/Phase-6 closure. |
 
-Operations M003, M002a, and conditionally M004 are closed. M004 used the historical `v0.1.0` draft only as discovery evidence and qualified a corrected `v0.1.1` draft containing the runner fix and an Eggwork-owned deterministic Windows link policy. Do not widen M004 into runtime release discovery, service-manager duplication, or Eggpack/Eggup interoperability. Windows service hosting is a **new** milestone, not an M004 continuation, because it requires a service-control dispatcher that the daemon does not have.
+Operations M003, M002a, and conditionally M004 are closed. Foundation M004 has since implemented and native-qualified the Windows process-tree backend, but no immutable candidate contains it yet. M004 used the historical `v0.1.0` draft only as discovery evidence and qualified a corrected `v0.1.1` draft with the then-current support matrix. Do not widen M004 into runtime release discovery, service-manager duplication, or Eggpack/Eggup interoperability. Windows service hosting is a **new** milestone, not an M004 continuation, because it requires a service-control dispatcher that the daemon does not have.
 
 ## Corrected execution graph
 
@@ -156,8 +157,8 @@ Operations M002 [historically CLOSED] --> Operations M002a [CLOSED corrective]
                                               |
 Operations M003 [CLOSED] ---------------------+--> Operations M004 [CONDITIONALLY CLOSED]
                                                                 |
-Foundation M004 Windows Job Object runner [READY] <---------------+--> Windows child execution
-Operations M004a fixture isolation [READY] <----------------------+--> deterministic qualification evidence
+Foundation M004 Windows Job Object runner [CONDITIONALLY CLOSED] <-+--> Windows child execution (release receipt outstanding)
+Operations M004a fixture isolation [CLOSED] <----------------------+--> deterministic qualification invariant
 Operations M007 Windows service host [READY] <--------------------+--> Windows service management
 Operations release publication  [HUMAN ACTION: §14]       <----+--> public bootstrap evidence
 ```
