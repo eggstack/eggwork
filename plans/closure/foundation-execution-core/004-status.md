@@ -27,7 +27,8 @@ record is projected to pass.
 | Landlock suite file gate | `098c4a4` (Windows-only clippy drift the new job surfaced) |
 | Fixture/ownership hardening | `0e6682a` (Operations M004a work landing on the same branch; see its closure record) |
 | Windows import gate | `edcf056` |
-| Closure head | `edcf056` |
+| Windows CI fixture corrections | `758051f` (`cmd.exe` batch fixtures); `12496cb` (`OverflowPolicy::Terminate`, synthesised-`cmd` environment keys, verbatim-path comparison) |
+| Closure head | the commit that carries this record, on top of `12496cb` |
 
 ## 2. Dependency decision
 
@@ -162,21 +163,55 @@ distinction is deliberate.
 | Item | Value |
 | --- | --- |
 | Workflow | `.github/workflows/ci.yml`, job `windows-runner` |
-| Runs | `37351216736`, `37351879411`, `37353435727` (all failing for reasons this milestone fixed) and the closure run recorded below |
-| Steps | `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`; `cargo test --locked -p eggwork-runner --all-targets -- --nocapture` |
+| **Closure run** | **`37413709840`** — `rust` success, `release-drift` success, `windows-runner` success; the Windows job ran 2026-10-06T04:26:27Z → 04:30:19Z |
+| Windows suite result | `17 passed; 0 failed` in 21.29 s |
+| Steps | `cargo clippy --locked --workspace --lib --bins --all-features -- -D warnings`; `cargo clippy --locked -p eggwork-runner --all-targets --all-features -- -D warnings`; `cargo test --locked -p eggwork-runner --all-targets -- --nocapture` |
 
-The three earlier runs are part of the record because they found real drift that
-Linux could not:
+The run history is part of the record, because the failures found real drift
+that Linux cannot see — and because two of the four were *not* backend bugs,
+which is worth being explicit about rather than presenting as a clean sweep:
 
-- `37351216736` — `landlock_runner.rs` compiled on Windows but its imports and
-  the `request` helper were not gated; per-test `#[cfg(target_os = "linux")]`
-  had left the file header un-gated. Fixed in `098c4a4`.
-- `37351879411` — `eggworkd.rs` had a Linux-only `deadline` binding and a
-  needless `return` in the Windows SCM refusal path. Fixed in `0e6682a`.
-- `37353435727` — `capability_probe.rs` imported `PathBuf` for a Linux-only
-  helper. Fixed in `edcf056`.
+| Run | Outcome | What it found |
+| --- | --- | --- |
+| `37351216736` | failed | `landlock_runner.rs` compiled on Windows but its imports and the `request` helper were un-gated: per-test `#[cfg(target_os = "linux")]` never covered the file header. Fixed at `098c4a4`. |
+| `37351879411` | failed | `eggworkd.rs` had a Linux-only `deadline` binding and a needless `return` in the Windows SCM refusal path. Fixed at `0e6682a`. |
+| `37353435727` | failed | `capability_probe.rs` imported `PathBuf` for a Linux-only helper. Fixed at `edcf056`. |
+| `37411582121` | failed | The scope fix exposed that the server's Unix-shaped unit tests do not compile for Windows; the job was re-scoped honestly (see below). **The Windows tree suite ran for the first time and 11 of 16 tests failed.** |
+| `37412678849` | failed | Suite taken from 5/16 to **14/16** by moving fixtures from PowerShell to `cmd.exe` batch files. |
+| `37413709840` | **green** | 17/17. |
 
-CLOSURE_RUN_PLACEHOLDER
+The three suite failures in `37412678849` were fixture defects, and one of them
+showed the runner behaving *correctly*:
+
+- `output_limit_terminates_the_whole_tree` requested `OverflowPolicy::Truncate`
+  and then expected `OutputLimit`. A truncating overflow is *supposed* to leave
+  the target running, so the runner kept waiting and the test observed `TimedOut`
+  after its full patience window. The test was asking for the wrong policy; it
+  now requests `Terminate`, matching the Unix equivalent.
+- `environment_...` reported `COMSPEC`, `PATHEXT`, and `PROMPT` as environment
+  leaks. `cmd.exe` synthesises those at startup; the runner clears the
+  environment and supplies only the baseline. The assertion is now exact — the
+  child key set must be the baseline plus what the interpreter synthesises.
+- `working_directory_...` compared `fs::canonicalize`'s verbatim `\\?\C:\...`
+  form against the plain form `cmd` prints, and failed on spelling.
+
+The first suite run (`37411582121`) also failed on PowerShell fixtures for a
+fixture reason, not a backend reason: sixteen concurrent PowerShell startups on
+a hosted runner take longer than the deadlines under test, so the heartbeats
+never got a chance to beat. Rewriting the fixtures as `cmd.exe` batch files
+(startup in milliseconds) removed the timing dependence without weakening a
+single assertion.
+
+### What the closure run actually proves
+
+Every plan §9 proof passes on hosted `windows-latest`: descendant convergence at
+startup, timeout, cancellation, and output limit; leader exit not releasing a
+live descendant; leader exit status not rewritten by convergence; pipe
+inheritance from a real child process; stdin delivery and close; typed spawn
+failure; the documented environment baseline with no ambient leak; working
+directory honoured with no isolation claimed; required isolation and required
+resources refused before the marker command runs; bare program name resolution;
+and three repeated timeout convergences.
 
 ## 7. Unix regression evidence
 
@@ -253,7 +288,7 @@ Operations M004's own conditional status is unchanged by this record.
 
 | # | Criterion | Verdict | Evidence |
 | --- | --- | --- | --- |
-| 1 | Windows ordinary argv execution succeeds through the canonical runner | **Qualified** | `direct_exit_captures_output_and_reports_status`; hosted run in §6 |
+| 1 | Windows ordinary argv execution succeeds through the canonical runner | **Qualified** | `direct_exit_captures_output_and_reports_status` (exit code 3, CRLF stdout/stderr) in run `37413709840` |
 | 2 | The initial target cannot run before Job Object ownership | **Qualified by construction + consequence tests** | suspend/assign/resume inside `spawn`; startup-descendant test. Not directly observable, §5 |
 | 3 | Timeout, cancellation, output limit converge the complete tree | **Qualified** | §9.3–9.5, plus 5-iteration repeat |
 | 4 | Leader exit never releases a remaining descendant | **Qualified** | §9.6 |

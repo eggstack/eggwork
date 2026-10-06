@@ -135,9 +135,16 @@ a fixture the trust check never sees).
 
 ## 6. Ordinary CI evidence
 
-`cargo test --locked --workspace --all-targets` is green at `edcf056`, including
-all 15 Landlock-suite tests and the runner's 16 unit tests. The `rust` CI job is
-green on every push recorded in §8.
+`cargo test --locked --workspace --all-targets` is green, including all 15
+Landlock-suite tests and the runner's 16 unit tests. The `rust` CI job is green
+on every push recorded in §8; the closure run is `37413709840`, where `rust`,
+`release-drift`, and `windows-runner` all succeeded.
+
+Hosted Linux is where the flake was originally recorded and where it still
+occurs: the `rust` job runs the same 15 Landlock tests on a GitHub runner, and
+those runs have not reproduced it. That asymmetry is itself evidence — the
+failure is load-dependent, and a two-core hosted runner is less loaded than the
+19-user development host this was characterised on.
 
 ## 7. Verification
 
@@ -157,6 +164,14 @@ green on every push recorded in §8.
 | `0e6682a` | shared atomic per-fixture staging, the five invariant tests, and the Windows-only clippy fixes |
 | `098c4a4` | file-level Linux gate for the Landlock suite (found by the new Windows CI job) |
 | `edcf056` | gate the Linux-only fixture-path import in the capability probe |
+
+Both suites that stage a trusted helper now go through the one implementation:
+`crates/eggwork-sandbox-helper/tests/landlock_runner.rs` via `mod`, and
+`crates/eggwork-runner/tests/capability_probe.rs` via
+`#[path = "../../eggwork-sandbox-helper/tests/support/helper_fixture.rs"]`. The
+`#[path]` include is deliberate and was reviewed as such: the alternative is a
+dev-only workspace member, and `release_contract.rs` enumerates workspace
+members and their target-scoped dependencies.
 
 ## 9. Acceptance criteria
 
