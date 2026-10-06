@@ -1,6 +1,8 @@
 # Operations M004a — Qualification helper fixture isolation corrective
 
-Status: **ready**
+Status: closed
+
+Closure record: `plans/closure/operations-distribution/004a-status.md`
 
 Class: corrective / test-infrastructure invariant
 

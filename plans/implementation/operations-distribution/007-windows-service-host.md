@@ -213,6 +213,8 @@ git diff --check
 
 Also record native Windows service qualification and `cargo tree` evidence showing `windows-service` is Windows-target-scoped.
 
+The `windows-runner` CI job in `.github/workflows/ci.yml` now exists and is the hosted place to run Windows-target lint and `eggwork-runner` tests. It became available with Foundation M004's closure, so M007 gets hosted Windows evidence it did not previously have. Note its scope honestly: the job lints production code on the Windows target (`--lib --bins`) plus `eggwork-runner` test targets, because the server's and client's unit tests are Linux-shaped and do not compile for Windows. A service-host state-machine test placed in `eggwork-server` unit tests would therefore need either a Linux-compatible design or a new Windows-target test target before this job would run it — decide that when writing §10 tests, and record the choice.
+
 No Eggwork source file may add an `unsafe` block.
 
 ## 13. Documentation
@@ -292,4 +294,6 @@ Record:
 
 ## 18. Handoff
 
-M007 and Foundation M004 are independently ready and may be implemented in parallel. The next immutable release candidate should be cut only after the product capabilities intended for that candidate are complete; do not publish `v0.1.5` as the Phase-6 closure release.
+M007 remains **ready** and independent: Foundation M004 closed conditionally without introducing any service-host interface, and M004's closure record says so explicitly. The one new fact is that hosted Windows evidence is now cheap to produce — the `windows-runner` CI job exists — where before M007 had no Windows-target CI surface at all.
+
+The next immutable release candidate should be cut only after the product capabilities intended for that candidate are complete; do not publish `v0.1.5` as the Phase-6 closure release. As of the Foundation M004 closure, the release candidate is *blocked on that decision* rather than on missing implementation: M004's Windows process-tree backend is complete and hosted-qualified, and its only outstanding evidence is an installed-release receipt that requires a tag.

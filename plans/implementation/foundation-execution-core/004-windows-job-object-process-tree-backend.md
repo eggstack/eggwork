@@ -1,6 +1,8 @@
 # Foundation M004 — Windows Job Object finite-process backend
 
-Status: **ready**
+Status: conditionally closed
+
+Closure record: `plans/closure/foundation-execution-core/004-status.md`
 
 Class: capability / invariant
 
