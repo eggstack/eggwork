@@ -207,14 +207,31 @@ A second job in the same workflow, on `windows-latest`, added by Foundation M004
       - uses: Swatinem/rust-cache@v2
         with:
           key: windows-msvc
-      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --workspace --lib --bins --all-features -- -D warnings
+      - name: eggwork-runner test targets
+        run: cargo clippy --locked -p eggwork-runner --all-targets --all-features -- -D warnings
       - name: Windows process-tree lifecycle suite
         run: cargo test --locked -p eggwork-runner --all-targets -- --nocapture
 ```
 
 **Why it exists.** The Windows process-tree backend cannot be observed from Linux. Job Object ownership, descendant convergence after leader exit, and pipe inheritance across a process tree only mean something on a real Windows kernel, and a green Linux run must never be readable as Windows coverage. Foundation M004's `runner` tests are `#![cfg(windows)]`, so without this job the entire suite would silently not exist in CI.
 
-**What it deliberately does not run.** `cargo test --workspace` is not used: the server's own tests are `/bin/sh`-shaped (18 occurrences across `crates/eggwork-server/src/lib.rs`), so they would fail on Windows for reasons that have nothing to do with this milestone. Reshaping them is separate work. Clippy *does* run `--workspace --all-targets`, because compilation is platform-neutral and `-D warnings` on the Windows target is what keeps the Windows-only code paths honest — an unused import or an `unused_mut` that Linux never sees is exactly the kind of drift this job exists to catch. The installed production path is qualified by `operational-qualification.yml` from a staged release's own bytes, not from a build tree; a build-tree job could not prove release identity.
+**What it deliberately does not run.** `cargo test --workspace` is not used, and test-target clippy is scoped to `eggwork-runner`. The server's and client's unit tests are Linux-shaped: they spawn `/bin/sh` and set `0700`/`0600` modes through `std::os::unix::fs`, so several test helpers do not even *compile* for Windows (`place_trusted_helper` in `crates/eggwork-server/src/lib.rs`, the `PermissionsExt` uses in `artifact.rs`, `blob.rs`, `operations.rs`, and `deployment.rs`). Making them portable is its own milestone.
+
+That gap is stated rather than papered over, and the split is deliberate:
+
+- `cargo clippy --locked --workspace --lib --bins --all-features -- -D warnings`
+  covers production code on the Windows target, which is the surface a release
+  binary is built from and the place a Windows-only regression actually matters.
+- `cargo clippy --locked -p eggwork-runner --all-targets --all-features -- -D warnings`
+  covers test targets for the crate Foundation M004 changed.
+
+This job is still earning its keep: it found three real Windows-only lints that
+Linux can never see — an un-gated `landlock_runner.rs` header, a Linux-only
+`deadline` binding plus a needless `return` in the Windows SCM refusal path, and
+an ungated `PathBuf` import in the capability probe. The installed production
+path stays qualified by `operational-qualification.yml` from a staged release's
+own bytes; a build-tree job could not prove release identity.
 
 **Cross-check against the local guard.** Before pushing, `cargo check --locked -p eggwork-runner --all-targets --target x86_64-pc-windows-msvc` compiles the Windows-only code paths on a Linux host. It catches types, imports, and lints; it does not catch kernel behaviour, which is the entire point of the hosted job. (A full `--workspace --target x86_64-pc-windows-msvc` check does not work on Linux: `cc-rs` needs MSVC's `lib.exe` for a transitive C dependency.)
 
