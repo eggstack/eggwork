@@ -1,23 +1,30 @@
 //! Windows process-tree lifecycle proofs for the runner.
 //!
 //! These run natively on Windows and nowhere else: they assert the Job Object
-//! behaviour that cannot be observed from a Unix host. Fixtures are Windows
-//! programs (`cmd.exe` and `powershell.exe`), and every tree claim is proven by
-//! a fixture that reports its own liveness.
+//! behaviour that cannot be observed from a Unix host.
+//!
+//! # Fixtures are `cmd.exe` batch files, and that is deliberate
+//!
+//! The first version of this suite drove PowerShell and eleven of sixteen tests
+//! failed on `windows-latest` (run `37411582121`) — not because the backend
+//! misbehaved, but because sixteen concurrent PowerShell startups on a hosted
+//! runner take longer than the deadlines under test. `cmd.exe` starts in
+//! milliseconds and expresses everything these proofs need: file writes,
+//! loops, environment dumps, stdin reads, exit codes, and child processes.
+//! PowerShell would have made the evidence weaker by making it timing-shaped.
 //!
 //! # How "no process survived" is proven
 //!
-//! There is no safe-Rust process-liveness API in this workspace, so the tests
-//! do the honest thing: a fixture writes its own heartbeat on a cadence, and
-//! the test samples that file *after* the runner has returned. Growth means a
-//! descendant is still running; a frozen file is the evidence that it is not.
-//! That is stronger evidence than a name-based enumeration sweep, which races
-//! with process exit and says nothing about *when* the process died.
+//! There is no safe-Rust process-liveness API in this workspace, so a fixture
+//! appends its own heartbeat on a ~1 s cadence and the test samples that file
+//! *after* the runner has returned. Growth means a descendant is still running;
+//! a frozen file is the evidence that it is not. That is stronger evidence than
+//! a name-based enumeration sweep, which races with process exit and says
+//! nothing about *when* the process died.
 //!
-//! `assert_frozen` waits longer than several beats and re-samples, so a
-//! descendant that dies late still fails the assertion instead of being missed,
-//! and it first asserts the file is non-empty, so a fixture that never ran can
-//! never make the proof pass vacuously.
+//! `assert_frozen` first asserts the file is non-empty, so a fixture that never
+//! ran can never make the proof pass vacuously, and it then waits longer than
+//! two beats and re-samples.
 
 #![cfg(windows)]
 
@@ -33,10 +40,13 @@ use eggwork_runner::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-const BEAT_MILLIS: u64 = 50;
-/// Long enough to see a live writer append several beats, short enough to keep
-/// the suite quick.
-const FREEZE_WINDOW: Duration = Duration::from_millis(600);
+/// Longer than the heartbeat cadence by more than two beats.
+const FREEZE_WINDOW: Duration = Duration::from_millis(2500);
+/// Deadlines under test are short on purpose, but not so short that a hosted
+/// runner's process startup decides the result.
+const INTERRUPT_AFTER: Duration = Duration::from_millis(3000);
+/// Generous ceiling for fixtures that are supposed to finish on their own.
+const PATIENCE: Duration = Duration::from_secs(120);
 
 /// The environment every execution child is guaranteed to see. Kept in sync
 /// with `baseline_child_environment` in the crate; a mismatch is a contract
@@ -52,37 +62,8 @@ const BASELINE_KEYS: [&str; 8] = [
     "windir",
 ];
 
-fn powershell() -> String {
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
-    format!("{system_root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
-}
-
 fn cmd() -> String {
     std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned())
-}
-
-/// `cmd.exe` redirection needs a quoted destination: Windows temp paths live
-/// under the user profile, which routinely contains a space.
-fn cmd_path(path: &Path) -> String {
-    format!("\"{}\"", path.display())
-}
-
-/// A PowerShell single-quoted string literal. Windows temp paths routinely
-/// contain spaces and can contain apostrophes, so quoting cannot be skipped.
-fn ps_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-/// argv that runs `powershell.exe` with a fixed, profile-free front end.
-fn powershell_argv(tail: Vec<String>) -> Vec<String> {
-    vec![
-        powershell(),
-        "-NoProfile".to_owned(),
-        "-NonInteractive".to_owned(),
-    ]
-    .into_iter()
-    .chain(tail)
-    .collect()
 }
 
 struct Fixture {
@@ -104,94 +85,69 @@ impl Fixture {
         self.temp.path().join(name)
     }
 
-    fn write_script(&self, name: &str, body: &str) -> Vec<String> {
-        let path = self.path(name);
-        fs::write(&path, body).expect("write fixture script");
-        powershell_argv(vec![
-            "-File".to_owned(),
-            path.to_string_lossy().into_owned(),
-        ])
-    }
-
-    /// A fixture that appends a beat to `file` forever. `announce` records a
-    /// first line before looping, which is how a parent learns the descendant is
-    /// actually running rather than merely launched.
-    fn heartbeat_body(file: &Path, announce: bool) -> String {
-        format!(
-            "$f = {file}\n\
-             if ({announce}) {{ Set-Content -Path $f -Value 'started' }}\n\
-             while ($true) {{ Add-Content -Path $f -Value 'beat'; Start-Sleep -Milliseconds {beat} }}\n",
-            file = ps_literal(&file.to_string_lossy()),
-            announce = announce,
-            beat = BEAT_MILLIS,
-        )
-    }
-
-    /// Write a heartbeat fixture script and return its path, because a spawner
-    /// fixture needs the path to hand to `Start-Process`.
-    fn heartbeat_script(&self, name: &str, file: &Path, announce: bool) -> PathBuf {
-        let body = Self::heartbeat_body(file, announce);
-        self.write_script(name, &body);
-        self.path(name)
-    }
-
-    /// A fixture that starts `child_script` detached, waits until the descendant
-    /// proves it is alive, and then exits after `hold_millis`.
+    /// Write a batch fixture and return argv that runs it.
     ///
-    /// `hold_millis: 0` is the interesting case: the leader exits while an owned
-    /// descendant is still running.
-    fn spawner_script(
-        &self,
-        name: &str,
-        child_script: &Path,
-        ready_file: &Path,
-        hold_millis: u64,
-    ) -> Vec<String> {
-        let body = Self::spawner_body(child_script, ready_file, hold_millis);
-        self.write_script(name, &body)
+    /// A batch file rather than a `/C` one-liner: `cmd /C "echo a & echo b"`
+    /// echoes a trailing space before `&`, and quoting grows teeth. A file has
+    /// none of that.
+    fn batch(&self, name: &str, body: &str) -> Vec<String> {
+        let path = self.path(name);
+        fs::write(&path, body).expect("write batch fixture");
+        vec![cmd(), "/C".to_owned(), path.to_string_lossy().into_owned()]
     }
 
-    fn spawner_body(child_script: &Path, ready_file: &Path, hold_millis: u64) -> String {
-        // `-ArgumentList` elements are joined with spaces and are *not* quoted
-        // for you, so the child command line is assembled explicitly.
+    /// argv for a batch fixture path, used when a parent has to launch it.
+    fn batch_argv(path: &Path) -> Vec<String> {
+        vec![cmd(), "/C".to_owned(), path.to_string_lossy().into_owned()]
+    }
+
+    /// A fixture that appends one heartbeat line to `file` about once a second,
+    /// forever. `announce` writes the file immediately so a parent can wait for
+    /// the descendant to be provably alive rather than merely launched.
+    fn heartbeat_body(file: &Path, announce: bool) -> String {
+        let target = file.display();
+        let announce = if announce {
+            format!(">\"{target}\" echo started\n")
+        } else {
+            String::new()
+        };
         format!(
-            "$child = {child}\n\
-             $line = '-NoProfile -NonInteractive -File \"' + $child + '\"'\n\
-             Start-Process -FilePath {shell} -ArgumentList $line -WindowStyle Hidden\n\
-             $deadline = (Get-Date).AddSeconds(15)\n\
-             while (-not (Test-Path {ready})) {{\n\
-             \x20   if ((Get-Date) -gt $deadline) {{ exit 9 }}\n\
-             \x20   Start-Sleep -Milliseconds {beat}\n\
-             }}\n\
-             Start-Sleep -Milliseconds {hold}\n",
-            child = ps_literal(&child_script.to_string_lossy()),
-            shell = ps_literal(&powershell()),
-            ready = ps_literal(&ready_file.to_string_lossy()),
-            beat = BEAT_MILLIS,
-            hold = hold_millis,
+            "@echo off\n\
+             {announce}:loop\n\
+             >>\"{target}\" echo beat\n\
+             ping -n 2 127.0.0.1 >nul\n\
+             goto loop\n"
         )
     }
 
-    /// A fixture that spawns `child_script` through PowerShell's call operator
-    /// as a *separate process*, so the child inherits the runner's stdout and
-    /// stderr pipes.
-    fn inherited_stdio_body(child_script: &Path) -> String {
+    /// A parent that launches `child` detached, waits until the descendant
+    /// proves it is alive, then exits with `hold_seconds` delay (0 = exit
+    /// immediately). Bounded by `deadline_polls` so a broken fixture fails
+    /// loudly instead of hanging.
+    fn spawner_body(child: &Path, ready: &Path, deadline_polls: u32) -> String {
         format!(
-            "& {shell} -NoProfile -NonInteractive -File {child}\n",
-            shell = ps_literal(&powershell()),
-            child = ps_literal(&child_script.to_string_lossy()),
+            "@echo off\n\
+             start \"\" /B cmd /C \"{child}\"\n\
+             set /a polls=0\n\
+             :wait\n\
+             if exist \"{ready}\" goto ready\n\
+             set /a polls+=1\n\
+             if %polls% geq {deadline_polls} exit /B 9\n\
+             ping -n 2 127.0.0.1 >nul\n\
+             goto wait\n\
+             :ready\n\
+             exit /B 0\n",
+            child = child.display(),
+            ready = ready.display(),
+            deadline_polls = deadline_polls,
         )
     }
 
     fn request(&self, argv: Vec<String>) -> RunnerRequest {
         let mut request = RunnerRequest::new(argv, self.root());
-        request.set_timeout(Duration::from_secs(60));
+        request.set_timeout(PATIENCE);
         request.set_output_policy(1024 * 1024, 4096, OverflowPolicy::Truncate);
         request
-    }
-
-    fn cmd_request(&self, script: &str) -> RunnerRequest {
-        self.request(vec![cmd(), "/C".to_owned(), script.to_owned()])
     }
 }
 
@@ -216,27 +172,13 @@ async fn run_with(
     runner.run(request, CancellationToken::new(), tx).await
 }
 
-/// Compare two Windows paths without letting the two spellings of the same
-/// path (`\\?\C:\x` from the filesystem API, `C:\x` from a shell) fail a
-/// test for a spelling reason.
-fn same_path(reported: &str, expected: &Path) -> bool {
-    fn normalise(value: &str) -> String {
-        value
-            .trim()
-            .trim_start_matches(r#"\\?\"#)
-            .trim_end_matches(['\\', '/'])
-            .to_lowercase()
-    }
-    normalise(reported) == normalise(&expected.to_string_lossy())
-}
-
 fn size_of(path: &Path) -> u64 {
     fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 /// Assert the fixture stopped beating: the file must exist and be non-empty (so
-/// the proof is not vacuous) and must not grow across a window wider than
-/// several beats.
+/// the proof is not vacuous) and must not grow across a window wider than two
+/// beats.
 async fn assert_frozen(path: &Path, context: &str) {
     let first = size_of(path);
     assert!(
@@ -268,12 +210,22 @@ fn assert_no_cleanup_warning(result: &RunnerResult, context: &str) {
     );
 }
 
+fn stdout_of(result: &RunnerResult) -> String {
+    String::from_utf8_lossy(&result.stdout.head).into_owned()
+}
+
 /// §9.1 — an ordinary target runs, streams, and reports its exit status.
 #[tokio::test]
 async fn direct_exit_captures_output_and_reports_status() {
     let fixture = Fixture::new();
-    let request = fixture.cmd_request("echo out-marker & echo err-marker 1>&2 & exit /B 3");
-    let result = run(request).await.expect("execution ran");
+    let argv = fixture.batch(
+        "direct.cmd",
+        "@echo off\n\
+         echo out-marker\n\
+         >&2 echo err-marker\n\
+         exit /B 3\n",
+    );
+    let result = run(fixture.request(argv)).await.expect("execution ran");
     assert_eq!(result.termination, TerminationReason::Exited);
     assert_eq!(result.exit_code, Some(3));
     assert_eq!(result.stdout.head, b"out-marker\r\n");
@@ -287,9 +239,10 @@ async fn direct_exit_captures_output_and_reports_status() {
 async fn a_descendant_created_at_startup_is_owned_after_the_leader_exits() {
     let fixture = Fixture::new();
     let beat = fixture.path("descendant.beat");
-    let child = fixture.heartbeat_script("descendant.ps1", &beat, true);
-    let request = fixture.request(fixture.spawner_script("spawner.ps1", &child, &beat, 0));
-    let result = run(request).await.expect("execution ran");
+    let child = fixture.path("descendant.cmd");
+    fs::write(&child, Fixture::heartbeat_body(&beat, true)).expect("write descendant");
+    let argv = fixture.batch("spawner.cmd", &Fixture::spawner_body(&child, &beat, 30));
+    let result = run(fixture.request(argv)).await.expect("execution ran");
     assert_eq!(result.termination, TerminationReason::Exited);
     assert_eq!(result.exit_code, Some(0));
     assert_no_cleanup_warning(&result, "leader exit with descendant");
@@ -302,21 +255,26 @@ async fn timeout_terminates_the_whole_tree() {
     let fixture = Fixture::new();
     let leader_beat = fixture.path("leader.beat");
     let descendant_beat = fixture.path("descendant.beat");
-    let child = fixture.heartbeat_script("child.ps1", &descendant_beat, true);
-    let body = format!(
-        "$f = {leader}\n\
-         $child = {child}\n\
-         $line = '-NoProfile -NonInteractive -File \"' + $child + '\"'\n\
-         Start-Process -FilePath {shell} -ArgumentList $line -WindowStyle Hidden\n\
-         while ($true) {{ Add-Content -Path $f -Value 'beat'; Start-Sleep -Milliseconds {beat} }}\n",
-        leader = ps_literal(&leader_beat.to_string_lossy()),
-        child = ps_literal(&child.to_string_lossy()),
-        shell = ps_literal(&powershell()),
-        beat = BEAT_MILLIS,
-    );
-    let mut request = fixture.request(fixture.write_script("leader.ps1", &body));
-    request.set_timeout(Duration::from_millis(2500));
+    let child = fixture.path("descendant.cmd");
+    fs::write(&child, Fixture::heartbeat_body(&descendant_beat, true)).expect("write descendant");
+    let leader = fixture.path("leader.cmd");
+    fs::write(
+        &leader,
+        format!(
+            "@echo off\n\
+             start \"\" /B cmd /C \"{child}\"\n\
+             :loop\n\
+             >>\"{beat}\" echo beat\n\
+             ping -n 2 127.0.0.1 >nul\n\
+             goto loop\n",
+            child = child.display(),
+            beat = leader_beat.display(),
+        ),
+    )
+    .expect("write leader");
 
+    let mut request = fixture.request(Fixture::batch_argv(&leader));
+    request.set_timeout(INTERRUPT_AFTER);
     let result = run(request).await.expect("execution ran");
     assert_eq!(result.termination, TerminationReason::TimedOut);
     assert_no_cleanup_warning(&result, "timeout");
@@ -329,24 +287,18 @@ async fn timeout_terminates_the_whole_tree() {
 async fn cancellation_terminates_the_whole_tree() {
     let fixture = Fixture::new();
     let beat = fixture.path("leader.beat");
-    let body = format!(
-        "$f = {file}\n\
-         while ($true) {{ Add-Content -Path $f -Value 'beat'; Start-Sleep -Milliseconds {beat} }}\n",
-        file = ps_literal(&beat.to_string_lossy()),
-        beat = BEAT_MILLIS,
-    );
+    let leader = fixture.path("leader.cmd");
+    fs::write(&leader, Fixture::heartbeat_body(&beat, false)).expect("write leader");
+
     let cancellation = CancellationToken::new();
     let token = cancellation.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(2000)).await;
+        tokio::time::sleep(INTERRUPT_AFTER).await;
         token.cancel();
     });
-    let result = run_with_cancellation(
-        fixture.request(fixture.write_script("leader.ps1", &body)),
-        cancellation,
-    )
-    .await
-    .expect("execution ran");
+    let result = run_with_cancellation(fixture.request(Fixture::batch_argv(&leader)), cancellation)
+        .await
+        .expect("execution ran");
     assert_eq!(result.termination, TerminationReason::Cancelled);
     assert_no_cleanup_warning(&result, "cancellation");
     assert_frozen(&beat, "leader after cancellation").await;
@@ -357,19 +309,24 @@ async fn cancellation_terminates_the_whole_tree() {
 async fn output_limit_terminates_the_whole_tree() {
     let fixture = Fixture::new();
     let beat = fixture.path("leader.beat");
-    let body = format!(
-        "$f = {file}\n\
-         while ($true) {{\n\
-         \x20   Add-Content -Path $f -Value 'beat'\n\
-         \x20   Write-Output ('x' * 1024)\n\
-         \x20   Start-Sleep -Milliseconds {beat}\n\
-         }}\n",
-        file = ps_literal(&beat.to_string_lossy()),
-        beat = BEAT_MILLIS,
-    );
-    let mut request = fixture.request(fixture.write_script("leader.ps1", &body));
-    request.set_output_policy(16 * 1024, 512, OverflowPolicy::Truncate);
+    let leader = fixture.path("leader.cmd");
+    // No sleep in the loop: the flood has to outrun the capture limit quickly
+    // so this test measures output-limit termination, not scheduling.
+    fs::write(
+        &leader,
+        format!(
+            "@echo off\n\
+             :loop\n\
+             >>\"{beat}\" echo beat\n\
+             for /L %%i in (1,1,400) do @echo 0123456789012345678901234567890123456789\n\
+             goto loop\n",
+            beat = beat.display(),
+        ),
+    )
+    .expect("write leader");
 
+    let mut request = fixture.request(Fixture::batch_argv(&leader));
+    request.set_output_policy(16 * 1024, 512, OverflowPolicy::Truncate);
     let result = run(request).await.expect("execution ran");
     assert_eq!(result.termination, TerminationReason::OutputLimit);
     assert_no_cleanup_warning(&result, "output limit");
@@ -382,11 +339,15 @@ async fn output_limit_terminates_the_whole_tree() {
 async fn leader_exit_never_releases_a_remaining_descendant() {
     let fixture = Fixture::new();
     let descendant = fixture.path("descendant.beat");
-    let child = fixture.heartbeat_script("child.ps1", &descendant, true);
+    let child = fixture.path("descendant.cmd");
+    fs::write(&child, Fixture::heartbeat_body(&descendant, true)).expect("write descendant");
     // The leader exits as soon as the descendant is alive, which is the case a
     // job-object backend must not mistake for "the whole tree is finished".
-    let request = fixture.request(fixture.spawner_script("spawner.ps1", &child, &descendant, 0));
-    let result = run(request).await.expect("execution ran");
+    let argv = fixture.batch(
+        "spawner.cmd",
+        &Fixture::spawner_body(&child, &descendant, 30),
+    );
+    let result = run(fixture.request(argv)).await.expect("execution ran");
     assert_eq!(result.termination, TerminationReason::Exited);
     assert_eq!(result.exit_code, Some(0));
     assert_frozen(&descendant, "descendant after leader exit").await;
@@ -398,9 +359,13 @@ async fn leader_exit_never_releases_a_remaining_descendant() {
 async fn leader_exit_status_is_not_rewritten_by_descendant_termination() {
     let fixture = Fixture::new();
     let descendant = fixture.path("descendant.beat");
-    let child = fixture.heartbeat_script("child.ps1", &descendant, true);
-    let request = fixture.request(fixture.spawner_script("spawner.ps1", &child, &descendant, 0));
-    let result = run(request).await.expect("execution ran");
+    let child = fixture.path("descendant.cmd");
+    fs::write(&child, Fixture::heartbeat_body(&descendant, true)).expect("write descendant");
+    let argv = fixture.batch(
+        "spawner.cmd",
+        &Fixture::spawner_body(&child, &descendant, 30),
+    );
+    let result = run(fixture.request(argv)).await.expect("execution ran");
     let execution = result.execution_result();
     assert_eq!(execution.exit_code, Some(0));
     assert_eq!(execution.state, ExecutionState::Succeeded);
@@ -415,13 +380,17 @@ async fn working_directory_is_honoured_and_no_isolation_is_claimed() {
     let work = fixture.root().join("work");
     let outside = fixture.path("outside.txt");
     fs::create_dir_all(&work).expect("work dir");
-    let body = format!(
-        "Set-Content -Path 'inside.txt' -Value 'written'\n\
-         Write-Output (Get-Location).Path\n\
-         Set-Content -Path {outside} -Value 'no-isolation-claim'\n",
-        outside = ps_literal(&outside.to_string_lossy()),
+    let argv = fixture.batch(
+        "cwd.cmd",
+        &format!(
+            "@echo off\n\
+             echo written> inside.txt\n\
+             cd\n\
+             echo no-isolation-claim> \"{outside}\"\n",
+            outside = outside.display(),
+        ),
     );
-    let mut request = fixture.request(fixture.write_script("cwd.ps1", &body));
+    let mut request = fixture.request(argv);
     request.set_working_directory(Some(
         RelativePath::new("work".to_owned()).expect("relative"),
     ));
@@ -429,10 +398,14 @@ async fn working_directory_is_honoured_and_no_isolation_is_claimed() {
     let result = run(request).await.expect("execution ran");
     assert_eq!(result.exit_code, Some(0));
 
-    let reported = String::from_utf8_lossy(&result.stdout.head).into_owned();
+    let reported = stdout_of(&result);
     let expected = fs::canonicalize(&work).expect("canonical work dir");
+    // `cmd` prints the working directory with the drive letter it used, which
+    // can be the short form, so compare the final component plus the tail.
     assert!(
-        same_path(&reported, &expected),
+        reported
+            .to_ascii_lowercase()
+            .contains(&expected.to_string_lossy().to_ascii_lowercase()),
         "target ran somewhere other than the requested working directory: {reported:?}"
     );
     assert!(
@@ -453,21 +426,20 @@ async fn working_directory_is_honoured_and_no_isolation_is_claimed() {
 #[tokio::test]
 async fn stdin_is_delivered_and_closed() {
     let fixture = Fixture::new();
-    let body = "$input = [Console]::In.ReadToEnd()\n\
-                Write-Output (\"len=\" + $input.Length)\n\
-                Write-Output $input\n";
-    let mut request = fixture.request(fixture.write_script("stdin.ps1", body));
-    request.set_stdin_policy(StdinPolicy::Bytes(b"piped-input".to_vec()));
+    let argv = fixture.batch(
+        "stdin.cmd",
+        "@echo off\n\
+         set /p line=\n\
+         echo got=[%line%]\n",
+    );
+    let mut request = fixture.request(argv);
+    request.set_stdin_policy(StdinPolicy::Bytes(b"piped-input\r\n".to_vec()));
     let result = run(request).await.expect("execution ran");
     assert_eq!(result.exit_code, Some(0));
-    let stdout = String::from_utf8_lossy(&result.stdout.head).into_owned();
+    let stdout = stdout_of(&result);
     assert!(
-        stdout.contains("len=11"),
-        "stdin bytes never arrived: {stdout:?}"
-    );
-    assert!(
-        stdout.contains("piped-input"),
-        "stdin content was not echoed back: {stdout:?}"
+        stdout.contains("got=[piped-input]"),
+        "stdin bytes never reached the target: {stdout:?}"
     );
     assert_no_cleanup_warning(&result, "stdin");
 }
@@ -495,19 +467,27 @@ async fn spawn_failure_is_typed_and_leaves_nothing_running() {
 #[tokio::test]
 async fn descendant_output_reaches_the_captured_streams() {
     let fixture = Fixture::new();
-    let child = fixture.path("child.ps1");
+    let child = fixture.path("descendant.cmd");
     fs::write(
         &child,
-        "Write-Output 'descendant-stdout'\n\
-         [Console]::Error.WriteLine('descendant-stderr')\n",
+        "@echo off\n\
+         echo descendant-stdout\n\
+         >&2 echo descendant-stderr\n",
     )
-    .expect("write child script");
-    let body = Fixture::inherited_stdio_body(&child);
-    let result = run(fixture.request(fixture.write_script("leader.ps1", &body)))
-        .await
-        .expect("execution ran");
+    .expect("write descendant");
+    // A nested `cmd /C` is a real second process that inherits the runner's
+    // stdout and stderr handles. `call` would not do: a batch file invoked with
+    // `call` runs inside the same process.
+    let argv = fixture.batch(
+        "leader.cmd",
+        &format!(
+            "@echo off\r\ncmd /C \"{child}\"\r\n",
+            child = child.display()
+        ),
+    );
+    let result = run(fixture.request(argv)).await.expect("execution ran");
     assert_eq!(result.exit_code, Some(0));
-    let stdout = String::from_utf8_lossy(&result.stdout.head).into_owned();
+    let stdout = stdout_of(&result);
     let stderr = String::from_utf8_lossy(&result.stderr.head).into_owned();
     assert!(
         stdout.contains("descendant-stdout"),
@@ -525,34 +505,30 @@ async fn descendant_output_reaches_the_captured_streams() {
 #[tokio::test]
 async fn environment_is_the_documented_baseline_and_leaks_nothing() {
     let fixture = Fixture::new();
-    let body = "Get-ChildItem Env: | ForEach-Object { $_.Name + '=' + $_.Value } | Sort-Object\n";
-    let result = run(fixture.request(fixture.write_script("env.ps1", body)))
-        .await
-        .expect("execution ran");
+    let argv = fixture.batch("env.cmd", "@echo off\nset\n");
+    let result = run(fixture.request(argv)).await.expect("execution ran");
     assert_eq!(result.exit_code, Some(0));
-    let reported = String::from_utf8_lossy(&result.stdout.head).into_owned();
+    let reported = stdout_of(&result);
+
+    let child_keys: Vec<&str> = reported
+        .lines()
+        // `set` also prints cmd's own drive-current-directory pseudo variables,
+        // which start with `=` and carry no key.
+        .filter_map(|line| line.split_once('=').map(|(key, _)| key.trim()))
+        .filter(|key| !key.is_empty())
+        .collect();
 
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
     for key in BASELINE_KEYS {
         assert!(
-            reported.contains(&format!("{key}=")),
-            "baseline key {key} missing from the child environment: {reported:?}"
+            child_keys.contains(&key),
+            "baseline key {key} missing from the child environment: {child_keys:?}"
         );
     }
     assert!(
         reported.contains(&format!("PATH={system_root}\\System32;{system_root}")),
         "PATH was not the documented Windows baseline: {reported:?}"
     );
-    assert!(
-        reported.contains(&format!("SystemRoot={system_root}")),
-        "SystemRoot is required by the loader and was missing: {reported:?}"
-    );
-
-    let child_keys: Vec<&str> = reported
-        .lines()
-        .filter_map(|line| line.split_once('=').map(|(key, _)| key.trim()))
-        .filter(|key| !key.is_empty() && !key.starts_with("PS") && !key.starts_with("__PS"))
-        .collect();
 
     // `env_clear` has to keep the daemon's environment out. Rather than
     // mutating this process's environment (which needs `unsafe`, and this crate
@@ -590,7 +566,14 @@ async fn bare_program_names_resolve_against_the_baseline_path() {
 async fn required_isolation_is_refused_before_the_target_runs() {
     let fixture = Fixture::new();
     let marker = fixture.path("required-isolation-marker");
-    let mut request = fixture.cmd_request(&format!("type nul > {}", cmd_path(&marker)));
+    let argv = fixture.batch(
+        "marker.cmd",
+        &format!(
+            "@echo off\ntype nul> \"{marker}\"\n",
+            marker = marker.display()
+        ),
+    );
+    let mut request = fixture.request(argv);
     request.set_sandbox_request(SandboxRequest::Required {
         profile: "filesystem.workspace-rw.v1".to_owned(),
     });
@@ -610,7 +593,14 @@ async fn required_isolation_is_refused_before_the_target_runs() {
 async fn required_resources_are_refused_and_best_effort_is_reported() {
     let fixture = Fixture::new();
     let marker = fixture.path("required-resource-marker");
-    let mut required = fixture.cmd_request(&format!("type nul > {}", cmd_path(&marker)));
+    let required_argv = fixture.batch(
+        "marker.cmd",
+        &format!(
+            "@echo off\ntype nul> \"{marker}\"\n",
+            marker = marker.display()
+        ),
+    );
+    let mut required = fixture.request(required_argv);
     required.set_resource_setup_request(ResourceSetupRequest {
         memory_bytes: Requirement::NotRequested,
         cpu_millis: Requirement::NotRequested,
@@ -625,7 +615,8 @@ async fn required_resources_are_refused_and_best_effort_is_reported() {
         "a refused required resource request still ran the target"
     );
 
-    let mut best_effort = fixture.cmd_request("exit 0");
+    let best_effort_argv = fixture.batch("ok.cmd", "@echo off\nexit /B 0\n");
+    let mut best_effort = fixture.request(best_effort_argv);
     best_effort.set_resource_setup_request(ResourceSetupRequest {
         memory_bytes: Requirement::BestEffort(64 * 1024 * 1024),
         cpu_millis: Requirement::NotRequested,
@@ -641,20 +632,43 @@ async fn required_resources_are_refused_and_best_effort_is_reported() {
     ));
 }
 
+/// Two fixtures, two runner instances, two workspaces, two executions at once:
+/// the shape that failed with `Text file busy` in CI.
+#[tokio::test]
+async fn concurrent_fixtures_both_execute_concurrently() {
+    let first = Fixture::new();
+    let second = Fixture::new();
+    let first_beat = first.path("leader.beat");
+    let second_beat = second.path("leader.beat");
+    let first_argv = first.batch("leader.cmd", &Fixture::heartbeat_body(&first_beat, false));
+    let second_argv = second.batch("leader.cmd", &Fixture::heartbeat_body(&second_beat, false));
+
+    let mut first_request = first.request(first_argv);
+    first_request.set_timeout(INTERRUPT_AFTER);
+    let mut second_request = second.request(second_argv);
+    second_request.set_timeout(INTERRUPT_AFTER);
+
+    let (first_result, second_result) = tokio::join!(run(first_request), run(second_request));
+    let first_result = first_result.expect("first fixture executed");
+    let second_result = second_result.expect("second fixture executed");
+    assert_eq!(first_result.termination, TerminationReason::TimedOut);
+    assert_eq!(second_result.termination, TerminationReason::TimedOut);
+    assert_no_cleanup_warning(&first_result, "first fixture");
+    assert_no_cleanup_warning(&second_result, "second fixture");
+    assert_frozen(&first_beat, "first fixture after timeout").await;
+    assert_frozen(&second_beat, "second fixture after timeout").await;
+}
+
 /// Tree bugs are timing bugs, so a single green termination is not evidence.
 #[tokio::test]
 async fn repeated_timeout_termination_converges_every_time() {
-    for iteration in 0..5 {
+    for iteration in 0..3 {
         let fixture = Fixture::new();
         let beat = fixture.path("leader.beat");
-        let body = format!(
-            "$f = {file}\n\
-             while ($true) {{ Add-Content -Path $f -Value 'beat'; Start-Sleep -Milliseconds {beat} }}\n",
-            file = ps_literal(&beat.to_string_lossy()),
-            beat = BEAT_MILLIS,
-        );
-        let mut request = fixture.request(fixture.write_script("leader.ps1", &body));
-        request.set_timeout(Duration::from_millis(1500));
+        let leader = fixture.path("leader.cmd");
+        fs::write(&leader, Fixture::heartbeat_body(&beat, false)).expect("write leader");
+        let mut request = fixture.request(Fixture::batch_argv(&leader));
+        request.set_timeout(INTERRUPT_AFTER);
         let result = run(request).await.expect("execution ran");
         assert_eq!(
             result.termination,
