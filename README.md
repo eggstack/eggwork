@@ -12,8 +12,9 @@ orchestrator like CodeGG without competing with its policy.
 The protocol-neutral core, the local process runner, the authenticated remote
 control plane, durable leases, workspace transfer, declared artifact capture,
 bounded retention/GC, Linux sandbox and resource controls, the node operations
-surface, and Eggup-backed deployment are implemented. The CodeGG adapter is
-planned work.
+surface, and Eggup-backed deployment are implemented. Downstream CodeGG
+fixed-target integration through content-aware derived workspace transfer is
+closed; the whole-AgentRun remote worker remains deferred.
 
 ## Quickstart
 
