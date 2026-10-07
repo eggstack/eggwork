@@ -31,6 +31,10 @@ eggworkd service spec|status|install|start|stop|restart|uninstall --config <node
 
 `eggworkd` with no arguments prints its usage and exits `2`.
 
+Every failure exits `2`, including a `service` mutation whose report carries
+`"completed": false`: the JSON is printed first, so the attempt stays recorded,
+but the exit code reports that the node did not reach the requested state.
+
 ## Readiness
 
 `doctor` is the gate. It returns seven checks, and `ready` is true only when all

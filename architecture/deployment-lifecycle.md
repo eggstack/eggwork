@@ -302,7 +302,7 @@ The pieces:
 | `post_commit` | `PostCommitFailurePolicy::RollBack` | what Eggup does when the post-commit health check fails |
 
 `wait_for_quiescence(active: impl Fn() -> usize, policy) -> Result<(), DeploymentError>`
-polls `active()` every 5 ms until it returns `0`, or fails closed with
+polls `active()` every `QUIESCENCE_POLL_INTERVAL` (100 ms) until it returns `0`, or fails closed with
 `DeploymentError { kind: "draining", detail: "active executions remain after bounded drain wait" }`
 once `start.elapsed() >= policy.drain_timeout`. It is fail-closed by default: a
 stuck execution cannot be waited out indefinitely, and the update does not proceed
@@ -366,7 +366,8 @@ Eggup-supplied `remaining` deadline and passes it to the caller's budgeted
 closure.
 
 What the CLI's closure actually does, in order: compute
-`deadline = now + remaining` and `timeout = min(remaining, 5 s)`, failing with
+`deadline = now + remaining` **once, at the top of the closure**, and
+`timeout = min(remaining, 5 s)`, failing with
 `"post-install check budget exhausted"` if zero; run
 `<installation_root>/bin/eggworkd version` via `eggup_core::run_bounded` with
 `.max_output_bytes(MAX_VERSION_PROBE_BYTES)` (bounded, shell-free,
@@ -377,6 +378,13 @@ require `matched()`; then on Linux, with the remaining deadline as budget, requi
 `check_helper_compatibility_with_timeout(Some(<root>/bin/eggwork-sandbox-helper),
 CARGO_PKG_VERSION, helper_budget).compatible()`, else
 `"installed sandbox helper is untrusted or version-incoherent"`.
+
+`helper_budget` is `deadline.saturating_duration_since(now)` evaluated at the point of use, which
+is only correct because `deadline` was computed once at the top. `remaining` is a *duration* that
+Eggup measured when it called us, not a deadline, so re-deriving `now + remaining` after the version
+probe had already been allowed up to 5 s of it would hand the helper check the whole remaining
+allowance a second time — up to `post_commit_timeout + 5 s` of post-commit work in total, and
+roughly double the true budget when little time remained.
 
 The probe reads the **installed** daemon's own `version` report — not a cached
 manifest, not the staged file, not a checksum comparison. It therefore observes the
@@ -698,7 +706,7 @@ Every bound in and around this module, with what it bounds:
 | CLI service transition timeout | 60 s | systemd/launchd start/stop/restart transitions |
 | helper version output length | 64 bytes | `--version` stdout, plus a control-character rejection |
 | `DeploymentError` detail | 256 chars | every error detail, applied in `new` and again in the `From` impls |
-| drain poll interval | 5 ms | quiescence poll granularity |
+| `QUIESCENCE_POLL_INTERVAL` | 100 ms | quiescence poll granularity. Was 5 ms, i.e. up to 6,000 polls across a 30 s drain window, each opening its own read-only SQLite connection |
 
 **Which operations are bounded rather than exhaustive.** Honest accounting:
 `wait_for_quiescence` is a *time* bound, not a *count* bound — the execution count

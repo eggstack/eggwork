@@ -89,8 +89,16 @@ the private key through `trusted_private_key`.
 
 The directory and file trust predicates, on Unix:
 
-- `trusted_directory`: owned by the effective uid, `mode & 0o700 == 0o700`, and
-  `mode & 0o022 == 0`.
+- `trusted_directory`: owned by the effective uid, and `mode & 0o777 == 0o700` exactly.
+  This is the published operator rule — "directories owner-only (`0700`)" in
+  `docs/quickstart.md` — and it has to be exact, because this predicate gates
+  `execution_root`, `blob_root`, `workspace_root` and the database parent. The
+  weaker `mode & 0o700 == 0o700` (an earlier revision of this document and of the
+  code) only proves the *owner* has `rwx` and happily accepts `0750`/`0755`, so a
+  `chmod -R` on a multi-user host would leave every execution's output, workspace
+  and blob world-readable while `config validate` and `doctor` still reported the
+  configuration valid. The redundant `mode & 0o022 == 0` clause is retained so the
+  property that actually mattered stays visible in the source.
 - `config_writable_by_others`: owned by someone other than root or the effective uid, or
   writable by group/other.
 - `owned_writable_file`: owned by the effective uid with `mode & 0o200 != 0`.
@@ -180,7 +188,7 @@ removes both from the argument vector. The remaining vector keeps the subcommand
 | `deployment apply` | `--config`, `--installation-root`, `--release`, `--daemon`, `--service-config` (+ platform conditions, see below) | Release transaction JSON report |
 | `service spec` | `--config`, `--service-config <abs>`; `--executable <abs>` or a canonicalizable `current_exe` | `service_id`, `executable`, `args`, `config` |
 | `service status` | as above + platform policy flags | `service_id`, `platform`, `backend`, `ownership`, `state` |
-| `service install` / `start` / `stop` / `restart` / `uninstall` | as above + platform policy flags | `service_id`, `platform`, `backend`, `operation`, `completed` |
+| `service install` / `start` / `stop` / `restart` / `uninstall` | as above + platform policy flags | `service_id`, `platform`, `backend`, `operation`, `completed`; exit 2 when `completed` is `false` |
 | unknown verb | — | usage string on stderr, exit 2 |
 
 **Flags that exist in `usage()`'s prose but are worth checking.** The usage string's
@@ -224,6 +232,13 @@ and `config validate` print their complete, valid JSON report to stdout *and the
 produced and it described a problem". A partial failure is not separately represented:
 a `deployment apply` that rolled back and one that committed and failed a post-commit
 check both exit 2, and the difference is only in the JSON body.
+
+A `service` mutation carries its own completion signal: `TransitionResult::completed`
+means the manager reached the desired end state. `apply_service_operation` prints the
+structured report (including `"completed": false`) and *then* returns `Err`, so the
+machine-readable record of the attempt survives while the exit code still reports
+failure. This matches the release path, which treats the same value as a hard failure —
+a `deployment apply` that leaves the node not-transitioned is not a successful apply.
 
 **Error text is a fixed vocabulary.** The library's `OperationsError` renders to strings
 like "operator configuration is invalid", and the binary discards them entirely
@@ -371,6 +386,16 @@ a missing database yields `0`; a database that is not a regular non-symlink file
 `usize::MAX`; any load or decode error yields `usize::MAX`. Both non-zero answers mean
 "never quiet", so an unreadable database stalls a release rather than authorizing one. The
 source comment says so directly.
+
+It counts in SQL — `SELECT COUNT(*) FROM executions WHERE state IN ('Accepted','Preparing',
+'Running','Cancelling')`, the `store::state_name` PascalCase spellings — rather than by
+decoding snapshots. It used to route through `load_snapshots`, which opened a fresh read-only
+connection and `serde_json`-decoded up to 2048 durable snapshots on every call. Because
+`wait_for_quiescence` polls this on a timer for the whole drain window, that was up to 6,000
+connections and ~12 M decodes for one update, spent filtering four values that `executions.state`
+already stores as a real column. (The 2048-row `Bounds` ceiling that came with `load_snapshots` was
+a property of the *listing* page, not of a count, so nothing is lost by dropping it here.)
+`load_snapshots` itself is unchanged and still backs `execution_page`.
 
 `storage_summary` is the one genuinely *unbounded* operation in this file: `tree_bytes`
 walks `blob_root` and `workspace_root` iteratively with no limit, summing file lengths and

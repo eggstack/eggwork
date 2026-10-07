@@ -15,7 +15,7 @@ use std::{
 use thiserror::Error;
 
 const MAX_RETAINED_EVENTS: usize = 256;
-const MAX_RETAINED_EVENT_BYTES: usize = 512 * 1024;
+const MAX_RETAINED_EVENT_BYTES: usize = eggwork_core::MAX_EVENT_BYTES;
 const MAX_EXECUTION_IDENTITIES: i64 = 2048;
 
 #[derive(Debug, Error)]
@@ -481,19 +481,45 @@ impl ExecutionStore {
         name: &'static str,
         amount: u64,
     ) -> Result<(), StoreError> {
-        if name.is_empty() || name.len() > 64 {
-            return Err(StoreError::InvalidEvent);
+        self.increment_metrics(&[(name, amount)]).await
+    }
+
+    /// Apply several counter increments under one connection acquisition and one
+    /// durable commit.
+    ///
+    /// The execution-terminal path used to await up to four separate
+    /// `increment_metric` calls. Each was its own `spawn_blocking`, its own
+    /// `connection.lock()`, and its own write — and `commit_event` needs the
+    /// *same* connection mutex, so counter bookkeeping queued in front of
+    /// durable event commits. Batching keeps the per-name upsert arithmetic
+    /// identical while collapsing that to one lock and one fsync.
+    pub async fn increment_metrics(
+        &self,
+        deltas: &[(&'static str, u64)],
+    ) -> Result<(), StoreError> {
+        for (name, _) in deltas {
+            if name.is_empty() || name.len() > 64 {
+                return Err(StoreError::InvalidEvent);
+            }
+        }
+        if deltas.is_empty() {
+            return Ok(());
         }
         let connection = self.connection.clone();
+        let deltas = deltas.to_vec();
         tokio::task::spawn_blocking(move || {
-            let connection = connection.lock().map_err(|_| StoreError::Worker)?;
-            connection.execute(
-                "INSERT INTO node_metrics(name,value) VALUES (?1,?2)
-                 ON CONFLICT(name) DO UPDATE SET value=CASE
-                   WHEN value > 9223372036854775807 - excluded.value THEN 9223372036854775807
-                   ELSE value + excluded.value END",
-                params![name, amount.min(i64::MAX as u64) as i64],
-            )?;
+            let mut connection = connection.lock().map_err(|_| StoreError::Worker)?;
+            let transaction = connection.transaction()?;
+            for (name, amount) in &deltas {
+                transaction.execute(
+                    "INSERT INTO node_metrics(name,value) VALUES (?1,?2)
+                     ON CONFLICT(name) DO UPDATE SET value=CASE
+                       WHEN value > 9223372036854775807 - excluded.value THEN 9223372036854775807
+                       ELSE value + excluded.value END",
+                    params![name, (*amount).min(i64::MAX as u64) as i64],
+                )?;
+            }
+            transaction.commit()?;
             Ok(())
         })
         .await

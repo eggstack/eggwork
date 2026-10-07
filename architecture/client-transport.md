@@ -222,9 +222,16 @@ Constructed only by `execute_with_workspace`. Two consumers, both consuming `sel
   `\n`, splits the line off, truncates the newline, skips empty lines, then
   `serde_json::from_slice::<ExecutionEvent>` **and** `event.validate()`; any failure is
   `InvalidResponse`. When the buffer holds no complete line it awaits `events.next()` and appends —
-  unless the accumulated buffer would exceed **128 KiB**, in which case it fails with
   `InvalidResponse`. If the underlying stream ends with a non-empty partial buffer, the tail is
   parsed as one final event (a trailing newline is not required); if it ends empty, the stream ends.
+
+  The bound is `eggwork_core::MAX_EVENT_BYTES` (512 KiB), **not** a client-chosen number and not
+  `MAX_EVENT_CHUNK_BYTES`. `Stdout`/`Stderr` carry `Vec<u8>` with no compact wire representation, so
+  a 64 KiB chunk serializes as a JSON number array at up to four characters per byte: a chunk sized at
+  the protocol maximum produces a ~256 KiB line. A client cap below the encoded ceiling reports
+  `InvalidResponse` for a line a conforming node is entitled to emit, and because the stream is
+  `try_unfold` that error discards the whole event history. The node refuses to persist an event
+  larger than the same constant (`store.rs` `commit_event`), so the two sides agree by construction.
 - **`into_bytes()`** → the raw `BoxBytesStream`, preserving transport chunk boundaries, for callers
   that want to do their own framing.
 
@@ -232,7 +239,7 @@ Constructed only by `execute_with_workspace`. Two consumers, both consuming `sel
 `events.next().await` only when it needs more bytes, so a slow consumer stops draining the response
 body and the bound is carried by the transport. The client allocates no queue, no per-listener
 buffer, and no unbounded collection. The one client-side buffer is the `BytesMut`, hard-capped at
-128 KiB.
+`eggwork_core::MAX_EVENT_BYTES`.
 
 **Termination is explicit, not RAII.** There is no `impl Drop for ExecutionStream`. Dropping the
 stream (or the `ExecutionStream`) tears down the response body and nothing else. The method
@@ -309,12 +316,26 @@ table, the error renderer, and the blob/workspace/event handlers, not all ~6,300
 `eggwork-blob-digest` on blob download; `eggwork-artifact-id` and `eggwork-artifact-digest` on
 artifact download.
 
-**Size limits are asymmetric.** The server bounds its own request bodies
+**Size limits are now symmetric.** The server bounds its own request bodies
 (`MAX_REQUEST_BYTES` 1 MiB, `MAX_BLOB_FIND_REQUEST_BYTES` 64 KiB,
-`MAX_WORKSPACE_REQUEST_BYTES` 4 MiB). The client bounds its event line buffer at 128 KiB but
-applies **no** limit to buffered JSON responses — `decode_json` calls `response.bytes()` with no
-cap, so `capabilities`, `status`, `observe`, `observe_generation`, `cancel`, `renew`, `artifacts`,
-and the two workspace calls are all unbounded reads of node-controlled data.
+`MAX_WORKSPACE_REQUEST_BYTES` 4 MiB). The client bounds its event line buffer at
+`eggwork_core::MAX_EVENT_BYTES` and its buffered responses at
+`MAX_BUFFERED_BODY_BYTES` (16 MiB, set via `max_decoded_body_size`). That ceiling covers **both**
+buffered-read paths — `decode_json` and `api_error` — and the second is the hotter of the two,
+since it runs on every non-2xx response. 16 MiB is generous against the protocol's real maxima (the
+largest single buffered reply is an execution snapshot, which the journal caps at 256 events and
+512 KiB of encoded events), so it never truncates a legitimate response.
+
+**Timeouts.** Both builders (`new`, `with_eggress`) set
+`timeout(transport_timeouts())`: pool 30 s, connect 30 s, write 60 s, read 60 s, and **no** total.
+The read deadline resets on every chunk, which is what makes it safe for a long-lived event stream:
+a stream that is simply quiet between executions is unaffected, while a node that accepts the
+connection and then goes silent still terminates. The unary calls — `get_json` (and therefore
+`capabilities`, `status`, `observe`, `observe_generation`, `cancel`, `renew`, `artifacts`), the two
+workspace calls, `find_missing_blobs`, and `prepare_blob` — additionally set a 120 s **total**
+deadline per request, so a node trickling bytes forever still ends. `execute`, `events`, blob upload,
+blob download, and artifact download are deliberately excluded from the total: those transfers are
+legitimately long-lived. `every_request_path_carries_a_deadline` pins this split.
 
 ## Authentication and TLS
 
@@ -370,7 +391,7 @@ a response body; `serde_json::to_vec` failure on a request body; a missing, unpa
 mismatched `eggwork-execution-id` (including the explicit `id != handle.execution_id` check);
 a missing or mismatched `eggwork-blob-digest`; a missing or mismatched
 `eggwork-artifact-id`/`eggwork-artifact-digest`; a `usize::try_from(declared_length)` overflow on
-blob upload; an NDJSON partial line exceeding 128 KiB; a line that is not a valid `ExecutionEvent`;
+blob upload; an NDJSON partial line exceeding `eggwork_core::MAX_EVENT_BYTES`; a line that is not a valid `ExecutionEvent`;
 and an `ExecutionEvent` that fails `validate()`. Note the last-but-one category is **local**: the
 `create_workspace_derived` base-digest mismatch is detected before any request is sent.
 
@@ -461,8 +482,11 @@ All three drive `EggressDialer` directly; none constructs a `NodeClient` or perf
 | Route credentials never reach route bodies or `Debug` | no route field in `ExecuteRequest`; `Debug` prints only origin | none in this file |
 | SOCKS5 and HTTP CONNECT routes work | `EggressDialer` + `EggressIo` — `lib.rs:553` | `socks5_route_round_trips`, `http_connect_route_round_trips` |
 | Streamed responses are bound to the request that asked for them | `eggwork-execution-id` == `handle.execution_id`; blob/artifact header equality — `lib.rs:220`, `lib.rs:472`, `lib.rs:511` | none in this file |
-| Client buffering is bounded | 128 KiB partial-line cap — `lib.rs:656` | none in this file |
+| Client buffering is bounded | `eggwork_core::MAX_EVENT_BYTES` partial-line cap; `MAX_BUFFERED_BODY_BYTES` on buffered reads — `lib.rs:656`, `lib.rs:127`, `lib.rs:141-143` | `an_oversized_partial_line_is_still_refused` |
+| Every request path has a deadline | `transport_timeouts()` on both builders; `unary_timeout()` total on the 7 unary calls | `every_request_path_carries_a_deadline` |
 | Every delivered event is re-validated | `event.validate()` at `lib.rs:651` and `lib.rs:666` | none in this file |
+| Framing handles empty lines, split boundaries, and a final partial line | `into_events` newline scan; `ndjson` fixture delivers in 7-byte pieces | `framing_handles_empty_lines_split_boundaries_and_a_final_partial_line` |
+| A protocol-maximum chunk is delivered, not rejected | 64 KiB payload encodes to ~256 KiB, past the old 128 KiB cap | `a_maximum_size_chunk_is_delivered_not_rejected` |
 | Incompatible nodes are refused before submission | `ensure_protocol_compatible` — `lib.rs:230`, called from `execute` (`lib.rs:196`) and `events` (`lib.rs:375`) | none in this file |
 | No `unsafe` | `#![forbid(unsafe_code)]` — `lib.rs:1` | compile-time |
 

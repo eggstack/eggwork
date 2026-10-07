@@ -103,6 +103,20 @@ pub struct DoctorReport {
     pub checks: Vec<DoctorCheck>,
 }
 
+impl DoctorReport {
+    /// Whether the configuration-and-TLS check passed.
+    ///
+    /// `status` needs this to fail closed on an invalid configuration, and the
+    /// alternative was calling `config.validate()` a second time. That is not
+    /// free: `validate` calls `tls_config()`, which re-reads and re-parses the
+    /// private key and rebuilds a `TlsServerConfig`.
+    pub fn configuration_ok(&self) -> bool {
+        self.checks
+            .iter()
+            .any(|check| check.name == "configuration" && check.ok)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorCheck {
     pub name: &'static str,
@@ -227,6 +241,21 @@ impl OperatorConfig {
             let meta = fs::symlink_metadata(path).map_err(|_| OperationsError::Config)?;
             if !meta.is_dir() || meta.file_type().is_symlink() || !trusted_directory(&meta) {
                 return Err(OperationsError::Config);
+            }
+        }
+        // These roots must not overlap, and they must not contain one another.
+        // `WorkspaceManager::reconcile` deletes every directory under
+        // `workspace_root` that is not a known workspace storage key, so an
+        // operator who pointed `workspace_root` at `blob_root` would have every
+        // two-hex-character blob shard deleted on the next open — by the daemon
+        // at startup and again by `eggworkd gc`. Reject the configuration
+        // instead: a misconfiguration must not be able to destroy the blob store.
+        let roots = [&self.execution_root, &self.blob_root, &self.workspace_root];
+        for (index, path) in roots.iter().enumerate() {
+            for other in &roots[index + 1..] {
+                if path == other || path.starts_with(other) || other.starts_with(path) {
+                    return Err(OperationsError::Config);
+                }
             }
         }
         for path in [&self.database_path] {
@@ -377,9 +406,19 @@ fn read_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, Operat
 #[cfg(unix)]
 fn trusted_directory(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // Exactly `0700`, not "the owner has `rwx`". `mode & 0o700 == 0o700` also
+    // accepts `0750` and `0755`, and this predicate gates `execution_root`,
+    // `blob_root`, `workspace_root` and the database parent — the directories
+    // holding every execution's stdout/stderr, every workspace and every blob.
+    // A readable-by-others state directory silently exposes all of it while
+    // `config validate` and `doctor` still report the configuration valid, and
+    // the operator rule we publish (`docs/quickstart.md`) is owner-only `0700`.
+    // The `0o022` clause is kept explicit: it is the property that actually
+    // mattered, and stating it documents why `0o700` alone is insufficient.
+    let mode = metadata.permissions().mode();
     metadata.uid() == rustix::process::geteuid().as_raw()
-        && metadata.permissions().mode() & 0o700 == 0o700
-        && metadata.permissions().mode() & 0o022 == 0
+        && mode & 0o777 == 0o700
+        && mode & 0o022 == 0
 }
 
 #[cfg(not(unix))]
@@ -447,6 +486,13 @@ pub async fn doctor(config: &OperatorConfig) -> DoctorReport {
         }
         .into(),
     });
+    // The helper is verified here and again inside `execution_capabilities`, which
+    // calls `verify_trusted_helper` on the same path. That is deliberate: the
+    // runner's answer is the one that gates admission, and caching a trust
+    // verdict across the two calls would create exactly the window trust
+    // verification exists to close. `doctor` is a one-shot operator diagnostic,
+    // so the duplicated ancestor walk and file digest cost microseconds and are
+    // not worth a cross-crate trust cache.
     let helper_ok = config
         .sandbox_helper
         .as_ref()
@@ -632,21 +678,33 @@ pub fn active_execution_count(config: &OperatorConfig) -> usize {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
         _ => return usize::MAX,
     }
-    match load_snapshots(config) {
-        Ok(executions) => executions
-            .iter()
-            .filter(|snapshot| {
-                matches!(
-                    snapshot.state,
-                    eggwork_core::ExecutionState::Accepted
-                        | eggwork_core::ExecutionState::Preparing
-                        | eggwork_core::ExecutionState::Running
-                        | eggwork_core::ExecutionState::Cancelling
-                )
-            })
-            .count(),
+    match count_active_executions(config) {
+        Ok(count) => count,
         Err(_) => usize::MAX,
     }
+}
+
+/// Count non-terminal executions in SQL rather than by decoding snapshots.
+///
+/// `wait_for_quiescence` polls `active_execution_count` on a timer for the whole
+/// drain window. It used to go through `load_snapshots`, which opened a fresh
+/// connection and `serde_json`-decoded up to 2048 durable snapshots on every
+/// poll — thousands of connections and millions of decodes over one update —
+/// only to filter four state values that `executions.state` already stores as a
+/// real column. The literals below are the `store::state_name` spellings, which
+/// are PascalCase, not the snake_case used by `state_label` for display.
+fn count_active_executions(config: &OperatorConfig) -> Result<usize, OperationsError> {
+    require_regular_file(&config.database_path)?;
+    let db = read_only_database(&config.database_path)?;
+    let count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM executions
+             WHERE state IN ('Accepted','Preparing','Running','Cancelling')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| OperationsError::Data)?;
+    Ok(count.max(0) as usize)
 }
 
 pub async fn execution_show(
@@ -860,6 +918,32 @@ pub async fn collect_garbage(
 fn acquire_maintenance_lock(database_path: &Path) -> Result<File, OperationsError> {
     use fs2::FileExt;
     let lock_path = database_path.with_extension("lock");
+    // Refuse a pre-existing path that is not an owner-only regular file before
+    // adopting it. `create(true)` opens whatever is already there, and without
+    // this check a local user who can write the state directory could pre-create
+    // the lock as a symlink: the victim would then open the *target*, lock it,
+    // and every competing `flock` — including the node's own startup lock, which
+    // uses the same pattern — would fail forever with a generic error. This is
+    // the same discipline `require_regular_file` and `trusted_private_key`
+    // already apply to every other path we adopt.
+    match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(OperationsError::Data);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                if metadata.uid() != rustix::process::geteuid().as_raw()
+                    || metadata.permissions().mode() & 0o077 != 0
+                {
+                    return Err(OperationsError::Data);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(OperationsError::Data),
+    }
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
@@ -1243,6 +1327,27 @@ mod tests {
         assert!(!encoded.contains("super-secret-key.pem"));
         assert!(!encoded.contains(&"ab".repeat(32)));
         assert!(!report.ready);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_directories_must_be_exactly_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join("state");
+        fs::create_dir(&directory).unwrap();
+        let metadata = |mode: u32| {
+            fs::set_permissions(&directory, fs::Permissions::from_mode(mode)).unwrap();
+            fs::symlink_metadata(&directory).unwrap()
+        };
+        assert!(trusted_directory(&metadata(0o700)));
+        // The published rule is owner-only `0700`. `0750`/`0755` leave the whole
+        // execution output, workspace and blob surface readable by other local
+        // users while the configuration still validates.
+        assert!(!trusted_directory(&metadata(0o750)));
+        assert!(!trusted_directory(&metadata(0o755)));
+        assert!(!trusted_directory(&metadata(0o500)));
+        assert!(!trusted_directory(&metadata(0o707)));
     }
 
     #[test]

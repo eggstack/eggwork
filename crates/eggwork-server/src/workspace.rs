@@ -56,6 +56,11 @@ struct WorkspaceManagerInner {
     quota_bytes: u64,
     metadata: Mutex<Connection>,
     materialize_lock: tokio::sync::Mutex<()>,
+    /// Resume point for the paged orphan-reference sweep in
+    /// `reconcile_manifests`. Held in memory on purpose: it only has to survive
+    /// long enough for one process lifetime to walk the whole owner range, and
+    /// a restart simply starts the sweep over.
+    manifest_sweep_cursor: Mutex<Option<String>>,
 }
 
 #[derive(Debug)]
@@ -122,6 +127,7 @@ impl WorkspaceManager {
                 quota_bytes,
                 metadata: Mutex::new(metadata),
                 materialize_lock: tokio::sync::Mutex::new(()),
+                manifest_sweep_cursor: Mutex::new(None),
             }),
         };
         manager.reconcile()?;
@@ -500,12 +506,22 @@ impl WorkspaceManager {
         }
         let mut deleted = 0u64;
         for (principal_id, manifest_digest) in &expired {
-            connection.execute(
+            // The row count is the whole point. `store_manifest` extends an
+            // already-expired row's expiry with no precondition, so between the
+            // SELECT above and this DELETE a concurrent store on the same live
+            // connection can resurrect the row. Releasing its blob pins anyway
+            // would unpin blobs the cache still advertises, and a later blob GC
+            // would reclaim them out from under a manifest the caller was told
+            // was retained.
+            let removed = connection.execute(
                 "DELETE FROM retained_manifests
                  WHERE principal_id = ?1 AND manifest_digest = ?2
                    AND expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?3",
                 params![principal_id, manifest_digest, now_unix_ms as i64],
             )?;
+            if removed == 0 {
+                continue;
+            }
             let _ =
                 blobs.release_references("manifest", &format!("{principal_id}:{manifest_digest}"));
             deleted += 1;
@@ -581,33 +597,73 @@ impl WorkspaceManager {
         // Orphan `manifest` blob references (no matching cache row, e.g. after
         // a crash between reference creation and row commit) must expire
         // instead of pinning bytes indefinitely.
-        let known: HashSet<String> = {
-            let connection = self
-                .inner
-                .metadata
-                .lock()
-                .map_err(|_| WorkspaceError::Worker)?;
-            let mut statement = connection
-                .prepare("SELECT principal_id, manifest_digest FROM retained_manifests")?;
-            statement
-                .query_map([], |row| {
-                    Ok(format!(
-                        "{}:{}",
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?
-                    ))
-                })?
-                .collect::<Result<_, _>>()?
-        };
+        //
+        // The sweep pages through owners with a resumable cursor. The ordering
+        // and cursor are load-bearing: with an unordered `LIMIT ?` the same
+        // arbitrary page came back every time, so once `limit` legitimate
+        // manifests were retained ahead of the orphans, nothing past them was
+        // ever examined and their blobs stayed pinned forever. The cursor
+        // wraps back to the start once the end is reached, so a bounded pass
+        // still covers every owner across repeated invocations.
+        //
+        // Retention is tested per owner against the `(principal_id,
+        // manifest_digest)` primary key rather than by materialising every
+        // retained key into a `HashSet`: this runs on the startup path, and
+        // `retained_manifests` grows without bound.
+        let mut cursor = self
+            .inner
+            .manifest_sweep_cursor
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
         let orphans = blobs
-            .reference_owners("manifest", limit)
+            .reference_owners("manifest", cursor.as_deref(), limit)
             .map_err(WorkspaceError::from)?;
-        for owner in orphans.iter().take(limit) {
-            if !known.contains(owner) {
-                let _ = blobs.release_references("manifest", owner);
+        for owner in &orphans {
+            // Owners are `"{principal_id}:{manifest_digest}"`. A digest is hex
+            // and contains no colon, so splitting at the *last* one recovers the
+            // key unambiguously even when the principal itself contains colons.
+            // An owner with no colon cannot correspond to any cache row, so it
+            // is an orphan by construction and must still be released.
+            let retained = match owner.rsplit_once(':') {
+                Some((principal, digest)) => self.is_retained_manifest(principal, digest),
+                None => false,
+            };
+            if retained {
+                continue;
             }
+            let _ = blobs.release_references("manifest", owner);
+        }
+        // Advance only when the page was full: a short page means we reached the
+        // end, so the next pass starts over rather than walking off the end of
+        // a stale cursor and never re-examining low `owner_id` values.
+        cursor = if orphans.len() >= limit {
+            orphans.last().cloned()
+        } else {
+            None
+        };
+        if let Ok(mut guard) = self.inner.manifest_sweep_cursor.lock() {
+            *guard = cursor;
         }
         Ok(())
+    }
+
+    /// Whether `(principal_id, manifest_digest)` is still a live cache row.
+    fn is_retained_manifest(&self, principal_id: &str, manifest_digest: &str) -> bool {
+        self.inner
+            .metadata
+            .lock()
+            .map(|connection| {
+                connection
+                    .query_row(
+                        "SELECT 1 FROM retained_manifests
+                         WHERE principal_id = ?1 AND manifest_digest = ?2",
+                        params![principal_id, manifest_digest],
+                        |_| Ok(()),
+                    )
+                    .is_ok()
+            })
+            .unwrap_or(false)
     }
 
     pub fn mark_terminal(
@@ -633,33 +689,50 @@ impl WorkspaceManager {
         workspace_id: &WorkspaceId,
         blobs: &BlobStore,
     ) -> Result<(), WorkspaceError> {
+        // Resolve the storage key *before* taking the connection mutex or opening
+        // a transaction. `fs::symlink_metadata` on a slow or network-backed
+        // workspace root would otherwise be paid while holding both, blocking
+        // every other metadata operation — including `materialize`, which
+        // additionally holds `materialize_lock`, so two executions touching the
+        // same root would serialise behind one `stat`.
+        let key: String = self
+            .inner
+            .metadata
+            .lock()
+            .map_err(|_| WorkspaceError::Worker)?
+            .query_row(
+                "SELECT storage_key FROM workspaces WHERE workspace_id = ?1 AND state = 'Ready'
+                 AND (expires_unix_ms IS NULL OR expires_unix_ms > ?2)",
+                params![workspace_id.as_str(), crate::artifact::now_unix_ms() as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .filter(|key| valid_storage_key(key))
+            .ok_or(WorkspaceError::NotFound)?;
+        let metadata = fs::symlink_metadata(self.inner.root.join(&key))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(WorkspaceError::NotFound);
+        }
+        // Re-verify under the write transaction: between the lookup above and
+        // this update, a concurrent `mark_terminal` may have moved the row out of
+        // `Ready` or set an expiry, and a workspace that is no longer active must
+        // not be resurrected.
         let mut connection = self
             .inner
             .metadata
             .lock()
             .map_err(|_| WorkspaceError::Worker)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let key: Option<String> = transaction
-            .query_row(
-                "SELECT storage_key FROM workspaces WHERE workspace_id = ?1 AND state = 'Ready'
-                 AND (expires_unix_ms IS NULL OR expires_unix_ms > ?2)",
-                params![workspace_id.as_str(), crate::artifact::now_unix_ms() as i64],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(key) = key.filter(|key| valid_storage_key(key)) else {
-            return Err(WorkspaceError::NotFound);
-        };
-        let root = self.inner.root.join(key);
-        let metadata = fs::symlink_metadata(root)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(WorkspaceError::NotFound);
-        }
-        transaction.execute(
-            "UPDATE workspaces SET expires_unix_ms = NULL WHERE workspace_id = ?1",
-            [workspace_id.as_str()],
+        let changed = transaction.execute(
+            "UPDATE workspaces SET expires_unix_ms = NULL
+             WHERE workspace_id = ?1 AND storage_key = ?2 AND state = 'Ready'",
+            params![workspace_id.as_str(), key],
         )?;
         transaction.commit()?;
+        drop(connection);
+        if changed == 0 {
+            return Err(WorkspaceError::NotFound);
+        }
         blobs.clear_reference_expiry("workspace", workspace_id.as_str())?;
         Ok(())
     }
@@ -1536,7 +1609,105 @@ mod tests {
         reopened
             .reconcile_manifests(&blobs, crate::artifact::now_unix_ms(), 8)
             .unwrap();
-        assert!(blobs.reference_owners("manifest", 8).unwrap().is_empty());
+        assert!(
+            blobs
+                .reference_owners("manifest", None, 8)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_orphan_sweep_reaches_owners_past_the_first_page() {
+        // Regression: the orphan sweep asked for one unordered `LIMIT ?` page of
+        // `manifest` owners and re-read that same page on every invocation. Once
+        // as many legitimate retained manifests existed as the page size, every
+        // owner on the page was known-good, nothing was released, and orphans
+        // positioned behind them kept their blob references pinned forever —
+        // contradicting this function's own "never leaves permanent unbounded
+        // blob references behind" contract.
+        let temp = TempDir::new().unwrap();
+        let blobs = BlobStore::open(temp.path().join("blobs"), 1024 * 1024).unwrap();
+        let manager = WorkspaceManager::open(temp.path().join("workspaces"), 1024 * 1024).unwrap();
+        let principal = PrincipalId::new("principal-a").unwrap();
+
+        let upload = |bytes: Vec<u8>| {
+            let blobs = &blobs;
+            async move {
+                let digest = eggwork_core::BlobDigest::from_bytes(&bytes);
+                blobs
+                    .put_stream(
+                        digest.clone(),
+                        bytes.len() as u64,
+                        stream::iter([Ok::<_, ()>(bytes::Bytes::from(bytes))]),
+                    )
+                    .await
+                    .unwrap();
+                digest
+            }
+        };
+
+        // Three legitimate retained manifests, all owned by `principal-a`.
+        let mut legitimate = Vec::new();
+        for index in 0..3u8 {
+            let payload = format!("legitimate-{index}").into_bytes();
+            let digest = upload(payload.clone()).await;
+            let manifest = derived_fixture_manifest(digest, payload.len() as u64);
+            let canonical = manifest.digest().unwrap();
+            manager
+                .materialize(
+                    WorkspaceId::new(format!("ws-legit-{index}")).unwrap(),
+                    &owner_handle(&format!("exec-legit-{index}")),
+                    &principal,
+                    manifest,
+                    &blobs,
+                )
+                .await
+                .unwrap();
+            legitimate.push(canonical);
+        }
+
+        // Orphans: `manifest` references with no cache row, exactly what a crash
+        // between reference creation and row commit leaves behind. `zz-` sorts
+        // after `principal-a:...`, so these sit behind every legitimate owner.
+        for index in 0..3u8 {
+            let digest = upload(format!("orphan-{index}").into_bytes()).await;
+            blobs
+                .retain(
+                    "manifest",
+                    &format!("zz-orphan-{index}:{}", digest.as_str()),
+                    &[digest],
+                    None,
+                )
+                .unwrap();
+        }
+        // A page size smaller than the retained-manifest count is precisely the
+        // condition that starved the old unordered sweep.
+        assert_eq!(
+            blobs.reference_owners("manifest", None, 2).unwrap().len(),
+            2
+        );
+        for _ in 0..8 {
+            manager.reconcile_manifests(&blobs, 0, 2).unwrap();
+        }
+        // Legitimate manifests still hold their own pins, so the check is that
+        // no orphan owner survives — not that no owner survives.
+        let remaining = blobs.reference_owners("manifest", None, 64).unwrap();
+        assert!(
+            !remaining
+                .iter()
+                .any(|owner| owner.starts_with("zz-orphan-")),
+            "orphan references survived the sweep: {remaining:?}"
+        );
+        // And the sweep must not have touched the legitimate manifests.
+        for canonical in &legitimate {
+            assert!(
+                manager
+                    .lookup_manifest(&principal, canonical, &blobs)
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     #[tokio::test]

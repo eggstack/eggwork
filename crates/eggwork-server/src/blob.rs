@@ -18,6 +18,9 @@ use tokio::{io::AsyncWriteExt, sync::Mutex};
 
 pub const MAX_BLOB_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_FIND_DIGESTS: usize = 512;
+/// Digests per `IN (...)` clause in `find_missing`. Well under SQLite's
+/// `SQLITE_MAX_VARIABLE_NUMBER`, which is 32766 in every build this ships on.
+const FIND_CHUNK: usize = 256;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GcReport {
@@ -127,21 +130,35 @@ impl BlobStore {
             .join(digest.as_str())
     }
 
+    /// Report which of `digests` the store does not have.
+    ///
+    /// One chunked statement rather than a per-digest probe: at the
+    /// `MAX_FIND_DIGESTS` ceiling the old loop ran 512 single-row queries and
+    /// allocated an owned `String` per hit, all while holding the metadata mutex
+    /// that every other blob operation needs. `SQLITE_MAX_VARIABLE_NUMBER`
+    /// comfortably exceeds one chunk, and a digest that repeats across chunks
+    /// only affects the presence set, which is what the answer depends on.
     pub fn find_missing(&self, digests: &[BlobDigest]) -> Result<Vec<BlobDigest>, BlobError> {
         if digests.len() > MAX_FIND_DIGESTS {
             return Err(BlobError::TooManyDigests);
         }
         let connection = self.inner.metadata.lock().map_err(|_| BlobError::Worker)?;
-        let mut present = HashSet::new();
-        let mut statement = connection.prepare("SELECT digest FROM blobs WHERE digest = ?1")?;
-        for digest in digests {
-            if statement
-                .query_row([digest.as_str()], |row| row.get::<_, String>(0))
-                .optional()?
-                .is_some()
-            {
-                present.insert(digest.as_str().to_owned());
-            }
+        let mut present = HashSet::with_capacity(digests.len());
+        for chunk in digests.chunks(FIND_CHUNK) {
+            let mut statement = connection.prepare(&format!(
+                "SELECT digest FROM blobs WHERE digest IN ({})",
+                std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ))?;
+            let params: Vec<&str> = chunk.iter().map(|digest| digest.as_str()).collect();
+            present.extend(
+                statement
+                    .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<HashSet<String>, _>>()?,
+            );
         }
         Ok(digests
             .iter()
@@ -206,28 +223,66 @@ impl BlobStore {
         let mut connection = self.inner.metadata.lock().map_err(|_| BlobError::Worker)?;
         let transaction = connection.transaction()?;
         for digest in digests {
-            let exists: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM blobs WHERE digest = ?1)",
-                [digest.as_str()],
-                |row| row.get(0),
-            )?;
-            if !exists {
-                return Err(BlobError::NotFound);
-            }
-            transaction.execute(
-                "INSERT INTO blob_references(owner_kind, owner_id, digest, expires_unix_ms)
+            Self::retain_one(&transaction, owner_kind, owner_id, digest, expires_unix_ms)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Retain one digest per distinct owner, all in a single durable
+    /// transaction.
+    ///
+    /// `retain` opens and commits its own transaction per call and the store runs
+    /// `PRAGMA synchronous=FULL`, so calling it once per artifact record meant up
+    /// to `MAX_ARTIFACT_FILES` (4096) fsync-ing commits for a single execution.
+    /// The per-digest existence check and upsert are unchanged — they are simply
+    /// evaluated in one transaction now.
+    pub fn retain_per_owner(
+        &self,
+        owner_kind: &str,
+        entries: &[(&str, BlobDigest)],
+        expires_unix_ms: Option<u64>,
+    ) -> Result<(), BlobError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.inner.metadata.lock().map_err(|_| BlobError::Worker)?;
+        let transaction = connection.transaction()?;
+        for (owner_id, digest) in entries {
+            Self::retain_one(&transaction, owner_kind, owner_id, digest, expires_unix_ms)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// One existence check and one upsert inside an open transaction.
+    fn retain_one(
+        transaction: &rusqlite::Transaction<'_>,
+        owner_kind: &str,
+        owner_id: &str,
+        digest: &BlobDigest,
+        expires_unix_ms: Option<u64>,
+    ) -> Result<(), BlobError> {
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM blobs WHERE digest = ?1)",
+            [digest.as_str()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(BlobError::NotFound);
+        }
+        transaction.execute(
+            "INSERT INTO blob_references(owner_kind, owner_id, digest, expires_unix_ms)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(owner_kind, owner_id, digest) DO UPDATE
                    SET expires_unix_ms = excluded.expires_unix_ms",
-                params![
-                    owner_kind,
-                    owner_id,
-                    digest.as_str(),
-                    expires_unix_ms.map(|v| v as i64)
-                ],
-            )?;
-        }
-        transaction.commit()?;
+            params![
+                owner_kind,
+                owner_id,
+                digest.as_str(),
+                expires_unix_ms.map(|v| v as i64)
+            ],
+        )?;
         Ok(())
     }
 
@@ -281,21 +336,59 @@ impl BlobStore {
     /// List distinct blob-reference owners for one owner kind, bounded by
     /// `limit`. Used by restart reconciliation to find orphan references
     /// without scanning blob bytes.
+    ///
+    /// Owners are returned in stable `owner_id` order.
+    ///
+    /// `after` is an exclusive resume cursor: pass the last owner from the
+    /// previous page to continue past it. The ordering is load-bearing, not
+    /// cosmetic — without it a bounded sweep always re-reads the same arbitrary
+    /// first page, so any owner positioned beyond `limit` could never be
+    /// examined and its references would be pinned forever.
     pub fn reference_owners(
         &self,
         owner_kind: &str,
+        after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<String>, BlobError> {
         let connection = self.inner.metadata.lock().map_err(|_| BlobError::Worker)?;
         let mut statement = connection.prepare(
-            "SELECT DISTINCT owner_id FROM blob_references WHERE owner_kind = ?1 LIMIT ?2",
+            "SELECT DISTINCT owner_id FROM blob_references
+             WHERE owner_kind = ?1 AND (?2 IS NULL OR owner_id > ?2)
+             ORDER BY owner_id LIMIT ?3",
         )?;
         Ok(statement
             .query_map(
-                params![owner_kind, limit.min(i64::MAX as usize) as i64],
+                params![owner_kind, after, limit.min(i64::MAX as usize) as i64],
                 |row| row.get(0),
             )?
             .collect::<Result<_, _>>()?)
+    }
+
+    /// Unreferenced blobs, coldest first, bounded by `limit`.
+    ///
+    /// Shared by the dry run and the real run on purpose. They select at
+    /// *different points* in the transaction — a preview before expired
+    /// references are deleted, the real pass after — so the same statement
+    /// must be evaluated in both places. Two hand-copied copies of it are what
+    /// let the two paths drift apart and made `NodeGcReport.blob_candidates`
+    /// under-predict what `--apply` would actually remove.
+    fn unreferenced_candidates(
+        transaction: &rusqlite::Transaction<'_>,
+        limit: usize,
+    ) -> Result<Vec<(String, u64)>, BlobError> {
+        let mut statement = transaction.prepare(
+            "SELECT digest, size_bytes FROM blobs
+             WHERE NOT EXISTS (SELECT 1 FROM blob_references r WHERE r.digest = blobs.digest)
+             ORDER BY last_used_unix_ms ASC LIMIT ?1",
+        )?;
+        Ok(statement
+            .query_map([limit.min(i64::MAX as usize) as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Remove expired references and then a bounded number of unreferenced blobs.
@@ -313,20 +406,7 @@ impl BlobStore {
             [now_unix_ms as i64],
             |row| row.get::<_, i64>(0),
         )?;
-        let mut statement = transaction.prepare(
-            "SELECT digest, size_bytes FROM blobs
-             WHERE NOT EXISTS (SELECT 1 FROM blob_references r WHERE r.digest = blobs.digest)
-             ORDER BY last_used_unix_ms ASC LIMIT ?1",
-        )?;
-        let mut candidates = statement
-            .query_map([limit.min(i64::MAX as usize) as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?.max(0) as u64,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
+        let mut candidates = Self::unreferenced_candidates(&transaction, limit)?;
         let mut removed_blobs = 0u64;
         let mut removed_bytes = 0u64;
         let mut expired_references_removed = 0u64;
@@ -337,21 +417,8 @@ impl BlobStore {
                    AND expires_unix_ms <= ?1 LIMIT ?2)",
                 params![now_unix_ms as i64, limit.min(i64::MAX as usize) as i64],
             )? as u64;
-            candidates = {
-                let mut statement = transaction.prepare(
-                    "SELECT digest, size_bytes FROM blobs
-                     WHERE NOT EXISTS (SELECT 1 FROM blob_references r WHERE r.digest = blobs.digest)
-                     ORDER BY last_used_unix_ms ASC LIMIT ?1",
-                )?;
-                statement
-                    .query_map([limit.min(i64::MAX as usize) as i64], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?.max(0) as u64,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?
-            };
+            candidates = Self::unreferenced_candidates(&transaction, limit)?;
+            let mut unlink_error: Option<io::Error> = None;
             for (encoded, size) in &candidates {
                 let Ok(digest) = BlobDigest::parse(encoded.clone()) else {
                     continue;
@@ -374,11 +441,28 @@ impl BlobStore {
                             [digest.as_str()],
                         )?;
                     }
-                    Err(error) => return Err(BlobError::Io(error)),
+                    Err(error) => {
+                        // Stop touching the filesystem, but do not abandon the
+                        // transaction. Earlier candidates in this loop already had
+                        // their files unlinked; rolling their `DELETE`s back would
+                        // resurrect rows for blobs that no longer exist on disk,
+                        // which then count against `blob_quota_bytes`, report the
+                        // digest as present to `find_missing`, and surface as an
+                        // opaque error on the next read. A row whose file could not
+                        // be unlinked is already the consistent state, so commit
+                        // what is true and report the error afterwards.
+                        unlink_error.get_or_insert(error);
+                        break;
+                    }
                 }
             }
+            transaction.commit()?;
+            if let Some(error) = unlink_error {
+                return Err(BlobError::Io(error));
+            }
+        } else {
+            transaction.commit()?;
         }
-        transaction.commit()?;
         Ok(GcReport {
             expired_references: expired_references.max(0) as u64,
             expired_references_removed,
@@ -418,7 +502,12 @@ impl BlobStore {
                 [],
                 |row| row.get(0),
             )?;
-        if used as u64 + declared_length > self.inner.quota_bytes {
+        // Same arithmetic as `prepare_upload` above, saturating in both places.
+        // Two adjacent copies of one quota check with different overflow
+        // behaviour is a latent trap even though neither is reachable today: the
+        // sum only overflows near `u64::MAX`, and SQLite's `sum()` returns REAL
+        // past `i64::MAX`, so the read fails closed first.
+        if (used.max(0) as u64).saturating_add(declared_length) > self.inner.quota_bytes {
             return Err(BlobError::QuotaExceeded);
         }
 
@@ -803,5 +892,103 @@ mod tests {
         let restarted = BlobStore::open(&root, 5).unwrap();
         assert!(!root.join(".part-crash-fixture").exists());
         assert_eq!(restarted.find_missing(&[first]).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn find_missing_reports_across_the_chunk_boundary() {
+        // `find_missing` uses a chunked `IN (...)` statement; this crosses the
+        // chunk boundary, includes an absent digest, a repeat, and the empty
+        // request, so a chunking bug cannot hide.
+        let temp = TempDir::new().unwrap();
+        let store = BlobStore::open(temp.path().join("blobs"), 1024 * 1024).unwrap();
+        let mut stored = Vec::new();
+        for index in 0..FIND_CHUNK + 5 {
+            let payload = format!("stored-{index}").into_bytes();
+            let digest = BlobDigest::from_bytes(&payload);
+            store
+                .put_stream(
+                    digest.clone(),
+                    payload.len() as u64,
+                    stream::iter([Ok::<_, ()>(Bytes::from(payload))]),
+                )
+                .await
+                .unwrap();
+            stored.push(digest);
+        }
+        let absent = BlobDigest::from_bytes(b"absent");
+        let mut queried = stored.clone();
+        queried.push(absent.clone());
+        queried.push(stored[0].clone());
+        let missing = store.find_missing(&queried).unwrap();
+        assert_eq!(missing, vec![absent]);
+        assert!(store.find_missing(&[]).unwrap().is_empty());
+        assert!(matches!(
+            store.find_missing(&vec![stored[0].clone(); MAX_FIND_DIGESTS + 1]),
+            Err(BlobError::TooManyDigests)
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn gc_commits_unlinked_rows_even_when_a_later_unlink_fails() {
+        // Regression: the unlink loop returned `Err` on the first non-`NotFound`
+        // failure with the transaction still open, so rusqlite rolled it back —
+        // including the `DELETE`s for candidates already unlinked. That left
+        // `blobs` rows pointing at files that no longer existed, which inflated
+        // `SUM(size_bytes)` into a spurious `QuotaExceeded` and made
+        // `find_missing` report the digest as present so a client skipped the
+        // re-upload that would have repaired it.
+        let temp = TempDir::new().unwrap();
+        let store = BlobStore::open(temp.path().join("blobs"), 1024 * 1024).unwrap();
+
+        let first = BlobDigest::from_bytes(b"aaaaa");
+        store
+            .put_stream(
+                first.clone(),
+                5,
+                stream::iter([Ok::<_, ()>(Bytes::from_static(b"aaaaa"))]),
+            )
+            .await
+            .unwrap();
+        // `garbage_collect` orders candidates by `last_used_unix_ms ASC` at
+        // millisecond resolution, so make `blocked` strictly newer.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let blocked = BlobDigest::from_bytes(b"bbbbbbb");
+        store
+            .put_stream(
+                blocked.clone(),
+                7,
+                stream::iter([Ok::<_, ()>(Bytes::from_static(b"bbbbbbb"))]),
+            )
+            .await
+            .unwrap();
+
+        // `remove_file` against a non-empty directory fails with something other
+        // than `NotFound`, which is the shape of error the pass must survive.
+        let blocked_path = store.path_for(&blocked);
+        fs::remove_file(&blocked_path).unwrap();
+        fs::create_dir(&blocked_path).unwrap();
+        fs::write(blocked_path.join("child"), b"x").unwrap();
+
+        assert!(matches!(
+            store.garbage_collect(0, 8, false).await,
+            Err(BlobError::Io(_))
+        ));
+
+        // The unlink that already happened must not be undone by the rollback.
+        assert!(!store.path_for(&first).exists());
+        assert_eq!(
+            store.find_missing(std::slice::from_ref(&first)).unwrap(),
+            vec![first.clone()]
+        );
+        // The blob whose unlink failed keeps its row: its file is still present,
+        // so the row and the filesystem still agree.
+        assert!(
+            store
+                .find_missing(std::slice::from_ref(&blocked))
+                .unwrap()
+                .is_empty()
+        );
+        fs::remove_dir_all(&blocked_path).unwrap();
     }
 }

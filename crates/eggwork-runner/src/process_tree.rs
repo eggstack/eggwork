@@ -169,11 +169,17 @@ mod imp {
         }
 
         /// Timeout, cancellation, or output-limit termination: ask the group to
-        /// stop, let it have a grace period, then force it and reap the leader.
+        /// stop, let it have `grace`, then force it and reap the leader.
+        ///
+        /// `grace` is honoured in both places it applies: the wait between
+        /// `SIGTERM` and `SIGKILL`, and the bounded reap afterwards. It used to
+        /// sleep the module constant here while still using the parameter for the
+        /// reap, so a caller passing anything other than `TERMINATION_GRACE` got a
+        /// silent no-op for half its request.
         pub(crate) async fn terminate_and_reap(&mut self, grace: Duration) -> TreeConvergence {
             let mut signal_error = match terminate_group(self.group) {
                 Ok(true) => {
-                    tokio::time::sleep(TERMINATION_GRACE).await;
+                    tokio::time::sleep(grace).await;
                     None
                 }
                 Ok(false) => None,

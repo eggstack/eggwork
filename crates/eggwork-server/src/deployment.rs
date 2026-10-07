@@ -40,6 +40,15 @@ pub const MAX_CANDIDATE_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default bounded post-update health probe budget.
 pub const DEFAULT_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Quiescence poll interval.
+///
+/// This used to be 5 ms, which over a 30 s drain window meant up to 6,000 polls.
+/// Each poll opened its own read-only SQLite connection, so a single update could
+/// spend minutes of I/O just watching for quiescence. The probe is now a single
+/// indexed `COUNT(*)`, and 100 ms keeps drain latency well under a tenth of the
+/// timeout while cutting the poll count ~20x. The granularity was never a
+/// correctness property — the loop is bounded by `drain_timeout` either way.
+pub const QUIESCENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Secret-safe deployment error with bounded detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +74,29 @@ impl DeploymentError {
     /// Machine-readable error kind.
     pub fn kind(&self) -> &'static str {
         self.kind
+    }
+
+    /// Record, on a failure, that the node was left refusing new work.
+    ///
+    /// The drain marker is set *before* quiescence and is deliberately never
+    /// cleared on any error path — an update that dies mid-flight must not let
+    /// the node resume accepting executions against a half-installed release.
+    /// That is the right behaviour, but it used to be invisible: only the
+    /// success report carried `drain_remains_active`, so an operator reading a
+    /// failure had no way to learn that a later `eggworkd undrain` was needed.
+    fn note_drain_remains(self, drain_remains_active: bool) -> Self {
+        const SUFFIX: &str = "; node left draining, run `eggworkd undrain` to clear";
+        if !drain_remains_active || self.detail.contains(SUFFIX) {
+            return self;
+        }
+        // Reserve room for the suffix rather than truncating it away.
+        let room = 256usize.saturating_sub(SUFFIX.chars().count());
+        let mut detail = self.detail.chars().take(room).collect::<String>();
+        detail.push_str(SUFFIX);
+        Self {
+            kind: self.kind,
+            detail,
+        }
     }
 }
 
@@ -442,7 +474,7 @@ pub fn wait_for_quiescence(
                 "active executions remain after bounded drain wait",
             ));
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(QUIESCENCE_POLL_INTERVAL);
     }
 }
 
@@ -648,12 +680,17 @@ pub fn orchestrate_update_with_lifecycle_budgeted(
         .prepare()?
         .verify_integrity()?
         .validate(&eggup_core::AllValidators::new())?;
+    // Whether a failure below will leave this node refusing work. The marker is set
+    // before quiescence and never cleared on an error path, which is deliberate —
+    // but the operator has to be told, or a failed update looks like a clean one.
+    let drain_remains_active = request.drain_marker.is_some();
     if let Some(marker) = request.drain_marker {
         crate::operations::set_persistent_drain(marker, true).map_err(|_| {
             DeploymentError::new("draining", "persistent drain marker could not be set")
         })?;
     }
-    wait_for_quiescence(active_executions, request.policy)?;
+    wait_for_quiescence(active_executions, request.policy)
+        .map_err(|error| error.note_drain_remains(drain_remains_active))?;
     let mut adapter = ServiceManagerAdapter(manager);
     let check = OneShotHealthCheck(std::cell::RefCell::new(Some(health_check)));
     eggup_service::commit_with_lifecycle(
@@ -670,7 +707,7 @@ pub fn orchestrate_update_with_lifecycle_budgeted(
         },
         &check,
     )
-    .map_err(DeploymentError::from)
+    .map_err(|error| DeploymentError::from(error).note_drain_remains(drain_remains_active))
 }
 
 pub fn orchestrate_update(

@@ -200,8 +200,10 @@ root; `storage_summary` only *reports* `blob_bytes` against `blob_quota_bytes`
 ### GC
 
 `garbage_collect(now_unix_ms, limit, dry_run)` (`blob.rs:302-392`) takes `write_lock` and an
-`IMMEDIATE` transaction, so it is serialized against `put_stream` (same lock) though not against
-`retain` (metadata mutex only).
+`IMMEDIATE` transaction, so it is serialized against `put_stream` (same lock). It also holds the
+`metadata` mutex (`blob.rs:309`) for its entire body, including `commit()`, so it cannot interleave
+with `retain` either — the code here is stronger than the older "metadata mutex only" phrasing used
+for divergence 6 in `overview.md`.
 
 Two phases. First, an unbounded `COUNT(*)` of expired references
 (`expires_unix_ms IS NOT NULL AND expires_unix_ms <= now`) - the number a dry run reports. Then,
@@ -213,8 +215,15 @@ a blob that just became unreferenced is eligible in the same pass.
 
 Per candidate: `fs::remove_file`, then
 `DELETE FROM blobs WHERE digest = ?1 AND NOT EXISTS (SELECT 1 FROM blob_references WHERE digest =
-?1)`. `NotFound` on the unlink still removes the row; any other unlink error aborts the whole
-transaction (`blob.rs:377`), leaving the store consistent.
+?1)`. `NotFound` on the unlink still removes the row. Any *other* unlink error stops the loop, but
+**the transaction is still committed** before the error is returned. It must be: candidates already
+processed in this loop have had their files unlinked, and rolling their `DELETE`s back would
+resurrect rows for blobs that no longer exist — inflating `SUM(size_bytes)` into a spurious
+`QuotaExceeded`, letting `find_missing` report the digest as present so a client skips re-upload, and
+turning the next read into an opaque error instead of a clean 404. A row whose file could *not* be
+unlinked is already the consistent state, so the pass commits what is true and then surfaces
+`BlobError::Io`. Only a `commit()` failure itself leaves the crash-equivalent state that
+`ArtifactStore` reconciles at startup (`startup_reconciles_a_crash_after_blob_unlink_during_gc`).
 
 GC is **bounded, not exhaustive**: one call removes at most `limit` expired references *and* at
 most `limit` blobs. A backlog drains over repeated invocations, and
@@ -408,7 +417,19 @@ served after its blobs are gone.
 `reconcile_manifests` (`workspace.rs:535-611`) and `recover_manifest_retention`
 (`workspace.rs:518-533`) run at startup: expired manifests are dropped with their references, and
 any `"manifest"` owner id in `blob_references` with no matching `retained_manifests` row is released
-via `blobs.reference_owners("manifest", limit)`.
+via `blobs.reference_owners("manifest", after, limit)`.
+
+Two details of that sweep are load-bearing. `reference_owners` returns `ORDER BY owner_id` and takes
+an exclusive resume cursor; `reconcile_manifests` keeps the cursor in memory
+(`WorkspaceManagerInner::manifest_sweep_cursor`) and advances it only when the page came back full,
+resetting to the start once the end is reached. Without both, an unordered `LIMIT ?` re-read the
+same page every invocation, so once `limit` legitimate manifests were retained ahead of the orphans,
+nothing behind them was ever examined and their blobs stayed pinned forever — while the function's
+own contract claimed it "never leaves permanent unbounded blob references behind". Retention is
+tested per owner with an indexed `(principal_id, manifest_digest)` lookup rather than by
+materialising every retained key into a `HashSet`: this runs on the startup path and
+`retained_manifests` grows without bound. An owner id with no colon in it cannot match any cache row
+and is therefore treated as an orphan.
 
 ### Quota and limits
 
@@ -463,11 +484,13 @@ mid-walk cannot be followed even if the workspace can create one. On non-unix pl
 `open_file_beneath` returns `ErrorKind::Unsupported`, so the safe path is unavailable rather than
 silently replaced by a path-based open.
 
-The real `WorkspaceManifest` is then rebuilt with actual digests and validated again, `blobs.retain`
-is called per record under owner kind `"artifact"` **before** the rows become visible
-(`artifact.rs:311-321`), and only then does `store.insert_many` publish them. The comment at
-`artifact.rs:312-313` states the asymmetry: a crash here can retain extra bytes until expiry, never
-lose live data.
+The real `WorkspaceManifest` is then rebuilt with actual digests and validated again, and
+`blobs.retain_per_owner("artifact", …)` establishes every record's blob reference in **one**
+transaction **before** the rows become visible (`artifact.rs:311-322`), and only then does
+`store.insert_many` publish them. This used to call `retain` once per record; since `retain` opens
+and commits its own transaction under `PRAGMA synchronous=FULL`, that was up to `MAX_ARTIFACT_FILES`
+(4096) fsync-ing commits for a single execution. The ordering itself is unchanged and is the point:
+a crash here can retain extra bytes until expiry, never lose live data.
 
 **Where artifact metadata lives: the artifact store's own SQLite file, not the journal.**
 `ArtifactStore::open` (`artifact.rs:63-97`) opens `<database_path>.with_extension("artifacts.sqlite")`
@@ -759,8 +782,10 @@ runner's confinement to the materialized root.
   Windows-reserved name, a trailing dot, a non-ASCII byte) through the `workspace_create` handler.
 - No test exercises the non-unix branches: `open_file_beneath` returning `ErrorKind::Unsupported`,
   the `#[cfg(not(unix))]` permission helpers, or the `sync_directory` no-op.
-- No test covers `reconcile_manifests`' orphan-reference sweep independently of a crash, nor a
-  hardlink-based quota bypass, nor unbounded `retained_manifests` growth.
+- No test drives `reconcile_manifests`' orphan-reference sweep past the first page *except*
+  `manifest_orphan_sweep_reaches_owners_past_the_first_page`, which pins the resume cursor and the
+  wrap-back-at-end behaviour. Unbounded `retained_manifests` growth and a hardlink-based quota
+  bypass remain uncovered.
 - Nothing in `crates/eggwork-server/tests/` touches the data plane: `installed_qualification.rs` and
   `release_contract.rs` are the only integration files.
 - Recorded evidence: [001](../plans/closure/workspace-artifact-transport/001-status.md) through
@@ -776,11 +801,12 @@ runner's confinement to the materialized root.
   mitigation is that the staging root is fresh, 0700, and contains only this module's own
   `create_dir` results. Confirm the threat model holds, and whether `openat2(RESOLVE_BENEATH)` is
   worth the cost.
-- **GC racing a concurrent `retain`.** Blob GC holds `write_lock` and an `IMMEDIATE` transaction, but
-  `retain` takes only the metadata mutex. A `retain` committing between `fs::remove_file` and
-  `DELETE ... AND NOT EXISTS (...)` leaves a live reference pointing at a deleted file; the guard
-  correctly keeps the row and `remove_stale_parts` cleans the dangling row at the next open, but the
-  window is real and untested.
+- ~~**GC racing a concurrent `retain`.**~~ **Closed 2026-10-07.** This said GC holds `write_lock`
+  while `retain` takes "only the metadata mutex". It does: `garbage_collect` locks `inner.metadata`
+  at entry (`blob.rs:337`) and holds it across `commit()` (`blob.rs:399`), and `retain` needs that
+  same mutex for its whole body. They are mutually exclusive, so no reference can commit between
+  `fs::remove_file` and `DELETE ... AND NOT EXISTS (...)`. The `NOT EXISTS` guard and
+  `remove_stale_parts` remain as defence in depth, not as the only thing holding.
 - **Asymmetric download protection.** `artifact_download` takes a `"reader"` lease;
   `blob_download` does not. Verify the intended invariant is "unreferenced bytes may vanish
   mid-transfer, but the open fd keeps working on unix", and note that elsewhere the removal would

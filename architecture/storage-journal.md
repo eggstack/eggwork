@@ -526,7 +526,7 @@ covers the cross-process case (the read-only CLI connections).
 | `load_snapshot_for_principal` | none | two shapes, both single `SELECT`s |
 | `load_page` | none | **three** separate statements: `next_sequence`, `MIN(sequence)`, then the event range — not a consistent snapshot |
 | `load_all` | none | single `SELECT` |
-| `increment_metric` | none (implicit single-statement transaction) | |
+| `increment_metric` | none (explicit single-transaction batch) | validates every name *before* opening the transaction, so one bad name rejects the whole batch without partial application |
 
 **Windows where an inconsistency can be observed:**
 
@@ -570,11 +570,11 @@ Every limit the module enforces, with values. Rows marked *core* are enforced by
 | Bound | Value | What it bounds / where enforced |
 |---|---|---|
 | `MAX_RETAINED_EVENTS` | `256` | Events retained per `(execution_id, generation)`; `trim_events` |
-| `MAX_RETAINED_EVENT_BYTES` | `512 * 1024` | (a) retained bytes per generation, in `trim_events`; (b) per-event ceiling in `commit_event` (`encoded.len() > MAX_RETAINED_EVENT_BYTES` -> `InvalidEvent`). The same constant does double duty, so (b) is redundant with the 64 KiB core cap |
+| `MAX_RETAINED_EVENT_BYTES` | `eggwork_core::MAX_EVENT_BYTES` (`512 * 1024`) | (a) retained bytes per generation, in `trim_events`; (b) per-event ceiling in `commit_event` (`encoded.len() > MAX_RETAINED_EVENT_BYTES` -> `InvalidEvent`). The same constant does double duty. (b) is **not** implied by the 64 KiB core payload cap: `Stdout`/`Stderr` serialize as a JSON number array at up to four characters per byte, so a maximum-size chunk encodes to ~256 KiB. It is the shared ceiling the client also reads — see `client-transport.md` — so the two sides agree by construction |
 | `MAX_EXECUTION_IDENTITIES` | `2048` | `COUNT(*) FROM executions` - i.e. *rows*, so it counts *(id, generation)* pairs, not distinct `execution_id`s, despite the name. Checked only on the new-row path in `reserve`; a generation bump consumes budget |
 | `MAX_EVENT_CHUNK_BYTES` *(core)* | `64 * 1024` | The real per-event payload ceiling, via `ExecutionEvent::validate` at `store.rs:319` |
 | `MAX_ID_BYTES` *(core)* | `128` | `ExecutionId` / `LeaseId` / `PrincipalId`, upstream of the store |
-| metric name length | `1..=64` bytes | `increment_metric` (`store.rs:484-486`) |
+| metric name length | `1..=64` bytes | `increment_metric` / `increment_metrics` (`store.rs`) |
 | metric value | saturating at `i64::MAX` | `CHECK(value >= 0)` + the upsert `CASE` |
 | `load_page` result size | <= 256 implicitly | **no SQL `LIMIT`**; bounded only by trimming |
 
@@ -697,14 +697,18 @@ holder.
 
 ## Metrics
 
-`increment_metric` (`lib.rs:779-781`) is a thin `let _ = store
-.increment_metric(name, amount).await;` wrapper — every metric failure is
+`increment_metric` is a thin `let _ = store.increment_metric(name, amount).await;`
+wrapper, and `increment_metrics` its batched sibling — every metric failure is
 silently discarded. The `name: &'static str` argument means metric names are
 compile-time constants chosen by `lib.rs`, never request-derived, so the 64-byte
-name bound is defense in depth. Each call is one `spawn_blocking` + mutex
-acquisition + implicit-transaction upsert, so metric traffic contends with
-`commit_event` on the same single connection — a stdout-heavy execution
-generates one metric write per terminal transition plus three, not one per chunk.
+name bound is defense in depth. Because `commit_event` needs the *same* connection
+mutex, unbatched metric traffic queued in front of durable event commits: the
+execution-terminal path used to await up to four sequential increments, and
+`create_workspace_derived` three. `increment_metrics` takes the deltas as a slice
+and applies them in one `spawn_blocking`, one connection acquisition and one
+explicit transaction, with the per-name upsert arithmetic unchanged; both those
+sites now use it. So a terminal transition costs one metric write instead of up
+to four — batching amortises the mutex and the commit, not the number of upserts.
 
 The 20 names in `operations::METRIC_NAMES` (`operations.rs:28-50`) that flow
 through this store:
@@ -842,7 +846,8 @@ Honest gaps:
   a state variant is added.
 - **Unchecked integer narrowing.** `ExecutionGeneration::new` only rejects `0`
   (`eggwork-core/src/lib.rs:113-120`), yet the store does
-  `snapshot.generation.get() as i64` in six places; a generation above
+  `snapshot.generation.get() as i64` in **eleven** places (an earlier revision of this
+  document said six); a generation above
   `i64::MAX` wraps negative and would be written to the PK. Same class of issue
   for `after_sequence as i64` in `load_page`, guarded only at the HTTP route and
   not in the store method itself. `sequence + 1` and the `.min(i64::MAX as u128)`

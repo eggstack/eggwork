@@ -200,6 +200,18 @@ struct NodeState {
 
 struct ExecutionRecord {
     snapshot: RwLock<ExecutionSnapshot>,
+    /// Serialises publishers across the durable commit.
+    ///
+    /// Separate from `snapshot` on purpose. `publish` derives `proposed` from a
+    /// snapshot read, so two overlapping publishers would each rebase onto a
+    /// stale base and the later one would erase the earlier one's fields — the
+    /// `snapshot` write guard used to prevent that by being held across the
+    /// whole commit. Holding an `RwLock` write guard across a
+    /// `synchronous=FULL` SQLite commit blocked every reader (`event_response`,
+    /// `control`) for the duration of an fsync, which is why the two jobs are
+    /// now split: this mutex keeps writers serialised, and `snapshot` is only
+    /// held for the cheap read and the short assign.
+    commit_lock: tokio::sync::Mutex<()>,
     cancellation: CancellationToken,
     events: broadcast::Sender<ExecutionEvent>,
     store: store::ExecutionStore,
@@ -361,6 +373,7 @@ impl NodeServer {
                 snapshot.execution_id.clone(),
                 Arc::new(ExecutionRecord {
                     snapshot: RwLock::new(snapshot),
+                    commit_lock: tokio::sync::Mutex::new(()),
                     cancellation: CancellationToken::new(),
                     events,
                     store: store.clone(),
@@ -780,6 +793,15 @@ async fn increment_metric(store: &store::ExecutionStore, name: &'static str, amo
     let _ = store.increment_metric(name, amount).await;
 }
 
+/// Record several counters under one connection acquisition and one commit.
+///
+/// Prefer this wherever a single request or a single execution terminal state
+/// moves more than one counter: the store's connection mutex is the same one
+/// `commit_event` needs, so unbatched accounting delays durable event commits.
+async fn increment_metrics(store: &store::ExecutionStore, deltas: &[(&'static str, u64)]) {
+    let _ = store.increment_metrics(deltas).await;
+}
+
 fn resource_for_path(operation: Operation, path: &str) -> Option<ResourceId> {
     let parts: Vec<_> = path.split('/').collect();
     match operation {
@@ -1189,9 +1211,15 @@ async fn workspace_derive(
         .await
     {
         Ok(ready) => {
-            increment_metric(&state.store, "workspace_derived_hits", 1).await;
-            increment_metric(&state.store, "workspace_manifest_registrations", 1).await;
-            increment_metric(&state.store, "workspace_patch_entries", patch_entries).await;
+            increment_metrics(
+                &state.store,
+                &[
+                    ("workspace_derived_hits", 1),
+                    ("workspace_manifest_registrations", 1),
+                    ("workspace_patch_entries", patch_entries),
+                ],
+            )
+            .await;
             Ok(json_response(
                 201,
                 &WorkspaceReadyResponse {
@@ -1893,6 +1921,7 @@ fn new_record(
     let (events, _) = broadcast::channel(EVENT_CAPACITY);
     Arc::new(ExecutionRecord {
         snapshot: RwLock::new(snapshot),
+        commit_lock: tokio::sync::Mutex::new(()),
         cancellation: CancellationToken::new(),
         events,
         store,
@@ -1915,6 +1944,7 @@ fn recovered_record(
     let (events, _) = broadcast::channel(EVENT_CAPACITY);
     Arc::new(ExecutionRecord {
         snapshot: RwLock::new(snapshot),
+        commit_lock: tokio::sync::Mutex::new(()),
         cancellation: CancellationToken::new(),
         events,
         store,
@@ -2493,14 +2523,16 @@ async fn run_execution(
         ExecutionState::Interrupted => Some("terminal_interrupted"),
         _ => None,
     };
+    let mut terminal_counters = Vec::with_capacity(4);
     if let Some(name) = terminal_metric {
-        increment_metric(&record.store, name, 1).await;
+        terminal_counters.push((name, 1u64));
     }
-    increment_metric(&record.store, "stdout_bytes", execution_result.stdout_bytes).await;
-    increment_metric(&record.store, "stderr_bytes", execution_result.stderr_bytes).await;
+    terminal_counters.push(("stdout_bytes", execution_result.stdout_bytes));
+    terminal_counters.push(("stderr_bytes", execution_result.stderr_bytes));
     if execution_result.cleanup_warning.is_some() {
-        increment_metric(&record.store, "cleanup_failures", 1).await;
+        terminal_counters.push(("cleanup_failures", 1u64));
     }
+    increment_metrics(&record.store, &terminal_counters).await;
     publish_terminal(
         &record,
         terminal.clone(),
@@ -2572,18 +2604,25 @@ async fn publish(
     result: Option<ExecutionResult>,
     kind: ExecutionEventKind,
 ) {
-    let mut current = record.snapshot.write().await;
-    if is_terminal(&current.state) {
+    // See `ExecutionRecord::commit_lock` for why this is a separate mutex from
+    // `snapshot`. A reader can now observe the pre-commit snapshot for the
+    // duration of the durable write instead of blocking on it; the transition is
+    // monotonic, so a reader that wins the race simply sees the previous state
+    // and then receives the event on the broadcast channel.
+    let _writer = record.commit_lock.lock().await;
+    let base = record.snapshot.read().await;
+    if is_terminal(&base.state) {
         return;
     }
-    let mut proposed = current.clone();
+    let mut proposed = base.clone();
+    drop(base);
     proposed.state = state;
     if let Some(result) = result {
         proposed.result = Some(result);
     }
     match record.store.commit_event(proposed.clone(), kind).await {
         Ok(Some(event)) => {
-            *current = proposed;
+            *record.snapshot.write().await = proposed;
             let _ = record.events.send(event);
         }
         Ok(None) => {}
@@ -2731,6 +2770,18 @@ mod tests {
     use std::{fs, sync::Arc};
     use tempfile::TempDir;
     use uuid::Uuid;
+
+    /// Wall-clock budget for a whole-execution round trip.
+    ///
+    /// These waits cover a real subprocess, SQLite commits under
+    /// `synchronous=FULL`, a full event-stream drain and artifact capture. A 4 s
+    /// bound only held on an unloaded machine: under the concurrent workspace
+    /// suite — exactly what a shared CI runner looks like — it failed while the
+    /// same test passed in isolation, and measured isolated runs straddled the
+    /// budget by roughly 3x. Each of these assertions tests convergence, never
+    /// latency, so a generous bound loses no signal and costs nothing when the
+    /// code is healthy.
+    const ROUND_TRIP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
     fn init_tls() {
         static INIT: std::sync::Once = std::sync::Once::new();
@@ -3563,7 +3614,7 @@ mod tests {
             .await
             .unwrap();
         let workspace_events = tokio::time::timeout(
-            std::time::Duration::from_secs(4),
+            ROUND_TRIP_BUDGET,
             stream.into_events().try_collect::<Vec<_>>(),
         )
         .await
@@ -3803,7 +3854,7 @@ mod tests {
             .unwrap();
         let id = execution.execution_id.clone();
         let event_read = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            ROUND_TRIP_BUDGET,
             execution.into_events().collect::<Vec<_>>(),
         )
         .await;
@@ -3842,7 +3893,7 @@ mod tests {
                 .all(|stream| stream.execution_id == idempotent_handle.execution_id)
         );
         drop(streams);
-        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        tokio::time::timeout(ROUND_TRIP_BUDGET, async {
             loop {
                 if client
                     .observe(&idempotent_handle.execution_id)
@@ -3883,7 +3934,7 @@ mod tests {
             Err(eggwork_client::ClientError::Api { status: 409, .. })
         ));
         drop(generation_two);
-        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        tokio::time::timeout(ROUND_TRIP_BUDGET, async {
             loop {
                 if client
                     .observe_generation(&next_generation.execution_id, 2)
@@ -3940,13 +3991,13 @@ mod tests {
         operations::set_persistent_drain(&server.state.drain_path, false).unwrap();
         assert!(!server.is_draining());
         drop(running); // A disconnected live stream does not cancel execution.
-        let attached_events = tokio::time::timeout(std::time::Duration::from_secs(4), events_task)
+        let attached_events = tokio::time::timeout(ROUND_TRIP_BUDGET, events_task)
             .await
             .expect("GET events stream should end at terminal state")
             .unwrap()
             .unwrap();
         assert!(!attached_events.is_empty());
-        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        tokio::time::timeout(ROUND_TRIP_BUDGET, async {
             loop {
                 if client.observe(&running_id).await.unwrap().state == ExecutionState::Succeeded {
                     break;
@@ -3977,7 +4028,7 @@ mod tests {
             .unwrap();
         client.cancel(&cancellable_handle).await.unwrap();
         client.cancel(&cancellable_handle).await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        tokio::time::timeout(ROUND_TRIP_BUDGET, async {
             loop {
                 if client.observe(&cancellable_id).await.unwrap().state == ExecutionState::Cancelled
                 {
@@ -4109,7 +4160,7 @@ mod tests {
             .await
             .unwrap();
         drop(stream);
-        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        let snapshot = tokio::time::timeout(ROUND_TRIP_BUDGET, async {
             loop {
                 let snapshot = client.observe(&handle.execution_id).await.unwrap();
                 if is_terminal(&snapshot.state) {
@@ -4807,7 +4858,7 @@ mod tests {
             .await
             .unwrap();
         let events = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            ROUND_TRIP_BUDGET,
             stream.into_events().try_collect::<Vec<_>>(),
         )
         .await
@@ -5115,7 +5166,7 @@ mod tests {
         let handle = execution_handle("best-effort-without-helper");
         let stream = client.execute(&spec, &handle).await.unwrap();
         let events = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            ROUND_TRIP_BUDGET,
             stream.into_events().try_collect::<Vec<_>>(),
         )
         .await
@@ -5305,7 +5356,7 @@ mod tests {
         let handle = execution_handle("required-resource-available");
         let stream = client.execute(&spec, &handle).await.unwrap();
         let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            ROUND_TRIP_BUDGET,
             stream.into_events().try_collect::<Vec<_>>(),
         )
         .await
@@ -5433,7 +5484,7 @@ mod tests {
             .await
             .unwrap();
         let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            ROUND_TRIP_BUDGET,
             stream.into_events().try_collect::<Vec<_>>(),
         )
         .await

@@ -10,7 +10,7 @@ mod linux {
     use serde::Deserialize;
     use std::{
         collections::HashSet,
-        fs,
+        fs::{self, File},
         io::{Read, Seek, SeekFrom, Write},
         os::unix::{fs::MetadataExt, net::UnixStream, process::ExitStatusExt},
         path::{Path, PathBuf},
@@ -23,6 +23,12 @@ mod linux {
     const MAX_ENV_COUNT: usize = 256;
     const MAX_ENV_NAME_BYTES: usize = 256;
     const MAX_ENV_VALUE_BYTES: usize = 16 * 1024;
+
+    /// Bit 2 of the post-mortem status byte: at least one counter the caller
+    /// asked about could not be opened, so "no limit was exceeded" is unknown
+    /// rather than established. The runner turns this into `NotApplied` rather
+    /// than `Applied` for the affected dimension.
+    const STATUS_UNOBSERVED: u8 = 1 << 2;
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -67,7 +73,7 @@ mod linux {
             return Err(());
         }
         let mut status = UnixStream::connect(&status_path).map_err(|_| ())?;
-        let spec = match read_spec(&spec_path) {
+        let (spec, root) = match read_spec(&spec_path) {
             Ok(spec) => spec,
             Err(code) => {
                 let _ = status.write_all(&[code]);
@@ -84,7 +90,7 @@ mod linux {
             spec.resource_pids.is_some(),
         );
         if spec.profile.is_some()
-            && let Err(code) = restrict(&spec)
+            && let Err(code) = restrict(root)
         {
             let _ = status.write_all(&[code]);
             return Err(());
@@ -114,13 +120,19 @@ mod linux {
         status.write_all(&[1]).map_err(|_| ())?;
         status.flush().map_err(|_| ())?;
         let result = child.wait().map_err(|_| ())?;
+        // The target has already finished. Post-mortem reporting must never be
+        // able to change its exit status: the runner takes the *tree leader's*
+        // code, and in the helper path the leader is us, so a failed write here
+        // would report `125` for a target that ran perfectly well. Capture the
+        // code first, then report best-effort.
+        let code = exit_code(result);
         let resource_status = resource_events.status_code();
-        status.write_all(&[resource_status]).map_err(|_| ())?;
-        status.flush().map_err(|_| ())?;
-        Ok(exit_code(result))
+        let _ = status.write_all(&[resource_status]);
+        let _ = status.flush();
+        Ok(code)
     }
 
-    fn read_spec(path: &Path) -> Result<LaunchSpec, u8> {
+    fn read_spec(path: &Path) -> Result<(LaunchSpec, File), u8> {
         let metadata = fs::symlink_metadata(path).map_err(|_| 4u8)?;
         if !metadata.is_file()
             || metadata.file_type().is_symlink()
@@ -180,10 +192,30 @@ mod linux {
         if root != spec.root || !root.is_dir() || !cwd.starts_with(&root) || !cwd.is_dir() {
             return Err(15);
         }
-        Ok(spec)
+        // Pin the validated inode. `restrict` used to re-resolve `spec.root` by
+        // name, so any process able to write the *parent* of the workspace root
+        // could swap it for a symlink in the gap between the checks above and
+        // the ruleset, and confinement would then be granted beneath the link
+        // target — while still reporting `FullyEnforced`. Opening once, here,
+        // makes the enforced object the same object that was validated. This is
+        // the same discipline the spec file itself already gets: refuse a
+        // symlink, then compare dev/ino on the descriptor actually read.
+        let root = open_directory(&root).map_err(|_| 16u8)?;
+        Ok((spec, root))
     }
 
-    fn restrict(spec: &LaunchSpec) -> Result<RestrictionStatus, u8> {
+    /// Open a directory for Landlock enforcement, mirroring `PathFd::new`'s
+    /// `O_PATH | O_CLOEXEC` semantics so enforcement needs no read permission on
+    /// the directory itself and the descriptor is never inherited by the target.
+    fn open_directory(path: &Path) -> std::io::Result<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_PATH | nix::libc::O_CLOEXEC)
+            .open(path)
+    }
+
+    fn restrict(root: File) -> Result<RestrictionStatus, u8> {
         let abi = ABI::V4;
         let handled = AccessFs::from_all(abi);
         let mut ruleset = Ruleset::default()
@@ -192,10 +224,7 @@ mod linux {
             .create()
             .map_err(|_| 2u8)?;
         ruleset = ruleset
-            .add_rule(PathBeneath::new(
-                PathFd::new(&spec.root).map_err(|_| 2u8)?,
-                handled,
-            ))
+            .add_rule(PathBeneath::new(root, handled))
             .map_err(|_| 2u8)?;
 
         for path in ["/usr", "/etc/ld.so.cache", "/etc/ssl/certs", "/dev/null"] {
@@ -271,19 +300,35 @@ mod linux {
     struct ResourceEvents {
         memory: Option<EventCounter>,
         pids: Option<EventCounter>,
+        /// Counters the caller asked about that we could not actually observe.
+        /// Reported as `STATUS_UNOBSERVED` rather than folded into "no
+        /// violation", because reporting "not exceeded" for a limit we could
+        /// not watch is a fail-open claim we cannot support.
+        unobserved: Vec<&'static str>,
     }
 
     impl ResourceEvents {
         fn new(track_memory: bool, track_pids: bool) -> Self {
+            let memory = track_memory.then(EventCounter::memory).flatten();
+            let pids = track_pids.then(EventCounter::pids).flatten();
+            let mut unobserved = Vec::new();
+            if track_memory && memory.is_none() {
+                unobserved.push("memory.events");
+            }
+            if track_pids && pids.is_none() {
+                unobserved.push("pids.events");
+            }
             Self {
-                memory: track_memory.then(EventCounter::memory).flatten(),
-                pids: track_pids.then(EventCounter::pids).flatten(),
+                memory,
+                pids,
+                unobserved,
             }
         }
 
         fn status_code(&mut self) -> u8 {
             u8::from(self.memory.as_mut().is_some_and(EventCounter::exceeded))
                 | (u8::from(self.pids.as_mut().is_some_and(EventCounter::exceeded)) << 1)
+                | (u8::from(!self.unobserved.is_empty()) * STATUS_UNOBSERVED)
         }
     }
 

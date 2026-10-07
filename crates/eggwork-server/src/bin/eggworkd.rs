@@ -76,16 +76,22 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             }
         }
         "status" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            // `doctor` runs `config.validate()` — which builds a full
+            // `TlsServerConfig` from the private key — and we embed its report in
+            // the output below. Validating separately first meant doing that work
+            // twice on every single `status` invocation, so ask the report we are
+            // going to print anyway.
+            let report = doctor(&config).await;
+            if !report.configuration_ok() {
+                return Err("configuration is invalid".to_owned());
+            }
             let page = execution_page(&config, 1, 0)
                 .await
                 .map_err(|_| "execution state is unavailable".to_owned())?;
             let metrics = metrics_snapshot(&config)
                 .map_err(|_| "operator metrics are unavailable".to_owned())?;
             output(
-                &serde_json::json!({"schema_version":1,"node_id":config.node_id,"draining":is_persistently_draining(&config.drain_path()),"active_executions":page.active_executions,"max_active_executions":config.max_active_executions,"execution_records":page.total,"execution_states":page.states,"stdout_bytes":page.stdout_bytes,"stderr_bytes":page.stderr_bytes,"cleanup_failures":page.cleanup_failures,"metrics":metrics,"doctor":doctor(&config).await}),
+                &serde_json::json!({"schema_version":1,"node_id":config.node_id,"draining":is_persistently_draining(&config.drain_path()),"active_executions":page.active_executions,"max_active_executions":config.max_active_executions,"execution_records":page.total,"execution_states":page.states,"stdout_bytes":page.stdout_bytes,"stderr_bytes":page.stderr_bytes,"cleanup_failures":page.cleanup_failures,"metrics":metrics,"doctor":report}),
             )
         }
         "drain" | "undrain" => {
@@ -466,6 +472,15 @@ fn deployment_apply(
         &verifier,
         || eggwork_server::operations::active_execution_count(config),
         move |remaining| {
+            // One deadline for the whole post-commit check. `remaining` is a
+            // *duration* measured when Eggup computed it, not a deadline, so
+            // deriving `now + remaining` again further down — after the daemon
+            // probe has already been allowed up to 5 s of it — would hand this
+            // phase the entire remaining allowance a second time. Computing the
+            // deadline once here makes the Linux helper check below spend what
+            // is genuinely left, which is what `deployment-lifecycle.md` and
+            // `operations-cli.md` both describe.
+            let deadline = std::time::Instant::now() + remaining;
             let timeout = std::cmp::min(remaining, std::time::Duration::from_secs(5));
             if timeout.is_zero() {
                 return Err("post-install check budget exhausted".into());
@@ -498,9 +513,8 @@ fn deployment_apply(
             #[cfg(target_os = "linux")]
             if require_helper {
                 // Only the Linux path still spends the remaining budget on the
-                // helper compatibility check, so the deadline is computed here
+                // helper compatibility check, so the budget is derived here
                 // rather than being an unused binding on every other target.
-                let deadline = std::time::Instant::now() + remaining;
                 let helper_budget = deadline.saturating_duration_since(std::time::Instant::now());
                 if !deployment::check_helper_compatibility_with_timeout(
                     Some(&installed_helper),
@@ -515,7 +529,7 @@ fn deployment_apply(
                 }
             }
             #[cfg(not(target_os = "linux"))]
-            let _ = (&installed_helper, require_helper);
+            let _ = (&installed_helper, require_helper, &deadline);
             Ok(())
         },
     )
@@ -605,9 +619,28 @@ fn apply_service_operation(
         _ => return Err(usage().into()),
     }
     .map_err(|error| error.to_string())?;
+    // Emit the structured report first so the machine-readable record of the
+    // attempt survives even on failure, then fail the process. `completed: false`
+    // means the manager did not reach the desired end state, so exiting 0 would
+    // tell a provisioning script the node was transitioned when it was not —
+    // and would contradict our own release path, which treats the same value as
+    // a hard failure.
+    let completed = outcome.completed();
+    let detail = outcome.detail.clone();
     output(
-        &serde_json::json!({"schema_version": 1, "service_id": spec.id().as_str(), "platform": std::env::consts::OS, "backend": backend, "operation": verb, "completed": outcome.completed()}),
-    )
+        &serde_json::json!({"schema_version": 1, "service_id": spec.id().as_str(), "platform": std::env::consts::OS, "backend": backend, "operation": verb, "completed": completed}),
+    )?;
+    if completed {
+        return Ok(());
+    }
+    Err(format!(
+        "service {verb} did not complete{}",
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        }
+    ))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]

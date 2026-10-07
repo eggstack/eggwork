@@ -20,6 +20,46 @@ use thiserror::Error;
 
 const API_SCHEMA_VERSION: u16 = 1;
 
+/// Ceiling on a buffered (non-streamed) response body.
+///
+/// Every non-2xx response goes through `api_error`, and every JSON reply
+/// through `decode_json`, and both used to read the body with no bound at all.
+/// This is generous relative to the protocol's real maxima — the largest single
+/// buffered reply is an execution snapshot, which the journal caps at 256 events
+/// and 512 KiB of encoded events — so it never truncates a legitimate response
+/// while still refusing to accumulate unbounded node-controlled data.
+const MAX_BUFFERED_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Time allowed for a pool slot, the connect/TLS handshake, each request-body
+/// frame, and each *gap* between response chunks.
+///
+/// These are the deadlines a long-lived stream needs. Without the read phase a
+/// hung or black-holed node left `execute`, `events` or `renew` pending forever;
+/// because the read deadline resets on every chunk, an event stream that is
+/// simply quiet between executions is unaffected.
+fn transport_timeouts() -> eggfetch_core::Timeout {
+    eggfetch_core::Timeout {
+        pool: Some(std::time::Duration::from_secs(30)),
+        connect: Some(std::time::Duration::from_secs(30)),
+        write: Some(std::time::Duration::from_secs(60)),
+        read: Some(std::time::Duration::from_secs(60)),
+        total: None,
+    }
+}
+
+/// Wall-clock deadline for the unary request/response calls.
+///
+/// Applied per request rather than on the client, because the streaming calls —
+/// `execute`, `events`, blob upload, blob and artifact download — are legitimately
+/// long-lived and a total deadline would abort a healthy transfer. They are held
+/// to `transport_timeouts` instead.
+fn unary_timeout() -> eggfetch_core::Timeout {
+    eggfetch_core::Timeout {
+        total: Some(std::time::Duration::from_secs(120)),
+        ..transport_timeouts()
+    }
+}
+
 #[derive(Error)]
 pub enum ClientError {
     #[error("node endpoint must be an https URL without query, fragment, or credentials")]
@@ -124,7 +164,11 @@ impl NodeClient {
     /// Build a fixed-target client with a caller-configured Eggfetch TLS policy.
     pub fn new(endpoint: impl AsRef<str>, tls: TlsConfig) -> Result<Self, ClientError> {
         let endpoint = normalize_endpoint(endpoint.as_ref())?;
-        let http = HttpClient::builder().tls_config(tls).build();
+        let http = HttpClient::builder()
+            .tls_config(tls)
+            .timeout(transport_timeouts())
+            .max_decoded_body_size(MAX_BUFFERED_BODY_BYTES)
+            .build();
         Ok(Self { endpoint, http })
     }
 
@@ -140,6 +184,8 @@ impl NodeClient {
         let endpoint = normalize_endpoint(endpoint.as_ref())?;
         let http = HttpClient::builder()
             .tls_config(tls)
+            .timeout(transport_timeouts())
+            .max_decoded_body_size(MAX_BUFFERED_BODY_BYTES)
             .dialer(EggressDialer {
                 connector: Arc::new(connector),
             })
@@ -254,6 +300,7 @@ impl NodeClient {
         let mut response = self
             .http
             .post(&self.url("/v1/workspaces"))?
+            .timeout(unary_timeout())
             .header("content-type", "application/json")
             .bytes(
                 serde_json::to_vec(&CreateWorkspaceRequest {
@@ -290,6 +337,7 @@ impl NodeClient {
         let mut response = self
             .http
             .post(&self.url("/v1/workspaces/derive"))?
+            .timeout(unary_timeout())
             .header("content-type", "application/json")
             .bytes(
                 serde_json::to_vec(&CreateDerivedWorkspaceRequest {
@@ -316,6 +364,7 @@ impl NodeClient {
         let mut response = self
             .http
             .post(&self.url(&format!("/v1/executions/{}/cancel", handle.execution_id)))?
+            .timeout(unary_timeout())
             .header("content-type", "application/json")
             .bytes(
                 serde_json::to_vec(&ControlRequest {
@@ -341,6 +390,7 @@ impl NodeClient {
         let mut response = self
             .http
             .post(&self.url(&format!("/v1/executions/{}/renew", handle.execution_id)))?
+            .timeout(unary_timeout())
             .header("content-type", "application/json")
             .bytes(
                 serde_json::to_vec(&ControlRequest {
@@ -396,6 +446,7 @@ impl NodeClient {
         let mut response = self
             .http
             .post(&self.url("/v1/blobs/missing"))?
+            .timeout(unary_timeout())
             .header("content-type", "application/json")
             .bytes(
                 serde_json::to_vec(&FindMissingRequest { digests })
@@ -420,6 +471,7 @@ impl NodeClient {
         let mut preparation = self
             .http
             .post(&self.url("/v1/blobs/prepare"))?
+            .timeout(unary_timeout())
             .header("content-type", "application/json")
             .bytes(
                 serde_json::to_vec(&PrepareBlobRequest {
@@ -517,7 +569,12 @@ impl NodeClient {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
-        let mut response = self.http.get(&self.url(path))?.send().await?;
+        let mut response = self
+            .http
+            .get(&self.url(path))?
+            .timeout(unary_timeout())
+            .send()
+            .await?;
         if !response.status().is_success() {
             return Err(api_error(response.status().as_u16(), &mut response).await);
         }
@@ -653,7 +710,9 @@ impl ExecutionStream {
                     }
                     match events.next().await {
                         Some(Ok(bytes)) => {
-                            if pending.len().saturating_add(bytes.len()) > 128 * 1024 {
+                            if pending.len().saturating_add(bytes.len())
+                                > eggwork_core::MAX_EVENT_BYTES
+                            {
                                 return Err(ClientError::InvalidResponse);
                             }
                             pending.extend_from_slice(&bytes)
@@ -787,6 +846,31 @@ mod security_tests {
     }
 
     #[test]
+    fn every_request_path_carries_a_deadline() {
+        // Regression: neither builder set a timeout, and Eggfetch derives every
+        // phase from `Default` as `None`, so a hung or black-holed node left
+        // `execute`, `events` and `renew` pending forever — with `renew` the
+        // sharpest case, because the lease expires silently while the caller is
+        // still blocked on it.
+        let transport = transport_timeouts();
+        assert!(transport.pool.is_some());
+        assert!(transport.connect.is_some());
+        assert!(transport.write.is_some());
+        assert!(
+            transport.read.is_some(),
+            "the streaming paths depend on the read deadline to bound idle"
+        );
+        // A total deadline would abort a healthy long-lived transfer, so the
+        // shared client must never carry one.
+        assert!(transport.total.is_none());
+        // The unary paths additionally get a wall-clock cap, so a node that
+        // trickles bytes forever still terminates.
+        let unary = unary_timeout();
+        assert!(unary.total.is_some());
+        assert!(unary.read.is_some());
+    }
+
+    #[test]
     fn client_error_debug_redacts_remote_message() {
         let error = ClientError::Api {
             status: 500,
@@ -795,6 +879,119 @@ mod security_tests {
         };
         assert!(!format!("{error:?}").contains("private-key-material"));
         assert!(!error.to_string().contains("private-key-material"));
+    }
+}
+
+#[cfg(test)]
+mod event_framing_tests {
+    use super::*;
+    use eggwork_core::{EventSequence, ExecutionEventKind};
+
+    /// Frame `events` as the node writes them: one JSON object per `\n`-terminated
+    /// line, delivered in `chunk` sized transport pieces so the line-splitting
+    /// path is exercised rather than short-circuited by whole-line delivery.
+    fn ndjson(events: &[&ExecutionEvent], chunk: usize) -> Vec<Result<bytes::Bytes, HttpError>> {
+        let mut body = Vec::new();
+        for event in events {
+            let line = serde_json::to_vec(event).unwrap();
+            body.extend_from_slice(&line);
+            body.push(b'\n');
+        }
+        body.chunks(chunk)
+            .map(|piece| Ok(bytes::Bytes::copy_from_slice(piece)))
+            .collect()
+    }
+
+    fn stream_over(chunks: Vec<Result<bytes::Bytes, HttpError>>) -> ExecutionStream {
+        ExecutionStream {
+            handle: ExecutionHandle {
+                execution_id: ExecutionId::new("exec-a").unwrap(),
+                generation: eggwork_core::ExecutionGeneration::new(1).unwrap(),
+                lease_id: eggwork_core::LeaseId::new("lease-a").unwrap(),
+            },
+            execution_id: ExecutionId::new("exec-a").unwrap(),
+            events: Box::pin(stream::iter(chunks)),
+        }
+    }
+
+    fn stdout_event(sequence: u64, bytes: &[u8]) -> ExecutionEvent {
+        ExecutionEvent {
+            sequence: EventSequence::new(sequence),
+            kind: ExecutionEventKind::Stdout(bytes.to_vec()),
+            metadata: eggwork_core::EventMetadata { fields: vec![] },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_maximum_size_chunk_is_delivered_not_rejected() {
+        // Regression: the framing cap used to be 128 KiB, but a caller may legally
+        // ask for `MAX_EVENT_CHUNK_BYTES` of output, which encodes to ~256 KiB
+        // because `Vec<u8>` serializes as a JSON number array. The client rejected
+        // the line, and because the stream is `try_unfold` that discarded every
+        // event already delivered.
+        let payload = vec![0xFFu8; eggwork_core::MAX_EVENT_CHUNK_BYTES];
+        let event = stdout_event(1, &payload);
+        let line = serde_json::to_vec(&event).unwrap();
+        assert!(
+            line.len() > 128 * 1024,
+            "fixture must exceed the old cap, got {}",
+            line.len()
+        );
+
+        let trailing = stdout_event(2, b"done");
+        let chunks = ndjson(&[&event, &trailing], 8192);
+
+        let mut events = Box::pin(stream_over(chunks).into_events());
+        let first = events.next().await.unwrap().unwrap();
+        assert_eq!(first.kind, ExecutionEventKind::Stdout(payload));
+        // The oversized line must not terminate the stream: `try_unfold` turns a
+        // framing error into the loss of everything already buffered.
+        let second = events.next().await.unwrap().unwrap();
+        assert_eq!(second.kind, ExecutionEventKind::Stdout(b"done".to_vec()));
+        assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn framing_handles_empty_lines_split_boundaries_and_a_final_partial_line() {
+        let first = stdout_event(1, b"alpha");
+        let second = stdout_event(2, b"beta");
+        let mut body = Vec::new();
+        body.extend_from_slice(b"\n");
+        body.extend_from_slice(&serde_json::to_vec(&first).unwrap());
+        body.extend_from_slice(b"\n\n");
+        body.extend_from_slice(&serde_json::to_vec(&second).unwrap());
+
+        let pieces: Vec<Result<bytes::Bytes, HttpError>> = body
+            .chunks(7)
+            .map(|piece| Ok(bytes::Bytes::copy_from_slice(piece)))
+            .collect();
+        let mut events = Box::pin(stream_over(pieces).into_events());
+        assert_eq!(
+            events.next().await.unwrap().unwrap().kind,
+            ExecutionEventKind::Stdout(b"alpha".to_vec())
+        );
+        // The last line carries no trailing newline and must still be parsed.
+        assert_eq!(
+            events.next().await.unwrap().unwrap().kind,
+            ExecutionEventKind::Stdout(b"beta".to_vec())
+        );
+        assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_partial_line_is_still_refused() {
+        // The bound protects memory, so it must not simply be removed: a line
+        // past `MAX_EVENT_BYTES` with no newline is still `InvalidResponse`.
+        let pieces: Vec<Result<bytes::Bytes, HttpError>> = vec![Ok(bytes::Bytes::from(vec![
+                b'x';
+                eggwork_core::MAX_EVENT_BYTES
+                    + 1
+            ]))];
+        let mut events = Box::pin(stream_over(pieces).into_events());
+        assert!(matches!(
+            events.next().await,
+            Some(Err(ClientError::InvalidResponse))
+        ));
     }
 }
 

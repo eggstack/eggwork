@@ -549,10 +549,22 @@ and the page comes from `store.load_page`. No correctness rests on the broadcast
 `slow_event_consumer_is_bounded_and_gets_a_stream_error` (`lib.rs:3102`) pins the failure mode
 explicitly rather than allowing an unbounded per-subscriber queue.
 
-`publish` (`lib.rs:2569-2595`) is the single write funnel: snapshot write lock, terminal short-
-circuit, clone-and-propose, `store.commit_event` (which assigns the sequence), then update the
-in-memory snapshot and `events.send`. `Ok(None)` means the store declined the event (already
-recorded) and is silently ignored. `publish_terminal` is just `publish` with `Some(result)`.
+`publish` is the single write funnel, and it takes **two** locks with different jobs.
+`ExecutionRecord::commit_lock` (`lib.rs:205-216`) serialises publishers across the durable commit;
+`snapshot` is a plain `RwLock` held only for the cheap read and the short assign. The order is:
+commit lock, read lock + terminal short-circuit, clone-and-propose, `store.commit_event` (which
+assigns the sequence), write lock to install the new snapshot, `events.send`. `Ok(None)` means the
+store declined the event (already recorded) and is silently ignored. `publish_terminal` is just
+`publish` with `Some(result)`.
+
+The split matters. `proposed` is derived from a snapshot *read*, so two overlapping publishers would
+each rebase onto a stale base and the later would erase the earlier's fields; the write guard that
+used to span the whole commit prevented that, at the cost of blocking every snapshot reader
+(`event_response`, `control`) for the duration of a `synchronous=FULL` fsync. The separate
+`commit_lock` keeps writer serialisation identical while readers only ever wait for a pointer-sized
+write. The one visible relaxation is that a reader can now observe the pre-commit snapshot during
+the write instead of blocking — the transition is monotonic, so such a reader sees the previous
+state and then receives the event on the broadcast channel.
 
 ## Observing and control
 
@@ -853,8 +865,8 @@ file). Fixtures first: `init_tls`, `issue_identity`, `tls_material`, `untrusted_
   re-check (`execute`'s `workspace_id`, `blob_prepare`'s digest, `blob_missing`'s whole batch).
 - **Lease fencing under concurrency.** `control` checks the store row, the latest generation, and the
   in-memory record across three separate awaits. Can a newer generation land between `lib.rs:2072`
-  and `lib.rs:2163`'s `publish`? `publish` re-checks terminal under the snapshot write lock but does
-  **not** re-check generation.
+  and `lib.rs:2163`'s `publish`? `publish` re-checks terminal while holding `commit_lock` and the
+  snapshot read guard, but does **not** re-check generation.
 - **Digest reuse across callers.** `store.lookup` compares `principal_id` *before* the digest
   (`1677` vs `1684`), so a foreign principal learns an execution id exists from the 403 while a
   matching principal learns identity conflicts. Intended?

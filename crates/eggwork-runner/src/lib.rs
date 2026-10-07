@@ -91,19 +91,149 @@ impl BoundedCapture {
         let head_limit = limit.div_ceil(2);
         let tail_limit = limit.saturating_sub(head_limit);
         self.total_bytes = self.total_bytes.saturating_add(bytes.len() as u64);
-        for &byte in bytes {
-            if self.head.len() < head_limit {
-                self.head.push(byte);
-            } else if tail_limit > 0 {
-                if self.tail.len() == tail_limit {
-                    self.tail.pop_front();
-                }
-                self.tail.push_back(byte);
-            }
+        // Bulk, not per-byte. Once the head is full only the *last* `tail_limit`
+        // bytes of the incoming slice can survive: everything between is evicted
+        // by the byte after it. Walking `bytes` one element at a time made a 1 GB
+        // stdout a billion-iteration `VecDeque` pop/push loop even though the
+        // overwhelming majority of those iterations were immediately discarded.
+        let remaining = if self.head.len() < head_limit {
+            let room = head_limit - self.head.len();
+            let take = room.min(bytes.len());
+            self.head.extend_from_slice(&bytes[..take]);
+            &bytes[take..]
+        } else {
+            bytes
+        };
+        if tail_limit == 0 {
+            // Nothing after the head is retained.
+        } else if remaining.len() >= tail_limit {
+            // The tail is exactly the final `tail_limit` bytes of everything
+            // retained so far, so replace it wholesale.
+            let window = &remaining[remaining.len() - tail_limit..];
+            self.tail.clear();
+            self.tail.extend(window.iter().copied());
+        } else if self.tail.len() + remaining.len() <= tail_limit {
+            self.tail.extend(remaining.iter().copied());
+        } else {
+            // Keep only what fits: the old tail's tail plus all of `remaining`.
+            let keep_from_old = tail_limit - remaining.len();
+            let mut merged = VecDeque::with_capacity(tail_limit);
+            merged.extend(
+                self.tail
+                    .iter()
+                    .copied()
+                    .skip(self.tail.len().saturating_sub(keep_from_old)),
+            );
+            merged.extend(remaining.iter().copied());
+            self.tail = merged;
         }
         self.omitted_bytes = self
             .total_bytes
             .saturating_sub((self.head.len() + self.tail.len()) as u64);
+    }
+}
+
+/// The original per-byte `BoundedCapture::push`, kept as a test oracle.
+///
+/// The production `push` works in bulk and is only allowed to differ from this
+/// in cost, never in result. See
+/// `bounded_capture_bulk_push_matches_the_per_byte_oracle`.
+#[cfg(test)]
+fn push_per_byte(
+    head: &mut Vec<u8>,
+    tail: &mut VecDeque<u8>,
+    total_bytes: &mut u64,
+    omitted_bytes: &mut u64,
+    bytes: &[u8],
+    limit: usize,
+) {
+    let head_limit = limit.div_ceil(2);
+    let tail_limit = limit.saturating_sub(head_limit);
+    *total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+    for &byte in bytes {
+        if head.len() < head_limit {
+            head.push(byte);
+        } else if tail_limit > 0 {
+            if tail.len() == tail_limit {
+                tail.pop_front();
+            }
+            tail.push_back(byte);
+        }
+    }
+    *omitted_bytes = total_bytes.saturating_sub((head.len() + tail.len()) as u64);
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_capture_bulk_push_matches_the_per_byte_oracle() {
+        // The bulk implementation only skips work that the per-byte loop would
+        // have discarded on the next byte, so the retained head, tail, total and
+        // omitted counters must be identical for every chunking — including the
+        // cases that straddle the head/tail boundary, the tail filling up
+        // mid-slice, and a `limit` of zero or one.
+        for limit in [0usize, 1, 2, 3, 7, 16, 64] {
+            let mut fast = BoundedCapture {
+                head: Vec::new(),
+                tail: VecDeque::new(),
+                total_bytes: 0,
+                omitted_bytes: 0,
+            };
+            let mut slow = BoundedCapture {
+                head: Vec::new(),
+                tail: VecDeque::new(),
+                total_bytes: 0,
+                omitted_bytes: 0,
+            };
+            let mut sequence: Vec<u8> = Vec::new();
+            // Chunk sizes deliberately cross every internal threshold.
+            for chunk in [1usize, 3, 5, 8, 13, 21, 64] {
+                sequence.clear();
+                for index in 0..chunk * 5 {
+                    sequence.push((index % 251) as u8);
+                }
+                fast.push(&sequence, limit);
+                push_per_byte(
+                    &mut slow.head,
+                    &mut slow.tail,
+                    &mut slow.total_bytes,
+                    &mut slow.omitted_bytes,
+                    &sequence,
+                    limit,
+                );
+                assert_eq!(
+                    fast.head, slow.head,
+                    "head diverged at limit={limit} chunk={chunk}"
+                );
+                assert_eq!(
+                    fast.tail, slow.tail,
+                    "tail diverged at limit={limit} chunk={chunk}"
+                );
+                assert_eq!(fast.total_bytes, slow.total_bytes);
+                assert_eq!(fast.omitted_bytes, slow.omitted_bytes);
+            }
+            // An empty push must be a no-op in both.
+            fast.push(&[], limit);
+            assert_eq!(fast.total_bytes, slow.total_bytes);
+        }
+    }
+
+    #[test]
+    fn bounded_capture_keeps_the_head_and_the_last_tail_bytes() {
+        let mut capture = BoundedCapture {
+            head: Vec::new(),
+            tail: VecDeque::new(),
+            total_bytes: 0,
+            omitted_bytes: 0,
+        };
+        // limit 8 => head 4, tail 4.
+        capture.push(b"abcdefghij", 8);
+        assert_eq!(capture.head, b"abcd");
+        assert_eq!(capture.tail.iter().copied().collect::<Vec<_>>(), b"ghij");
+        assert_eq!(capture.total_bytes, 10);
+        assert_eq!(capture.omitted_bytes, 2);
     }
 }
 
@@ -1372,10 +1502,14 @@ impl LocalProcessRunner {
             },
         };
         #[cfg(target_os = "linux")]
+        let mut resource_unobserved: Vec<eggwork_core::ResourceDimension> = Vec::new();
+        #[cfg(target_os = "linux")]
         let mut resource_limits_exceeded = if matches!(&termination, TerminationReason::Exited)
             && let Some(session) = sandbox_session.take()
         {
-            session.resource_limits_exceeded().await
+            let (exceeded, unobserved) = session.resource_status().await;
+            resource_unobserved = unobserved;
+            exceeded
         } else {
             Vec::new()
         };
@@ -1389,6 +1523,28 @@ impl LocalProcessRunner {
         }
         #[cfg(not(target_os = "linux"))]
         let resource_limits_exceeded: Vec<eggwork_core::ResourceDimension> = Vec::new();
+        #[cfg(target_os = "linux")]
+        // A dimension the caller requested and the backend installed, but whose
+        // post-mortem counter the helper could not open, is not evidence that
+        // the limit held. Record `NotApplied` rather than letting it fall
+        // through as `Applied`.
+        if matches!(setup.resources, ResourceSetupOutcome::Applied { .. }) {
+            let requested = &request.resources;
+            let unobserved = if matches!(requested.memory_bytes, Requirement::NotRequested) {
+                false
+            } else {
+                resource_unobserved.contains(&eggwork_core::ResourceDimension::Memory)
+            } || if matches!(requested.pids, Requirement::NotRequested) {
+                false
+            } else {
+                resource_unobserved.contains(&eggwork_core::ResourceDimension::Pids)
+            };
+            if unobserved {
+                setup.resources = ResourceSetupOutcome::NotApplied {
+                    reason: "installed resource limits could not be observed after exit".into(),
+                };
+            }
+        }
         #[cfg(target_os = "linux")]
         let resource_cleanup_warning = if let Some(unit) = resource_unit.as_deref() {
             match SystemdCgroupBackend::discover() {
@@ -1627,22 +1783,42 @@ struct SandboxSession {
 
 #[cfg(target_os = "linux")]
 impl SandboxSession {
-    async fn resource_limits_exceeded(mut self) -> Vec<eggwork_core::ResourceDimension> {
+    /// Bit 2 of the helper's post-mortem status byte: a counter the caller asked
+    /// about could not be opened, so the helper cannot say the limit held.
+    const STATUS_UNOBSERVED: u8 = 1 << 2;
+
+    /// Returns the dimensions the helper observed being exceeded, and the
+    /// dimensions it could not observe at all. The second list must not be
+    /// reported as "not exceeded": the limit was real, we just could not watch
+    /// it, so the caller records `NotApplied` instead of `Applied`.
+    async fn resource_status(
+        mut self,
+    ) -> (
+        Vec<eggwork_core::ResourceDimension>,
+        Vec<eggwork_core::ResourceDimension>,
+    ) {
         let mut status = [0u8; 1];
         if !matches!(
             tokio::time::timeout(Duration::from_secs(2), self.stream.read_exact(&mut status)).await,
             Ok(Ok(_))
         ) {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let mut exceeded = Vec::new();
+        let mut unobserved = Vec::new();
         if status[0] & 1 != 0 {
             exceeded.push(eggwork_core::ResourceDimension::Memory);
         }
         if status[0] & 2 != 0 {
             exceeded.push(eggwork_core::ResourceDimension::Pids);
         }
-        exceeded
+        if status[0] & Self::STATUS_UNOBSERVED != 0 {
+            unobserved.extend([
+                eggwork_core::ResourceDimension::Memory,
+                eggwork_core::ResourceDimension::Pids,
+            ]);
+        }
+        (exceeded, unobserved)
     }
 }
 
@@ -2258,8 +2434,31 @@ mod tests {
             .trim()
             .parse::<i32>()
             .unwrap();
-        let proc_state = std::fs::read_to_string(format!("/proc/{pid}/stat"));
-        assert!(proc_state.is_err() || proc_state.unwrap().split_whitespace().nth(2) == Some("Z"));
+        assert!(descendant_converged(pid).await);
+    }
+
+    /// Wait for a descendant to reach a terminal outcome: reaped (`/proc` entry
+    /// gone) or a zombie awaiting reaping by its new parent.
+    ///
+    /// The runner escalates to `SIGKILL` on the process group and returns as
+    /// soon as the *leader* has been reaped. Kernel delivery of that `SIGKILL`
+    /// to an already-orphaned descendant is asynchronous, so a single immediate
+    /// read races it and can observe `S` or `R` on a loaded machine. The
+    /// property under test is convergence, not one instantaneous sample.
+    #[cfg(target_os = "linux")]
+    async fn descendant_converged(pid: i32) -> bool {
+        for _ in 0..200 {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => return true,
+                Ok(stat) => {
+                    if stat.split_whitespace().nth(2) == Some("Z") {
+                        return true;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
     }
 
     #[cfg(target_os = "linux")]

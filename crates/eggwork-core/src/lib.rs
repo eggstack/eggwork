@@ -20,6 +20,15 @@ pub const MAX_METADATA_VALUE_BYTES: usize = 2048;
 pub const MAX_OUTPUTS: usize = 128;
 pub const MAX_STDIN_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EVENT_CHUNK_BYTES: usize = 64 * 1024;
+/// Ceiling on the JSON encoding of a single [`ExecutionEvent`].
+///
+/// `Stdout`/`Stderr` carry `Vec<u8>` without a compact wire representation, so
+/// `MAX_EVENT_CHUNK_BYTES` of payload serializes as a JSON number array at up
+/// to four characters per byte plus the event envelope. A node refuses to
+/// persist a larger event and a conforming client must still be able to read
+/// one back, so both sides derive their bound from this constant rather than
+/// from the payload cap.
+pub const MAX_EVENT_BYTES: usize = 512 * 1024;
 pub const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const MAX_CAPABILITIES: usize = 256;

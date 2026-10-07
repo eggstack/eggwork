@@ -308,16 +308,17 @@ pub async fn capture_declared(
     manifest
         .validate()
         .map_err(|_| ArtifactError::InvalidTree)?;
-    for record in &records {
-        // Establish the blob reference before metadata becomes visible. A crash
-        // here can retain extra bytes until expiry, never lose live data.
-        blobs.retain(
-            "artifact",
-            record.artifact_id.as_str(),
-            std::slice::from_ref(&record.digest),
-            Some(expires_unix_ms),
-        )?;
-    }
+    // Establish the blob references before metadata becomes visible. A crash here
+    // can retain extra bytes until expiry, never lose live data. One transaction
+    // covers every record rather than one fsync-ing commit per record.
+    blobs.retain_per_owner(
+        "artifact",
+        &records
+            .iter()
+            .map(|record| (record.artifact_id.as_str(), record.digest.clone()))
+            .collect::<Vec<_>>(),
+        Some(expires_unix_ms),
+    )?;
     store.insert_many(&records, principal)?;
     Ok(discovered_count as u32)
 }
@@ -521,13 +522,24 @@ fn visit_output(
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             let child_path = entry.path();
-            let child_metadata = fs::symlink_metadata(&child_path)?;
-            let relative = child_path
+            // An unrepresentable child must not cost the whole capture. A
+            // non-UTF-8 name cannot be expressed as a `RelativePath` at all
+            // (`validate_portable_workspace_path` requires ASCII), so there is
+            // nothing to record — exactly like the `UnsupportedType` arm below,
+            // which already skips FIFOs and symlinks. A per-entry `symlink_metadata`
+            // failure is the same story: one unreadable entry is a gap in the
+            // tree, not a reason to drop every declared artifact.
+            let Ok(child_metadata) = fs::symlink_metadata(&child_path) else {
+                continue;
+            };
+            let Some(relative) = child_path
                 .strip_prefix(root)
-                .map_err(|_| ArtifactError::InvalidTree)?
-                .to_str()
-                .ok_or(ArtifactError::InvalidTree)?
-                .replace(std::path::MAIN_SEPARATOR, "/");
+                .ok()
+                .and_then(|relative| relative.to_str())
+                .map(|relative| relative.replace(std::path::MAIN_SEPARATOR, "/"))
+            else {
+                continue;
+            };
             visit_output(
                 root,
                 &child_path,
@@ -877,6 +889,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.removed_blobs, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrepresentable_names_are_skipped_without_losing_the_whole_capture() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::open(temp.path().join("blobs"), 1024 * 1024).unwrap();
+        let artifacts = ArtifactStore::open(temp.path().join("artifacts.sqlite")).unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(workspace.join("out/nested")).unwrap();
+        fs::write(workspace.join("out/nested/result.txt"), b"payload").unwrap();
+        // A name that is not valid UTF-8. It cannot be expressed as a
+        // `RelativePath` at all, so it has nothing to be recorded as — but it
+        // must not take the valid files down with it.
+        fs::write(
+            workspace
+                .join("out")
+                .join(std::ffi::OsStr::from_bytes(b"latin1-\xFF")),
+            b"unrepresentable",
+        )
+        .unwrap();
+        let outputs = vec![DeclaredOutput {
+            path: RelativePath::new("out".to_owned()).unwrap(),
+            required: true,
+        }];
+        let execution = ExecutionId::new("artifact-mixed-names").unwrap();
+        let generation = ExecutionGeneration::new(1).unwrap();
+        let principal = PrincipalId::new("controller-a").unwrap();
+        let captured = capture_declared(
+            &artifacts,
+            &blobs,
+            &workspace,
+            &outputs,
+            &execution,
+            generation,
+            &principal,
+            now_unix_ms() + 60_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(captured, 1);
+        let records = artifacts.list(&execution, generation, &principal).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].path.as_str(),
+            "out/nested/result.txt",
+            "the representable file must survive"
+        );
     }
 
     #[cfg(unix)]
