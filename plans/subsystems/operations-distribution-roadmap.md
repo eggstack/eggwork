@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M001-M003, M002a and M004a closed, M004 conditionally closed; M007 ready
+Status: active roadmap; M001-M003, M002a, M004a and M004b closed, M004 conditionally closed; M007 ready
 
 Canonical authority:
 
@@ -245,6 +245,64 @@ Closure summary:
   load-dependent kernel window around executing a just-written executable, reproducible
   outside Eggwork's spawn path. The finding is re-dispositioned there rather than
   closed by assertion.
+  **Superseded by M004b:** that characterisation was accurate about what was observed
+  and wrong about what it implied. The condition is per-inode and persistent, not a
+  microsecond-wide timing window, and it is eliminated by committing the publication
+  before execution. See `plans/closure/operations-distribution/004b-status.md`.
+
+### M004b — Staged helper publication durability corrective
+
+Class: corrective / test-infrastructure invariant
+
+Status: **closed** — `plans/closure/operations-distribution/004b-status.md`
+
+Implementation plan:
+
+- `plans/implementation/operations-distribution/004b-staged-helper-publication-durability-corrective.md`
+
+Objective:
+
+Eliminate the intermittent `ETXTBSY` refusal that M004a characterised but left open,
+so that a Linux suite which stages a helper and immediately executes it cannot go red
+at random. M004a is closed and preserved; this is the corrective that closes the
+residual it recorded.
+
+Trigger:
+
+CI run `39306109740` failed the Landlock suite on the optional-Gregg telemetry
+branch with `ExecutableFileBusy` at
+`crates/eggwork-sandbox-helper/tests/landlock_runner.rs:471`. A characterisation that
+leaves the suite able to go red is not a disposition.
+
+Closure summary:
+
+- The staged helper is no longer written. The shared staging path
+  (`crates/eggwork-sandbox-helper/tests/support/helper_fixture.rs`) links the
+  Cargo-built helper into the fixture's private `0700` directory instead of
+  copying it, so the file the fixture executes carries no write reference and
+  the kernel has no reason to refuse it. A file that is never written is
+  executable every time: 0 refusals in 1 920 attempts, against 35.78% for the
+  M004a copy-and-rename sequence.
+- The copy path that remains is committed before publication, in the
+  repository's own write-then-`sync_all`-then-rename-then-sync-parent order,
+  and the commit follows the mode change — because the mode change is itself a
+  write to the inode.
+- The refusal is per-inode and persistent, not a timing window: 100 immediate
+  retries of the same path all failed, so a retry or a sleep would not have
+  cleared it.
+- `set_mode` and `replace_with_junk` publish a replacement instead of mutating
+  the inode, so no fixture mutates an inode it shares with another fixture or
+  with the Cargo-built helper. That is a stronger form of the M004a isolation
+  invariant than the one M004a recorded, and it is what supersedes M004a §10's
+  rejection of hard links.
+- Two regression tests, both verified to fail when the corresponding fix is
+  removed (6 of 32 stagings refused, and 2 of 32).
+- The suite is no slower — 3.6 s, unchanged — because the per-fixture 8 MB
+  copy is gone.
+- No retry, no sleep, no `O_TMPFILE`+`linkat`, no trust-rule change, no
+  production change.
+- The M004a closure record is preserved as written; an additive addendum marks
+  the residual as eliminated and points at this record.
 
 ### M007 — Windows service host
 

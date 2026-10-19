@@ -37,6 +37,11 @@ Follow-up accepted ADR: `plans/adrs/ADR-0006-optional-gregg-host-telemetry.md` (
 
 Latest Eggwork implementation/closure head reviewed for this planning batch:
 
+- Operations M004b — the staged-helper publication durability corrective: the
+  residual `ETXTBSY` refusal that M004a characterised is eliminated by making
+  the staged helper a link that is never written, with two regression tests
+  proven non-vacuous;
+
 - `5ccb1e6` / `2190818` — optional Gregg host telemetry M002 and M001 closed: the default-off
   loopback adapter, the frozen `NodeTelemetry` contract, the narrow `telemetry` read grant, and the
   fixed-target client method;
@@ -83,7 +88,7 @@ The repository is no longer planning-only.
 | Control-plane protocol | closed | M001-M003 complete | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | closed | M001-M004 closed, including reusable manifest CAS + derived materialization (`plans/closure/workspace-artifact-transport/004-status.md`) | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | closed | M001-M004 plus remote-admission corrective C001 are closed (`plans/closure/security-isolation-resource/004-status.md`); macOS/Windows hosted qualification remains future Operations M004 work, not a Security defect | `plans/subsystems/security-isolation-resource-roadmap.md`, `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md` |
-| Operations / distribution | M004 conditionally closed; M004a closed; M007 ready | Foundation M004's Windows runner is implemented/native-qualified; M004 still needs immutable installed-release evidence and Windows SCM service qualification. M004a closed the fixture-ownership defect. M007 is the only substantive Phase-6 implementation capability still ready. | `plans/subsystems/operations-distribution-roadmap.md`, `plans/closure/operations-distribution/004-status.md`, `plans/closure/operations-distribution/004a-status.md` |
+| Operations / distribution | M004 conditionally closed; M004a and M004b closed; M007 ready | Foundation M004's Windows runner is implemented/native-qualified; M004 still needs immutable installed-release evidence and Windows SCM service qualification. M004a closed the fixture-ownership defect; M004b closed the residual `ETXTBSY` refusal it left open, by making the staged helper a link that is never written. M007 is the only substantive Phase-6 implementation capability still ready. | `plans/subsystems/operations-distribution-roadmap.md`, `plans/closure/operations-distribution/004-status.md`, `plans/closure/operations-distribution/004a-status.md`, `plans/closure/operations-distribution/004b-status.md` |
 | CodeGG integration | Eggwork reference closed; downstream M001+C001+M002+M002a+M003 closed | CodeGG required-Landlock live qualification closed at `f5f8d96d`; downstream M003 closed at CodeGG `d51afe46` (implementation `1ce377ce`, hosted `36745285774`) against this repository's Workspace M004 contract; only downstream M004 remains, deferred. | `plans/subsystems/codegg-integration-roadmap.md` |
 
 ## Dependency-ready implementation plans
@@ -131,7 +136,8 @@ M007 is the only dependency-ready Eggwork implementation handoff. The optional G
 |---|---|---|
 | Optional Gregg host telemetry M002 authenticated node API/client | **closed** | `plans/closure/optional-gregg-host-telemetry/002-status.md` (implementation `5ccb1e6`). The mTLS-authorized read-only projection is implemented, the contract is frozen, and the default-off no-Gregg execution is proven by an installed-release receipt. |
 | Foundation M004 Windows finite-process backend | **conditionally closed** | Implemented at `f41a8ae`; tree lifecycle qualified on hosted `windows-latest` (`plans/closure/foundation-execution-core/004-status.md`). Remaining evidence is the installed-release receipt, which needs a release containing M004 — a release-lineage action reserved for the maintainer. |
-| Operations M004a qualification helper fixture isolation | **closed** | `plans/closure/operations-distribution/004a-status.md`. The fixture-isolation invariant is implemented and proven; the recorded `ETXTBSY` finding is re-dispositioned there as a host-level kernel window with measurements, not as a fixture defect. |
+| Operations M004a qualification helper fixture isolation | **closed** | `plans/closure/operations-distribution/004a-status.md`. The fixture-isolation invariant is implemented and proven; the recorded `ETXTBSY` finding is re-dispositioned there as a host-level kernel window with measurements, not as a fixture defect. That residual was subsequently eliminated by M004b — see the addendum appended to the M004a record. |
+| Operations M004b staged helper publication durability corrective | **closed** | `plans/closure/operations-distribution/004b-status.md`. The residual `ETXTBSY` refusal M004a characterised is eliminated by construction: the staged helper is linked rather than copied, so the file the fixture executes is never written, and the copy path that remains is committed before publication. Two regression tests, both verified to fail when the corresponding fix is removed. |
 | Operations M004 operational/release qualification | **conditionally closed** | `plans/closure/operations-distribution/004-status.md`. Foundation M004 has now implemented/native-qualified Windows child execution, but immutable installed-release evidence still needs a new candidate containing it. Windows SCM service hosting remains the substantive implementation gap under M007; public publication/bootstrap remains a maintainer action. |
 | Operations M005 reverse-connect relay | deferred (not unblocked) | M004 neither implements nor claims a remote connect/accept path, so it does not supply the interface M005 relies on. No immediate product need; stable identity/lease semantics already exist. |
 | Operations M006 PTY extension | deferred (not unblocked) | PTY capability streams are out of M004 scope. Requires a separate interactive ownership/attach design. |
@@ -169,6 +175,7 @@ Operations M003 [CLOSED] ---------------------+--> Operations M004 [CONDITIONALL
                                                                 |
 Foundation M004 Windows Job Object runner [CONDITIONALLY CLOSED] <-+--> Windows child execution (release receipt outstanding)
 Operations M004a fixture isolation [CLOSED] <----------------------+--> deterministic qualification invariant
+Operations M004b publication durability [CLOSED] <--------------------+--> executable staged helper
 Operations M007 Windows service host [READY] <--------------------+--> Windows service management
 Operations release publication  [HUMAN ACTION: §14]       <----+--> public bootstrap evidence
 

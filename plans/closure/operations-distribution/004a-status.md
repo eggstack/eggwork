@@ -241,3 +241,35 @@ private copy and spawning it) rather than by a committed test, because a test
 that needs a loaded host to fail is not a test. Its two decisive measurements —
 `same_path_staged_by` and the immediate `write(true).open` probe — are the ones
 worth rerunning if this is ever revisited.
+## 13. Addendum, 2026-10-19 — the residual was subsequently eliminated
+
+This section is an addition. Nothing above it is changed: the findings, the
+evidence, and the verdicts in §1–§12 stand as they were written on 2026-10-05,
+and they are what the corrective was reasoned from.
+
+The residual `ETXTBSY` window characterised in §5 and dispositioned in §11 was
+later eliminated, after it failed CI run `39306109740` on the optional-Gregg
+host-telemetry branch. The elimination and its evidence are recorded in
+`plans/closure/operations-distribution/004b-status.md`
+(`plans/implementation/operations-distribution/004b-staged-helper-publication-durability-corrective.md`).
+
+Two statements above should be read with that record in hand:
+
+- **§11's "next step" is superseded.** It proposed `O_TMPFILE`+`linkat`
+  publication for the case where the residual "needs to be eliminated rather
+  than characterised". M004b eliminated it by a different route: the staged
+  helper is linked rather than copied, so the file the fixture executes is
+  never written, and the copy path that remains is committed before it is
+  published. No `unsafe` and no new dependency were needed.
+- **§10's rejection of hard links is superseded.** Its stated reason — that
+  `chmod` on one fixture's copy would change the mode every other fixture
+  sees — no longer applies, because a mode change now publishes a replacement
+  instead of mutating the inode. M004b §5 states the reasoning in full. The
+  isolation invariant this milestone established still holds, and in a
+  stronger form: no fixture mutates an inode it shares with another fixture
+  or with the Cargo-built helper.
+
+§5's measurements were sound and remain the measurements. What they did not
+settle — and what M004b measured — is that the condition is a property of the
+inode rather than a microsecond-wide timing window: a hundred immediate
+retries of the same path all failed.
