@@ -2981,9 +2981,28 @@ mod tests {
         let source = locate_helper_binary()?;
         let helper_dir = tempfile::tempdir().ok()?;
         let helper = helper_dir.path().join("eggwork-sandbox-helper");
-        fs::copy(&source, &helper).ok()?;
         fs::set_permissions(helper_dir.path(), fs::Permissions::from_mode(0o700)).ok()?;
-        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).ok()?;
+        // The helper is executed immediately afterwards, and Linux refuses to
+        // execute a file whose inode still carries a write reference
+        // (`ETXTBSY`). A link never writes the file it will execute, so the
+        // refusal cannot arise; the inode was last written when the linker
+        // produced the binary. A copy has to be committed instead, and that
+        // commit comes after the mode change, which is itself a write to the
+        // inode. Same reasoning, same barrier, as the shared fixture staging
+        // in `eggwork-sandbox-helper`'s test support.
+        let linked = fs::metadata(&source)
+            .map(|metadata| {
+                let mode = metadata.permissions().mode();
+                mode & 0o111 != 0 && mode & 0o022 == 0
+            })
+            .unwrap_or(false)
+            && fs::hard_link(&source, &helper).is_ok();
+        if !linked {
+            fs::copy(&source, &helper).ok()?;
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).ok()?;
+            fs::File::open(&helper).ok()?.sync_all().ok()?;
+            fs::File::open(helper_dir.path()).ok()?.sync_all().ok()?;
+        }
         // Leak the directory so the helper keeps living for the duration of the
         // test; trust checks happen once at capability probe time.
         let leaked: &'static TempDir = Box::leak(Box::new(helper_dir));

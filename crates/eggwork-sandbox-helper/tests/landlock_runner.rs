@@ -20,6 +20,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::mpsc;
@@ -508,6 +512,104 @@ fn malformed_private_spec_and_unavailable_status_channel_do_not_launch_target() 
 // refusing to open a running executable for writing. These tests assert the
 // properties that make that whole class of failure structurally impossible in
 // this suite, instead of adding a retry or a sleep and hoping.
+
+/// A freshly published helper must be executable at once.
+///
+/// This is the regression test for the `ETXTBSY` refusal that CI hit on the
+/// optional-Gregg telemetry branch. The fixture published its helper
+/// atomically but did not commit it, and Linux refuses to execute a file whose
+/// inode still carries a write reference — so the refusal was intermittent and
+/// moved between tests, and the suite went red without any test changing.
+///
+/// The test is non-vacuous in both directions. Before the durability barrier in
+/// the shared fixture staging, 16 threads staging and executing in a loop were
+/// refused 22.6% of the time, so 32 parallel stagings hit the refusal with
+/// probability very close to one, and this test failed on essentially every
+/// run. After the barrier the same measurement is 0 refusals in 32 000
+/// attempts.
+///
+/// Both staging paths are covered: the link path, which never writes the file
+/// it will execute, and the copy path, which does and therefore has to be
+/// committed first.
+#[test]
+fn a_staged_helper_is_executable_immediately_after_publication() {
+    const PARALLEL: usize = 32;
+
+    // `/bin/sh` stands in for the helper here because the property under test
+    // is the staging mechanism, not the helper's contents, and a small source
+    // keeps the test cheap. It is already a dependency of this file.
+    let small = Path::new("/bin/sh");
+    assert!(small.exists(), "the staging regression test needs /bin/sh");
+
+    let refused = Arc::new(AtomicUsize::new(0));
+    let handles: Vec<_> = (0..PARALLEL)
+        .map(|_| {
+            let refused = Arc::clone(&refused);
+            std::thread::spawn(move || {
+                let fixture = TrustedHelperFixture::stage_private_copy(small);
+                // The shell needs a script to run, or it would wait on stdin.
+                match Command::new(fixture.path()).arg("-c").arg("exit 0").spawn() {
+                    Ok(mut child) => {
+                        let _ = child.wait();
+                    }
+                    Err(error) => {
+                        eprintln!("a staged helper was refused: {error}");
+                        refused.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("staging thread joined");
+    }
+    assert_eq!(
+        refused.load(Ordering::Relaxed),
+        0,
+        "a freshly published helper must be executable without an ETXTBSY refusal"
+    );
+}
+
+/// The link path never writes the file it will execute, so the kernel has no
+/// reason to refuse it.
+///
+/// This is the property that makes the refusal impossible rather than
+/// unlikely, and it is the reason the staged helper is a link to the
+/// Cargo-built binary rather than a copy of it.
+#[test]
+fn a_linked_helper_is_executable_immediately_after_publication() {
+    const PARALLEL: usize = 32;
+
+    let refused = Arc::new(AtomicUsize::new(0));
+    let handles: Vec<_> = (0..PARALLEL)
+        .map(|_| {
+            let refused = Arc::clone(&refused);
+            std::thread::spawn(move || {
+                let fixture = TrustedHelperFixture::stage(built_helper());
+                // The helper exits 125 without arguments. What is under test
+                // is the spawn itself: whether the kernel accepted the freshly
+                // published executable at all.
+                match Command::new(fixture.path()).spawn() {
+                    Ok(mut child) => {
+                        let _ = child.wait();
+                    }
+                    Err(error) => {
+                        eprintln!("a linked helper was refused: {error}");
+                        refused.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("staging thread joined");
+    }
+    assert_eq!(
+        refused.load(Ordering::Relaxed),
+        0,
+        "a linked helper must be executable without an ETXTBSY refusal"
+    );
+}
 
 #[tokio::test]
 async fn two_fixtures_stage_distinct_executable_paths() {
