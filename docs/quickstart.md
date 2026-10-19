@@ -125,6 +125,13 @@ The field shape is also available as a committed example:
 [`examples/eggworkd.example.json`](../examples/eggworkd.example.json). Replace
 its paths and fingerprint with your own.
 
+Host telemetry is optional and **off unless you ask for it**. The config above
+has no `host_telemetry` block, so the node creates no provider, starts no
+polling task, and reports no host measurements. See
+[operations.md](operations.md#host-telemetry-optional-off-by-default) if you
+want to point the node at a telemetry provider bound to the loopback
+interface.
+
 ## 5. Set permissions (required)
 
 Eggwork refuses to load a config or certificate that others could tamper with,

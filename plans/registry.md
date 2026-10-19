@@ -17,6 +17,8 @@ Founding ADRs:
 - `plans/adrs/ADR-0004-content-addressed-workspaces-and-artifacts.md`
 - `plans/adrs/ADR-0005-runner-service-separation-and-local-admission.md`
 
+Follow-up accepted ADR: `plans/adrs/ADR-0006-optional-gregg-host-telemetry.md` (Eggwork reads local Gregg optionally; Gregg unchanged).
+
 ## Status vocabulary
 
 - **proposed** — plan exists but is not approved for execution.
@@ -34,6 +36,16 @@ Founding ADRs:
 ## Current Eggwork implementation baseline
 
 Latest Eggwork implementation/closure head reviewed for this planning batch:
+
+- Operations M004b — the staged-helper write-access corrective: the residual
+  `ETXTBSY` refusal that M004a characterised is eliminated by making the
+  staged helper a link that is never written, with no copy path left to fail;
+  the mechanism is confirmed against the kernel's own `i_writecount`
+  accounting, and two regression tests are proven non-vacuous;
+
+- `5ccb1e6` / `2190818` — optional Gregg host telemetry M002 and M001 closed: the default-off
+  loopback adapter, the frozen `NodeTelemetry` contract, the narrow `telemetry` read grant, and the
+  fixed-target client method;
 
 - `d4db4e72` — merged Foundation M004 + Operations M004a line: Windows Job Object process-tree execution is native-qualified, helper fixture isolation is closed, and current CI is green;
 - `d992ca5` — architecture deep dives: module overview plus systematic
@@ -72,16 +84,17 @@ The repository is no longer planning-only.
 
 | Workstream | Status | Current work | Authority |
 |---|---|---|---|
+| Optional Gregg host telemetry | **closed; M001 and M002 both closed** | M001 closed the default-off loopback Gregg adapter, normalized cache and single polling owner (`plans/closure/optional-gregg-host-telemetry/001-status.md`, implementation `ac55985`); M002 closed the authorized node telemetry API/client behind a narrow `telemetry` grant (`plans/closure/optional-gregg-host-telemetry/002-status.md`, implementation `5ccb1e6`). The frozen contract is `eggwork_core::NodeTelemetry` schema version 1. No Gregg changes, no Eggwork scheduling, no capability feature added. The CodeGG worker-telemetry consumer is unblocked. | `plans/subsystems/optional-gregg-host-telemetry-roadmap.md`, `plans/adrs/ADR-0006-optional-gregg-host-telemetry.md` |
 | Foundation / execution core | M001-M003 closed; M004 conditionally closed; no ready implementation work | Windows execution is implemented: M004 replaced the `UnsupportedPlatform` gate with a Job Object process-tree backend and qualified the tree lifecycle on hosted `windows-latest`. What remains is the installed-release receipt, which needs a release containing M004 | `plans/subsystems/foundation-execution-core-roadmap.md`, `plans/closure/foundation-execution-core/004-status.md`, `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md` |
 | Control-plane protocol | closed | M001-M003 complete | `plans/subsystems/control-plane-protocol-roadmap.md` |
 | Workspace / artifacts | closed | M001-M004 closed, including reusable manifest CAS + derived materialization (`plans/closure/workspace-artifact-transport/004-status.md`) | `plans/subsystems/workspace-artifact-transport-roadmap.md` |
 | Security / isolation / resources | closed | M001-M004 plus remote-admission corrective C001 are closed (`plans/closure/security-isolation-resource/004-status.md`); macOS/Windows hosted qualification remains future Operations M004 work, not a Security defect | `plans/subsystems/security-isolation-resource-roadmap.md`, `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md` |
-| Operations / distribution | M004 conditionally closed; M004a closed; M007 ready | Foundation M004's Windows runner is implemented/native-qualified; M004 still needs immutable installed-release evidence and Windows SCM service qualification. M004a closed the fixture-ownership defect. M007 is the only substantive Phase-6 implementation capability still ready. | `plans/subsystems/operations-distribution-roadmap.md`, `plans/closure/operations-distribution/004-status.md`, `plans/closure/operations-distribution/004a-status.md` |
+| Operations / distribution | M004 conditionally closed; M004a and M004b closed; M007 ready | Foundation M004's Windows runner is implemented/native-qualified; M004 still needs immutable installed-release evidence and Windows SCM service qualification. M004a closed the fixture-ownership defect; M004b closed the residual `ETXTBSY` refusal it left open, by staging the helper as a link that is never written — no copy path, no barrier, and the mechanism confirmed against the kernel's own write-access accounting. M007 is the only substantive Phase-6 implementation capability still ready. | `plans/subsystems/operations-distribution-roadmap.md`, `plans/closure/operations-distribution/004-status.md`, `plans/closure/operations-distribution/004a-status.md`, `plans/closure/operations-distribution/004b-status.md` |
 | CodeGG integration | Eggwork reference closed; downstream M001+C001+M002+M002a+M003 closed | CodeGG required-Landlock live qualification closed at `f5f8d96d`; downstream M003 closed at CodeGG `d51afe46` (implementation `1ce377ce`, hosted `36745285774`) against this repository's Workspace M004 contract; only downstream M004 remains, deferred. | `plans/subsystems/codegg-integration-roadmap.md` |
 
 ## Dependency-ready implementation plans
 
-M007 is the current ready Eggwork implementation handoff. Closed downstream CodeGG rows are retained only for dependency history.
+M007 is the only dependency-ready Eggwork implementation handoff. The optional Gregg telemetry line is closed and remains dependency history. Closed downstream CodeGG rows remain dependency history.
 
 | Workstream | Milestone | Status | Implementation plan | Handoff note |
 |---|---|---|---|---|
@@ -109,6 +122,8 @@ M007 is the current ready Eggwork implementation handoff. Closed downstream Code
 | Security | M003 resource enforcement | qualified/closed | `plans/closure/security-isolation-resource/003-status.md` |
 | Security | M004 adversarial + cross-platform closure | closed | `plans/closure/security-isolation-resource/004-status.md` (implementation `283f3ea`, incl. null-device write hardening fix); platform claims limited to hosted Linux with macOS/Windows fail-closed by construction |
 | Security corrective | C001 remote enforcement admission + capability truthfulness | closed | `plans/closure/security-isolation-resource-remote-admission-corrective/001-status.md` |
+| Optional Gregg telemetry | M001 default-off loopback adapter/cache | closed | `plans/closure/optional-gregg-host-telemetry/001-status.md` (implementation `ac55985`) |
+| Optional Gregg telemetry | M002 authenticated node telemetry API/client | closed | `plans/closure/optional-gregg-host-telemetry/002-status.md` (implementation `5ccb1e6`); frozen contract `eggwork_core::NodeTelemetry` schema version 1, narrow `telemetry` grant, `NodeClient::telemetry`/`telemetry_for` |
 | Operations | M001 node operations | closed | `plans/closure/operations-distribution/001-status.md` |
 | Operations | M002 Eggup deployment/service integration | closed (resumed) | `plans/closure/operations-distribution/002-resumed-status.md` (implementation `d5722d9`, published `eggup-core`/`eggup-service` 0.1.1); historical pre-M007 blocker preserved immutably at `plans/closure/operations-distribution/002-status.md` |
 | Operations | M003 Eggpack producer packaging integration | closed | `plans/closure/operations-distribution/003-status.md` (implementation `012383b` plus hosted-run portability correctives `4b95443`/`8827ed4`; `release/eggpack/` producer configuration, generated `.github/workflows/release.yml`, CI drift guard, static release/deployment parity suite). Hosted evidence: run `36787942079`, all 20 jobs green across the five required targets; draft `eggwork v0.1.0` (release id `400502116`, 17 assets) staged, nothing published, tag unmoved by the workflow. |
@@ -120,8 +135,10 @@ M007 is the current ready Eggwork implementation handoff. Closed downstream Code
 
 | Work | Status | Blocker / rationale |
 |---|---|---|
+| Optional Gregg host telemetry M002 authenticated node API/client | **closed** | `plans/closure/optional-gregg-host-telemetry/002-status.md` (implementation `5ccb1e6`). The mTLS-authorized read-only projection is implemented, the contract is frozen, and the default-off no-Gregg execution is proven by an installed-release receipt. |
 | Foundation M004 Windows finite-process backend | **conditionally closed** | Implemented at `f41a8ae`; tree lifecycle qualified on hosted `windows-latest` (`plans/closure/foundation-execution-core/004-status.md`). Remaining evidence is the installed-release receipt, which needs a release containing M004 — a release-lineage action reserved for the maintainer. |
-| Operations M004a qualification helper fixture isolation | **closed** | `plans/closure/operations-distribution/004a-status.md`. The fixture-isolation invariant is implemented and proven; the recorded `ETXTBSY` finding is re-dispositioned there as a host-level kernel window with measurements, not as a fixture defect. |
+| Operations M004a qualification helper fixture isolation | **closed** | `plans/closure/operations-distribution/004a-status.md`. The fixture-isolation invariant is implemented and proven; the recorded `ETXTBSY` finding is re-dispositioned there as a host-level kernel window with measurements, not as a fixture defect. That residual was subsequently eliminated by M004b — see the addendum appended to the M004a record. |
+| Operations M004b staged helper write-access corrective | **closed** | `plans/closure/operations-distribution/004b-status.md`. The residual `ETXTBSY` refusal M004a characterised is eliminated by construction: the staged helper is linked rather than copied, so the file the fixture executes is never written, and no copy path remains to fail. The mechanism is the inode's write access — `execve()` refuses an inode that is open for writing — read from the kernel rather than inferred, and the copy-and-commit barrier the first attempt proposed was itself refused 3 times in 32 stagings on CI. Two regression tests: one asserts the staged helper *is* the build output's inode, the other the one-time trust-mode normalisation. |
 | Operations M004 operational/release qualification | **conditionally closed** | `plans/closure/operations-distribution/004-status.md`. Foundation M004 has now implemented/native-qualified Windows child execution, but immutable installed-release evidence still needs a new candidate containing it. Windows SCM service hosting remains the substantive implementation gap under M007; public publication/bootstrap remains a maintainer action. |
 | Operations M005 reverse-connect relay | deferred (not unblocked) | M004 neither implements nor claims a remote connect/accept path, so it does not supply the interface M005 relies on. No immediate product need; stable identity/lease semantics already exist. |
 | Operations M006 PTY extension | deferred (not unblocked) | PTY capability streams are out of M004 scope. Requires a separate interactive ownership/attach design. |
@@ -159,8 +176,12 @@ Operations M003 [CLOSED] ---------------------+--> Operations M004 [CONDITIONALL
                                                                 |
 Foundation M004 Windows Job Object runner [CONDITIONALLY CLOSED] <-+--> Windows child execution (release receipt outstanding)
 Operations M004a fixture isolation [CLOSED] <----------------------+--> deterministic qualification invariant
+Operations M004b write-access staging [CLOSED] <--------------------+--> executable staged helper
 Operations M007 Windows service host [READY] <--------------------+--> Windows service management
 Operations release publication  [HUMAN ACTION: §14]       <----+--> public bootstrap evidence
+
+Optional Gregg M001 loopback adapter/cache [CLOSED] --> Optional Gregg M002 authenticated API/client [CLOSED]
+             --> CodeGG worker telemetry consumer [UNBLOCKED; separately registered]
 ```
 
 Operations M002 is not a dependency of CodeGG M001. The canonical long-term roadmap already defines CodeGG Phase 7 as depending on Eggwork Phases 0-5, not completion of Phase 6 packaging.
@@ -180,7 +201,7 @@ These are reviewed research baselines, not permanent dependency pins.
 | Eggup | published `v0.1.1` -> `881c95ff069d3d465a282cb6a495ba6fcb70cb6f`; current main reviewed `0f791324be406b9a07dd35c1c1121279bc38dcdb` | Eggwork remains pinned to registry `eggup-core`/`eggup-service` 0.1.1. That published service crate includes systemd/launchd/Windows SCM plus `commit_with_lifecycle`, whose `RecoveryRequired` contract suppresses automatic restart; newer main service work is not required for M002a/M004. |
 | Eggpack | current reviewed main `56ed7e747fd39e4d6a32a9f1fe3e09dd44355069`; Eggwork remains pinned to durable `32a0903936fcc283863e0bfb86151b13b4d75ce9` | producer authority; the pinned revision contains qualified M003e/f/g behavior and M003h reconciliation, and `eggpack ci check` is zero-drift. Windows byte determinism is product-owned and does not require an Eggpack change. Runtime Eggup-manifest consumer adoption remains separate. |
 | eggsact | `f1352101dab748066c788e65e21e1bf303cfe995` | prior-art evidence only: its product-owned MSVC `/BREPRO` + `/DEBUG:NONE` correction demonstrates the mechanism behind the same Windows mismatch; Eggwork must implement and qualify its own policy and does not depend on eggsact closure |
-| Gregg | `5b2c7e8c67616f872070e2acdcce90790f750fbf` | telemetry/protocol patterns only; not an execution control plane |
+| Gregg | `5b2c7e8c67616f872070e2acdcce90790f750fbf`; `gregg-protocol 1.0.15` published, reviewed 2026-10-19 | telemetry/protocol patterns only; not an execution control plane. M001 consumed the published `gregg-protocol` v2 types and its own `validate_payload_v2`; the published `v2.rs` is byte-identical to the reviewed working tree. No Gregg change was made. |
 
 Implementation agents MUST re-check current APIs at execution time.
 

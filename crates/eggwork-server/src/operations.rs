@@ -2,7 +2,8 @@
 
 use crate::{
     Authorizer, FingerprintPrincipalResolver, NodeConfig, NodeGcReport, NodePrincipal, NodeServer,
-    Operation, artifact::ArtifactStore, blob::BlobStore, workspace::WorkspaceManager,
+    Operation, artifact::ArtifactStore, blob::BlobStore, telemetry::HostTelemetryConfig,
+    workspace::WorkspaceManager,
 };
 use eggserve_core::tls::TlsServerConfig;
 use eggwork_core::{ExecutionGeneration, ExecutionId, NodeId, PrincipalId};
@@ -77,6 +78,39 @@ pub struct OperatorConfig {
     pub sandbox_helper: Option<PathBuf>,
     pub tls: TlsFiles,
     pub clients: Vec<ClientGrant>,
+    /// Optional host-telemetry provider.
+    ///
+    /// Absent means the node claims no host measurements at all: no provider
+    /// is created, no task is started, and no telemetry is served.
+    pub host_telemetry: Option<HostTelemetrySettings>,
+}
+
+/// Operator configuration for the optional host-telemetry provider.
+///
+/// The endpoint is a loopback address of a locally installed telemetry
+/// daemon. It is validated when the configuration is validated, not when the
+/// node starts, so a misconfigured endpoint is refused at load time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostTelemetrySettings {
+    /// Loopback status endpoint of the local provider.
+    pub endpoint: String,
+    /// Seconds between provider polls.
+    pub refresh_interval_seconds: u64,
+    /// Seconds a cached observation stays fresh.
+    pub freshness_seconds: u64,
+}
+
+impl HostTelemetrySettings {
+    /// Validate the settings into a provider configuration.
+    pub fn config(&self) -> Result<HostTelemetryConfig, OperationsError> {
+        HostTelemetryConfig::new(
+            &self.endpoint,
+            self.refresh_interval_seconds,
+            self.freshness_seconds,
+        )
+        .map_err(|_| OperationsError::Config)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +271,13 @@ impl OperatorConfig {
             }
         }
         let _ = self.tls_config()?;
+        if let Some(settings) = &self.host_telemetry {
+            // A refused endpoint must fail the whole configuration: a node
+            // that silently ignored a misconfigured provider would look like a
+            // node with no telemetry at all, and the operator would have no
+            // way to tell that from a node whose provider is down.
+            settings.config()?;
+        }
         for path in [&self.execution_root, &self.blob_root, &self.workspace_root] {
             let meta = fs::symlink_metadata(path).map_err(|_| OperationsError::Config)?;
             if !meta.is_dir() || meta.file_type().is_symlink() || !trusted_directory(&meta) {
@@ -328,6 +369,11 @@ impl OperatorConfig {
             max_active_executions: self.max_active_executions,
             lease_ttl: Duration::from_secs(self.lease_ttl_seconds),
             tls: self.tls_config()?,
+            host_telemetry: self
+                .host_telemetry
+                .as_ref()
+                .map(HostTelemetrySettings::config)
+                .transpose()?,
         })
     }
 
@@ -372,6 +418,7 @@ fn operation(name: &str) -> Option<Operation> {
     Some(match name {
         "capabilities" => Operation::Capabilities,
         "status" => Operation::Status,
+        "telemetry" => Operation::Telemetry,
         "execute" => Operation::Execute,
         "observe" => Operation::Observe,
         "cancel" => Operation::Cancel,
@@ -485,6 +532,23 @@ pub async fn doctor(config: &OperatorConfig) -> DoctorReport {
             "configuration or TLS material is invalid"
         }
         .into(),
+    });
+    // The provider is *not* contacted here. `doctor` is an offline diagnostic:
+    // a node whose telemetry provider happens to be down is still a healthy
+    // node, and a check that failed on the provider's availability would
+    // report the operator's provider outage as the node's fault. The endpoint
+    // is not echoed either, so a diagnostic line cannot carry a provider
+    // address into a log.
+    checks.push(DoctorCheck {
+        name: "host-telemetry",
+        ok: true,
+        detail: match config.host_telemetry.as_ref() {
+            None => "host telemetry is disabled; the node reports no host measurements".into(),
+            Some(settings) => format!(
+                "host telemetry is enabled against a validated loopback provider endpoint (refresh {}s, freshness {}s)",
+                settings.refresh_interval_seconds, settings.freshness_seconds
+            ),
+        },
     });
     // The helper is verified here and again inside `execution_capabilities`, which
     // calls `verify_trusted_helper` on the same path. That is deliberate: the
@@ -1158,6 +1222,7 @@ mod tests {
                 certificate_sha256: "ab".repeat(32),
                 operations: vec!["status".into()],
             }],
+            host_telemetry: None,
         }
     }
 
@@ -1168,6 +1233,168 @@ mod tests {
         assert!(!encoded.contains("super-secret-key.pem"));
         assert!(!encoded.contains(&"ab".repeat(32)));
         assert!(encoded.contains("[REDACTED]"));
+    }
+
+    /// A configuration document in the shape the loader accepts.
+    fn config_json(root: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "node_id": "node-test",
+            "bind": "127.0.0.1:0",
+            "execution_root": root.join("execution"),
+            "database_path": root.join("state/executions.sqlite"),
+            "blob_root": root.join("blobs"),
+            "blob_quota_bytes": 4096,
+            "workspace_root": root.join("workspaces"),
+            "workspace_quota_bytes": 4096,
+            "max_active_executions": 2,
+            "lease_ttl_seconds": 60,
+            "tls": {
+                "certificate_chain": root.join("server.pem"),
+                "private_key": root.join("server-key.pem"),
+                "client_ca": root.join("client-ca.pem")
+            },
+            "clients": [{
+                "principal_id": "controller",
+                "certificate_sha256": "ab".repeat(32),
+                "operations": ["status"]
+            }]
+        })
+    }
+
+    #[test]
+    fn a_configuration_without_host_telemetry_asks_for_none() {
+        let temp = TempDir::new().unwrap();
+        let parsed: OperatorConfig =
+            serde_json::from_value(config_json(temp.path())).expect("config");
+        assert!(parsed.host_telemetry.is_none());
+    }
+
+    #[test]
+    fn a_configuration_with_host_telemetry_is_read_and_validated() {
+        let temp = TempDir::new().unwrap();
+        let mut value = config_json(temp.path());
+        value["host_telemetry"] = serde_json::json!({
+            "endpoint": "http://127.0.0.1:18080/v2/status",
+            "refresh_interval_seconds": 15,
+            "freshness_seconds": 60
+        });
+        let parsed: OperatorConfig = serde_json::from_value(value).expect("config");
+        let settings = parsed.host_telemetry.expect("settings");
+        assert!(settings.config().is_ok());
+    }
+
+    #[test]
+    fn a_misconfigured_host_telemetry_endpoint_is_refused() {
+        for endpoint in [
+            "http://example.com:18080/v2/status",
+            "http://localhost:18080/v2/status",
+            "https://127.0.0.1:18080/v2/status",
+            "http://127.0.0.1:18080/",
+            "http://127.0.0.1:18080/v2/status?probe=1",
+        ] {
+            let settings = HostTelemetrySettings {
+                endpoint: endpoint.into(),
+                refresh_interval_seconds: 15,
+                freshness_seconds: 60,
+            };
+            assert!(
+                settings.config().is_err(),
+                "endpoint {endpoint} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_host_telemetry_field_is_refused() {
+        let temp = TempDir::new().unwrap();
+        let mut value = config_json(temp.path());
+        value["host_telemetry"] = serde_json::json!({
+            "endpoint": "http://127.0.0.1:18080/v2/status",
+            "refresh_interval_seconds": 15,
+            "freshness_seconds": 60,
+            "unexpected": true
+        });
+        assert!(serde_json::from_value::<OperatorConfig>(value).is_err());
+    }
+
+    /// A configuration with real TLS material and owner-only directories.
+    fn installed_config(root: &Path) -> OperatorConfig {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["eggwork test CA".into()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let server_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let server = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
+        fs::write(root.join("server.pem"), server.pem()).unwrap();
+        fs::write(root.join("client-ca.pem"), ca.pem()).unwrap();
+        let key_path = root.join("server-key.pem");
+        fs::write(&key_path, server_key.serialize_pem()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // The loader refuses group- or world-writable material, and the
+            // process umask is not ours to rely on.
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(root.join("server.pem"), fs::Permissions::from_mode(0o644))
+                .unwrap();
+            fs::set_permissions(
+                root.join("client-ca.pem"),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+        for name in ["execution", "blobs", "workspaces", "state"] {
+            let path = root.join(name);
+            fs::create_dir_all(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let parsed: OperatorConfig = serde_json::from_value(config_json(root)).expect("config");
+        parsed
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_that_host_telemetry_is_off_by_default() {
+        let temp = TempDir::new().unwrap();
+        let config = installed_config(temp.path());
+        assert!(config.validate().is_ok());
+        let report = doctor(&config).await;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "host-telemetry")
+            .expect("host-telemetry check");
+        assert!(check.ok);
+        assert!(check.detail.contains("disabled"));
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_a_configured_host_telemetry_provider() {
+        let temp = TempDir::new().unwrap();
+        let mut config = installed_config(temp.path());
+        config.host_telemetry = Some(HostTelemetrySettings {
+            endpoint: "http://127.0.0.1:18080/v2/status".into(),
+            refresh_interval_seconds: 15,
+            freshness_seconds: 60,
+        });
+        assert!(config.validate().is_ok());
+        let report = doctor(&config).await;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "host-telemetry")
+            .expect("host-telemetry check");
+        assert!(check.ok);
+        assert!(check.detail.contains("enabled"));
+        // A diagnostic line must not carry the provider's address.
+        assert!(!check.detail.contains("127.0.0.1"));
     }
 
     #[test]

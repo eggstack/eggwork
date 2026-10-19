@@ -9,6 +9,9 @@ license.workspace = true
 eggwork-core = { path = "../eggwork-core" }
 eggwork-runner = { path = "../eggwork-runner" }
 eggserve-core.workspace = true
+eggfetch-core.workspace = true
+url.workspace = true
+async-trait.workspace = true
 tokio = { workspace = true, features = ["net", "signal"] }
 bytes.workspace = true
 futures-util.workspace = true
@@ -26,6 +29,7 @@ rustls-pemfile = "2"
 fs2 = "0.4"
 eggup-core = "0.1.1"
 eggup-service = "0.1.1"
+gregg-protocol = "1.0.15"
 
 # The installed-release qualification harness (Operations M004) is opt-in: it
 # drives an installed `eggworkd` through the production client path and must not

@@ -8,8 +8,8 @@ use eggfetch_core::{
 };
 use eggwork_core::{
     ApiError, ArtifactId, ArtifactRecord, BlobDigest, ExecutionEvent, ExecutionHandle, ExecutionId,
-    ExecutionSnapshot, ExecutionSpec, NodeCapabilities, NodeStatus, WorkspaceId, WorkspaceManifest,
-    WorkspaceManifestPatch,
+    ExecutionSnapshot, ExecutionSpec, NodeCapabilities, NodeId, NodeStatus, NodeTelemetry,
+    WorkspaceId, WorkspaceManifest, WorkspaceManifestPatch,
 };
 use futures_util::{StreamExt, stream};
 use serde::{Serialize, de::DeserializeOwned};
@@ -29,6 +29,16 @@ const API_SCHEMA_VERSION: u16 = 1;
 /// and 512 KiB of encoded events — so it never truncates a legitimate response
 /// while still refusing to accumulate unbounded node-controlled data.
 const MAX_BUFFERED_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Ceiling on a node telemetry response body.
+///
+/// The telemetry response is a small, bounded document — a schema version, a
+/// node id, a state, and at most seven measurement groups. The transport cap
+/// (`MAX_BUFFERED_BODY_BYTES`) bounds what the client will *accumulate*; this
+/// cap bounds what the client will *accept* for this route, so a node that
+/// answers with a megabyte of measurement-shaped JSON is refused rather than
+/// parsed.
+const MAX_TELEMETRY_BODY_BYTES: usize = 64 * 1024;
 
 /// Time allowed for a pool slot, the connect/TLS handshake, each request-body
 /// frame, and each *gap* between response chunks.
@@ -80,6 +90,8 @@ pub enum ClientError {
     ProtocolIncompatible,
     #[error("node does not support a required protocol capability")]
     UnsupportedCapability,
+    #[error("node does not implement the node telemetry contract")]
+    TelemetryUnsupported,
 }
 
 impl From<HttpError> for ClientError {
@@ -120,6 +132,7 @@ impl fmt::Debug for ClientError {
             Self::InvalidResponse => f.write_str("ClientError::InvalidResponse"),
             Self::ProtocolIncompatible => f.write_str("ClientError::ProtocolIncompatible"),
             Self::UnsupportedCapability => f.write_str("ClientError::UnsupportedCapability"),
+            Self::TelemetryUnsupported => f.write_str("ClientError::TelemetryUnsupported"),
         }
     }
 }
@@ -211,6 +224,74 @@ impl NodeClient {
 
     pub async fn status(&self) -> Result<NodeStatus, ClientError> {
         self.get_json("/v1/status").await
+    }
+
+    /// Read the node's host-wide telemetry observation.
+    ///
+    /// The node serves this from its own cache. A remote read never contacts
+    /// the telemetry provider, so a burst of readers cannot become a burst of
+    /// provider requests, and a provider that is down does not turn a read into
+    /// a timeout.
+    ///
+    /// The three states a caller most often needs to tell apart are
+    /// distinguishable without parsing prose:
+    ///
+    /// * the node has no provider configured — the response's `state` is
+    ///   `disabled`;
+    /// * the node's provider is failing — the response's `state` is
+    ///   `unavailable` and `last_error` carries the bounded category;
+    /// * the node does not implement this contract at all — the call fails
+    ///   with [`ClientError::TelemetryUnsupported`].
+    ///
+    /// A node that reports `unavailable` is not reporting zero utilization.
+    /// The per-measurement groups keep the difference explicit: a measurement
+    /// the host platform cannot produce is `unsupported`, one that was
+    /// supported but not reported is `unknown`, and only a real measurement is
+    /// a value.
+    pub async fn telemetry(&self) -> Result<NodeTelemetry, ClientError> {
+        let mut response = self
+            .http
+            .get(&self.url("/v1/node/telemetry"))?
+            .timeout(unary_timeout())
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        if status == 404 {
+            // The node does not have the route at all. That is a node older
+            // than this contract, and it is not the same answer as a node
+            // that has the route and refuses the caller.
+            return Err(ClientError::TelemetryUnsupported);
+        }
+        if !response.status().is_success() {
+            return Err(api_error(status, &mut response).await);
+        }
+        let bytes = response.bytes().await?;
+        if bytes.len() > MAX_TELEMETRY_BODY_BYTES {
+            return Err(ClientError::InvalidResponse);
+        }
+        let telemetry: NodeTelemetry =
+            serde_json::from_slice(&bytes).map_err(|_| ClientError::InvalidResponse)?;
+        if telemetry.schema_version != eggwork_core::NODE_TELEMETRY_SCHEMA_VERSION {
+            return Err(ClientError::ProtocolIncompatible);
+        }
+        telemetry
+            .validate()
+            .map_err(|_| ClientError::InvalidResponse)?;
+        Ok(telemetry)
+    }
+
+    /// Read the node's host-wide telemetry observation and require it to name
+    /// `expected`.
+    ///
+    /// A node is a fixed target, so a response naming a different node is a
+    /// misdirected or substituted answer. This refuses it rather than handing
+    /// the caller a measurement taken somewhere else.
+    pub async fn telemetry_for(&self, expected: &NodeId) -> Result<NodeTelemetry, ClientError> {
+        let telemetry = self.telemetry().await?;
+        if &telemetry.node_id != expected {
+            return Err(ClientError::InvalidResponse);
+        }
+        Ok(telemetry)
     }
 
     /// Submit to this node and return its execution identifier and live event stream.

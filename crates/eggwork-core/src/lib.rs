@@ -1103,6 +1103,422 @@ pub struct NodeStatus {
     pub capabilities: NodeCapabilities,
 }
 
+// ---------------------------------------------------------------------------
+// Optional host telemetry
+// ---------------------------------------------------------------------------
+//
+// These types are the *normalized* vocabulary for host-wide measurements. They
+// are deliberately protocol-neutral: no provider's wire types, field names or
+// collection shapes appear here, and nothing in this module knows how a
+// measurement was obtained. A provider-specific payload is validated and
+// translated into these types before it is cached, so the vocabulary can be
+// projected onto a wire contract without dragging a provider's schema along.
+//
+// Host telemetry is advisory observation, never enforcement evidence. Nothing
+// in this module grants, withholds, or qualifies an execution capability, and
+// `NodeStatus`/`NodeCapabilities` keep their existing meaning.
+
+/// Ceiling on the accepted sampling cadence of a host observation.
+///
+/// Mirrors the bound the provider protocol applies, so a payload that the
+/// provider itself would reject is rejected here too.
+pub const MAX_TELEMETRY_SAMPLE_INTERVAL_MS: u64 = 86_400_000;
+
+/// Where a host-wide observation came from.
+///
+/// The set is closed on purpose: an unrecognized source is a protocol error
+/// for a reader, not a new variant it may silently accept. Adding a source
+/// means adding a variant here and re-freezing the wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetrySource {
+    /// Readings come from a locally installed Gregg daemon.
+    Gregg,
+}
+
+/// Lifecycle state of the optional host-telemetry provider.
+///
+/// The state describes the *provider*, not the host. A provider that is
+/// `Disabled` is not a host with zero usage; it is a host with no provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryProviderState {
+    /// No provider is configured. Nothing is polled and nothing is claimed.
+    Disabled,
+    /// A provider is configured but has not produced an observation yet.
+    Warming,
+    /// A validated observation is available and within its freshness bound.
+    Ready,
+    /// An observation is available but older than the freshness bound.
+    Stale,
+    /// The provider could not be reached, or answered with something unusable.
+    Unavailable,
+    /// The provider answered with a payload that failed validation.
+    Invalid,
+}
+
+/// Why the last provider interaction failed.
+///
+/// Categories are a closed, bounded set and carry no provider-supplied text, so
+/// a failure can be reported without leaking a response body, a URL, or a host
+/// path into a response, a log line, or a metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryErrorCategory {
+    /// The connection could not be established.
+    Connection,
+    /// The request exceeded its deadline.
+    Timeout,
+    /// The provider answered with an unexpected HTTP status.
+    HttpStatus,
+    /// The response body was not the expected JSON document.
+    Malformed,
+    /// The response carried an unsupported schema version.
+    SchemaVersion,
+    /// The response parsed but violated the protocol's invariants.
+    Invalid,
+    /// The response exceeded the accepted body size.
+    TooLarge,
+    /// The observation timestamp is outside the accepted clock-skew window.
+    ClockSkew,
+}
+
+/// One host-wide measurement, together with the reason it is absent.
+///
+/// A missing measurement is never zero. `Unsupported` means the host platform
+/// cannot produce the metric at all; `Unknown` means it can but this sample
+/// carried no value; `Value` carries a validated measurement. A reader can
+/// therefore tell "this host does not have swap" apart from "this host has
+/// swap and it is currently unused".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryMetric<T> {
+    /// The host platform does not support this measurement.
+    Unsupported,
+    /// The measurement is supported, but this sample carried no value.
+    Unknown,
+    /// A validated measurement.
+    Value(T),
+}
+
+impl<T> TelemetryMetric<T> {
+    /// The measured value, or `None` when the metric is absent.
+    pub fn value(&self) -> Option<&T> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Unsupported | Self::Unknown => None,
+        }
+    }
+
+    /// Whether the host platform does not support this measurement.
+    pub fn is_unsupported(&self) -> bool {
+        matches!(self, Self::Unsupported)
+    }
+
+    /// Whether the measurement is supported but was not reported.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+}
+
+/// CPU utilization for the host as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryCpu {
+    /// Logical CPU cores visible to the kernel.
+    pub logical_cores: u32,
+    /// Aggregate CPU busy percentage, `0.0..=100.0`.
+    pub usage_pct: f32,
+    /// Aggregate CPU I/O-wait percentage, `0.0..=100.0`.
+    ///
+    /// `None` when the host platform does not report I/O wait. It is never
+    /// `Some(0.0)` as a substitute for "not reported".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iowait_pct: Option<f32>,
+}
+
+/// Physical memory utilization for the host as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryMemory {
+    /// Bytes available without swapping.
+    pub available_bytes: u64,
+    /// Total physical memory in bytes.
+    pub total_bytes: u64,
+    /// Bytes currently resident in physical memory.
+    pub used_bytes: u64,
+}
+
+/// Load averages for the host as a whole.
+///
+/// These are load averages, not percentages: they are unbounded above and are
+/// only required to be finite and non-negative.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryLoad {
+    /// One-minute load average.
+    pub one: f32,
+    /// Five-minute load average.
+    pub five: f32,
+    /// Fifteen-minute load average.
+    pub fifteen: f32,
+}
+
+/// Swap utilization for the host as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetrySwap {
+    /// Bytes currently in swap.
+    pub used_bytes: u64,
+    /// Total swap in bytes.
+    pub total_bytes: u64,
+}
+
+/// Storage capacity for the host as a whole.
+///
+/// The figures are aggregates over every volume the provider reported. They
+/// are not a per-volume claim, and they carry no mount path, device
+/// identifier, or filesystem label.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryDisk {
+    /// Free bytes across the reported volumes.
+    pub available_bytes: u64,
+    /// Total bytes across the reported volumes.
+    pub total_bytes: u64,
+    /// How many volumes contributed to the aggregate.
+    pub volume_count: u32,
+}
+
+/// Aggregate disk throughput for the host as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryDiskIo {
+    /// Aggregate read throughput in bytes per second.
+    pub read_bytes_per_sec: u64,
+    /// Aggregate write throughput in bytes per second.
+    pub write_bytes_per_sec: u64,
+}
+
+/// Aggregate network throughput for the host as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryNetwork {
+    /// Aggregate receive throughput in bytes per second.
+    pub rx_bytes_per_sec: u64,
+    /// Aggregate transmit throughput in bytes per second.
+    pub tx_bytes_per_sec: u64,
+}
+
+/// One validated host-wide observation.
+///
+/// The observation is a *measurement*, not a verdict: it says what the host
+/// looked like at `observed_at_unix_ms`, and it never says whether an
+/// execution may run. Per-execution utilization is not representable here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostTelemetry {
+    /// Provider wall-clock timestamp of the sample, in Unix milliseconds.
+    pub observed_at_unix_ms: u64,
+    /// Provider sampling cadence in milliseconds.
+    pub sample_interval_ms: u64,
+    /// CPU utilization.
+    pub cpu: TelemetryMetric<TelemetryCpu>,
+    /// Physical memory utilization.
+    pub memory: TelemetryMetric<TelemetryMemory>,
+    /// Load averages.
+    pub load: TelemetryMetric<TelemetryLoad>,
+    /// Swap utilization.
+    pub swap: TelemetryMetric<TelemetrySwap>,
+    /// Storage capacity.
+    pub disk: TelemetryMetric<TelemetryDisk>,
+    /// Aggregate disk throughput.
+    pub disk_io: TelemetryMetric<TelemetryDiskIo>,
+    /// Aggregate network throughput.
+    pub network: TelemetryMetric<TelemetryNetwork>,
+}
+
+/// Wire schema version of the node telemetry response.
+///
+/// The contract is additive within version 1: a reader accepts a version-1
+/// payload and refuses a version it does not know, rather than guessing.
+pub const NODE_TELEMETRY_SCHEMA_VERSION: u16 = 1;
+
+/// The node's host-wide telemetry observation, as served to an authorized caller.
+///
+/// This is the frozen wire contract for the node telemetry response. It is
+/// additive and deliberately separate from
+/// [`NodeStatus`]: `NodeStatus` answers "is this node accepting work", and
+/// this answers "what did this host look like". The two are never merged, and
+/// nothing here qualifies an execution.
+///
+/// The fields mean:
+///
+/// * `schema_version` — the contract version. A reader refuses anything else.
+/// * `node_id` — the node that produced the observation, so a reader can tell
+///   that a response came from the node it asked.
+/// * `source` — where the measurement came from. The set is closed: a reader
+///   refuses a source it does not know. The source names the *kind* of
+///   provider; whether that provider is live is `state`'s answer, not this
+///   field's.
+/// * `state` — what the provider is doing, not what the host is doing. A node
+///   with no provider is `disabled`, which is not the same as a host with no
+///   usage.
+/// * `age_ms` — how long ago, in milliseconds, the node received the
+///   observation, measured on the node's monotonic clock. `None` when there is
+///   no observation.
+/// * `last_error` — the bounded category of the most recent provider failure.
+///   `None` when the last interaction succeeded or none has failed.
+/// * `observation` — the most recent measurement the node holds, or `None` when
+///   it holds none.
+///
+/// The `state` and `observation` pair is the part a reader must understand:
+///
+/// | `state` | `observation` | meaning |
+/// |---|---|---|
+/// | `disabled` | absent | no provider is configured |
+/// | `warming` | absent | the provider is alive but has not produced a sample |
+/// | `ready` | present | a sample is present and within its freshness bound |
+/// | `stale` | present | a sample is present but older than the freshness bound |
+/// | `unavailable` | present or absent | the provider could not be reached |
+/// | `invalid` | present or absent | the provider answered with something unusable |
+///
+/// A sample is *current* only when the state is `ready`. A reader that needs a
+/// fresh measurement must check the state, not merely the presence of an
+/// observation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeTelemetry {
+    pub schema_version: u16,
+    pub node_id: NodeId,
+    pub source: TelemetrySource,
+    pub state: TelemetryProviderState,
+    pub age_ms: Option<u64>,
+    pub last_error: Option<TelemetryErrorCategory>,
+    pub observation: Option<HostTelemetry>,
+}
+
+impl NodeTelemetry {
+    /// Check the invariants of a telemetry response.
+    ///
+    /// The node applies this to what it serves, and a client applies it again
+    /// to what it receives, so a node that skipped it cannot hand a reader a
+    /// response the reader would have to reject.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.schema_version != NODE_TELEMETRY_SCHEMA_VERSION {
+            return Err(ValidationError::OutOfRange {
+                field: "node telemetry schema version",
+            });
+        }
+        match self.state {
+            // A ready or stale node always holds the sample it is reporting.
+            TelemetryProviderState::Ready | TelemetryProviderState::Stale => {
+                if self.observation.is_none() {
+                    return Err(ValidationError::OutOfRange {
+                        field: "node telemetry observation",
+                    });
+                }
+            }
+            // A node with no provider, or one that has not sampled yet, holds
+            // no sample. Reporting one would claim a measurement the node
+            // never took.
+            TelemetryProviderState::Disabled | TelemetryProviderState::Warming => {
+                if self.observation.is_some() {
+                    return Err(ValidationError::OutOfRange {
+                        field: "node telemetry observation",
+                    });
+                }
+            }
+            // A failed provider may still be holding the last sample it took.
+            TelemetryProviderState::Unavailable | TelemetryProviderState::Invalid => {}
+        }
+        if self.observation.is_some() != self.age_ms.is_some() {
+            return Err(ValidationError::OutOfRange {
+                field: "node telemetry age",
+            });
+        }
+        if let Some(observation) = &self.observation {
+            observation.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Reject a percentage that is not a finite value in `0.0..=100.0`.
+///
+/// A non-finite percentage cannot be serialized as a JSON number, and an
+/// out-of-range one is a provider defect rather than a measurement. Both are
+/// refused instead of being clamped, because a clamped value is a fabricated
+/// measurement.
+fn validate_percentage(value: f32, field: &'static str) -> Result<(), ValidationError> {
+    if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+        return Err(ValidationError::OutOfRange { field });
+    }
+    Ok(())
+}
+
+/// Reject a load average that is not a finite, non-negative value.
+fn validate_load(value: f32, field: &'static str) -> Result<(), ValidationError> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(ValidationError::OutOfRange { field });
+    }
+    Ok(())
+}
+
+impl HostTelemetry {
+    /// Check the invariants every consumer of an observation depends on.
+    ///
+    /// This is the same check on both sides of the boundary: the node applies
+    /// it before caching a provider payload, and a client applies it again
+    /// after decoding, so a node that skips it cannot hand a reader a
+    /// measurement the reader would have to reject.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.observed_at_unix_ms == 0 {
+            return Err(ValidationError::OutOfRange {
+                field: "telemetry observation timestamp",
+            });
+        }
+        if self.sample_interval_ms == 0
+            || self.sample_interval_ms > MAX_TELEMETRY_SAMPLE_INTERVAL_MS
+        {
+            return Err(ValidationError::OutOfRange {
+                field: "telemetry sample interval",
+            });
+        }
+        if let TelemetryMetric::Value(cpu) = &self.cpu {
+            if cpu.logical_cores == 0 {
+                return Err(ValidationError::OutOfRange {
+                    field: "telemetry cpu logical cores",
+                });
+            }
+            validate_percentage(cpu.usage_pct, "telemetry cpu usage")?;
+            if let Some(iowait) = cpu.iowait_pct {
+                validate_percentage(iowait, "telemetry cpu iowait")?;
+            }
+        }
+        if let TelemetryMetric::Value(memory) = &self.memory
+            && memory.used_bytes > memory.total_bytes
+        {
+            return Err(ValidationError::OutOfRange {
+                field: "telemetry memory used bytes",
+            });
+        }
+        if let TelemetryMetric::Value(load) = &self.load {
+            validate_load(load.one, "telemetry load one")?;
+            validate_load(load.five, "telemetry load five")?;
+            validate_load(load.fifteen, "telemetry load fifteen")?;
+        }
+        if let TelemetryMetric::Value(swap) = &self.swap
+            && swap.used_bytes > swap.total_bytes
+        {
+            return Err(ValidationError::OutOfRange {
+                field: "telemetry swap used bytes",
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Versioned<T> {
     pub schema_version: u16,
@@ -1676,5 +2092,203 @@ mod tests {
         .apply_to(&base)
         .unwrap();
         assert_eq!(noop.digest().unwrap(), base.digest().unwrap());
+    }
+
+    fn observation() -> HostTelemetry {
+        HostTelemetry {
+            observed_at_unix_ms: 1_700_000_000_000,
+            sample_interval_ms: 1_000,
+            cpu: TelemetryMetric::Value(TelemetryCpu {
+                logical_cores: 8,
+                usage_pct: 12.5,
+                iowait_pct: Some(0.5),
+            }),
+            memory: TelemetryMetric::Value(TelemetryMemory {
+                available_bytes: 4_000,
+                total_bytes: 8_000,
+                used_bytes: 4_000,
+            }),
+            load: TelemetryMetric::Unsupported,
+            swap: TelemetryMetric::Unknown,
+            disk: TelemetryMetric::Value(TelemetryDisk {
+                available_bytes: 100,
+                total_bytes: 500,
+                volume_count: 2,
+            }),
+            disk_io: TelemetryMetric::Value(TelemetryDiskIo {
+                read_bytes_per_sec: 10,
+                write_bytes_per_sec: 20,
+            }),
+            network: TelemetryMetric::Value(TelemetryNetwork {
+                rx_bytes_per_sec: 30,
+                tx_bytes_per_sec: 40,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_valid_observation_validates() {
+        assert!(observation().validate().is_ok());
+    }
+
+    #[test]
+    fn a_missing_measurement_is_not_zero() {
+        let sample = observation();
+        assert!(sample.load.is_unsupported());
+        assert!(sample.swap.is_unknown());
+        assert!(sample.load.value().is_none());
+        assert!(sample.swap.value().is_none());
+        assert_eq!(sample.cpu.value().map(|cpu| cpu.logical_cores), Some(8));
+    }
+
+    #[test]
+    fn out_of_range_and_non_finite_measurements_are_refused() {
+        let mut sample = observation();
+        if let TelemetryMetric::Value(cpu) = &mut sample.cpu {
+            cpu.usage_pct = 100.5;
+        }
+        assert!(sample.validate().is_err());
+
+        let mut sample = observation();
+        if let TelemetryMetric::Value(cpu) = &mut sample.cpu {
+            cpu.usage_pct = f32::NAN;
+        }
+        assert!(sample.validate().is_err());
+
+        let mut sample = observation();
+        if let TelemetryMetric::Value(cpu) = &mut sample.cpu {
+            cpu.logical_cores = 0;
+        }
+        assert!(sample.validate().is_err());
+
+        let mut sample = observation();
+        if let TelemetryMetric::Value(memory) = &mut sample.memory {
+            memory.used_bytes = memory.total_bytes + 1;
+        }
+        assert!(sample.validate().is_err());
+
+        let mut sample = observation();
+        sample.swap = TelemetryMetric::Value(TelemetrySwap {
+            used_bytes: 1,
+            total_bytes: 0,
+        });
+        assert!(sample.validate().is_err());
+
+        let mut sample = observation();
+        sample.sample_interval_ms = 0;
+        assert!(sample.validate().is_err());
+
+        let mut sample = observation();
+        sample.sample_interval_ms = MAX_TELEMETRY_SAMPLE_INTERVAL_MS + 1;
+        assert!(sample.validate().is_err());
+
+        let mut sample = observation();
+        sample.observed_at_unix_ms = 0;
+        assert!(sample.validate().is_err());
+    }
+
+    #[test]
+    fn a_load_average_may_exceed_one_hundred() {
+        let mut sample = observation();
+        sample.load = TelemetryMetric::Value(TelemetryLoad {
+            one: 12.5,
+            five: 8.0,
+            fifteen: 0.25,
+        });
+        assert!(sample.validate().is_ok());
+
+        sample.load = TelemetryMetric::Value(TelemetryLoad {
+            one: f32::INFINITY,
+            five: 0.0,
+            fifteen: 0.0,
+        });
+        assert!(sample.validate().is_err());
+    }
+
+    #[test]
+    fn the_observation_round_trips_through_json() {
+        let encoded = serde_json::to_string(&observation()).unwrap();
+        let decoded: HostTelemetry = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, observation());
+        // An absent measurement keeps its reason instead of decaying into zero.
+        assert!(encoded.contains("\"unsupported\""));
+        assert!(encoded.contains("\"unknown\""));
+    }
+
+    #[test]
+    fn an_observation_with_an_unknown_field_is_refused() {
+        let mut value = serde_json::to_value(observation()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), serde_json::json!(1));
+        assert!(serde_json::from_value::<HostTelemetry>(value).is_err());
+    }
+
+    fn node_telemetry() -> NodeTelemetry {
+        NodeTelemetry {
+            schema_version: NODE_TELEMETRY_SCHEMA_VERSION,
+            node_id: NodeId::new("node-a").unwrap(),
+            source: TelemetrySource::Gregg,
+            state: TelemetryProviderState::Ready,
+            age_ms: Some(12),
+            last_error: None,
+            observation: Some(observation()),
+        }
+    }
+
+    #[test]
+    fn a_ready_telemetry_response_validates() {
+        assert!(node_telemetry().validate().is_ok());
+    }
+
+    #[test]
+    fn a_telemetry_response_with_an_unknown_schema_version_is_refused() {
+        let mut telemetry = node_telemetry();
+        telemetry.schema_version = NODE_TELEMETRY_SCHEMA_VERSION + 1;
+        assert!(telemetry.validate().is_err());
+    }
+
+    #[test]
+    fn a_ready_telemetry_response_without_an_observation_is_refused() {
+        let mut telemetry = node_telemetry();
+        telemetry.observation = None;
+        assert!(telemetry.validate().is_err());
+    }
+
+    #[test]
+    fn a_disabled_telemetry_response_with_an_observation_is_refused() {
+        let mut telemetry = node_telemetry();
+        telemetry.state = TelemetryProviderState::Disabled;
+        assert!(telemetry.validate().is_err());
+    }
+
+    #[test]
+    fn a_disabled_telemetry_response_is_valid_without_an_observation() {
+        let mut telemetry = node_telemetry();
+        telemetry.state = TelemetryProviderState::Disabled;
+        telemetry.observation = None;
+        telemetry.age_ms = None;
+        assert!(telemetry.validate().is_ok());
+    }
+
+    #[test]
+    fn a_telemetry_response_whose_age_contradicts_its_observation_is_refused() {
+        let mut telemetry = node_telemetry();
+        telemetry.age_ms = None;
+        assert!(telemetry.validate().is_err());
+    }
+
+    #[test]
+    fn a_telemetry_response_round_trips_through_json() {
+        let encoded = serde_json::to_string(&node_telemetry()).unwrap();
+        let decoded: NodeTelemetry = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, node_telemetry());
+        let mut value = serde_json::to_value(node_telemetry()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), serde_json::json!(1));
+        assert!(serde_json::from_value::<NodeTelemetry>(value).is_err());
     }
 }

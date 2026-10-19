@@ -239,7 +239,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "rustls",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -254,7 +254,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b16f85a1fdbc2deb5c705001a1d8ec4c05934175262a62664e634bd09043fde0"
 dependencies = [
  "base64 0.23.1",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
@@ -283,7 +283,7 @@ dependencies = [
  "regex",
  "rustls",
  "serde",
- "thiserror",
+ "thiserror 2.0.20",
  "toml",
  "zeroize",
 ]
@@ -301,7 +301,7 @@ dependencies = [
  "rustls",
  "serde",
  "socket2 0.5.10",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
@@ -326,7 +326,7 @@ dependencies = [
  "libc",
  "rustls",
  "subtle",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
@@ -344,7 +344,7 @@ dependencies = [
  "fancy-regex",
  "regex",
  "serde",
- "thiserror",
+ "thiserror 2.0.20",
  "toml",
  "tracing",
 ]
@@ -365,7 +365,7 @@ dependencies = [
  "once_cell",
  "sha2",
  "subtle",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
@@ -380,7 +380,7 @@ dependencies = [
  "bytes",
  "eggress-core",
  "subtle",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
  "zeroize",
 ]
@@ -409,7 +409,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
@@ -428,7 +428,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
  "toml",
@@ -444,7 +444,7 @@ dependencies = [
  "eggress-core",
  "pkcs8",
  "rustls",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -465,7 +465,7 @@ dependencies = [
  "ipnet",
  "rand",
  "serde",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
@@ -478,7 +478,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0703337615177ae5533a7e222d291c5fdf95201c0ce896859968f94f435975eb"
 dependencies = [
  "serde",
- "thiserror",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -500,7 +500,7 @@ dependencies = [
  "hyper-util",
  "rustix",
  "rustls",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
 ]
@@ -578,7 +578,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
  "url",
 ]
@@ -591,7 +591,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -606,7 +606,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
 ]
@@ -630,6 +630,7 @@ dependencies = [
 name = "eggwork-server"
 version = "0.1.5"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "bytes",
  "eggfetch-core",
@@ -642,6 +643,7 @@ dependencies = [
  "eggwork-runner",
  "fs2",
  "futures-util",
+ "gregg-protocol",
  "hex",
  "rcgen",
  "rusqlite",
@@ -652,10 +654,11 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "toml",
+ "url",
  "uuid",
 ]
 
@@ -879,6 +882,17 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi",
+]
+
+[[package]]
+name = "gregg-protocol"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d3a817ba61881543ccc89622df17707f3f065a9d6f1b06d31ab50ac9602f051"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1169,7 +1183,7 @@ checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
 dependencies = [
  "enumflags2",
  "libc",
- "thiserror",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1760,11 +1774,31 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
 version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 2.0.20",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

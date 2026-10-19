@@ -37,12 +37,13 @@ but the exit code reports that the node did not reach the requested state.
 
 ## Readiness
 
-`doctor` is the gate. It returns seven checks, and `ready` is true only when all
+`doctor` is the gate. It returns eight checks, and `ready` is true only when all
 of them pass:
 
 | Check | Meaning |
 |---|---|
 | `configuration` | Config parses and the TLS material loads into a usable server config |
+| `host-telemetry` | Whether the optional host-telemetry provider is configured (off by default) |
 | `sandbox-resource-backend` | The installed helper is trusted, and this host's actual isolation/resource capabilities were runtime-probed |
 | `listener` | The bind address is available |
 | `execution-root`, `blob-root`, `workspace-root` | Those directories exist and are trustworthy |
@@ -60,6 +61,113 @@ enforcement path would refuse.
 A helper is trusted when it is root- or effective-user-owned, not group/world
 writable, and inside non-writable ancestor directories. Anything else fails
 closed: required isolation stays unsupported instead of quietly degrading.
+
+## Host telemetry (optional, off by default)
+
+A node can read **host-wide** measurements — CPU, memory, load, swap, disk
+capacity, disk and network throughput — from a telemetry provider running on
+the same machine, and expose them to authorized callers. This is observation
+for scheduling decisions, not enforcement: it never qualifies an execution, and
+it is never per-execution utilization.
+
+**The default `eggworkd` runs without a provider.** With no `host_telemetry`
+block in the config, the node creates no provider, starts no polling task, and
+claims no host measurements. The `host-telemetry` doctor check reports
+`disabled`.
+
+To enable it, add a block to the node config:
+
+```json
+"host_telemetry": {
+  "endpoint": "http://127.0.0.1:18080/v2/status",
+  "refresh_interval_seconds": 15,
+  "freshness_seconds": 60
+}
+```
+
+The provider must be **bound to the loopback interface**. The endpoint is
+validated when the config is validated, and it is refused unless it is:
+
+- plain `http` (not `https`),
+- an **IP literal** that is a loopback address (`127.0.0.0/8` or `::1`) — a
+  hostname such as `localhost` is refused, so no name is ever resolved and no
+  answer can be rebound,
+- naming an explicit TCP port,
+- exactly the path `/v2/status`, with no userinfo, query string, or fragment.
+
+The client is built without redirect and proxy support, so a `3xx` is reported
+as an unexpected status rather than followed, and no ambient `HTTP_PROXY`
+setting is consulted. A redirect hop or an inherited proxy cannot move the
+request off the loopback interface.
+
+The node polls on its own schedule. One background task owns the provider and
+performs every request; readers consult the node's cache and never trigger a
+request themselves, so a burst of callers cannot become a burst of provider
+requests. A provider that is down is retried with a bounded backoff instead of
+being polled in a tight loop.
+
+`freshness_seconds` must not be shorter than `refresh_interval_seconds`; a
+sample older than the freshness bound is reported as **stale** rather than
+silently presented as current. A provider whose timestamp lies implausibly in
+the future is refused rather than treated as fresh.
+
+Provider failures are reported as a bounded category (connection, timeout,
+HTTP status, malformed, schema version, invalid, too large, clock skew). No
+response body, provider address, or host path is ever carried into a log line
+or a metric.
+
+## Reading host telemetry
+
+When a provider is configured, an **authorized controller** can read the node's
+host-wide observation over the existing mTLS channel:
+
+```text
+GET /v1/node/telemetry
+```
+
+The read is served from the node's own cache. It never contacts the provider,
+so a burst of readers cannot become a burst of provider requests, and a
+provider that is down does not turn a read into a timeout.
+
+**The `telemetry` grant is separate.** The operation name in a client's grant
+list is `telemetry`, and it is not implied by `status`:
+
+```json
+"clients": [
+  {
+    "principal_id": "controller-01",
+    "certificate_sha256": "0123…",
+    "operations": ["capabilities", "status", "telemetry"]
+  }
+]
+```
+
+A principal that is not granted `telemetry` receives the ordinary typed 403,
+and the refusal does not reveal whether the node holds an observation. A node
+that predates this route answers 404, which is a different answer: it means the
+node cannot serve telemetry at all.
+
+The response reports what the **provider** is doing, not what the host is
+doing:
+
+| `state` | Meaning |
+|---|---|
+| `disabled` | No provider is configured. The node reports no host measurements. |
+| `warming` | The provider is alive but has not produced a sample yet. |
+| `ready` | A sample is present and within its freshness bound. |
+| `stale` | A sample is present but older than the freshness bound. |
+| `unavailable` | The provider could not be reached. |
+| `invalid` | The provider answered with something unusable. |
+
+A sample is current only when the state is `ready`. `unavailable` is not zero
+utilization, and the per-measurement groups keep that explicit: a measurement
+the host platform cannot produce is `unsupported`, one that was supported but
+not reported is `unknown`, and only a real measurement is a value.
+
+The response carries no provider address, mount path, device or interface
+identity, hostname, or per-execution measurement. The node's `status` and
+`capabilities` are unchanged by this feature: they answer "is this node
+accepting work", and telemetry answers "what did this host look like".
 
 ## Drain
 

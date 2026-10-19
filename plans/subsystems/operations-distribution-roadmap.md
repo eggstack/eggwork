@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M001-M003, M002a and M004a closed, M004 conditionally closed; M007 ready
+Status: active roadmap; M001-M003, M002a, M004a and M004b closed, M004 conditionally closed; M007 ready
 
 Canonical authority:
 
@@ -245,6 +245,76 @@ Closure summary:
   load-dependent kernel window around executing a just-written executable, reproducible
   outside Eggwork's spawn path. The finding is re-dispositioned there rather than
   closed by assertion.
+  **Superseded by M004b:** that characterisation was accurate about what was observed
+  and wrong about what it implied. The condition is per-inode and persistent, not a
+  microsecond-wide timing window, and it is eliminated by never writing the file that
+  is executed — the staged helper is linked, not copied. See
+  `plans/closure/operations-distribution/004b-status.md`.
+
+### M004b — Staged helper write-access corrective
+
+Class: corrective / test-infrastructure invariant
+
+Status: **closed** — `plans/closure/operations-distribution/004b-status.md`
+
+Implementation plan:
+
+- `plans/implementation/operations-distribution/004b-staged-helper-publication-durability-corrective.md`
+
+Objective:
+
+Eliminate the intermittent `ETXTBSY` refusal that M004a characterised but left open,
+so that a Linux suite which stages a helper and immediately executes it cannot go red
+at random. M004a is closed and preserved; this is the corrective that closes the
+residual it recorded.
+
+Trigger:
+
+CI run `39306109740` failed the Landlock suite on the optional-Gregg telemetry
+branch with `ExecutableFileBusy` at
+`crates/eggwork-sandbox-helper/tests/landlock_runner.rs:471`. A characterisation that
+leaves the suite able to go red is not a disposition.
+
+Closure summary:
+
+- The staged helper is no longer written. The shared staging path
+  (`crates/eggwork-sandbox-helper/tests/support/helper_fixture.rs`) links the
+  Cargo-built helper into the fixture's private `0700` directory instead of
+  copying it, so the file the fixture executes is never opened for writing and
+  the kernel has no reason to refuse it. A file that is never written is
+  executable every time: 0 refusals in 1 920 attempts, against 35.78% for the
+  M004a copy-and-rename sequence, and 0 of 32 on CI.
+- **There is no copy path left, and that is the point.** The milestone was first
+  closed with a copy-and-commit fallback; CI then refused that copy 3 times in
+  32 stagings on the runner (`39316541191`), and the copy path was removed. A
+  copy is a file that was written, and the kernel refuses to execute an inode
+  that is open for writing — so a copy cannot be made safe by a barrier.
+- The mechanism is read from the kernel rather than inferred: `execve()` calls
+  `exe_file_deny_write_access()`, which is `deny_write_access()`, and that
+  returns `-ETXTBSY` exactly when the inode's `i_writecount` is positive —
+  that is, when the inode is open for writing. The access is taken by every
+  write-open and released with the file's teardown, which is deferred. That is
+  why `fsync`, `O_DSYNC`, a sleep and a retry change nothing.
+- A link carries the source's mode, so the build output's mode is normalised to
+  a trusted one once, before the first fixture exists. The change is
+  one-directional — it can only remove write permission for others — and the
+  build output's bytes are never touched.
+- The refusal is per-inode and persistent, not a timing window: 100 immediate
+  retries of the same path all failed, so a retry or a sleep would not have
+  cleared it.
+- `set_mode` and `replace_with_junk` publish a replacement instead of mutating
+  the inode, so no fixture mutates an inode it shares with another fixture or
+  with the Cargo-built helper. That is a stronger form of the M004a isolation
+  invariant than the one M004a recorded, and it is what supersedes M004a §10's
+  rejection of hard links.
+- Two regression tests: one proves 32 parallel stagings are never refused *and*
+  that the staged helper is the build output's own inode, so a regression to
+  copying fails the test without needing a race to reproduce; the other covers
+  the trust-mode normalisation.
+- No retry, no sleep, no durability barrier, no `O_TMPFILE`+`linkat`, no
+  trust-rule change, no production change.
+- The M004a closure record is preserved as written; two additive addends mark
+  the residual as eliminated and point at this record.
 
 ### M007 — Windows service host
 

@@ -18,8 +18,13 @@ use eggwork_runner::{
 use helper_fixture::TrustedHelperFixture;
 use std::{
     fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::mpsc;
@@ -509,6 +514,117 @@ fn malformed_private_spec_and_unavailable_status_channel_do_not_launch_target() 
 // properties that make that whole class of failure structurally impossible in
 // this suite, instead of adding a retry or a sleep and hoping.
 
+/// A freshly published helper must be executable at once.
+///
+/// This is the regression test for the `ETXTBSY` refusal that CI hit on the
+/// optional-Gregg telemetry branch. The fixture published its helper
+/// atomically but never opened the file it executes for writing, and Linux
+/// refuses to execute an inode that is open for writing — so the refusal was
+/// intermittent and moved between tests, and the suite went red without any
+/// test changing.
+///
+/// The test is non-vacuous in two independent ways, and the second one does
+/// not depend on a race at all:
+///
+/// 1. Thirty-two threads stage and spawn in parallel, and not one spawn may be
+///    refused. Before the fix, 16 threads staging and executing in a loop were
+///    refused 22.6% of the time, so 32 parallel stagings hit the refusal with
+///    probability very close to one.
+/// 2. The staged helper is asserted to *be* the build output's inode. Staging
+///    publishes a directory entry and writes nothing, so the staged path and
+///    the build output share a device and an inode number. A copy would have
+///    its own inode, and the assertion would fail immediately — no load, no
+///    timing and no lucky window is needed to catch a regression to copying.
+#[test]
+fn a_linked_helper_is_executable_immediately_after_publication() {
+    const PARALLEL: usize = 32;
+
+    let refused = Arc::new(AtomicUsize::new(0));
+    let handles: Vec<_> = (0..PARALLEL)
+        .map(|_| {
+            let refused = Arc::clone(&refused);
+            std::thread::spawn(move || {
+                let fixture = TrustedHelperFixture::stage(built_helper());
+                // The helper exits 125 without arguments. What is under test
+                // is the spawn itself: whether the kernel accepted the freshly
+                // published executable at all.
+                match Command::new(fixture.path()).spawn() {
+                    Ok(mut child) => {
+                        let _ = child.wait();
+                    }
+                    Err(error) => {
+                        eprintln!("a linked helper was refused: {error}");
+                        refused.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("staging thread joined");
+    }
+    assert_eq!(
+        refused.load(Ordering::Relaxed),
+        0,
+        "a freshly published helper must be executable without an ETXTBSY refusal"
+    );
+
+    // The structural half of the proof: staging published a link, so the
+    // staged helper and the build output are the same inode. Nothing was
+    // written, so the kernel's write-access accounting on that inode is
+    // untouched and the execution above cannot be refused.
+    let fixture = TrustedHelperFixture::stage(built_helper());
+    let staged = fs::metadata(fixture.path()).expect("staged helper metadata");
+    let built = fs::metadata(built_helper()).expect("build output metadata");
+    assert_eq!(
+        staged.ino(),
+        built.ino(),
+        "the staged helper must be the build output's own inode, not a copy of it"
+    );
+    assert_eq!(
+        staged.dev(),
+        built.dev(),
+        "the staged helper must live on the build output's filesystem"
+    );
+}
+
+/// A build output that anyone but its owner may write cannot be staged by
+/// linking, because a link carries the source's mode and
+/// `verify_trusted_helper` rejects a group- or world-writable helper.
+///
+/// Cargo derives the executable's mode from the umask, so a permissive umask
+/// leaves the build output group-writable. The fixture clears those bits once,
+/// before anything is staged, and the change is one-directional: it removes
+/// write permission for others and keeps the owner's permissions and the
+/// execute bits.
+#[test]
+fn a_group_writable_source_is_normalized_to_a_trusted_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("eggwork-sandbox-helper");
+    fs::write(&path, b"not an executable helper").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+
+    assert!(
+        helper_fixture::normalize_trusted_mode(&path),
+        "a group- and world-writable source must be normalized"
+    );
+    let mode = fs::metadata(&path)
+        .expect("normalized metadata")
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o022,
+        0,
+        "group and world write bits must be cleared"
+    );
+    assert_eq!(mode & 0o700, 0o700, "the owner's permissions must survive");
+    assert_eq!(mode & 0o111, 0o111, "the execute bits must survive");
+    assert!(
+        !helper_fixture::normalize_trusted_mode(&path),
+        "normalizing an already trusted mode must change nothing"
+    );
+}
+
 #[tokio::test]
 async fn two_fixtures_stage_distinct_executable_paths() {
     let first = TrustedHelperFixture::stage(built_helper());
@@ -526,16 +642,30 @@ async fn two_fixtures_stage_distinct_executable_paths() {
     }
 }
 
+/// Staging must treat the build output as read-only input.
+///
+/// The one exception is deliberate and one-directional: the first staging
+/// clears the group and world write bits of the build output, because a link
+/// carries the source's mode and a helper that anyone but its owner may write
+/// is not a trusted helper. After that first staging — which happens before
+/// any fixture exists — staging must not touch the build output again.
 #[tokio::test]
 async fn staging_never_mutates_the_cargo_built_helper() {
-    use std::os::unix::fs::PermissionsExt;
-
     let built = helper_fixture::digest(built_helper());
+
+    // This staging is the one that settles the build output's mode.
+    let _ = TrustedHelperFixture::stage(built_helper());
     let built_mode = fs::metadata(built_helper())
         .expect("build output metadata")
         .permissions()
         .mode()
         & 0o7777;
+    assert_eq!(
+        built_mode & 0o022,
+        0,
+        "the build output must be trusted once it has been staged"
+    );
+
     for _ in 0..8 {
         let fixture = TrustedHelperFixture::stage(built_helper());
         assert_eq!(helper_fixture::digest(fixture.path()), built);
