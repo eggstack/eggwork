@@ -23,6 +23,7 @@
       "operations": [
         "capabilities",
         "status",
+        "telemetry",
         "execute",
         "observe",
         "cancel",

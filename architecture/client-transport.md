@@ -179,6 +179,8 @@ with `finish_non_exhaustive()`.
 | `download_artifact(&artifact)` | GET | `/v1/artifacts/{artifact.artifact_id}` | — | `BoxBytesStream` |
 | `create_workspace(&workspace_id, &handle, &manifest)` | POST | `/v1/workspaces` | `{schema_version, workspace_id, handle, manifest}` | `WorkspaceReady` |
 | `create_workspace_derived(&workspace_id, &handle, &base_manifest_digest, &patch)` | POST | `/v1/workspaces/derive` | `{schema_version, workspace_id, handle, patch}` | `WorkspaceReady` |
+| `telemetry()` | GET | `/v1/node/telemetry` | — | `NodeTelemetry` |
+| `telemetry_for(&node_id)` | GET | `/v1/node/telemetry` | — | `NodeTelemetry` (node id must match) |
 
 Prose notes on the non-obvious ones:
 
@@ -198,6 +200,14 @@ Prose notes on the non-obvious ones:
   `eggwork-artifact-id` and `eggwork-artifact-digest` to equal the requested record's. A missing,
   unparseable, or mismatched header is `InvalidResponse` and the body is not handed back. These are
   the anti-mixup checks that make a content-addressed transfer trustworthy across a stream.
+- **`telemetry` is the optional host-observation read.** It is a `GET` on the node's own cache; the
+  node never contacts its provider because of a remote read. The response is validated on arrival:
+  the body must be within 64 KiB, the `schema_version` must be the known one, the `state` and
+  `observation` must agree, and every measurement must satisfy the domain's range rules. A `404` — a
+  node that predates the contract — is `ClientError::TelemetryUnsupported`, which is distinct from the
+  `403` an unauthorized principal receives and from the `state: "unavailable"` a failing provider
+  produces. `telemetry_for` additionally refuses a response naming a different node, so a
+  fixed-target caller cannot be handed a measurement taken somewhere else.
 - **`create_workspace_derived` performs a local consistency check first:** if
   `patch.base_manifest_digest != *base_manifest_digest` it returns `InvalidResponse` without
   sending anything. The base digest travels only inside the patch, so this is a caller-argument
@@ -385,6 +395,7 @@ makes a foreign base look *missing* (`409 base_manifest_missing`) rather than *f
 | `InvalidResponse` | `node response was malformed` | Response did not match the expected contract (see below). | Caller's judgement; usually a hard stop for that response. | Nothing beyond the variant. |
 | `ProtocolIncompatible` | `node protocol is incompatible` | `ensure_protocol_compatible`: the node's `[min, max]` does not contain `1.0`. | No — retrying the same node cannot help. | Nothing; the node's actual range is not carried. |
 | `UnsupportedCapability` | `node does not support a required protocol capability` | Node does not advertise `exec.argv.v1`. | No. | Nothing; the advertised feature list is not carried. |
+| `TelemetryUnsupported` | `node does not implement the node telemetry contract` | `GET /v1/node/telemetry` answered 404: the node predates the contract. | No. | Nothing. |
 
 `InvalidResponse` is produced in every one of these situations: `serde_json::from_slice` failure on
 a response body; `serde_json::to_vec` failure on a request body; a missing, unparseable, or
@@ -394,6 +405,13 @@ a missing or mismatched `eggwork-blob-digest`; a missing or mismatched
 blob upload; an NDJSON partial line exceeding `eggwork_core::MAX_EVENT_BYTES`; a line that is not a valid `ExecutionEvent`;
 and an `ExecutionEvent` that fails `validate()`. Note the last-but-one category is **local**: the
 `create_workspace_derived` base-digest mismatch is detected before any request is sent.
+
+The telemetry read adds its own refusals: a body over 64 KiB, a `schema_version` the client does not
+know (`ProtocolIncompatible`, not `InvalidResponse` — the node speaks a different version of this
+contract), a `state` that contradicts the presence of an observation, a measurement outside the
+domain's range, a `node_id` that is not the one the caller asked for, and a source the client does not
+know. A `404` is `TelemetryUnsupported`, not `InvalidResponse`: it means the node has no such route,
+not that the route answered badly.
 
 **Redaction.** `impl fmt::Debug for ClientError` is hand-written: `Transport` prints
 `ClientError::Transport([REDACTED])`, and `Api` prints `status` and `code` but renders `message` as

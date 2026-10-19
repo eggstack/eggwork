@@ -58,6 +58,7 @@ const MAX_WORKSPACE_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 pub enum Operation {
     Capabilities,
     Status,
+    Telemetry,
     Execute,
     Observe,
     Cancel,
@@ -677,6 +678,7 @@ fn operation_for(method: &str, path: &str) -> Option<(Operation, Route)> {
     match (method, path) {
         ("GET", "/v1/capabilities") => Some((Operation::Capabilities, Route::Capabilities)),
         ("GET", "/v1/status") => Some((Operation::Status, Route::Status)),
+        ("GET", "/v1/node/telemetry") => Some((Operation::Telemetry, Route::Telemetry)),
         ("POST", "/v1/executions") => Some((Operation::Execute, Route::Execute)),
         ("POST", "/v1/blobs/missing") => Some((Operation::BlobRead, Route::BlobMissing)),
         ("POST", "/v1/blobs/prepare") => Some((Operation::BlobWrite, Route::BlobPrepare)),
@@ -738,6 +740,7 @@ fn operation_for(method: &str, path: &str) -> Option<(Operation, Route)> {
 enum Route {
     Capabilities,
     Status,
+    Telemetry,
     Execute,
     Observe(ExecutionId),
     Cancel(ExecutionId),
@@ -791,6 +794,7 @@ async fn dispatch(
     match route {
         Route::Capabilities => Ok(json_response(200, &node_capabilities_for(&state))),
         Route::Status => Ok(json_response(200, &node_status(&state))),
+        Route::Telemetry => Ok(json_response(200, &node_telemetry(&state).await)),
         Route::Execute => execute(state, request, principal).await,
         Route::Observe(id) => observe(state, id, query.as_deref(), principal).await,
         Route::Cancel(id) => control(state, id, request, principal, false).await,
@@ -884,6 +888,24 @@ fn node_status(state: &NodeState) -> NodeStatus {
             || operations::is_persistently_draining(&state.drain_path),
         active_executions: state.max_active - state.permits.available_permits() as u32,
         capabilities: node_capabilities_for(state),
+    }
+}
+
+/// Project the cached host observation into the node telemetry wire contract.
+///
+/// This reads the cache and nothing else. A remote read never contacts the
+/// provider, so a burst of readers cannot become a burst of provider
+/// requests, and a provider that is down does not turn a read into a timeout.
+async fn node_telemetry(state: &NodeState) -> eggwork_core::NodeTelemetry {
+    let snapshot = state.telemetry.cache().snapshot().await;
+    eggwork_core::NodeTelemetry {
+        schema_version: eggwork_core::NODE_TELEMETRY_SCHEMA_VERSION,
+        node_id: state.node_id.clone(),
+        source: eggwork_core::TelemetrySource::Gregg,
+        state: snapshot.state,
+        age_ms: snapshot.age_ms,
+        last_error: snapshot.last_error,
+        observation: snapshot.observation,
     }
 }
 
@@ -3026,6 +3048,7 @@ mod tests {
         for (method, path, expected) in [
             ("GET", "/v1/capabilities", Operation::Capabilities),
             ("GET", "/v1/status", Operation::Status),
+            ("GET", "/v1/node/telemetry", Operation::Telemetry),
             ("POST", "/v1/executions", Operation::Execute),
             ("GET", "/v1/executions/exec-1", Operation::Observe),
             ("POST", "/v1/executions/exec-1/cancel", Operation::Cancel),
@@ -6373,5 +6396,779 @@ mod tests {
         assert_eq!(admitted + rejected, 8, "no admission may be lost");
         server.shutdown().await;
         server.wait().await.unwrap();
+    }
+
+    /// The authorized node-telemetry surface: one read route, one narrow
+    /// grant, and the guarantee that a remote read never becomes a provider
+    /// request.
+    mod telemetry_route {
+        use super::*;
+        use eggwork_core::{NodeTelemetry, TelemetryErrorCategory, TelemetryProviderState};
+        use futures_util::TryStreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        /// A loopback provider that serves one valid v2 status payload and
+        /// counts how often it was asked.
+        struct FakeProvider {
+            address: SocketAddr,
+            requests: Arc<AtomicUsize>,
+        }
+
+        impl FakeProvider {
+            async fn start() -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+                let address = listener.local_addr().expect("addr");
+                let requests = Arc::new(AtomicUsize::new(0));
+                let counter = requests.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let Ok((mut stream, _)) = listener.accept().await else {
+                            continue;
+                        };
+                        let counter = counter.clone();
+                        tokio::spawn(async move {
+                            let mut buffer = Vec::new();
+                            let mut chunk = [0u8; 1024];
+                            loop {
+                                let Ok(read) = stream.read(&mut chunk).await else {
+                                    return;
+                                };
+                                if read == 0 {
+                                    return;
+                                }
+                                buffer.extend_from_slice(&chunk[..read]);
+                                if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            let body = serde_json::json!({
+                                "schema_version": 2,
+                                "observed_at_unix_ms": artifact::now_unix_ms(),
+                                "sample_interval_ms": 1000,
+                                "capabilities": {
+                                    "cpu_iowait": true,
+                                    "load_average": true,
+                                    "swap": false,
+                                    "memory_commit": false
+                                },
+                                "system": {
+                                    "name": "host",
+                                    "hostname": "host.internal",
+                                    "os_name": "linux",
+                                    "os_version": "6.1",
+                                    "kernel_name": "Linux",
+                                    "kernel_release": "6.1.0",
+                                    "architecture": "x86_64"
+                                },
+                                "cpu": { "logical_cores": 8, "usage_pct": 12.5, "iowait_pct": 1.5 },
+                                "load": { "one": 0.5, "five": 0.25, "fifteen": 0.125 },
+                                "memory": { "used_bytes": 4000, "total_bytes": 8000, "usage_pct": 50.0 }
+                            })
+                            .to_string();
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(head.as_bytes()).await;
+                            let _ = stream.write_all(body.as_bytes()).await;
+                            let _ = stream.flush().await;
+                            let _ = stream.shutdown().await;
+                        });
+                    }
+                });
+                Self { address, requests }
+            }
+
+            fn endpoint(&self) -> String {
+                format!("http://127.0.0.1:{}/v2/status", self.address.port())
+            }
+
+            fn requests(&self) -> usize {
+                self.requests.load(Ordering::SeqCst)
+            }
+        }
+
+        /// A node whose provider is configured but not yet sampled.
+        fn telemetry_config(endpoint: &str) -> crate::telemetry::HostTelemetryConfig {
+            crate::telemetry::HostTelemetryConfig::new(endpoint, 3_600, 3_600).expect("config")
+        }
+
+        async fn wait_for_state(
+            server: &NodeServer,
+            expected: TelemetryProviderState,
+        ) -> NodeTelemetry {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let snapshot = server.state.telemetry.cache().snapshot().await;
+                if snapshot.state == expected {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "provider state stayed {snapshot:?} instead of reaching {expected:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            node_telemetry(&server.state).await
+        }
+
+        #[tokio::test]
+        async fn an_authorized_principal_reads_the_cached_observation() {
+            init_tls();
+            let (root, server_identity, client_identity, _) = tls_material();
+            let temp = TempDir::new().unwrap();
+            let work_root = temp.path().join("work");
+            fs::create_dir_all(&work_root).unwrap();
+            let provider = FakeProvider::start().await;
+            let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+            let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+                FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+                principal,
+            )]));
+            let server = NodeServer::start(
+                NodeConfig {
+                    host_telemetry: Some(telemetry_config(&provider.endpoint())),
+                    node_id: NodeId::new("node-a").unwrap(),
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    execution_root: work_root,
+                    database_path: temp.path().join("node.sqlite"),
+                    blob_root: temp.path().join("blob-store"),
+                    blob_quota_bytes: 1024 * 1024 * 1024,
+                    workspace_root: temp.path().join("workspace-store"),
+                    workspace_quota_bytes: 1024 * 1024 * 1024,
+                    max_active_executions: 2,
+                    lease_ttl: std::time::Duration::from_secs(30),
+                    tls: tls_server_config(root.clone(), &server_identity),
+                },
+                Arc::new(LocalProcessRunner::default()),
+                resolver,
+                Arc::new(|_: &NodePrincipal, operation| operation == Operation::Telemetry),
+            )
+            .await
+            .expect("node must start");
+
+            let client_temp = TempDir::new().unwrap();
+            let client = NodeClient::new(
+                format!("https://localhost:{}", server.local_addr().port()),
+                write_client_config(&client_temp, root.as_ref(), &client_identity),
+            )
+            .unwrap();
+
+            let telemetry = wait_for_state(&server, TelemetryProviderState::Ready).await;
+            assert_eq!(telemetry.node_id, NodeId::new("node-a").unwrap());
+            assert_eq!(telemetry.schema_version, 1);
+
+            let observed = client.telemetry().await.expect("authorized read");
+            assert_eq!(observed.state, TelemetryProviderState::Ready);
+            assert_eq!(observed.node_id, NodeId::new("node-a").unwrap());
+            assert_eq!(observed.source, eggwork_core::TelemetrySource::Gregg);
+            observed.validate().expect("served response must validate");
+            let observation = observed.observation.as_ref().expect("observation");
+            assert_eq!(observation.cpu.value().unwrap().logical_cores, 8);
+            assert_eq!(observation.cpu.value().unwrap().iowait_pct, Some(1.5));
+            assert!(observation.swap.is_unsupported());
+            assert!(observed.age_ms.is_some());
+            assert!(observed.last_error.is_none());
+
+            // The same read, requiring the node id to match.
+            let matched = client
+                .telemetry_for(&NodeId::new("node-a").unwrap())
+                .await
+                .expect("matching node id");
+            assert_eq!(matched.node_id, NodeId::new("node-a").unwrap());
+            assert!(matches!(
+                client.telemetry_for(&NodeId::new("node-b").unwrap()).await,
+                Err(eggwork_client::ClientError::InvalidResponse)
+            ));
+
+            // A remote read is served from the cache: it must not become a
+            // provider request.
+            let before = provider.requests();
+            for _ in 0..16 {
+                let _ = client.telemetry().await.expect("repeat read");
+            }
+            assert_eq!(
+                provider.requests(),
+                before,
+                "a remote read must never trigger a provider request"
+            );
+
+            server.shutdown().await;
+            server.wait().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn an_unauthorized_principal_cannot_read_the_observation() {
+            init_tls();
+            let (root, server_identity, client_identity, unknown_identity) = tls_material();
+            let temp = TempDir::new().unwrap();
+            let work_root = temp.path().join("work");
+            fs::create_dir_all(&work_root).unwrap();
+            let provider = FakeProvider::start().await;
+            let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+            // Only the first identity is known to the node. The second is a
+            // well-formed client certificate the node has no principal for,
+            // so it is refused at authentication rather than authorization.
+            let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+                FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+                principal,
+            )]));
+            let server = NodeServer::start(
+                NodeConfig {
+                    host_telemetry: Some(telemetry_config(&provider.endpoint())),
+                    node_id: NodeId::new("node-a").unwrap(),
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    execution_root: work_root,
+                    database_path: temp.path().join("node.sqlite"),
+                    blob_root: temp.path().join("blob-store"),
+                    blob_quota_bytes: 1024 * 1024 * 1024,
+                    workspace_root: temp.path().join("workspace-store"),
+                    workspace_quota_bytes: 1024 * 1024 * 1024,
+                    max_active_executions: 2,
+                    lease_ttl: std::time::Duration::from_secs(30),
+                    tls: tls_server_config(root.clone(), &server_identity),
+                },
+                Arc::new(LocalProcessRunner::default()),
+                resolver,
+                // The read is refused for every principal.
+                Arc::new(|_: &NodePrincipal, _operation| false),
+            )
+            .await
+            .expect("node must start");
+
+            let client_temp = TempDir::new().unwrap();
+            let client = NodeClient::new(
+                format!("https://localhost:{}", server.local_addr().port()),
+                write_client_config(&client_temp, root.as_ref(), &client_identity),
+            )
+            .unwrap();
+            let denied = client.telemetry().await;
+            assert!(
+                matches!(
+                    denied,
+                    Err(eggwork_client::ClientError::Api { status: 403, .. })
+                ),
+                "an unauthorized read must be refused with the typed 403"
+            );
+            // The refusal must not leak whether the node holds an observation.
+            let rendered = format!("{denied:?}");
+            assert!(!rendered.contains("logical_cores"));
+            assert!(!rendered.contains("usage_pct"));
+
+            // A principal the node does not know at all is refused earlier,
+            // at authentication.
+            let unknown_temp = TempDir::new().unwrap();
+            let unknown = NodeClient::new(
+                format!("https://localhost:{}", server.local_addr().port()),
+                write_client_config(&unknown_temp, root.as_ref(), &unknown_identity),
+            )
+            .unwrap();
+            let unknown_read = unknown.telemetry().await;
+            assert!(matches!(
+                unknown_read,
+                Err(eggwork_client::ClientError::Api { status: 401, .. })
+            ));
+
+            server.shutdown().await;
+            server.wait().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_node_without_a_provider_reports_disabled() {
+            init_tls();
+            let (root, server_identity, client_identity, _) = tls_material();
+            let temp = TempDir::new().unwrap();
+            let work_root = temp.path().join("work");
+            fs::create_dir_all(&work_root).unwrap();
+            let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+            let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+                FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+                principal,
+            )]));
+            let server = NodeServer::start(
+                NodeConfig {
+                    host_telemetry: None,
+                    node_id: NodeId::new("node-a").unwrap(),
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    execution_root: work_root,
+                    database_path: temp.path().join("node.sqlite"),
+                    blob_root: temp.path().join("blob-store"),
+                    blob_quota_bytes: 1024 * 1024 * 1024,
+                    workspace_root: temp.path().join("workspace-store"),
+                    workspace_quota_bytes: 1024 * 1024 * 1024,
+                    max_active_executions: 2,
+                    lease_ttl: std::time::Duration::from_secs(30),
+                    tls: tls_server_config(root.clone(), &server_identity),
+                },
+                Arc::new(LocalProcessRunner::default()),
+                resolver,
+                Arc::new(|_: &NodePrincipal, operation| operation == Operation::Telemetry),
+            )
+            .await
+            .expect("node must start");
+
+            let client_temp = TempDir::new().unwrap();
+            let client = NodeClient::new(
+                format!("https://localhost:{}", server.local_addr().port()),
+                write_client_config(&client_temp, root.as_ref(), &client_identity),
+            )
+            .unwrap();
+            let observed = client.telemetry().await.expect("authorized read");
+            assert_eq!(observed.state, TelemetryProviderState::Disabled);
+            assert!(observed.observation.is_none());
+            assert!(observed.age_ms.is_none());
+            assert!(observed.last_error.is_none());
+            observed.validate().expect("served response must validate");
+
+            server.shutdown().await;
+            server.wait().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn an_unreachable_provider_is_reported_as_unavailable() {
+            init_tls();
+            let (root, server_identity, client_identity, _) = tls_material();
+            let temp = TempDir::new().unwrap();
+            let work_root = temp.path().join("work");
+            fs::create_dir_all(&work_root).unwrap();
+            // Bind a port and drop it, so the endpoint refuses connections.
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let address = listener.local_addr().expect("addr");
+            drop(listener);
+            let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+            let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+                FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+                principal,
+            )]));
+            let server = NodeServer::start(
+                NodeConfig {
+                    host_telemetry: Some(telemetry_config(&format!(
+                        "http://127.0.0.1:{}/v2/status",
+                        address.port()
+                    ))),
+                    node_id: NodeId::new("node-a").unwrap(),
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    execution_root: work_root,
+                    database_path: temp.path().join("node.sqlite"),
+                    blob_root: temp.path().join("blob-store"),
+                    blob_quota_bytes: 1024 * 1024 * 1024,
+                    workspace_root: temp.path().join("workspace-store"),
+                    workspace_quota_bytes: 1024 * 1024 * 1024,
+                    max_active_executions: 2,
+                    lease_ttl: std::time::Duration::from_secs(30),
+                    tls: tls_server_config(root.clone(), &server_identity),
+                },
+                Arc::new(LocalProcessRunner::default()),
+                resolver,
+                Arc::new(|_: &NodePrincipal, operation| operation == Operation::Telemetry),
+            )
+            .await
+            .expect("node must start");
+
+            let client_temp = TempDir::new().unwrap();
+            let client = NodeClient::new(
+                format!("https://localhost:{}", server.local_addr().port()),
+                write_client_config(&client_temp, root.as_ref(), &client_identity),
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let observed = client.telemetry().await.expect("authorized read");
+                if observed.state == TelemetryProviderState::Unavailable {
+                    assert_eq!(
+                        observed.last_error,
+                        Some(TelemetryErrorCategory::Connection)
+                    );
+                    assert!(observed.observation.is_none());
+                    observed.validate().expect("served response must validate");
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "an unreachable provider must be reported as unavailable"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+
+            server.shutdown().await;
+            server.wait().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_node_without_the_route_is_reported_as_unsupported() {
+            init_tls();
+            let (root, server_identity, client_identity, _) = tls_material();
+            let temp = TempDir::new().unwrap();
+            let work_root = temp.path().join("work");
+            fs::create_dir_all(&work_root).unwrap();
+            let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+            let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+                FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+                principal,
+            )]));
+            let server = NodeServer::start(
+                NodeConfig {
+                    host_telemetry: None,
+                    node_id: NodeId::new("node-a").unwrap(),
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    execution_root: work_root,
+                    database_path: temp.path().join("node.sqlite"),
+                    blob_root: temp.path().join("blob-store"),
+                    blob_quota_bytes: 1024 * 1024 * 1024,
+                    workspace_root: temp.path().join("workspace-store"),
+                    workspace_quota_bytes: 1024 * 1024 * 1024,
+                    max_active_executions: 2,
+                    lease_ttl: std::time::Duration::from_secs(30),
+                    tls: tls_server_config(root.clone(), &server_identity),
+                },
+                Arc::new(LocalProcessRunner::default()),
+                resolver,
+                Arc::new(|_: &NodePrincipal, _operation| true),
+            )
+            .await
+            .expect("node must start");
+
+            // A base URL the node does not route is how a node that predates
+            // this contract behaves: the path is unknown, so the node answers
+            // 404 rather than 403.
+            let client_temp = TempDir::new().unwrap();
+            let legacy = NodeClient::new(
+                format!("https://localhost:{}/legacy", server.local_addr().port()),
+                write_client_config(&client_temp, root.as_ref(), &client_identity),
+            )
+            .unwrap();
+            assert!(matches!(
+                legacy.telemetry().await,
+                Err(eggwork_client::ClientError::TelemetryUnsupported)
+            ));
+
+            server.shutdown().await;
+            server.wait().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn telemetry_does_not_change_execution_semantics() {
+            init_tls();
+            let (root, server_identity, client_identity, _) = tls_material();
+            let temp = TempDir::new().unwrap();
+            let work_root = temp.path().join("work");
+            fs::create_dir_all(&work_root).unwrap();
+            let provider = FakeProvider::start().await;
+            let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+            let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+                FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+                principal,
+            )]));
+            let server = NodeServer::start(
+                NodeConfig {
+                    host_telemetry: Some(telemetry_config(&provider.endpoint())),
+                    node_id: NodeId::new("node-a").unwrap(),
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                    execution_root: work_root,
+                    database_path: temp.path().join("node.sqlite"),
+                    blob_root: temp.path().join("blob-store"),
+                    blob_quota_bytes: 1024 * 1024 * 1024,
+                    workspace_root: temp.path().join("workspace-store"),
+                    workspace_quota_bytes: 1024 * 1024 * 1024,
+                    max_active_executions: 2,
+                    lease_ttl: std::time::Duration::from_secs(30),
+                    tls: tls_server_config(root.clone(), &server_identity),
+                },
+                Arc::new(LocalProcessRunner::default()),
+                resolver,
+                Arc::new(|_: &NodePrincipal, _operation| true),
+            )
+            .await
+            .expect("node must start");
+
+            let client_temp = TempDir::new().unwrap();
+            let client = NodeClient::new(
+                format!("https://localhost:{}", server.local_addr().port()),
+                write_client_config(&client_temp, root.as_ref(), &client_identity),
+            )
+            .unwrap();
+            wait_for_state(&server, TelemetryProviderState::Ready).await;
+
+            let handle = execution_handle("telemetry-execution");
+            let marker = temp.path().join("telemetry-marker");
+            let stream = client
+                .execute(
+                    &execution_spec(vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        format!("touch {}", marker.display()),
+                    ]),
+                    &handle,
+                )
+                .await
+                .expect("execution must still be admitted");
+            let events = stream
+                .into_events()
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("event stream");
+            assert!(
+                events.iter().any(|event| matches!(
+                    &event.kind,
+                    ExecutionEventKind::State(ExecutionState::Succeeded)
+                )),
+                "execution must still reach a terminal state"
+            );
+            assert!(marker.exists(), "execution must still run its command");
+
+            let status = client.status().await.expect("status");
+            assert_eq!(status.node_id, NodeId::new("node-a").unwrap());
+            // The node's execution surface is unchanged by the telemetry read.
+            assert!(!status.capabilities.features.is_empty());
+            assert!(
+                !status
+                    .capabilities
+                    .features
+                    .iter()
+                    .any(|feature| feature.contains("telemetry")),
+                "telemetry is not an execution capability"
+            );
+
+            server.shutdown().await;
+            server.wait().await.unwrap();
+        }
+    }
+
+    /// The client's refusal to accept a telemetry response it cannot trust.
+    mod telemetry_client_validation {
+        use super::*;
+        use eggwork_core::{
+            HostTelemetry, NodeTelemetry, TelemetryCpu, TelemetryMetric, TelemetryProviderState,
+            TelemetrySource,
+        };
+
+        /// A service that answers every request with one canned status and
+        /// body, so the client's acceptance rules can be driven directly.
+        struct CannedService {
+            status: u16,
+            body: Vec<u8>,
+        }
+
+        impl Service for CannedService {
+            fn call(&self, _request: Request) -> ServiceFuture<'_> {
+                let status = self.status;
+                let body = self.body.clone();
+                Box::pin(async move {
+                    Ok(Response::builder()
+                        .status(StatusCode::new(status).expect("valid HTTP status"))
+                        .header("content-type", "application/json")
+                        .and_then(|builder| builder.body(ResponseBody::Bytes(body)))
+                        .expect("response"))
+                })
+            }
+        }
+
+        async fn serve(
+            status: u16,
+            body: Vec<u8>,
+            tls: TlsServerConfig,
+        ) -> (SocketAddr, ServerHandle) {
+            let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let runtime = RuntimeConfig::builder()
+                .bind(bind)
+                .max_request_body_bytes(1024)
+                .tls_config(tls.into_server_config())
+                .build()
+                .expect("runtime config");
+            let server = Server::builder()
+                .runtime(runtime)
+                .bind(bind)
+                .build()
+                .expect("server");
+            let handle = server
+                .start_with_service(CannedService { status, body })
+                .await
+                .expect("server start");
+            handle.ready().await.expect("server ready");
+            (handle.local_addr(), handle)
+        }
+
+        fn observation() -> HostTelemetry {
+            HostTelemetry {
+                observed_at_unix_ms: artifact::now_unix_ms(),
+                sample_interval_ms: 1_000,
+                cpu: TelemetryMetric::Value(TelemetryCpu {
+                    logical_cores: 8,
+                    usage_pct: 12.5,
+                    iowait_pct: None,
+                }),
+                memory: TelemetryMetric::Unsupported,
+                load: TelemetryMetric::Unsupported,
+                swap: TelemetryMetric::Unsupported,
+                disk: TelemetryMetric::Unsupported,
+                disk_io: TelemetryMetric::Unsupported,
+                network: TelemetryMetric::Unsupported,
+            }
+        }
+
+        fn telemetry() -> NodeTelemetry {
+            NodeTelemetry {
+                schema_version: 1,
+                node_id: NodeId::new("node-a").unwrap(),
+                source: TelemetrySource::Gregg,
+                state: TelemetryProviderState::Ready,
+                age_ms: Some(12),
+                last_error: None,
+                observation: Some(observation()),
+            }
+        }
+
+        async fn client_for(status: u16, body: Vec<u8>) -> (NodeClient, ServerHandle, TempDir) {
+            init_tls();
+            let (root, server_identity, client_identity, _) = tls_material();
+            let client_temp = TempDir::new().unwrap();
+            let (address, handle) = serve(
+                status,
+                body,
+                tls_server_config(root.clone(), &server_identity),
+            )
+            .await;
+            let client = NodeClient::new(
+                format!("https://localhost:{}", address.port()),
+                write_client_config(&client_temp, root.as_ref(), &client_identity),
+            )
+            .expect("client");
+            (client, handle, client_temp)
+        }
+
+        #[tokio::test]
+        async fn a_well_formed_response_is_accepted() {
+            let body = serde_json::to_vec(&telemetry()).unwrap();
+            let (client, handle, _temp) = client_for(200, body).await;
+            let observed = client.telemetry().await.expect("accepted");
+            assert_eq!(observed.state, TelemetryProviderState::Ready);
+            assert_eq!(observed.node_id, NodeId::new("node-a").unwrap());
+            handle.shutdown();
+        }
+
+        #[tokio::test]
+        async fn a_malformed_body_is_refused() {
+            let (client, handle, _temp) = client_for(200, b"not json".to_vec()).await;
+            assert!(matches!(
+                client.telemetry().await,
+                Err(eggwork_client::ClientError::InvalidResponse)
+            ));
+            handle.shutdown();
+        }
+
+        #[tokio::test]
+        async fn an_oversized_body_is_refused() {
+            // A response that is far larger than the telemetry contract allows
+            // must be refused rather than parsed.
+            let body = vec![b'x'; 256 * 1024];
+            let (client, handle, _temp) = client_for(200, body).await;
+            assert!(matches!(
+                client.telemetry().await,
+                Err(eggwork_client::ClientError::InvalidResponse)
+            ));
+            handle.shutdown();
+        }
+
+        #[tokio::test]
+        async fn an_unknown_schema_version_is_refused() {
+            let mut payload = telemetry();
+            payload.schema_version = 2;
+            let body = serde_json::to_vec(&payload).unwrap();
+            let (client, handle, _temp) = client_for(200, body).await;
+            assert!(matches!(
+                client.telemetry().await,
+                Err(eggwork_client::ClientError::ProtocolIncompatible)
+            ));
+            handle.shutdown();
+        }
+
+        #[tokio::test]
+        async fn an_unknown_source_is_refused() {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "node_id": "node-a",
+                "source": "something-else",
+                "state": "ready",
+                "age_ms": 1,
+                "last_error": null,
+                "observation": serde_json::to_value(observation()).unwrap()
+            }))
+            .unwrap();
+            let (client, handle, _temp) = client_for(200, body).await;
+            assert!(matches!(
+                client.telemetry().await,
+                Err(eggwork_client::ClientError::InvalidResponse)
+            ));
+            handle.shutdown();
+        }
+
+        #[tokio::test]
+        async fn a_response_whose_state_contradicts_its_observation_is_refused() {
+            let mut payload = telemetry();
+            // A ready node with no observation claims a measurement it does
+            // not have.
+            payload.observation = None;
+            let body = serde_json::to_vec(&payload).unwrap();
+            let (client, handle, _temp) = client_for(200, body).await;
+            assert!(matches!(
+                client.telemetry().await,
+                Err(eggwork_client::ClientError::InvalidResponse)
+            ));
+            handle.shutdown();
+        }
+
+        #[tokio::test]
+        async fn a_response_with_an_out_of_range_measurement_is_refused() {
+            let mut payload = telemetry();
+            if let Some(observation) = payload.observation.as_mut() {
+                observation.cpu = TelemetryMetric::Value(TelemetryCpu {
+                    logical_cores: 8,
+                    usage_pct: 1_000.0,
+                    iowait_pct: None,
+                });
+            }
+            let body = serde_json::to_vec(&payload).unwrap();
+            let (client, handle, _temp) = client_for(200, body).await;
+            assert!(matches!(
+                client.telemetry().await,
+                Err(eggwork_client::ClientError::InvalidResponse)
+            ));
+            handle.shutdown();
+        }
+
+        #[tokio::test]
+        async fn a_response_whose_number_does_not_fit_is_refused() {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "node_id": "node-a",
+                "source": "gregg",
+                "state": "ready",
+                "age_ms": 1,
+                "last_error": null,
+                "observation": {
+                    "observed_at_unix_ms": artifact::now_unix_ms(),
+                    "sample_interval_ms": 1000,
+                    "cpu": { "value": { "logical_cores": 8, "usage_pct": 1e300, "iowait_pct": null } },
+                    "memory": "unsupported",
+                    "load": "unsupported",
+                    "swap": "unsupported",
+                    "disk": "unsupported",
+                    "disk_io": "unsupported",
+                    "network": "unsupported"
+                }
+            }))
+            .unwrap();
+            let (client, handle, _temp) = client_for(200, body).await;
+            assert!(matches!(
+                client.telemetry().await,
+                Err(eggwork_client::ClientError::InvalidResponse)
+            ));
+            handle.shutdown();
+        }
     }
 }

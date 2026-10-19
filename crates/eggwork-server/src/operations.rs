@@ -418,6 +418,7 @@ fn operation(name: &str) -> Option<Operation> {
     Some(match name {
         "capabilities" => Operation::Capabilities,
         "status" => Operation::Status,
+        "telemetry" => Operation::Telemetry,
         "execute" => Operation::Execute,
         "observe" => Operation::Observe,
         "cancel" => Operation::Cancel,

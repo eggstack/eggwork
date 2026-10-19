@@ -1338,6 +1338,112 @@ pub struct HostTelemetry {
     pub network: TelemetryMetric<TelemetryNetwork>,
 }
 
+/// Wire schema version of the node telemetry response.
+///
+/// The contract is additive within version 1: a reader accepts a version-1
+/// payload and refuses a version it does not know, rather than guessing.
+pub const NODE_TELEMETRY_SCHEMA_VERSION: u16 = 1;
+
+/// The node's host-wide telemetry observation, as served to an authorized caller.
+///
+/// This is the frozen wire contract for the node telemetry response. It is
+/// additive and deliberately separate from
+/// [`NodeStatus`]: `NodeStatus` answers "is this node accepting work", and
+/// this answers "what did this host look like". The two are never merged, and
+/// nothing here qualifies an execution.
+///
+/// The fields mean:
+///
+/// * `schema_version` — the contract version. A reader refuses anything else.
+/// * `node_id` — the node that produced the observation, so a reader can tell
+///   that a response came from the node it asked.
+/// * `source` — where the measurement came from. The set is closed: a reader
+///   refuses a source it does not know. The source names the *kind* of
+///   provider; whether that provider is live is `state`'s answer, not this
+///   field's.
+/// * `state` — what the provider is doing, not what the host is doing. A node
+///   with no provider is `disabled`, which is not the same as a host with no
+///   usage.
+/// * `age_ms` — how long ago, in milliseconds, the node received the
+///   observation, measured on the node's monotonic clock. `None` when there is
+///   no observation.
+/// * `last_error` — the bounded category of the most recent provider failure.
+///   `None` when the last interaction succeeded or none has failed.
+/// * `observation` — the most recent measurement the node holds, or `None` when
+///   it holds none.
+///
+/// The `state` and `observation` pair is the part a reader must understand:
+///
+/// | `state` | `observation` | meaning |
+/// |---|---|---|
+/// | `disabled` | absent | no provider is configured |
+/// | `warming` | absent | the provider is alive but has not produced a sample |
+/// | `ready` | present | a sample is present and within its freshness bound |
+/// | `stale` | present | a sample is present but older than the freshness bound |
+/// | `unavailable` | present or absent | the provider could not be reached |
+/// | `invalid` | present or absent | the provider answered with something unusable |
+///
+/// A sample is *current* only when the state is `ready`. A reader that needs a
+/// fresh measurement must check the state, not merely the presence of an
+/// observation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeTelemetry {
+    pub schema_version: u16,
+    pub node_id: NodeId,
+    pub source: TelemetrySource,
+    pub state: TelemetryProviderState,
+    pub age_ms: Option<u64>,
+    pub last_error: Option<TelemetryErrorCategory>,
+    pub observation: Option<HostTelemetry>,
+}
+
+impl NodeTelemetry {
+    /// Check the invariants of a telemetry response.
+    ///
+    /// The node applies this to what it serves, and a client applies it again
+    /// to what it receives, so a node that skipped it cannot hand a reader a
+    /// response the reader would have to reject.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.schema_version != NODE_TELEMETRY_SCHEMA_VERSION {
+            return Err(ValidationError::OutOfRange {
+                field: "node telemetry schema version",
+            });
+        }
+        match self.state {
+            // A ready or stale node always holds the sample it is reporting.
+            TelemetryProviderState::Ready | TelemetryProviderState::Stale => {
+                if self.observation.is_none() {
+                    return Err(ValidationError::OutOfRange {
+                        field: "node telemetry observation",
+                    });
+                }
+            }
+            // A node with no provider, or one that has not sampled yet, holds
+            // no sample. Reporting one would claim a measurement the node
+            // never took.
+            TelemetryProviderState::Disabled | TelemetryProviderState::Warming => {
+                if self.observation.is_some() {
+                    return Err(ValidationError::OutOfRange {
+                        field: "node telemetry observation",
+                    });
+                }
+            }
+            // A failed provider may still be holding the last sample it took.
+            TelemetryProviderState::Unavailable | TelemetryProviderState::Invalid => {}
+        }
+        if self.observation.is_some() != self.age_ms.is_some() {
+            return Err(ValidationError::OutOfRange {
+                field: "node telemetry age",
+            });
+        }
+        if let Some(observation) = &self.observation {
+            observation.validate()?;
+        }
+        Ok(())
+    }
+}
+
 /// Reject a percentage that is not a finite value in `0.0..=100.0`.
 ///
 /// A non-finite percentage cannot be serialized as a JSON number, and an
@@ -2117,5 +2223,72 @@ mod tests {
             .unwrap()
             .insert("unexpected".into(), serde_json::json!(1));
         assert!(serde_json::from_value::<HostTelemetry>(value).is_err());
+    }
+
+    fn node_telemetry() -> NodeTelemetry {
+        NodeTelemetry {
+            schema_version: NODE_TELEMETRY_SCHEMA_VERSION,
+            node_id: NodeId::new("node-a").unwrap(),
+            source: TelemetrySource::Gregg,
+            state: TelemetryProviderState::Ready,
+            age_ms: Some(12),
+            last_error: None,
+            observation: Some(observation()),
+        }
+    }
+
+    #[test]
+    fn a_ready_telemetry_response_validates() {
+        assert!(node_telemetry().validate().is_ok());
+    }
+
+    #[test]
+    fn a_telemetry_response_with_an_unknown_schema_version_is_refused() {
+        let mut telemetry = node_telemetry();
+        telemetry.schema_version = NODE_TELEMETRY_SCHEMA_VERSION + 1;
+        assert!(telemetry.validate().is_err());
+    }
+
+    #[test]
+    fn a_ready_telemetry_response_without_an_observation_is_refused() {
+        let mut telemetry = node_telemetry();
+        telemetry.observation = None;
+        assert!(telemetry.validate().is_err());
+    }
+
+    #[test]
+    fn a_disabled_telemetry_response_with_an_observation_is_refused() {
+        let mut telemetry = node_telemetry();
+        telemetry.state = TelemetryProviderState::Disabled;
+        assert!(telemetry.validate().is_err());
+    }
+
+    #[test]
+    fn a_disabled_telemetry_response_is_valid_without_an_observation() {
+        let mut telemetry = node_telemetry();
+        telemetry.state = TelemetryProviderState::Disabled;
+        telemetry.observation = None;
+        telemetry.age_ms = None;
+        assert!(telemetry.validate().is_ok());
+    }
+
+    #[test]
+    fn a_telemetry_response_whose_age_contradicts_its_observation_is_refused() {
+        let mut telemetry = node_telemetry();
+        telemetry.age_ms = None;
+        assert!(telemetry.validate().is_err());
+    }
+
+    #[test]
+    fn a_telemetry_response_round_trips_through_json() {
+        let encoded = serde_json::to_string(&node_telemetry()).unwrap();
+        let decoded: NodeTelemetry = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, node_telemetry());
+        let mut value = serde_json::to_value(node_telemetry()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), serde_json::json!(1));
+        assert!(serde_json::from_value::<NodeTelemetry>(value).is_err());
     }
 }

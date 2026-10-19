@@ -771,7 +771,31 @@ resources behind a 403 (authorization precedes resolution, and observe/control/e
 single 404 for both "absent" and "not yours"). `secret_sentinels_stay_out_of_error_and_debug_surfaces`
 (`lib.rs:6104`) is the executable guard for the first two.
 
-## Optional host telemetry
+## The node telemetry read route
+
+`GET /v1/node/telemetry` is the one bounded read route that projects the
+optional host telemetry. It is a *read* of the node's own cache: it never
+contacts the provider, so a burst of readers cannot become a burst of provider
+requests, and a provider that is down does not turn a read into a timeout.
+
+The route maps to `Operation::Telemetry` and is authorized by a **narrow,
+separate grant**: the `telemetry` operation name in a client's grant list. It
+is deliberately not folded into `status`. `status` answers "is this node
+accepting work"; telemetry answers "what did this host look like", and folding
+the second into the first would silently widen every principal that already
+holds a status grant. A principal that is not granted `telemetry` receives the
+existing typed 403 with no detail about whether the node holds an observation.
+
+A node that predates this contract has no such route and answers 404. The
+client maps that to a distinct "unsupported" outcome, so "this node cannot
+serve telemetry" is distinguishable from "this principal may not read
+telemetry" and from "the provider is down".
+
+The response is the frozen `NodeTelemetry` document described in
+[protocol.md](protocol.md#the-node-telemetry-wire-contract-schema-version-1).
+The projection itself is `node_telemetry` (`lib.rs`), which reads the M001
+cache and copies its snapshot; it adds no measurement of its own and performs
+no validation the client would not also perform.
 
 `crates/eggwork-server/src/telemetry.rs` is an **optional, default-off** sibling of the control plane. It
 owns the outbound half of the node: reading host-wide measurements from a telemetry provider on the same

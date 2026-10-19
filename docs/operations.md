@@ -116,6 +116,59 @@ HTTP status, malformed, schema version, invalid, too large, clock skew). No
 response body, provider address, or host path is ever carried into a log line
 or a metric.
 
+## Reading host telemetry
+
+When a provider is configured, an **authorized controller** can read the node's
+host-wide observation over the existing mTLS channel:
+
+```text
+GET /v1/node/telemetry
+```
+
+The read is served from the node's own cache. It never contacts the provider,
+so a burst of readers cannot become a burst of provider requests, and a
+provider that is down does not turn a read into a timeout.
+
+**The `telemetry` grant is separate.** The operation name in a client's grant
+list is `telemetry`, and it is not implied by `status`:
+
+```json
+"clients": [
+  {
+    "principal_id": "controller-01",
+    "certificate_sha256": "0123…",
+    "operations": ["capabilities", "status", "telemetry"]
+  }
+]
+```
+
+A principal that is not granted `telemetry` receives the ordinary typed 403,
+and the refusal does not reveal whether the node holds an observation. A node
+that predates this route answers 404, which is a different answer: it means the
+node cannot serve telemetry at all.
+
+The response reports what the **provider** is doing, not what the host is
+doing:
+
+| `state` | Meaning |
+|---|---|
+| `disabled` | No provider is configured. The node reports no host measurements. |
+| `warming` | The provider is alive but has not produced a sample yet. |
+| `ready` | A sample is present and within its freshness bound. |
+| `stale` | A sample is present but older than the freshness bound. |
+| `unavailable` | The provider could not be reached. |
+| `invalid` | The provider answered with something unusable. |
+
+A sample is current only when the state is `ready`. `unavailable` is not zero
+utilization, and the per-measurement groups keep that explicit: a measurement
+the host platform cannot produce is `unsupported`, one that was supported but
+not reported is `unknown`, and only a real measurement is a value.
+
+The response carries no provider address, mount path, device or interface
+identity, hostname, or per-execution measurement. The node's `status` and
+`capabilities` are unchanged by this feature: they answer "is this node
+accepting work", and telemetry answers "what did this host look like".
+
 ## Drain
 
 ```bash
