@@ -1,10 +1,11 @@
 # Optional Gregg Telemetry M002 — Authenticated Node Observation API
 
-Status: **blocked** — Eggwork telemetry M001 closure and its normalized observation contract
+Status: **closed**
 Class: protocol / observability
 Source: `plans/subsystems/optional-gregg-host-telemetry-roadmap.md`
 Decision: `plans/adrs/ADR-0006-optional-gregg-host-telemetry.md`
 Reviewed baseline: `eggwork-core::NodeStatus`, `eggwork-server` node operation routes/mTLS authorization, `eggwork-client::NodeClient` (2026-10-19).
+Closure record: `plans/closure/optional-gregg-host-telemetry/002-status.md` (implementation `5ccb1e6`).
 
 ## 1. Objective
 
