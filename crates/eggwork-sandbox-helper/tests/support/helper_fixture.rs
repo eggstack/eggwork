@@ -10,30 +10,64 @@
 //! Operations M004 recorded one same-head CI failure of
 //! `required_landlock_allows_workspace_and_denies_outside_reads_and_writes`
 //! with `Spawn("Text file busy (os error 26)")`, which passed on an immediate
-//! rerun. `ETXTBSY` is what Linux returns when a file that is currently being
-//! executed is opened for writing, and it is also what a partially written
-//! executable can be replaced with mid-flight. The invariant this module exists
-//! to make true is:
+//! rerun. `ETXTBSY` is what Linux returns when a file that is currently open for
+//! writing is executed. The invariant this module exists to make true is:
 //!
 //! > A fixture must never mutate, truncate, overwrite, or rename over an
 //! > executable path another concurrently runnable test may execute.
 //!
-//! Four properties deliver it:
+//! # What the kernel actually does
+//!
+//! The refusal is not a timing window and it is not about write-back. Linux
+//! accounts write access on the inode itself: `struct inode::i_writecount` is
+//! positive while the file is open for writing, negative while it is being
+//! executed, and zero otherwise. `execve()` opens the candidate executable and
+//! then calls `exe_file_deny_write_access()`, which is `deny_write_access()`:
+//!
+//! ```c
+//! static inline int deny_write_access(struct file *file)
+//! {
+//!     struct inode *inode = file_inode(file);
+//!     return atomic_dec_unless_positive(&inode->i_writecount) ? 0 : -ETXTBSY;
+//! }
+//! ```
+//!
+//! The write access itself is taken by every write-open of a regular file, in
+//! `do_dentry_open()`, and released when that file is torn down. So an `execve()`
+//! of an inode that is *still* open for writing fails with `ETXTBSY`, and the
+//! release is asynchronous with respect to the closing thread — which is why the
+//! refusal can be observed on a file that no `/proc/<pid>/fd` entry points at.
+//!
+//! Three consequences follow, and they are the whole design:
+//!
+//! 1. `fsync`, `O_DSYNC` and sleeping do not help. They concern write-back;
+//!    the refusal is caused by the write *access*.
+//! 2. A retry does not help either, because a refused `execve` leaves the
+//!    access in place.
+//! 3. The only construction that cannot produce the refusal is one that never
+//!    opens the executed inode for writing.
+//!
+//! # The four properties
 //!
 //! 1. **Build output is an input, never an installation directory.** The
 //!    Cargo-built helper is only ever read. Each fixture gets its own `0700`
 //!    directory and its own path, so no two tests can name the same
 //!    executable.
 //! 2. **Staging never writes the file that will be executed.** The staged
-//!    helper is a hard link to the Cargo-built one, whose inode was last
-//!    written by the linker — long before any test ran — so it carries no
-//!    write reference and the kernel has no reason to refuse to execute it.
-//!    Publication is a directory entry, not a write. See `stage`.
-//! 3. **A published copy is durable before it is executed.** When a fixture
-//!    does need its own bytes — a mode change, a corrupted helper — the
-//!    replacement is written, committed, and published atomically, so the
-//!    write-back that releases the inode's write reference has completed
-//!    before anything may execute it. See `install_atomically`.
+//!    helper is a hard link to the Cargo-built one. A link shares the source's
+//!    inode and does not open it for writing, so the inode's write access is
+//!    never taken and the kernel has no reason to refuse to execute it. See
+//!    `stage`.
+//! 3. **A link shares the source's mode, so the source has to be trusted.**
+//!    `verify_trusted_helper` rejects a helper that anyone but its owner may
+//!    write, and Cargo's executable mode is `0666 & ~umask` plus the execute
+//!    bits — so a permissive umask produces a group-writable build output that
+//!    no fixture could stage by linking. The fixture therefore clears the group
+//!    and world write bits of the build output once, before anything is staged.
+//!    That is a mode change on a shared build artifact, and it is deliberately
+//!    one-directional: it can only ever *remove* write permission for others,
+//!    and the build output's bytes are never touched. See
+//!    `normalize_trusted_mode`.
 //! 4. **Cleanup follows convergence.** The fixture owns its directory and
 //!    removes it on drop. `LocalProcessRunner::run` returns only after the
 //!    owned process tree has converged, so a test that holds the fixture until
@@ -43,17 +77,26 @@
 //!
 //! Property 2 replaced an earlier property that claimed atomic publication was
 //! enough on its own. It was not: a file that is written and then immediately
-//! executed can be refused with `ETXTBSY`, and the refusal recurred in CI on
-//! the optional-Gregg telemetry branch before it was eliminated. The
-//! measurement is recorded in `publish_durably`.
+//! executed can be refused with `ETXTBSY`, and the refusal recurred in CI on the
+//! optional-Gregg telemetry branch before it was eliminated. The measurement is
+//! recorded in `plans/closure/operations-distribution/004b-status.md`.
+//!
+//! Property 3 is new with the same corrective. It is the price of property 2:
+//! a link cannot have a different mode from the file it links to.
 
 // Every include site gates this module with `#[cfg(target_os = "linux")]`; the
 // gate lives there rather than here so including this file does not emit a
 // duplicated-attribute warning.
 
+use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+/// The file name a staged helper is published under.
+const HELPER_NAME: &str = "eggwork-sandbox-helper";
 
 /// A fixture-owned installation of the sandbox helper.
 ///
@@ -71,47 +114,61 @@ impl TrustedHelperFixture {
     /// Stage `source` — normally the Cargo-built helper — into a fresh private
     /// installation.
     ///
-    /// The directory is `0700` and the copy `0755`, which is exactly what
-    /// `verify_trusted_helper` requires: an owner-only ancestor chain, a
-    /// regular file, and an executable mode. Trust is therefore satisfied by
-    /// construction, which is part of the contract under test rather than an
-    /// accident.
+    /// The directory is `0700` and the staged helper carries the source's
+    /// executable mode, which is exactly what `verify_trusted_helper` requires:
+    /// an owner-only ancestor chain, a regular file, and an executable mode.
+    /// Trust is therefore satisfied by construction, which is part of the
+    /// contract under test rather than an accident.
     ///
-    /// The staged helper is a hard link to `source` rather than a copy of it.
-    /// A link shares the source's inode, and that inode was last written when
-    /// the linker produced the binary, so it carries no write reference and
-    /// the kernel will never refuse to execute it. That is the difference
-    /// between a refusal that cannot happen and one that is merely unlikely.
-    /// It also removes a per-fixture copy of the whole binary from every test.
+    /// The staged helper is a hard link to `source` rather than a copy of it. A
+    /// link shares the source's inode and never opens it for writing, so the
+    /// inode's write access is never taken and the kernel will not refuse to
+    /// execute it. That is the difference between a refusal that cannot happen
+    /// and one that is merely unlikely. It also removes a per-fixture copy of
+    /// the whole binary from every test.
     ///
-    /// A hard link needs the source and the fixture to share a filesystem. When
-    /// they do not, the fixture falls back to a private copy, committed before
-    /// it is used.
+    /// A hard link needs the source and the fixture to share a filesystem. The
+    /// system temporary directory is tried first, because its ancestor chain is
+    /// the one `verify_trusted_helper` trusts by construction; a directory next
+    /// to the source is the fallback, because it is the same filesystem by
+    /// definition. When neither can be linked, staging fails loudly rather than
+    /// falling back to a copy, because a copy is exactly the construction that
+    /// can be refused.
     pub fn stage(source: &Path) -> Self {
-        let directory = tempfile::tempdir().expect("fixture directory");
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-            .expect("owner-only fixture directory");
-        let helper = directory.path().join("eggwork-sandbox-helper");
-        if !link_without_writing(source, &helper) {
-            install_atomically(source, &helper, 0o755);
+        let source = trusted_source(source);
+        let executable = fs::metadata(&source)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+        assert!(
+            executable,
+            "the sandbox helper source {} is not executable, so no trusted helper can be \
+             staged from it",
+            source.display()
+        );
+        let mut failure: Option<io::Error> = None;
+        for parent in [None, source.parent()] {
+            let directory = match parent {
+                None => tempfile::tempdir(),
+                Some(parent) => tempfile::tempdir_in(parent),
+            };
+            let Ok(directory) = directory else {
+                failure = Some(io::Error::other("no fixture directory could be created"));
+                continue;
+            };
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+                .expect("owner-only fixture directory");
+            let helper = directory.path().join(HELPER_NAME);
+            match fs::hard_link(&source, &helper) {
+                Ok(()) => return Self { directory, helper },
+                Err(error) => failure = Some(error),
+            }
         }
-        Self { directory, helper }
-    }
-
-    /// Stage a fixture whose helper is a *private copy* of `source`.
-    ///
-    /// `stage` links the source instead of copying it, and a link is never
-    /// written. This entry point publishes bytes of its own, which is the path
-    /// that has to survive a write before execution — the path that produced
-    /// the `ETXTBSY` refusal. It exists so that path can be exercised
-    /// directly rather than only through a fallback nobody takes.
-    pub fn stage_private_copy(source: &Path) -> Self {
-        let directory = tempfile::tempdir().expect("fixture directory");
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-            .expect("owner-only fixture directory");
-        let helper = directory.path().join("eggwork-sandbox-helper");
-        install_atomically(source, &helper, 0o755);
-        Self { directory, helper }
+        panic!(
+            "cannot stage a trusted helper from {}: {failure:?}. A copy is deliberately not \
+             used as a fallback: a file that was written can be refused with ETXTBSY, which is \
+             the failure this fixture exists to make impossible.",
+            source.display()
+        );
     }
 
     /// The trusted path to hand to `TrustedLandlockSetup`.
@@ -132,10 +189,17 @@ impl TrustedHelperFixture {
     /// Replace this fixture's helper bytes with junk, atomically.
     ///
     /// The replacement is *published*, not written in place: the staged helper
-    /// may be a hard link shared with the Cargo-built helper and with other
+    /// is a hard link shared with the Cargo-built helper and with other
     /// fixtures, and writing through it would reach all of them.
+    ///
+    /// The published replacement is a file that was written, so executing it
+    /// may be refused with `ETXTBSY` instead of failing as a malformed
+    /// executable. Both are loud failures, and the junk fixture is never
+    /// expected to run successfully.
     pub fn replace_with_junk(&self, bytes: &[u8]) {
-        self.publish_replacement(bytes, 0o755);
+        let staging = self.staging_path();
+        fs::write(&staging, bytes).expect("write the replacement helper");
+        self.publish(staging, 0o755);
     }
 
     /// Change only this fixture's helper mode, so a trust rejection can be
@@ -145,113 +209,76 @@ impl TrustedHelperFixture {
     /// changing the inode: the staged helper may be shared, and a `chmod` on a
     /// shared inode would be visible to every fixture that links it.
     pub fn set_mode(&self, mode: u32) {
-        let bytes = fs::read(&self.helper).expect("read the staged helper");
-        self.publish_replacement(&bytes, mode);
+        let staging = self.staging_path();
+        fs::copy(&self.helper, &staging).expect("copy the staged helper");
+        self.publish(staging, mode);
     }
 
-    /// Publish `bytes` as this fixture's helper, atomically and durably.
-    fn publish_replacement(&self, bytes: &[u8], mode: u32) {
-        let staging = self.directory.path().join("eggwork-sandbox-helper.staging");
-        fs::write(&staging, bytes).expect("write the replacement helper");
+    /// The staging name a replacement is written under, inside this fixture's
+    /// own directory, so that the final `rename` is a same-filesystem atomic
+    /// swap — the only replacement form Linux accepts for an executable that
+    /// may be running.
+    fn staging_path(&self) -> PathBuf {
+        self.directory.path().join(format!("{HELPER_NAME}.staging"))
+    }
+
+    /// Publish `staging` as this fixture's helper, atomically.
+    fn publish(&self, staging: PathBuf, mode: u32) {
         fs::set_permissions(&staging, fs::Permissions::from_mode(mode))
             .expect("stage the replacement mode");
-        commit(&staging);
         fs::rename(&staging, &self.helper).expect("publish the replacement helper");
-        publish_durably(&self.helper);
     }
 }
 
-/// Link `source` to `destination` without writing anything.
+/// Clear the group and world write bits of `path`, if it has any.
 ///
-/// Returns whether the link was made. The source has to be executable and not
-/// writable by anyone else, because a link shares the source's mode and the
-/// fixture must not change it — that would change the build output too.
-fn link_without_writing(source: &Path, destination: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(source) else {
+/// Returns whether the mode was changed.
+///
+/// A hard-linked helper carries the source's mode, and `verify_trusted_helper`
+/// rejects a helper that anyone but its owner may write. Cargo derives the
+/// executable's mode from the process umask — `0666 & ~umask` plus the execute
+/// bits — so a permissive umask (0002 is common in shared development
+/// environments) leaves the build output group-writable and no fixture could
+/// stage it by linking.
+///
+/// The change is deliberately one-directional: it removes write permission for
+/// everyone else and keeps the owner's permissions, the execute bits, and every
+/// other bit exactly as they were. It never makes a file more writable, so a
+/// fixture that stages a link can only become *more* trusted because of it, and
+/// the build output's bytes are never touched.
+pub fn normalize_trusted_mode(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
         return false;
     };
     let mode = metadata.permissions().mode();
-    if mode & 0o111 == 0 || mode & 0o022 != 0 {
+    if mode & 0o022 == 0 {
         return false;
     }
-    fs::hard_link(source, destination).is_ok()
+    let trusted = mode & 0o7777 & !0o022;
+    fs::set_permissions(path, fs::Permissions::from_mode(trusted))
+        .expect("normalize the build output's mode");
+    true
 }
 
-/// Copy `source` to `destination` without ever writing `destination` in place.
+/// The source of a staged helper, with its mode normalized once.
 ///
-/// The staging name lives in the destination directory so the final `rename` is
-/// a same-filesystem atomic swap, which is the only replacement form Linux
-/// accepts for an executable that may be running.
-///
-/// The copy is committed before it is published, because a file that has just
-/// been written still carries the write reference the kernel refuses to
-/// execute over. See `publish_durably`.
-fn install_atomically(source: &Path, destination: &Path, mode: u32) {
-    let name = destination
-        .file_name()
-        .expect("destination has a file name")
-        .to_string_lossy()
-        .into_owned();
-    let staging = destination.with_file_name(format!("{name}.staging"));
-    fs::copy(source, &staging).expect("copy helper into the fixture");
-    fs::set_permissions(&staging, fs::Permissions::from_mode(mode)).expect("stage executable mode");
-    // The mode change is itself a write to the inode, so the barrier has to
-    // come after it. Committing the staged file here — not the copy, and not
-    // the mode — is what completes the write-back that releases the write
-    // reference.
-    commit(&staging);
-    fs::rename(&staging, destination).expect("publish the staged helper");
-    publish_durably(destination);
-}
-
-/// Commit `path`'s contents and metadata, so that the write-back behind it has
-/// completed.
-fn commit(path: &Path) {
-    fs::File::open(path)
-        .and_then(|file| file.sync_all())
-        .expect("commit the staged helper");
-}
-
-/// Commit the publication of `path`, so that the file can be executed.
-///
-/// # Why this barrier is load-bearing
-///
-/// Linux refuses to `execve` a file whose inode still carries an open write
-/// reference, and reports the refusal as `ETXTBSY` ("Text file busy"). That
-/// reference is released when the write-back for the inode completes — not
-/// when the writer's descriptor is closed — so a file that was written and then
-/// immediately executed can be refused at random.
-///
-/// The refusal belongs to the inode, not to the moment. Measured on this host,
-/// a hundred immediate retries of the same path all failed, so a retry or a
-/// sleep at the call site cannot be relied on to clear it, and the M004a
-/// closure record's `write_open: no-writer` probe could not observe the
-/// holder because there is no holder to observe: the reference is already
-/// gone by the time the failure is reported.
-///
-/// Measured here, 16 threads each staging and executing a private copy in a
-/// loop, 32 000 attempts per variant:
-///
-/// | staging sequence | `ETXTBSY` rate |
-/// | --- | --- |
-/// | copy, rename | 22.6% |
-/// | copy, rename, commit the directory | 0% |
-///
-/// The fix is therefore a durability barrier rather than a retry or a sleep:
-/// the fixture publishes a durable copy before anything is allowed to execute
-/// it. This is the same write-then-`sync_all`-then-rename-then-sync-parent
-/// ordering the blob store and the drain marker already use (see
-/// `architecture/data-plane.md` and `architecture/operations-cli.md`).
-///
-/// A fixture that never writes the file it executes — `stage`, which links
-/// rather than copies — needs no barrier at all, and does not have one.
-fn publish_durably(path: &Path) {
-    let directory = path
-        .parent()
-        .expect("a published fixture path has a parent directory");
-    fs::File::open(directory)
-        .and_then(|directory| directory.sync_all())
-        .expect("commit the fixture directory");
+/// The normalization happens under a lock, before the first link is made, so
+/// that no fixture can stage a helper whose mode has not been settled yet: a
+/// fixture that linked before the normalization would hold a group-writable
+/// helper, and the trust check would reject it.
+fn trusted_source(source: &Path) -> PathBuf {
+    static TRUSTED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let trusted = TRUSTED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut seen = trusted
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let key = source.to_path_buf();
+    if seen.contains(&key) {
+        return key;
+    }
+    normalize_trusted_mode(source);
+    seen.insert(key.clone());
+    key
 }
 
 /// The digest of a file, used by the fixture tests to prove that staging never

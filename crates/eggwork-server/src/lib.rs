@@ -2976,36 +2976,52 @@ mod tests {
     /// while cargo test binaries sit under `target/debug/deps/`, so the helper
     /// cannot rely on `CARGO_BIN_EXE_eggwork-sandbox-helper`. We probe the
     /// current executable's sibling, then its grandparent, then `CARGO_TARGET_DIR`.
+    ///
+    /// The helper is staged by hard link, never by copy. Linux refuses to
+    /// execute an inode that is still open for writing, and reports the
+    /// refusal as `ETXTBSY`; a copy is by definition a file that was written,
+    /// so it is exactly the construction that can be refused. A link shares the
+    /// build output's inode and writes nothing, so the refusal cannot arise.
+    /// Because a link also carries the source's mode, the build output's group
+    /// and world write bits are cleared first: a trusted helper must not be
+    /// writable by anyone but its owner, and Cargo derives the executable's
+    /// mode from the umask. The same staging rules live in
+    /// `eggwork-sandbox-helper`'s shared test fixture.
     fn place_trusted_helper() -> Option<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         let source = locate_helper_binary()?;
-        let helper_dir = tempfile::tempdir().ok()?;
-        let helper = helper_dir.path().join("eggwork-sandbox-helper");
-        fs::set_permissions(helper_dir.path(), fs::Permissions::from_mode(0o700)).ok()?;
-        // The helper is executed immediately afterwards, and Linux refuses to
-        // execute a file whose inode still carries a write reference
-        // (`ETXTBSY`). A link never writes the file it will execute, so the
-        // refusal cannot arise; the inode was last written when the linker
-        // produced the binary. A copy has to be committed instead, and that
-        // commit comes after the mode change, which is itself a write to the
-        // inode. Same reasoning, same barrier, as the shared fixture staging
-        // in `eggwork-sandbox-helper`'s test support.
-        let linked = fs::metadata(&source)
-            .map(|metadata| {
-                let mode = metadata.permissions().mode();
-                mode & 0o111 != 0 && mode & 0o022 == 0
-            })
-            .unwrap_or(false)
-            && fs::hard_link(&source, &helper).is_ok();
-        if !linked {
-            fs::copy(&source, &helper).ok()?;
-            fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).ok()?;
-            fs::File::open(&helper).ok()?.sync_all().ok()?;
-            fs::File::open(helper_dir.path()).ok()?.sync_all().ok()?;
+        if let Ok(metadata) = fs::metadata(&source) {
+            let mode = metadata.permissions().mode();
+            if mode & 0o022 != 0 {
+                fs::set_permissions(&source, fs::Permissions::from_mode(mode & 0o7777 & !0o022))
+                    .ok()?;
+            }
+        }
+        // The system temporary directory is tried first, because its ancestor
+        // chain is the one the trust check accepts by construction; a directory
+        // next to the source is the fallback, because it is the same filesystem
+        // by definition.
+        let mut staged = None;
+        for parent in [None, source.parent()] {
+            let directory = match parent {
+                None => tempfile::tempdir(),
+                Some(parent) => tempfile::tempdir_in(parent),
+            };
+            let Ok(directory) = directory else {
+                continue;
+            };
+            if fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).is_err() {
+                continue;
+            }
+            let helper = directory.path().join("eggwork-sandbox-helper");
+            if fs::hard_link(&source, &helper).is_ok() {
+                staged = Some(directory);
+                break;
+            }
         }
         // Leak the directory so the helper keeps living for the duration of the
         // test; trust checks happen once at capability probe time.
-        let leaked: &'static TempDir = Box::leak(Box::new(helper_dir));
+        let leaked: &'static TempDir = Box::leak(Box::new(staged?));
         Some(leaked.path().join("eggwork-sandbox-helper"))
     }
 
