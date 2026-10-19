@@ -53,6 +53,7 @@ node-facing control plane defined here.
 | `max_active_executions` | `u32` | Must be `> 0` and `<= Semaphore::MAX_PERMITS`, else `InvalidLimit` (`lib.rs:302-306`). |
 | `lease_ttl` | `Duration` | Must be non-zero, else `InvalidLease` (`lib.rs:312-314`). |
 | `tls` | `TlsServerConfig` | Must have `ClientAuthMode::Required` and a default identity, else `TlsPolicy`. |
+| `host_telemetry` | `Option<telemetry::HostTelemetryConfig>` | Optional provider. `None` means no provider, no polling task, and no host measurements. |
 
 `NodeStartError` (`lib.rs:140-152`) has five variants: `TlsPolicy`, `EggServe(String)`,
 `InvalidLimit`, `InvalidLease`, `AlreadyRunning`.
@@ -770,6 +771,71 @@ resources behind a 403 (authorization precedes resolution, and observe/control/e
 single 404 for both "absent" and "not yours"). `secret_sentinels_stay_out_of_error_and_debug_surfaces`
 (`lib.rs:6104`) is the executable guard for the first two.
 
+## Optional host telemetry
+
+`crates/eggwork-server/src/telemetry.rs` is an **optional, default-off** sibling of the control plane. It
+owns the outbound half of the node: reading host-wide measurements from a telemetry provider on the same
+machine. It is the only place in the server that makes an outbound HTTP request, and it makes exactly one
+kind of request — a `GET` to a configured loopback status endpoint.
+
+**What it is not.** It is not a scheduler, not a sampler of the node's own executions, and not an input to
+admission. Nothing it observes qualifies, withholds, or changes an execution capability; `NodeStatus` and
+`NodeCapabilities` keep their existing meaning, and a node with the provider disabled is a node with no
+telemetry — not a node with zero usage.
+
+**The provider seam.** `HostTelemetryProvider` is a one-method trait (`observe() -> Result<ProviderOutcome,
+TelemetryError>`). `ProviderOutcome` is either an `Observed(HostTelemetry)` or `Warming`. One implementation
+exists: `GreggTelemetryProvider`, which reads a local Gregg daemon's `/v2/status`. The seam exists so the
+polling owner can be driven by a fake in tests and so a second provider could be added without touching the
+cache or the node lifecycle.
+
+**Provider vocabulary stops at the module boundary.** The provider's wire types (`gregg_protocol::v2`) are
+read, validated by the provider's own `validate_payload_v2`, and translated into
+`eggwork_core::HostTelemetry` — a protocol-neutral vocabulary with no Gregg types in it. The translation
+keeps only host-wide aggregates: CPU cores and utilization, physical memory, load, swap, storage capacity
+(summed across the reported volumes, with no mount path), aggregate disk and network throughput, and the
+provider's own timestamp and sample interval. Drive names, device identities, interface identities, and
+the provider's system identity are dropped in `normalize` and never leave the node.
+
+**A missing measurement is never zero.** Each measurement group is a `TelemetryMetric<T>` that is either
+`Value(T)`, `Unsupported` (the platform cannot produce it), or `Unknown` (it can, but this sample carried
+none). The provider's capability flags decide `Unsupported` vs `Unknown`; the translation never
+substitutes `0.0` for an absent measurement.
+
+**The endpoint is validated once, at load time.** `validate_endpoint` accepts only plain `http`, an IP
+literal that is a loopback address, an explicit TCP port, and exactly the path `/v2/status` — no userinfo,
+query, or fragment. A hostname, `localhost` included, is refused, so no name is ever resolved and no DNS
+answer can be rebound between validation and use. The alternative spellings of an IPv4 address
+(`127.0.0.1.`, `2130706433`, `0x7f000001`, `127.1`) are canonicalized by the URL parser to the literal
+address, so the endpoint the client is finally given names the address literally.
+
+**Why the client is built the way it is.** The provider client is an Eggfetch client with
+`standard-http1` and *without* the `redirects` and `proxy` features. A `3xx` is therefore returned
+unfollowed and reported as an unexpected status, and no ambient `HTTP_PROXY` setting is consulted. Neither
+a redirect hop nor an inherited proxy can move the request off the loopback interface. The decoded body is
+capped at 256 KiB, the connect deadline is 2 s, and the whole request is bounded at 5 s.
+
+**One owner polls.** `TelemetryMonitor::start` spawns exactly one task that performs every provider
+request. Readers consult `TelemetryCache`; they never trigger a request, so a burst of callers cannot
+become a burst of provider requests. The first attempt happens as soon as the node is running — waiting a
+whole interval before the first sample would make a freshly started node look empty for no reason. After
+that the cadence is the configured interval, and consecutive failures back off (15 s → 30 s → 60 s, capped
+at 5 minutes) so an absent provider is not polled in a tight loop. `TelemetryMonitor::disabled()` creates
+no task at all.
+
+**Freshness is measured monotonically.** The cache records the *reception* instant on the node's monotonic
+clock, so a wall-clock adjustment cannot make a stale sample look fresh. The provider's own wall-clock
+timestamp is kept as provenance and is checked against a 30 s skew tolerance: a timestamp implausibly in
+the future is refused (`ClockSkew`) rather than treated as indefinitely fresh. A sample that is already
+older than the freshness bound — when it arrives, or once the node's copy has aged out — is reported as
+`Stale`, not as `Ready`.
+
+**Failures are typed and bounded.** `TelemetryError` maps onto a closed set of
+`TelemetryErrorCategory` values (connection, timeout, HTTP status, malformed, schema version, invalid, too
+large, clock skew). No response body, provider URL, or host path is carried into a category, a log line, or
+a metric. The `doctor` check reports whether the provider is configured but never contacts it and never
+echoes its address: a node whose provider happens to be down is still a healthy node.
+
 ## Invariants and enforcement
 
 | Invariant | Enforcement site | Test |
@@ -802,6 +868,10 @@ single 404 for both "absent" and "not yours"). `secret_sentinels_stay_out_of_err
 | Secrets never reach error/debug surfaces | redacting `Debug`, hash-only leases (`lib.rs:154`, `1659`) | `tls_configuration_diagnostics_redact_certificate_paths` (3083), `secret_sentinels_stay_out_of_error_and_debug_surfaces` (6104) |
 | Required isolation is enforced, not merely requested | landlock admission + E2E denial (`lib.rs:613`, `606`) | `required_landlock_is_admitted_remotely_and_denies_outside_workspace_access` (4699), `required_landlock_denies_outside_writes_and_confines_descendants` (4846) |
 | Hostile workspace manifests cause no side effect | `WorkspaceError` mapping (`lib.rs:1083-1107`) | `hostile_workspace_manifests_are_rejected_without_side_effect` (6008) |
+| With no provider configured the node claims no host measurements | `TelemetryMonitor::disabled()` creates no task; cache reports `Disabled` | `a_disabled_monitor_never_polls` (`tests/host_telemetry.rs`), `a_configuration_without_host_telemetry_asks_for_none` (`operations.rs`) |
+| The provider endpoint cannot be moved off the loopback interface | `validate_endpoint` (IP literal, explicit port, fixed path, plain HTTP) + a client with no redirect or proxy support | `a_non_loopback_or_ambiguous_endpoint_is_refused`, `a_redirect_is_not_followed` |
+| One provider request per poll, regardless of reader count | one owner task; readers read the cache | `one_owner_polls_for_every_reader` |
+| A missing measurement is never reported as zero | `TelemetryMetric::{Unsupported, Unknown, Value}` | `an_unsupported_capability_is_not_reported_as_a_missing_value` |
 
 ## Test coverage
 

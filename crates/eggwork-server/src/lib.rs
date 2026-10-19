@@ -7,6 +7,7 @@ mod blob;
 pub mod deployment;
 pub mod operations;
 mod store;
+pub mod telemetry;
 mod workspace;
 
 use bytes::Bytes;
@@ -176,6 +177,11 @@ pub struct NodeConfig {
     pub max_active_executions: u32,
     pub lease_ttl: Duration,
     pub tls: TlsServerConfig,
+    /// Optional host-telemetry provider.
+    ///
+    /// `None` means the node has no provider: it creates no polling task and
+    /// claims no host measurements.
+    pub host_telemetry: Option<telemetry::HostTelemetryConfig>,
 }
 
 #[derive(Clone)]
@@ -196,6 +202,7 @@ struct NodeState {
     resolver: Arc<dyn PeerPrincipalResolver>,
     authorizer: Arc<dyn Authorizer>,
     executions: Arc<Mutex<HashMap<ExecutionId, Arc<ExecutionRecord>>>>,
+    telemetry: telemetry::TelemetryMonitor,
 }
 
 struct ExecutionRecord {
@@ -388,6 +395,17 @@ impl NodeServer {
                 }),
             );
         }
+        // The telemetry owner is created before the HTTP surface so that a
+        // configured provider is already polling by the time the node accepts
+        // requests. The task never blocks startup: it polls in the
+        // background, and a node with no provider creates no task at all.
+        let telemetry = match config.host_telemetry.as_ref() {
+            None => telemetry::TelemetryMonitor::disabled(),
+            Some(settings) => {
+                let provider = Arc::new(telemetry::GreggTelemetryProvider::new(settings));
+                telemetry::TelemetryMonitor::start(provider, settings)
+            }
+        };
         let state = NodeState {
             node_id: config.node_id,
             execution_root: config.execution_root,
@@ -405,6 +423,7 @@ impl NodeServer {
             resolver,
             authorizer,
             executions: Arc::new(Mutex::new(executions)),
+            telemetry,
         };
         let runtime = RuntimeConfig::builder()
             .bind(config.bind)
@@ -466,6 +485,10 @@ impl NodeServer {
                 record.cancellation.cancel();
             }
         }
+        // The telemetry owner is stopped with the node, so a shutting-down
+        // node stops contacting its provider instead of leaving a polling
+        // task behind it.
+        self.state.telemetry.shutdown().await;
         self.handle.shutdown();
     }
 
@@ -3198,6 +3221,7 @@ mod tests {
         )]));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-a").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -3386,6 +3410,7 @@ mod tests {
         )]));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("routed-node").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -3460,6 +3485,7 @@ mod tests {
         )]));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("blob-node").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -3785,6 +3811,7 @@ mod tests {
         )]));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-a").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -4127,6 +4154,7 @@ mod tests {
         )]));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-lease").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -4240,6 +4268,7 @@ mod tests {
         )]));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-recovery").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -4324,6 +4353,7 @@ mod tests {
         ]));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-derive").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -4566,6 +4596,7 @@ mod tests {
         }
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-derive-deny").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -4629,6 +4660,7 @@ mod tests {
         let work_root = temp.path().join("work");
         fs::create_dir_all(&work_root).unwrap();
         let config = NodeConfig {
+            host_telemetry: None,
             node_id: NodeId::new("node-drain-restart").unwrap(),
             bind: "127.0.0.1:0".parse().unwrap(),
             execution_root: work_root,
@@ -4686,6 +4718,7 @@ mod tests {
         };
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-cap-consistency").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -4772,6 +4805,7 @@ mod tests {
         ));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-required-landlock").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -4919,6 +4953,7 @@ mod tests {
         ));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-landlock-descendants").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -5064,6 +5099,7 @@ mod tests {
         ));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-no-helper").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -5137,6 +5173,7 @@ mod tests {
         ));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-best-effort-no-helper").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -5207,6 +5244,7 @@ mod tests {
         let runner = Arc::new(LocalProcessRunner::new(eggwork_runner::NoExecutionSetup));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-resource-rejection").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -5302,6 +5340,7 @@ mod tests {
         ));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-resource-accept").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -5416,6 +5455,7 @@ mod tests {
         )]));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-network-reject").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -5526,6 +5566,7 @@ mod tests {
         ));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-codegg-compat").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -5834,6 +5875,7 @@ mod tests {
         ]));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-fence").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -5967,6 +6009,7 @@ mod tests {
         )]));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-drain-gate").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -6069,6 +6112,7 @@ mod tests {
         )]));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-hostile-ws").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -6165,6 +6209,7 @@ mod tests {
         )]));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-sentinel").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
@@ -6241,6 +6286,7 @@ mod tests {
         )]));
         let server = NodeServer::start(
             NodeConfig {
+                host_telemetry: None,
                 node_id: NodeId::new("node-drain-race").unwrap(),
                 bind: "127.0.0.1:0".parse().unwrap(),
                 execution_root: work_root,
