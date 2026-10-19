@@ -273,3 +273,44 @@ Two statements above should be read with that record in hand:
 settle — and what M004b measured — is that the condition is a property of the
 inode rather than a microsecond-wide timing window: a hundred immediate
 retries of the same path all failed.
+
+## 14. Addendum, 2026-10-19 — the elimination is by link-only staging
+
+This section is an addition. Nothing above it is changed, and §13 stands as it
+was written.
+
+§13 described the elimination as it stood when M004b was first closed: the
+staged helper was linked rather than copied, and a copy path "that remains"
+was committed before publication. CI then refused that remaining copy path 3
+times in 32 stagings on the runner (`39316541191`), and the copy path was
+removed. The elimination is therefore by link-only staging, and the two
+statements in §13 that referred to a remaining copy path are superseded by
+this one.
+
+What changed, in the terms of this record:
+
+- **The copy path is gone.** The fixture no longer copies the helper at all,
+  not even as a fallback. A copy is a file that was written, and Linux refuses
+  to execute an inode that is open for writing. Staging now fails loudly when
+  a link is impossible, rather than falling back to the construction that CI
+  rejected.
+- **The mechanism is now read from the kernel.** §5's characterisation called
+  the condition "a host-level, load-dependent, microsecond-wide kernel window
+  around executing a just-written executable", and this record's own §5
+  measurement of "no writer at failure time" is what made the window reading
+  natural. The kernel's accounting is `struct inode::i_writecount`: an
+  `execve()` of an inode that is open for writing is refused with `ETXTBSY`,
+  and the access is released with the file's teardown, which is deferred. The
+  §5 measurements stand; what they measured was a rate, not a window.
+- **One cost was added, and it is recorded.** A link carries the source's
+  mode, so the build output's mode is normalised to a trusted one once, before
+  the first fixture exists. That is a mode change on a shared build artifact,
+  and it is deliberately one-directional: it can only remove write permission
+  for others, and the build output's bytes are never touched. §5's invariant —
+  that a fixture must never mutate, truncate, overwrite, or rename over an
+  executable path another concurrently runnable test may execute — still
+  holds, and the M004a proof that asserted it now states the exception
+  explicitly.
+
+The full reasoning, the kernel citations and the CI evidence are in
+`plans/closure/operations-distribution/004b-status.md`.
