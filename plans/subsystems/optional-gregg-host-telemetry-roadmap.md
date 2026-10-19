@@ -1,6 +1,6 @@
 # Optional Gregg Host Telemetry — Subsystem Roadmap
 
-Status: active planning; M001 ready, M002 blocked on M001 closure
+Status: active planning; M001 closed, M002 ready
 Primary class: infrastructure / observability
 Decision: `plans/adrs/ADR-0006-optional-gregg-host-telemetry.md`
 Governing references: `plans/000-long-term-specification.md`, `plans/001-terminology-and-domain-model.md`, `plans/003-planning-process.md`, ADR-0001/0002/0005.
@@ -14,7 +14,8 @@ Reuse an already installed local greggd for **host-wide, advisory resource measu
 
 - `greggd` exposes `GET /v2/status` with timestamp, CPU, memory, optional load/swap/drive/disk I/O/network and capability flags (see `eggstack/gregg: docs/api.md` and `architecture/protocol.md`). Its listener is unauthenticated, configurable, and may otherwise bind to all interfaces: when deployed for Eggwork use, operator must bind it to loopback.
 - Eggwork `NodeStatus` exposes node_id, draining, active_executions and `NodeCapabilities` (not host usage), `eggwork-core::ExecutionResult` exposes categorical resource setup outcomes (not quantitative per-attempt CPU/RSS).
-- `eggwork-server` has mTLS principal resolution, operation authorization and local protective admission; `eggwork-client` is fixed-target and uses Eggfetch. A Gregg adapter or authenticated telemetry route is not implemented.
+- `eggwork-server` has mTLS principal resolution, operation authorization and local protective admission; `eggwork-client` is fixed-target and uses Eggfetch.
+- M001 is closed: `eggwork-server` has a default-off loopback Gregg adapter, a normalized in-memory cache, and a single polling owner (`plans/closure/optional-gregg-host-telemetry/001-status.md`, implementation `ac55985`). The normalized observation is `eggwork_core::HostTelemetry`; no remote endpoint and no client method exist yet, and `NodeStatus`/`NodeCapabilities` are unchanged.
 - No new scheduler, node discovery, global worker selection or control authority is justified.
 
 ## Invariants and non-goals
@@ -27,10 +28,10 @@ Keep the existing Eggwork transport/authorization, controller identity, lease fe
 greggd existing v2 API (external, no changes)
              |
              v
- Eggwork M001 local read-only adapter/cache [ready]
+ Eggwork M001 local read-only adapter/cache [CLOSED]
              |
              v
- Eggwork M002 authenticated telemetry endpoint/client [blocked until M001 closure]
+ Eggwork M002 authenticated telemetry endpoint/client [ready]
              |
              v
  CodeGG worker telemetry consumer [interface-dependent; separately registered]
@@ -38,11 +39,12 @@ greggd existing v2 API (external, no changes)
 
 ## Milestones
 
-**M001 — Optional loopback Gregg adapter and normalized cache (ready).**
+**M001 — Optional loopback Gregg adapter and normalized cache (closed).**
 Implementation: `plans/implementation/optional-gregg-host-telemetry/001-loopback-gregg-adapter.md`.
-Exit: zero-default-overhead; validated and bounded native Gregg v2 parsing (prefer existing `gregg-protocol` only if dependency impact is reasonable); typified snapshot with sampling/source/staleness/capability facts; no subprocesses; loopback-only; explicit unknown, warming, stale and invalid conditions. Production node execution remains unaffected.
+Closure: `plans/closure/optional-gregg-host-telemetry/001-status.md` (implementation `ac55985`).
+Exit: zero-default-overhead; validated and bounded native Gregg v2 parsing (prefer existing `gregg-protocol` only if dependency impact is reasonable); typified snapshot with sampling/source/staleness/capability facts; no subprocesses; loopback-only; explicit unknown, warming, stale and invalid conditions. Production node execution remains unaffected. **Met.** `gregg-protocol` 1.0.15 was used: three added packages, no new dependency family, and the provider's own validation rules rather than a copy of them. The frozen normalized contract is `eggwork_core::HostTelemetry` with `TelemetryProviderState` and `TelemetryErrorCategory`.
 
-**M002 — Authorized Eggwork projection and fixed-target client method (blocked on M001).**
+**M002 — Authorized Eggwork projection and fixed-target client method (ready).**
 Implementation: `plans/implementation/optional-gregg-host-telemetry/002-authenticated-node-telemetry.md`.
 Exit: an authorized controller reads a bounded sanitized snapshot through mTLS; an unauthorized principal is refused, and an older node is reported unsupported; no Gregg endpoint reachable or required remotely. Node status, capabilities, execution semantics and error authority unchanged.
 

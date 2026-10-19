@@ -1,11 +1,12 @@
 # Optional Gregg Telemetry M001 — Loopback Adapter and Bounded Cache
 
-Status: **ready**
+Status: **closed**
 Class: infrastructure / observability
 Source: `plans/subsystems/optional-gregg-host-telemetry-roadmap.md`
 Decision: `plans/adrs/ADR-0006-optional-gregg-host-telemetry.md`
 Reviewed baseline: Eggwork `main` and Gregg `docs/api.md`, `architecture/protocol.md` (2026-10-19); implementation agent must reconfirm exact current APIs and lockfile before editing.
 Dependency: Gregg's existing v2 status contract only; **no Gregg code changes**.
+Closure record: `plans/closure/optional-gregg-host-telemetry/001-status.md` (implementation `ac55985`).
 
 ## 1. Objective
 
