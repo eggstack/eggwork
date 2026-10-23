@@ -157,7 +157,7 @@ Class: invariant
 Status: implemented — closure record written, implementation commit pending
 
 Closure evidence: `plans/closure/security-isolation-resource/005a-status.md`
-(implementation `IMPLEMENTATION-COMMIT-PENDING`)
+(implementation `6f41957`)
 
 Corrective addendum:
 
@@ -185,7 +185,7 @@ Class: invariant
 Status: implemented — closure record written, implementation commit pending
 
 Closure evidence: `plans/closure/security-isolation-resource/005b-status.md`
-(implementation `IMPLEMENTATION-COMMIT-PENDING`)
+(implementation `63699df`)
 
 Corrective addendum:
 

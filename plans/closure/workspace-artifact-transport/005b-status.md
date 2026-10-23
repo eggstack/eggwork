@@ -5,8 +5,8 @@ Corrective addendum: `plans/subsystems/workspace-artifact-transport-data-plane-c
 Subsystem roadmap: `plans/subsystems/workspace-artifact-transport-roadmap.md`
 Reviewed head at the start of the milestone: `6f41957` (`feat(security): M005a degraded isolation observability`)
 Head when the milestone work was finished: `a8abfcb` (`docs(plans): record the core protocol-contract ownership change as ADR-0008`) — a coordinator-owned documentation commit that does not touch any file in this milestone's change set.
-Implementation commit: `IMPLEMENTATION-COMMIT-PENDING`
-Closure record commit: `IMPLEMENTATION-COMMIT-PENDING`
+Implementation commit: `63699df`
+Closure record commit: `63699df`
 
 ## Finding
 

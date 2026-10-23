@@ -14,7 +14,7 @@ Source roadmap:
 "implemented")
 
 Reviewed repository head before implementation: `6f41957`
-Implementation commit: `IMPLEMENTATION-COMMIT-PENDING`
+Implementation commit: `63699df`
 
 Branch: `corrective/interrogation-batch-2026-10`. The working tree was left
 dirty for the coordinator to review and commit; no commit was made by the
@@ -552,8 +552,8 @@ invariant is not weakened by this milestone either way.
 registry is the coordinator's file and was not edited. The coordinator's action
 is to point M005b at
 `plans/closure/security-isolation-resource/005b-status.md`, mark it
-implemented, and fill `IMPLEMENTATION-COMMIT-PENDING` in this record and in
-the roadmap entry with the real commit SHA.
+implemented, and fill the real commit SHA in this record and in
+the roadmap entry. **Done:** the implementation commit is `63699df`.
 
 ## 15. Registry and roadmap disposition
 

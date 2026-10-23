@@ -14,7 +14,7 @@ Source roadmap:
 "implemented")
 
 Reviewed repository head before implementation: `778d83c`
-Implementation commit: `IMPLEMENTATION-COMMIT-PENDING`
+Implementation commit: `6f41957`
 
 Branch: `corrective/interrogation-batch-2026-10`. The working tree was left
 dirty for the coordinator to review and commit; no commit was made by the
@@ -448,8 +448,8 @@ separate, still-open item that this milestone neither closes nor worsens.
 - `plans/registry.md`: **not edited** — the registry is the coordinator's
   file. The coordinator's action is to register M005a as implemented (closure
   record `plans/closure/security-isolation-resource/005a-status.md`) and to
-  fill `IMPLEMENTATION-COMMIT-PENDING` in this record and in the roadmap
-  entry with the real commit SHA.
+  fill the real commit SHA in this record and in the roadmap entry. **Done:**
+  the implementation commit is `6f41957`.
 - `plans/implementation/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`:
   **not edited** — the plan is not in this milestone's ownership and is left
   as the authoritative statement of what was asked.

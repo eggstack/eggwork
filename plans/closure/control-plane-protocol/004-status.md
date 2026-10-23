@@ -13,7 +13,7 @@ Roadmap: `plans/subsystems/control-plane-protocol-roadmap.md`
 ## Reviewed baseline and implementation
 
 - Reviewed parent head: `63699df` (branch `corrective/interrogation-batch-2026-10`).
-- Implementation commit: `IMPLEMENTATION-COMMIT-PENDING`.
+- Implementation commit: `1da739b`.
 - Crates changed: `eggwork-core`, `eggwork-client`, `eggwork-runner`, `eggwork-server`. The
   sandbox helper's **production** code is unchanged; only its test file changed.
 - `eggwork-core` (`crates/eggwork-core/src/lib.rs`) — new public surface:
