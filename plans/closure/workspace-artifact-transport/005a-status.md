@@ -4,7 +4,7 @@
 - Corrective addendum: `plans/subsystems/workspace-artifact-transport-data-plane-corrective-addendum.md` (wins over the plan where they disagree)
 - Implementation plan: `plans/implementation/workspace-artifact-transport/005a-declared-artifact-capture-fail-closed-corrective.md`
 - Roadmap entry: `plans/subsystems/workspace-artifact-transport-roadmap.md` (§ M005a, status **implemented**)
-- Implementation commit: `IMPLEMENTATION-COMMIT-PENDING`
+- Implementation commit: `4258964`
 - Closed on: 2026-10-23 (Linux x86_64 host)
 
 ## Finding
@@ -285,7 +285,7 @@ The other non-vacuity arguments:
 ## Verification actually run
 
 All commands were run on this Linux x86_64 host against the working tree as it stands
-(commit `IMPLEMENTATION-COMMIT-PENDING`).
+(commit `4258964`).
 
 | Command | Result |
 | --- | --- |
