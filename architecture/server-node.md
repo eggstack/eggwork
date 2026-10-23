@@ -550,6 +550,28 @@ and the page comes from `store.load_page`. No correctness rests on the broadcast
 `slow_event_consumer_is_bounded_and_gets_a_stream_error` (`lib.rs:3102`) pins the failure mode
 explicitly rather than allowing an unbounded per-subscriber queue.
 
+**Where a degradation diagnostic is published.** The forwarding loop maps the runner's
+`OutputChunk::Diagnostic(payload)` to `ExecutionEventKind::Diagnostic(payload)` and publishes it
+through the same `publish` funnel as any other event, with `ExecutionState::Running` as the proposed
+state. The payload is forwarded unchanged: the runner is the sole producer and is inside the node's
+trust boundary, so the server does not re-derive or second-guess it.
+
+**The publication point is load-bearing.** `publish` returns early when the recorded base state is
+already terminal, and `store::ExecutionStore::commit_event` refuses to append to a terminal
+execution. A diagnostic published *after* the terminal event is therefore **silently dropped** —
+not rejected, not reported, simply lost. That is why the diagnostic is published from the forwarding
+loop while the execution is still running, and why the runner emits it *before* it spawns the target:
+the `biased` `select!` drains the runner's output channel first, so a chunk the runner sent before the
+spawn is published before any output the target produced, and long before the terminal event. The
+ordering is asserted on event sequence numbers, not by inspection — see
+`a_degraded_best_effort_execution_publishes_its_diagnostic_before_output_and_terminal`.
+
+A consequence worth stating plainly: a diagnostic the server derived from the `RunnerResult` could
+not satisfy this. The result arrives after the execution finished, so such a diagnostic would land
+after the terminal event and be dropped by the rule above. The runner is the only party that knows
+*why* an enforcement was not applied, and it knows it at the moment it decides not to apply it. The
+grammar and bound of the payload are in [protocol.md](protocol.md#the-execution-diagnostic-payload-schema-version-1).
+
 `publish` is the single write funnel, and it takes **two** locks with different jobs.
 `ExecutionRecord::commit_lock` (`lib.rs:205-216`) serialises publishers across the durable commit;
 `snapshot` is a plain `RwLock` held only for the cheap read and the short assign. The order is:
@@ -936,6 +958,17 @@ file). Fixtures first: `init_tls`, `issue_identity`, `tls_material`, `untrusted_
 - 5906 / 6180 — terminal records survive drain, and concurrent drain outcomes are closed.
 - 6104 `secret_sentinels_stay_out_of_error_and_debug_surfaces` — sentinels searched across error and
   `Debug` renderings.
+- The M005a degradation-diagnostic set: `a_degraded_best_effort_execution_publishes_its_diagnostic_before_output_and_terminal`
+  (the diagnostic's sequence number is strictly below the first stdout event's and below the terminal
+  event's), `the_diagnostic_is_replayed_from_the_journal_after_the_execution_ended` (the diagnostic is
+  committed, not merely broadcast), `a_required_sandbox_never_reaches_the_target_and_is_not_reported_as_a_degradation`
+  (the marker file is absent, the terminal classification is `Failed`/`Internal`, and no diagnostic is
+  published), `an_execution_with_nothing_degraded_publishes_no_diagnostic`, and
+  `a_degraded_best_effort_resource_request_publishes_a_dimension_scoped_diagnostic`. They use the
+  `node_with_runner` fixture, which injects the runner explicitly; the required-refusal case uses the
+  `AdvertisesLandlockButCannotEnforce` fixture, because the admission gate otherwise refuses a
+  `Required` request before the runner is reached and the runner's own fail-closed path would be
+  unreachable.
 
 **Honest gaps**, identified from the test names without reading every body:
 

@@ -37,6 +37,267 @@ pub const MAX_WORKSPACE_PATH_BYTES: usize = 1024 * 1024;
 pub const MAX_WORKSPACE_DEPTH: usize = 128;
 pub const MAX_WORKSPACE_LOGICAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Prefix of every diagnostic payload.
+///
+/// A diagnostic is carried by [`ExecutionEventKind::Diagnostic`] as a single
+/// bounded string. The grammar is
+/// `eggwork.diagnostic.<class>.v1 key=value key=value …`, so the prefix and
+/// the schema suffix bracket the class name and make the payload
+/// self-describing: a reader can tell what kind of fact it is holding without
+/// out-of-band knowledge.
+pub const DIAGNOSTIC_PREFIX: &str = "eggwork.diagnostic.";
+
+/// Schema version suffix of every diagnostic payload.
+pub const DIAGNOSTIC_SCHEMA_SUFFIX: &str = ".v1";
+
+/// The class of a diagnostic that reports a requested best-effort filesystem
+/// isolation that was not applied.
+pub const DIAGNOSTIC_CLASS_ISOLATION_DEGRADED: &str = "isolation.degraded";
+
+/// The class of a diagnostic that reports a requested best-effort resource
+/// enforcement that was not applied.
+pub const DIAGNOSTIC_CLASS_RESOURCES_DEGRADED: &str = "resources.degraded";
+
+/// The closed set of diagnostic classes. A payload naming anything else is
+/// refused rather than guessed at, because a class is what a consumer
+/// dispatches on.
+pub const DIAGNOSTIC_CLASSES: [&str; 2] = [
+    DIAGNOSTIC_CLASS_ISOLATION_DEGRADED,
+    DIAGNOSTIC_CLASS_RESOURCES_DEGRADED,
+];
+
+/// Ceiling on a whole diagnostic payload.
+///
+/// The bound is deliberately the same as one event-metadata value: a
+/// diagnostic is operator-facing text carried inside an event, so it must not
+/// be able to dominate the event it rides in.
+pub const MAX_DIAGNOSTIC_PAYLOAD_BYTES: usize = MAX_METADATA_VALUE_BYTES;
+
+/// Ceiling on one diagnostic key.
+pub const MAX_DIAGNOSTIC_KEY_BYTES: usize = 32;
+
+/// The literal marker appended to a diagnostic value that had to be shortened.
+///
+/// The marker is what makes truncation *observable*: a reader can tell a
+/// shortened reason from a complete one, so a bounded payload never silently
+/// reads as a complete statement.
+pub const DIAGNOSTIC_TRUNCATION_MARKER: &str = "...[truncated]";
+
+/// Errors from building or parsing a diagnostic payload.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DiagnosticError {
+    #[error("diagnostic class {0} is not in the closed class set")]
+    UnknownClass(String),
+    #[error("diagnostic key {0} is not a valid diagnostic key")]
+    InvalidKey(String),
+    #[error("diagnostic key {0} is reserved")]
+    ReservedKey(String),
+    #[error("diagnostic payload does not match the documented grammar")]
+    InvalidGrammar,
+    #[error("diagnostic payload exceeds its {max}-byte limit")]
+    TooLong { max: usize },
+}
+
+/// A bounded, machine-readable diagnostic payload.
+///
+/// The payload is built from a class drawn from [`DIAGNOSTIC_CLASSES`] and an
+/// ordered list of key/value pairs, and is rendered by [`DiagnosticPayload::build`]
+/// as `eggwork.diagnostic.<class>.v1 key=value key=value …`.
+///
+/// Two bounds are enforced here rather than at the call site, because a
+/// diagnostic rides inside an event and a caller that forgets to bound it would
+/// otherwise be able to overflow the event envelope:
+///
+/// * the assembled payload never exceeds [`MAX_DIAGNOSTIC_PAYLOAD_BYTES`];
+/// * a value that does not fit is shortened on a UTF-8 character boundary and
+///   gains [`DIAGNOSTIC_TRUNCATION_MARKER`], so the loss is visible in the
+///   payload instead of being silent.
+///
+/// Values are normalised to printable ASCII (everything outside `!`..=`~`
+/// becomes `_`) so that the space-separated `key=value` grammar stays
+/// unambiguous: a value can never contain the separator or a newline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticPayload {
+    class: String,
+    fields: Vec<(String, String)>,
+}
+
+impl DiagnosticPayload {
+    /// Creates a payload for a class in the closed set.
+    ///
+    /// A class outside [`DIAGNOSTIC_CLASSES`] is refused: the class is what a
+    /// consumer dispatches on, so an unknown one cannot be honoured.
+    pub fn new(class: &str) -> Result<Self, DiagnosticError> {
+        if !DIAGNOSTIC_CLASSES.contains(&class) {
+            return Err(DiagnosticError::UnknownClass(class.to_owned()));
+        }
+        Ok(Self {
+            class: class.to_owned(),
+            fields: Vec::new(),
+        })
+    }
+
+    /// The diagnostic class.
+    pub fn class(&self) -> &str {
+        &self.class
+    }
+
+    /// Adds a key/value pair.
+    ///
+    /// The key must be a lowercase ASCII token of at most
+    /// [`MAX_DIAGNOSTIC_KEY_BYTES`] bytes and must not be `class`, which the
+    /// builder derives from the payload's own class.
+    pub fn set(
+        &mut self,
+        key: &str,
+        value: impl Into<String>,
+    ) -> Result<&mut Self, DiagnosticError> {
+        if key == "class" {
+            return Err(DiagnosticError::ReservedKey(key.to_owned()));
+        }
+        if !valid_diagnostic_key(key) {
+            return Err(DiagnosticError::InvalidKey(key.to_owned()));
+        }
+        let value = normalize_diagnostic_value(&value.into());
+        self.fields.push((key.to_owned(), value));
+        Ok(self)
+    }
+
+    /// Renders the bounded payload.
+    ///
+    /// The result is never longer than [`MAX_DIAGNOSTIC_PAYLOAD_BYTES`]. When
+    /// the fields do not fit, values are shortened in insertion order: the
+    /// first value that does not fit is cut on a UTF-8 character boundary and
+    /// gains [`DIAGNOSTIC_TRUNCATION_MARKER`], and the fields after it are
+    /// omitted. Insert the free-form `reason` last so that it absorbs the
+    /// overage and the structured keys survive intact.
+    pub fn build(&self) -> String {
+        let prefix = format!(
+            "{DIAGNOSTIC_PREFIX}{}{DIAGNOSTIC_SCHEMA_SUFFIX}",
+            self.class
+        );
+        // The class is part of the prefix and of the key set, and it is drawn
+        // from a closed set, so it is never shortened.
+        let fixed = prefix.len() + 1 + "class=".len() + self.class.len();
+        let mut budget = MAX_DIAGNOSTIC_PAYLOAD_BYTES.saturating_sub(fixed);
+        let mut rendered: Vec<String> = Vec::with_capacity(self.fields.len());
+        for (key, value) in &self.fields {
+            let overhead = 1 + key.len() + 1;
+            let available = budget.saturating_sub(overhead);
+            if value.len() <= available {
+                rendered.push(format!("{key}={value}"));
+                budget -= overhead + value.len();
+                continue;
+            }
+            let marker = DIAGNOSTIC_TRUNCATION_MARKER;
+            if overhead + marker.len() > budget {
+                // Not even the marker fits: the field is omitted rather than
+                // pushed past the bound.
+                continue;
+            }
+            let keep = available - marker.len();
+            rendered.push(format!("{key}={}{marker}", truncate_utf8(value, keep)));
+            budget -= overhead + keep + marker.len();
+        }
+        let mut payload = prefix;
+        payload.push_str(" class=");
+        payload.push_str(&self.class);
+        for part in rendered {
+            payload.push(' ');
+            payload.push_str(&part);
+        }
+        payload
+    }
+
+    /// Parses a payload back into its class and fields.
+    ///
+    /// This is the validator a consumer uses to decide whether a diagnostic it
+    /// received is well formed. It refuses a payload that does not match the
+    /// documented grammar, names a class outside the closed set, exceeds the
+    /// bound, or omits one of the required keys.
+    pub fn parse(payload: &str) -> Result<Self, DiagnosticError> {
+        if payload.len() > MAX_DIAGNOSTIC_PAYLOAD_BYTES {
+            return Err(DiagnosticError::TooLong {
+                max: MAX_DIAGNOSTIC_PAYLOAD_BYTES,
+            });
+        }
+        let rest = payload
+            .strip_prefix(DIAGNOSTIC_PREFIX)
+            .ok_or(DiagnosticError::InvalidGrammar)?;
+        let (class, rest) = rest
+            .split_once(DIAGNOSTIC_SCHEMA_SUFFIX)
+            .ok_or(DiagnosticError::InvalidGrammar)?;
+        if !DIAGNOSTIC_CLASSES.contains(&class) {
+            return Err(DiagnosticError::UnknownClass(class.to_owned()));
+        }
+        let mut parsed = Self::new(class)?;
+        for token in rest.split_whitespace() {
+            let (key, value) = token
+                .split_once('=')
+                .ok_or(DiagnosticError::InvalidGrammar)?;
+            if key == "class" {
+                if value != class {
+                    return Err(DiagnosticError::InvalidGrammar);
+                }
+                continue;
+            }
+            if !valid_diagnostic_key(key) {
+                return Err(DiagnosticError::InvalidKey(key.to_owned()));
+            }
+            parsed.fields.push((key.to_owned(), value.to_owned()));
+        }
+        // `class` is implied by the prefix; the other two are the minimum key
+        // set every diagnostic has to carry, so a payload without them is not
+        // a diagnostic this grammar can describe.
+        for required in ["requirement", "reason"] {
+            if !parsed.fields.iter().any(|(key, _)| key == required) {
+                return Err(DiagnosticError::InvalidGrammar);
+            }
+        }
+        Ok(parsed)
+    }
+}
+
+/// A diagnostic key is a lowercase ASCII token.
+fn valid_diagnostic_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_DIAGNOSTIC_KEY_BYTES
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+/// Normalises a diagnostic value to printable ASCII.
+///
+/// The grammar separates fields with spaces, so a value that could contain a
+/// space would make the payload ambiguous. Every character outside `!`..=`~`
+/// becomes `_`, which keeps the value a single token without inventing an
+/// escaping scheme a reader would have to know about.
+fn normalize_diagnostic_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if ('!'..='~').contains(&character) {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Cuts a string to at most `max_bytes`, on a UTF-8 character boundary.
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
     #[error("{field} must not be empty")]
@@ -1630,6 +1891,84 @@ fn normalize_execution_spec(spec: &ExecutionSpec) -> ExecutionSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A diagnostic payload matches the documented grammar, carries the class
+    /// and the required keys, and round-trips through the parser.
+    #[test]
+    fn a_diagnostic_payload_matches_the_documented_grammar() {
+        let mut payload = DiagnosticPayload::new(DIAGNOSTIC_CLASS_ISOLATION_DEGRADED).unwrap();
+        payload.set("requirement", "best_effort").unwrap();
+        payload.set("profile", "workspace_rw").unwrap();
+        payload
+            .set("reason", "sandbox helper trust check failed")
+            .unwrap();
+        let built = payload.build();
+        assert!(built.starts_with("eggwork.diagnostic.isolation.degraded.v1 "));
+        assert!(built.contains(" class=isolation.degraded"));
+        assert!(built.contains(" requirement=best_effort"));
+        assert!(built.contains(" profile=workspace_rw"));
+        assert!(built.contains(" reason=sandbox_helper_trust_check_failed"));
+        assert!(built.len() <= MAX_DIAGNOSTIC_PAYLOAD_BYTES);
+        let parsed = DiagnosticPayload::parse(&built).unwrap();
+        assert_eq!(parsed.class(), DIAGNOSTIC_CLASS_ISOLATION_DEGRADED);
+    }
+    /// The bound is enforced, and an over-long reason is truncated in a way a
+    /// reader can see rather than silently.
+    #[test]
+    fn an_over_long_diagnostic_reason_is_truncated_observably() {
+        let mut payload = DiagnosticPayload::new(DIAGNOSTIC_CLASS_RESOURCES_DEGRADED).unwrap();
+        payload.set("requirement", "best_effort").unwrap();
+        payload.set("dimension", "memory").unwrap();
+        payload
+            .set("reason", "r".repeat(MAX_DIAGNOSTIC_PAYLOAD_BYTES * 2))
+            .unwrap();
+        let built = payload.build();
+        assert!(built.len() <= MAX_DIAGNOSTIC_PAYLOAD_BYTES);
+        assert!(built.contains(DIAGNOSTIC_TRUNCATION_MARKER));
+        // The structured keys survive the truncation; only the free-form
+        // reason is shortened.
+        assert!(built.contains(" requirement=best_effort"));
+        assert!(built.contains(" dimension=memory"));
+        let reason = built
+            .split_whitespace()
+            .find(|token| token.starts_with("reason="))
+            .unwrap();
+        assert!(reason.ends_with(DIAGNOSTIC_TRUNCATION_MARKER));
+    }
+    /// A value that cannot be shortened without losing its meaning still
+    /// yields a bounded payload, and the bound holds for a multi-byte value.
+    #[test]
+    fn a_diagnostic_payload_stays_within_its_bound() {
+        let mut payload = DiagnosticPayload::new(DIAGNOSTIC_CLASS_ISOLATION_DEGRADED).unwrap();
+        payload.set("requirement", "best_effort").unwrap();
+        payload
+            .set("reason", "é".repeat(MAX_DIAGNOSTIC_PAYLOAD_BYTES))
+            .unwrap();
+        let built = payload.build();
+        assert!(built.len() <= MAX_DIAGNOSTIC_PAYLOAD_BYTES);
+        assert!(built.contains(DIAGNOSTIC_TRUNCATION_MARKER));
+        assert!(DiagnosticPayload::parse(&built).is_ok());
+    }
+    /// The parser refuses what the grammar does not allow: an unknown class, a
+    /// malformed token, an over-long payload, and a missing required key.
+    #[test]
+    fn a_malformed_diagnostic_payload_is_refused() {
+        assert!(DiagnosticPayload::parse("eggwork.diagnostic.nope.v1 class=nope").is_err());
+        assert!(
+            DiagnosticPayload::parse(
+                "eggwork.diagnostic.isolation.degraded.v1 class=isolation.degraded"
+            )
+            .is_err()
+        );
+        assert!(DiagnosticPayload::parse("not a diagnostic").is_err());
+        assert!(DiagnosticPayload::parse(&"x".repeat(MAX_DIAGNOSTIC_PAYLOAD_BYTES + 1)).is_err());
+        assert!(
+            DiagnosticPayload::parse(
+                "eggwork.diagnostic.isolation.degraded.v1 class=isolation.degraded requirement=best_effort"
+            )
+            .is_err()
+        );
+        assert!(DiagnosticPayload::new("isolation.degraded.other").is_err());
+    }
     fn spec() -> ExecutionSpec {
         ExecutionSpec {
             schema_version: 1,

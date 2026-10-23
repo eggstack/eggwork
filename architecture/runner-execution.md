@@ -218,9 +218,11 @@ The non-Linux variant is unconditional refusal: `Err("trusted Landlock is unsupp
 
 **4. Setup.** `self.setup.prepare(&request.sandbox, &request.resources, &request.root).await?`. The `?` means a required-sandbox or required-resource refusal is an `Err`, never a silent downgrade to direct execution.
 
+**4a. Degradation diagnostics.** `report_setup_degradations` turns the outcomes `prepare` returned into diagnostic payloads and sends them on the output channel. It runs here — after the setup resolved and before any process exists — so the diagnostic reaches the caller *before* the target can produce a single byte of output. See [Reporting a degradation](#reporting-a-degradation) below.
+
 **5. Helper selection (Linux).** `use_helper` is true when (`sandbox != None` **and** `setup.sandbox` is `Applied`) or `setup.resources` is `Applied`, **and** `sandbox_helper_path()` is `Some`. The two conditions are the only way the helper subprocess is created.
 
-**6. Channel construction (Linux, if `use_helper`).** `SandboxChannel::new` may fail. On failure, if the request is not `Required` and has no required resources, both outcomes are downgraded to `NotApplied { reason }` and execution proceeds **without** the helper. Otherwise the error propagates.
+**6. Channel construction (Linux, if `use_helper`).** `SandboxChannel::new` may fail. On failure, if the request is not `Required` and has no required resources, both outcomes are downgraded to `NotApplied { reason }`, the degradation is reported on the output channel, and execution proceeds **without** the helper. Otherwise the error propagates.
 
 **7. Command assembly.** `channel.command()` or `direct_command(&request, cwd)`, then `wrap_resource_command(command, &request.resources, &setup.resources)` which — only when the outcome is `Applied { backend: "systemd-cgroup-v2" }` — rewrites the command through `SystemdCgroupBackend::wrap` into `systemd-run [--user] --scope --quiet --unit=eggwork-<pid>-<nanos>.scope --working-directory <cwd> --property=… -- <program> <args…>`. When both isolation and resources apply, the systemd scope wraps the *helper*, and the helper execs the target inside the scope. The wrapper's own environment is `env_clear()` plus `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`, `HOME` (only if present in the parent), `PATH=/usr/bin:/bin`, and the wrapped command's explicit environment. Non-Linux-unix skips this and calls `direct_command` directly.
 
@@ -229,9 +231,9 @@ The non-Linux variant is unconditional refusal: `Err("trusted Landlock is unsupp
 **9. Handshake (Linux + channel).** `SandboxChannel::wait(&mut child, cancellation.clone())` has four outcomes:
 
 - `Ok(Some(session))` — the target is confirmed confined and started; the session is retained for post-exit limit attribution.
-- `Ok(None)` and the request is not required — the helper child is `start_kill`ed and waited, the outcomes are downgraded (`"Landlock helper could not enforce the requested profile"` / `"resource helper could not verify the cgroup limits"`), and the **command is rebuilt and respawned** without the helper.
+- `Ok(None)` and the request is not required — the helper child is `start_kill`ed and waited, the outcomes are downgraded (`"Landlock helper could not enforce the requested profile"` / `"resource helper could not verify the cgroup limits"`), the degradation is reported on the output channel, and the **command is rebuilt and respawned** without the helper. The diagnostic is emitted *after* the handshake failure is classified and *before* the respawn: the target is about to run with no Landlock ruleset and no cgroup verification, and the caller has to learn that before the target runs.
 - `Ok(None)` and the request is required — kill, wait, `Err(RunnerError::RequiredSetupUnavailable)`.
-- `Err(_)` — kill, wait, return the error. `BeforeTarget` errors are recoverable (respawn unwrapped) when nothing was required; `AfterTarget` errors are always terminal.
+- `Err(_)` — kill, wait, return the error. `BeforeTarget` errors are recoverable (respawn unwrapped) when nothing was required; `AfterTarget` errors are always terminal. A recoverable `BeforeTarget` error reports the degradation before the respawn, exactly as the `Ok(None)` arm does.
 
 Note the ordering: `let process_group = child.id();` is taken at line 1290, *after* the handshake, so the group that gets signalled is the group of whichever child actually ended up running.
 
@@ -303,7 +305,7 @@ Consequences worth checking as a reviewer: retention is exactly `limit` bytes fo
 
 1. `capture.push(&buffer[..count], capture_limit)` — always, before anything else.
 2. If `overflow == Terminate` and `total_bytes` crossed `capture_limit` on this read (`before <= capture_limit && after > capture_limit`), `overflow_tx.send(true)`.
-3. `for bytes in buffer[..count].chunks(chunk_limit)` → `output_tx.try_send(OutputChunk { stderr, bytes })`; on **any** error, `dropped += bytes.len() as u64`.
+3. `for bytes in buffer[..count].chunks(chunk_limit)` → `output_tx.try_send(OutputChunk::Stdout(bytes))` or `OutputChunk::Stderr(bytes)` depending on the reader's stream; on **any** error, `dropped += bytes.len() as u64`.
 
 Why this is the right trade: the reader's job is to keep the pipe empty, because a child blocked on a full stdout pipe can never reach its own exit, never observe cancellation, and never respond to a timeout. `try_send` therefore never awaits. A full or closed channel costs *event* fidelity, not process progress, and the loss is machine-reported through `stream_chunks_dropped` so the caller can decide whether a missing chunk is acceptable. The alternatives are both worse: blocking on `send` reintroduces the deadlock the drain exists to prevent, and dropping the read (or the child) turns a slow consumer into a correctness failure. The `BoundedCapture` totals remain exact regardless of channel pressure, so the durable record of what the child produced is not a function of consumer speed.
 
@@ -345,7 +347,58 @@ Why this is the right trade: the reader's job is to keep the pipe empty, because
 
 `ExecutionProvenance { execution_id: Option<ExecutionId>, generation: Option<ExecutionGeneration> }` is the round-trip handle: the caller supplies it, the runner injects it into the child environment, and returns it on the result so a caller can attribute a receipt without re-deriving anything.
 
-`OutputChunk { stderr: bool, bytes: Vec<u8> }` is the streaming unit. Its doc says consumers "must treat bytes as arbitrary binary data" — there is no encoding assumption anywhere in the reader.
+`OutputChunk` is the streaming unit, and it is an enum: `OutputChunk::Stdout(Vec<u8>)`, `OutputChunk::Stderr(Vec<u8>)` and `OutputChunk::Diagnostic(String)`. Its doc says consumers "must treat bytes as arbitrary binary data" — there is no encoding assumption anywhere in the reader. The `Diagnostic` variant carries a bounded payload (see [protocol.md](protocol.md#the-execution-diagnostic-payload-schema-version-1)) rather than bytes, and it is the only way a degradation reaches a caller.
+
+### Reporting a degradation
+
+A degradation is a *best-effort* request that could not be honoured. It is
+reported on the output channel as `OutputChunk::Diagnostic`, and the server
+forwards it as `ExecutionEventKind::Diagnostic`. The terminal snapshot
+(`ExecutionResult.sandbox`, `ExecutionResult.resources`) carries the same fact;
+the diagnostic exists so that a caller watching the stream sees the
+degradation *while the execution is running* rather than only in the terminal
+result.
+
+**Why the runner and not the server.** The server learns the outcome from
+`RunnerResult`, which arrives after the execution has finished. A diagnostic
+the server derived from that result would necessarily arrive after all target
+output, which is the gap this reporting exists to close. The runner knows
+*why* an enforcement was not applied at the moment it decides not to apply
+it, and the output channel is the one carrier that preserves the order
+between the runner's knowledge and the target's output.
+
+**Where the runner emits.**
+
+| Site | When | Ordering |
+| --- | --- | --- |
+| `report_setup_degradations` after `prepare` | unsupported profile, untrusted helper, no backend configured, resource-probe failure | before the target process exists |
+| the `SandboxChannel::new` failure arm | the helper could not even be launched | before the target process exists |
+| the `SandboxChannel::wait` recovery arms (`Ok(None)` and a recoverable `BeforeTarget` error) | the handshake failed and the target is about to be respawned directly | after the failure is classified, before the respawn |
+| the post-mortem resource-observation block | the helper could not open a counter it had installed, so the limit cannot be *verified* | after the target exited, before the terminal event |
+
+The last row is the one exception to "before the target's output", and it is
+a property of the fact rather than of the mechanism: the helper reports an
+unobservable counter only after the target has exited, so no implementation
+could report it earlier. It still precedes the terminal event, because the
+server drains the output channel before it publishes the terminal state.
+
+**The rules.**
+
+* A `Required` request is *refused*, never degraded. `prepare` returns an
+  `Err` before any diagnostic could be emitted, and a refusal is not a
+  degradation: reporting one would dress a fail-closed refusal up as an
+  advisory.
+* One degraded dimension produces exactly one diagnostic. `ReportedDegradations`
+  keeps the bookkeeping, because a degradation can be discovered twice — a
+  sandbox `prepare` could not apply may also be the sandbox the handshake
+  could not enforce — and the second discovery refines the recorded outcome
+  rather than duplicating the event.
+* `resources.degraded` carries the affected `dimension`, and one event is
+  emitted per affected dimension when more than one is affected.
+* An execution with nothing degraded emits no diagnostic at all.
+* The runner never emits a diagnostic for a degradation it did not classify
+  itself: the payload and the terminal snapshot are derived from the same
+  `SetupOutcome`, so the two cannot disagree.
 
 `RunnerResult::execution_result()` (line 977) — also reachable via `impl From<RunnerResult> for ExecutionResult` (line 1924) — maps to the protocol-neutral result:
 
@@ -427,6 +480,8 @@ Drop-safety is partial by design. Every `Command` sets `.kill_on_drop(true)`, so
 | Required setup fails closed before the target runs | `TrustedLandlockSetup::prepare`; `NoExecutionSetup::prepare`; `SandboxChannel::wait` decode; `wrap_resource_command` backend match | `unsupported_resource_limits_are_reported_or_rejected_before_spawn` (marker file absent); `helper_trust_checks_reject_missing_wrong_and_symlinked_helpers` and `malformed_private_spec_and_unavailable_status_channel_do_not_launch_target` (helper crate) |
 | Advisory capability == enforcement answer | one `verify_trusted_helper`; `probe_landlock_ruleset` mirrors the helper's rules; delegation in `operations::trusted_helper` | `trusted_helper_advertises_landlock_workspace_rw_capability`; `missing_helper_advertises_no_landlock_capability`; `no_setup_advertises_empty_dynamic_capabilities`; `capability_feature_string_is_frozen_for_workspace_rw_profile` |
 | Pre-spawn refusals are typed and distinguishable | the two early returns in `run`; `failure_for_runner_error` in the server | `cancellation_before_spawn_and_spawn_failure_are_typed`; `unsupported_resource_limits_are_reported_or_rejected_before_spawn` |
+| A degradation is reported in the stream, before the target's output | `report_setup_degradations` after `prepare`, in the `SandboxChannel::new` failure arm, and in the handshake recovery arms; `OutputChunk::Diagnostic` on the same channel as the target's output | `crates/eggwork-runner/tests/diagnostic_degradation.rs` (the diagnostic is the first chunk on the channel); server-side `a_degraded_best_effort_execution_publishes_its_diagnostic_before_output_and_terminal` (sequence numbers) |
+| A required request is never reported as a degradation | `report_setup_degradations` only reports `BestEffort` requests; `prepare` errors on a required request before any diagnostic could be emitted | `a_required_sandbox_is_refused_without_a_degradation_diagnostic`; server-side `a_required_sandbox_never_reaches_the_target_and_is_not_reported_as_a_degradation` |
 | Cross-platform honesty | `#[cfg(not(unix))]` refusal; non-Linux fail-closed fallbacks | none in this crate (see Test coverage) |
 
 ## Platform support matrix
@@ -485,6 +540,8 @@ Per the closure evidence in `plans/closure/security-isolation-resource/004-statu
 `crates/eggwork-runner/tests/windows_process_tree.rs` (`#![cfg(windows)]`, run by the `windows-runner` CI job) is the Windows-only tree suite, and it is deliberately not a mirror of the Unix tests: the Unix ones use `/bin/sh`, which does not exist on Windows. Every tree claim is proven by a fixture that appends a heartbeat file on a 50 ms cadence, sampled *after* the runner returns, because there is no safe-Rust process-liveness API here. `assert_frozen` first asserts the heartbeat file is non-empty so the proof cannot pass vacuously, then re-samples after 600 ms. The proofs are: direct exit with CRLF-captured stdout/stderr and exit code 3; a descendant created at startup owned after the leader exits; timeout, cancellation, and output-limit convergence for both a leader and a detached descendant; leader exit not releasing a live descendant; leader exit status not rewritten by descendant termination; working directory honoured *and* a write outside the root succeeding with `sandbox: NotRequested`; stdin delivered and closed; typed spawn failure with no marker left behind; descendant output captured (pipe inheritance); the documented environment baseline with no ambient leak; bare program name resolved through `PATH`; required isolation and required resources refused before the marker command runs, with best-effort reported `NotApplied`; and five repeated timeout convergences, because tree bugs are timing bugs.
 
 `tests/capability_probe.rs` covers the advertisement boundary end to end. It copies the built `eggwork-sandbox-helper` out of `$CARGO_TARGET_DIR/debug` (or `OUT_DIR`) into a fresh `0700` tempdir as `0755`, deliberately leaks the tempdir, and asserts `LocalProcessRunner::new(TrustedLandlockSetup::new(helper)).execution_capabilities()` contains `isolation.landlock.workspace-rw.v1` on an ABI-V4 kernel. It **skips** (prints and returns) when no helper binary is present. The mirror case, `missing_helper_advertises_no_landlock_capability`, points at `/nonexistent/eggwork-sandbox-helper` and asserts the feature is absent.
+
+`crates/eggwork-runner/tests/diagnostic_degradation.rs` is the degradation-reporting suite. It drives the runner through its public API with `LocalProcessRunner::new(NoExecutionSetup)` — chosen explicitly, because `LocalProcessRunner::default()` picks a setup from the environment and a test that wanted "no enforcement available" could silently get an enforcing one. The argv is platform specific (`cmd.exe` on Windows, `/bin/sh` elsewhere) because the `windows-runner` CI job runs this suite and the runner has platform-specific spawn paths the diagnostic sits in front of. The proofs are: a degraded best-effort sandbox emits exactly one diagnostic and it is the *first* chunk on the channel, ahead of the target's output; a degraded best-effort resource request emits one diagnostic naming the affected dimension, and two affected dimensions emit two diagnostics; a required sandbox is refused with `RequiredSetupUnavailable`, the target's marker file does not exist, and no diagnostic is emitted; an execution with nothing degraded emits no diagnostic; a cancellation before the spawn emits no diagnostic; and every emitted payload stays within `MAX_DIAGNOSTIC_PAYLOAD_BYTES` and parses against the documented grammar.
 
 `SandboxChannel` internals are covered from the helper crate's integration test, `crates/eggwork-sandbox-helper/tests/landlock_runner.rs`, which drives the runner's public API: outside read/write denial, helper trust rejections (missing/wrong/symlinked), workspace and cwd symlink escapes, timeout and cancellation reaping the helper's own process group, required memory/PID/CPU enforcement and classification, concurrent cgroup scope isolation, and `malformed_private_spec_and_unavailable_status_channel_do_not_launch_target`.
 

@@ -93,3 +93,64 @@ own `NodeStatus` and `NodeCapabilities` are unchanged: they answer "is this
 node accepting work", and this document answers "what did this host look
 like". The two are never merged, and nothing in this contract qualifies an
 execution.
+
+## The execution diagnostic payload (schema version 1)
+
+`ExecutionEventKind::Diagnostic(String)` carries one diagnostic payload. The
+payload is a single bounded string, not an object, because it rides inside an
+event whose envelope is already bounded.
+
+### Grammar
+
+```text
+eggwork.diagnostic.<class>.v1 key=value key=value …
+```
+
+* The prefix is `eggwork_core::DIAGNOSTIC_PREFIX` (`eggwork.diagnostic.`) and
+  the schema suffix is `eggwork_core::DIAGNOSTIC_SCHEMA_SUFFIX` (`.v1`).
+* The class is one of the closed set in `eggwork_core::DIAGNOSTIC_CLASSES`:
+  `isolation.degraded` (`DIAGNOSTIC_CLASS_ISOLATION_DEGRADED`) and
+  `resources.degraded` (`DIAGNOSTIC_CLASS_RESOURCES_DEGRADED`). A class
+  outside the set is refused, not guessed at, because the class is what a
+  consumer dispatches on.
+* Fields are `key=value` pairs separated by single spaces. The key set is a
+  lowercase ASCII token of at most `MAX_DIAGNOSTIC_KEY_BYTES` bytes; `class` is
+  reserved and is derived from the payload's own class.
+* Values are printable ASCII. Every character outside `!`..=`~` — a space
+  included — becomes `_`, so a value can never contain the separator and the
+  tokenisation stays unambiguous without an escaping scheme.
+
+### Required keys
+
+| Key | Meaning |
+| --- | --- |
+| `class` | The class, repeated as a field so a consumer that only reads the key/value pairs does not have to parse the prefix. |
+| `requirement` | Always `best_effort`. A degradation is by definition a best-effort request that was not honoured; a required request is refused instead. |
+| `reason` | The bounded, human-readable cause of the degradation. |
+| `profile` | `isolation.degraded` only: the requested filesystem profile. |
+| `dimension` | `resources.degraded` only: the affected dimension (`memory`, `cpu`, `pids`). |
+
+`eggwork_core::DiagnosticPayload::parse` enforces the grammar, the closed
+class set, the bound, and the presence of `class`, `requirement` and `reason`.
+
+### Bound and truncation
+
+The assembled payload never exceeds
+`eggwork_core::MAX_DIAGNOSTIC_PAYLOAD_BYTES` (`MAX_METADATA_VALUE_BYTES`,
+2048 bytes). When the fields do not fit, values are shortened in insertion
+order: the first value that does not fit is cut on a UTF-8 character boundary
+and gains the literal marker `eggwork_core::DIAGNOSTIC_TRUNCATION_MARKER`
+(`...[truncated]`), and the fields after it are omitted. The marker is what
+makes truncation observable — a bounded payload never silently reads as a
+complete statement. The free-form `reason` is inserted last so that it
+absorbs the overage and the structured keys survive intact.
+
+### What the payload deliberately does not carry
+
+No secret, no credential, no path outside the execution's own workspace
+naming, no stack trace, and no per-dimension measurement. A diagnostic says
+*what was not enforced and why*, in the smallest form that lets a caller act
+on it. The terminal snapshot (`ExecutionResult.sandbox`,
+`ExecutionResult.resources`) remains the authoritative evidence; the
+diagnostic makes the same fact observable while the execution is still
+running.

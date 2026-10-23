@@ -1,6 +1,6 @@
 # Security, Isolation, and Resource Enforcement Roadmap
 
-Status: closed through M004 (remote-admission C001 and Operations M002 included); M005a and M005b correctives proposed; M005c blocked on ADR-0007
+Status: closed through M004 (remote-admission C001 and Operations M002 included); M005a implemented (closure record written, implementation commit pending); M005b corrective proposed; M005c blocked on ADR-0007
 
 Canonical authority:
 
@@ -154,7 +154,10 @@ Run hostile input/process/workspace/transport fixtures, audit dependencies and u
 
 Class: invariant
 
-Status: proposed
+Status: implemented — closure record written, implementation commit pending
+
+Closure evidence: `plans/closure/security-isolation-resource/005a-status.md`
+(implementation `IMPLEMENTATION-COMMIT-PENDING`)
 
 Corrective addendum:
 
@@ -171,7 +174,7 @@ Make degradation visible where a caller will actually see it. `SandboxResult::No
 Exit conditions:
 
 - a degraded best-effort execution emits a diagnostic into the event stream, with a payload that identifies what degraded and why;
-- the diagnostic is emitted on the same path as the terminal result, so the two cannot disagree;
+- the diagnostic is published **before the target's first output and before the terminal event**, so a caller sees the degradation while the execution is still running. The runner emits it on the output channel it already owns, and the payload and the terminal snapshot are derived from the same `SetupOutcome`, so the two cannot disagree. A diagnostic derived from the runner's result instead would necessarily arrive after all target output — and after the terminal event, where the store would refuse to append it;
 - no `Required` execution reaches the target without the requested control;
 - the required-isolation and required-resource fail-closed rules are unchanged.
 

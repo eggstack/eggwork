@@ -51,19 +51,51 @@ pub struct ExecutionProvenance {
     pub generation: Option<ExecutionGeneration>,
 }
 
-/// A bounded output chunk. Consumers must treat bytes as arbitrary binary data.
+/// A bounded output chunk, or a diagnostic about the execution's enforcement.
+///
+/// Consumers must treat the bytes of `Stdout`/`Stderr` as arbitrary binary
+/// data.
+///
+/// `Diagnostic` is the only way a degradation reaches the caller, and it is
+/// deliberately carried on the *same* channel as the target's output: the
+/// server's forwarding loop drains one channel in order, so a diagnostic the
+/// runner sends before it spawns the target is published before any output the
+/// target produces. A diagnostic derived from the runner's result instead
+/// would necessarily arrive after all target output, which is the gap this
+/// carrier exists to close.
 #[derive(Clone, PartialEq, Eq)]
-pub struct OutputChunk {
-    pub stderr: bool,
-    pub bytes: Vec<u8>,
+pub enum OutputChunk {
+    /// Target standard output.
+    Stdout(Vec<u8>),
+    /// Target standard error.
+    Stderr(Vec<u8>),
+    /// A bounded diagnostic payload about the execution's isolation or
+    /// resource enforcement. See [`eggwork_core::DiagnosticPayload`] for the
+    /// grammar and the bound.
+    Diagnostic(String),
 }
 impl std::fmt::Debug for OutputChunk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OutputChunk")
-            .field("stderr", &self.stderr)
-            .field("length", &self.bytes.len())
-            .field("bytes", &"[REDACTED]")
-            .finish()
+        match self {
+            Self::Stdout(bytes) => f
+                .debug_struct("OutputChunk")
+                .field("stream", &"stdout")
+                .field("length", &bytes.len())
+                .field("bytes", &"[REDACTED]")
+                .finish(),
+            Self::Stderr(bytes) => f
+                .debug_struct("OutputChunk")
+                .field("stream", &"stderr")
+                .field("length", &bytes.len())
+                .field("bytes", &"[REDACTED]")
+                .finish(),
+            Self::Diagnostic(payload) => f
+                .debug_struct("OutputChunk")
+                .field("stream", &"diagnostic")
+                .field("length", &payload.len())
+                .field("payload", &"[REDACTED]")
+                .finish(),
+        }
     }
 }
 
@@ -821,6 +853,161 @@ impl ExecutionSetup for NoExecutionSetup {
     }
 }
 
+/// The `requirement` value a degradation diagnostic always carries.
+///
+/// A degradation is by definition a *best-effort* request that was not
+/// honoured: a required request is refused instead, and a refusal is not a
+/// degradation.
+const DIAGNOSTIC_REQUIREMENT_BEST_EFFORT: &str = "best_effort";
+
+/// The degradations the runner has already reported to the caller.
+///
+/// The bookkeeping exists so that one degraded dimension produces exactly one
+/// diagnostic event. A degradation can be discovered more than once — a
+/// sandbox that `prepare` could not apply may also be the sandbox the helper
+/// handshake could not enforce — and the second discovery must refine the
+/// recorded outcome, not duplicate the event.
+#[derive(Debug, Default)]
+struct ReportedDegradations {
+    isolation: bool,
+    resources: Vec<eggwork_core::ResourceDimension>,
+}
+
+/// The best-effort resource dimensions a request asked for.
+///
+/// `Required` dimensions are excluded on purpose. A required dimension that
+/// reached a `NotApplied` outcome would be a failure of the fail-closed rule,
+/// not a degradation, and reporting it as one would turn a refusal into an
+/// advisory. The in-tree setups refuse a required request before they can
+/// produce such an outcome, so this filter never drops a real report.
+fn best_effort_resource_dimensions(
+    request: &ResourceSetupRequest,
+) -> Vec<eggwork_core::ResourceDimension> {
+    let mut dimensions = Vec::new();
+    if matches!(request.memory_bytes, Requirement::BestEffort(_)) {
+        dimensions.push(eggwork_core::ResourceDimension::Memory);
+    }
+    if matches!(request.cpu_millis, Requirement::BestEffort(_)) {
+        dimensions.push(eggwork_core::ResourceDimension::Cpu);
+    }
+    if matches!(request.pids, Requirement::BestEffort(_)) {
+        dimensions.push(eggwork_core::ResourceDimension::Pids);
+    }
+    dimensions
+}
+
+/// The wire name of a resource dimension, as the diagnostic grammar spells it.
+fn resource_dimension_name(dimension: eggwork_core::ResourceDimension) -> &'static str {
+    match dimension {
+        eggwork_core::ResourceDimension::Memory => "memory",
+        eggwork_core::ResourceDimension::Cpu => "cpu",
+        eggwork_core::ResourceDimension::Pids => "pids",
+    }
+}
+
+/// The requested dimensions whose post-mortem counter the helper could not
+/// open.
+///
+/// Only the dimensions the helper actually reported as unobservable are named:
+/// the diagnostic has to say which limit could not be *verified*, not merely
+/// that the resource outcome was downgraded.
+#[cfg(target_os = "linux")]
+fn unobserved_resource_dimensions(
+    request: &ResourceSetupRequest,
+    unobserved: &[eggwork_core::ResourceDimension],
+) -> Vec<eggwork_core::ResourceDimension> {
+    let mut dimensions = Vec::new();
+    if matches!(request.memory_bytes, Requirement::BestEffort(_))
+        && unobserved.contains(&eggwork_core::ResourceDimension::Memory)
+    {
+        dimensions.push(eggwork_core::ResourceDimension::Memory);
+    }
+    if matches!(request.pids, Requirement::BestEffort(_))
+        && unobserved.contains(&eggwork_core::ResourceDimension::Pids)
+    {
+        dimensions.push(eggwork_core::ResourceDimension::Pids);
+    }
+    dimensions
+}
+
+/// Builds the diagnostic payload for a degraded filesystem isolation.
+///
+/// The structured keys come first and the free-form reason last, so a reason
+/// that does not fit absorbs the truncation and the structured keys survive
+/// intact.
+fn isolation_diagnostic(profile: &str, reason: &str) -> Option<String> {
+    let mut payload =
+        eggwork_core::DiagnosticPayload::new(eggwork_core::DIAGNOSTIC_CLASS_ISOLATION_DEGRADED)
+            .ok()?;
+    let _ = payload.set("requirement", DIAGNOSTIC_REQUIREMENT_BEST_EFFORT);
+    let _ = payload.set("profile", profile);
+    let _ = payload.set("reason", reason);
+    Some(payload.build())
+}
+
+/// Builds the diagnostic payload for a degraded resource dimension.
+fn resources_diagnostic(
+    dimension: eggwork_core::ResourceDimension,
+    reason: &str,
+) -> Option<String> {
+    let mut payload =
+        eggwork_core::DiagnosticPayload::new(eggwork_core::DIAGNOSTIC_CLASS_RESOURCES_DEGRADED)
+            .ok()?;
+    let _ = payload.set("requirement", DIAGNOSTIC_REQUIREMENT_BEST_EFFORT);
+    let _ = payload.set("dimension", resource_dimension_name(dimension));
+    let _ = payload.set("reason", reason);
+    Some(payload.build())
+}
+
+/// Sends one diagnostic payload on the runner's output channel.
+///
+/// The channel is the only path from the runner to the caller that preserves
+/// ordering: the server drains it in order, so a payload sent before the
+/// target is spawned is published before anything the target writes.
+async fn send_diagnostic(output_tx: &mpsc::Sender<OutputChunk>, payload: Option<String>) {
+    let Some(payload) = payload else {
+        // The payload could not be built, which can only mean the class is not
+        // in the closed set. There is no grammar-conforming payload to send,
+        // and a malformed one would be worse than none: the degradation stays
+        // recorded in the terminal snapshot.
+        return;
+    };
+    // `send` rather than `try_send`: a dropped diagnostic would silently
+    // reopen the gap this milestone closes, and the channel is bounded, so
+    // awaiting it costs back-pressure and not correctness.
+    let _ = output_tx.send(OutputChunk::Diagnostic(payload)).await;
+}
+
+/// Emits the diagnostic events for the degradations `setup` records.
+///
+/// Only degradations of *best-effort* requests are reported: a required
+/// request that could not be satisfied is refused before the target starts
+/// and is never described as a degradation.
+async fn report_setup_degradations(
+    output_tx: &mpsc::Sender<OutputChunk>,
+    sandbox_request: &SandboxRequest,
+    resource_request: &ResourceSetupRequest,
+    setup: &SetupOutcome,
+    reported: &mut ReportedDegradations,
+) {
+    if !reported.isolation
+        && let SandboxOutcome::NotApplied { reason } = &setup.sandbox
+        && let SandboxRequest::BestEffort { profile } = sandbox_request
+    {
+        reported.isolation = true;
+        send_diagnostic(output_tx, isolation_diagnostic(profile, reason)).await;
+    }
+    if let ResourceSetupOutcome::NotApplied { reason } = &setup.resources {
+        for dimension in best_effort_resource_dimensions(resource_request) {
+            if reported.resources.contains(&dimension) {
+                continue;
+            }
+            reported.resources.push(dimension);
+            send_diagnostic(output_tx, resources_diagnostic(dimension, reason)).await;
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RunnerRequest {
     argv: Vec<String>,
@@ -1304,6 +1491,21 @@ impl LocalProcessRunner {
             .setup
             .prepare(&request.sandbox, &request.resources, &request.root)
             .await?;
+        // The degradations `prepare` decided are known before any process
+        // exists, so their diagnostics are emitted here — before the target is
+        // spawned, and therefore before the target can produce any output. A
+        // diagnostic the server derived from the runner's result instead would
+        // necessarily arrive after all target output, which is the gap this
+        // emission point exists to close.
+        let mut reported_degradations = ReportedDegradations::default();
+        report_setup_degradations(
+            &output_tx,
+            &request.sandbox,
+            &request.resources,
+            &setup,
+            &mut reported_degradations,
+        )
+        .await;
         #[cfg(target_os = "linux")]
         let use_helper = ((!matches!(request.sandbox, SandboxRequest::None)
             && matches!(setup.sandbox, SandboxOutcome::Applied { .. }))
@@ -1332,6 +1534,17 @@ impl LocalProcessRunner {
                             reason: error.to_string(),
                         };
                     }
+                    // The helper could not even be launched, so the target is
+                    // about to run without the requested enforcement. The
+                    // diagnostic is emitted here, before the target exists.
+                    report_setup_degradations(
+                        &output_tx,
+                        &request.sandbox,
+                        &request.resources,
+                        &setup,
+                        &mut reported_degradations,
+                    )
+                    .await;
                     None
                 }
                 Err(error) => return Err(error),
@@ -1384,6 +1597,19 @@ impl LocalProcessRunner {
                             reason: "resource helper could not verify the cgroup limits".into(),
                         };
                     }
+                    // The handshake failure is classified and the outcomes are
+                    // rewritten, and only now is the degradation reported: the
+                    // target is about to be re-spawned directly, with no
+                    // Landlock ruleset and no cgroup verification, so the
+                    // caller has to learn that before the target runs.
+                    report_setup_degradations(
+                        &output_tx,
+                        &request.sandbox,
+                        &request.resources,
+                        &setup,
+                        &mut reported_degradations,
+                    )
+                    .await;
                     let direct = direct_command(&request, cwd.clone());
                     let (direct, unit) =
                         wrap_resource_command(direct, &request.resources, &setup.resources)?;
@@ -1412,6 +1638,17 @@ impl LocalProcessRunner {
                             reason: error.to_string(),
                         };
                     }
+                    // Same rule as the `Ok(None)` arm above: the degradation is
+                    // reported after the handshake failure is classified and
+                    // before the target is re-spawned directly.
+                    report_setup_degradations(
+                        &output_tx,
+                        &request.sandbox,
+                        &request.resources,
+                        &setup,
+                        &mut reported_degradations,
+                    )
+                    .await;
                     let direct = direct_command(&request, cwd.clone());
                     let (direct, unit) =
                         wrap_resource_command(direct, &request.resources, &setup.resources)?;
@@ -1450,6 +1687,13 @@ impl LocalProcessRunner {
         let stderr = tree
             .take_stderr()
             .ok_or_else(|| RunnerError::Io("stderr pipe missing".into()))?;
+        // A post-mortem resource observation is only knowable after the target
+        // exited, so the diagnostic that reports it needs a sender of its own:
+        // `output_tx` is moved into the readers below. The clone is dropped
+        // again as soon as the observation has been reported, so the output
+        // channel still closes exactly when the readers finish.
+        #[cfg(target_os = "linux")]
+        let diagnostic_tx = output_tx.clone();
         let stdout_task = spawn_reader(
             stdout,
             false,
@@ -1528,22 +1772,40 @@ impl LocalProcessRunner {
         // post-mortem counter the helper could not open, is not evidence that
         // the limit held. Record `NotApplied` rather than letting it fall
         // through as `Applied`.
-        if matches!(setup.resources, ResourceSetupOutcome::Applied { .. }) {
-            let requested = &request.resources;
-            let unobserved = if matches!(requested.memory_bytes, Requirement::NotRequested) {
-                false
-            } else {
-                resource_unobserved.contains(&eggwork_core::ResourceDimension::Memory)
-            } || if matches!(requested.pids, Requirement::NotRequested) {
-                false
-            } else {
-                resource_unobserved.contains(&eggwork_core::ResourceDimension::Pids)
-            };
-            if unobserved {
-                setup.resources = ResourceSetupOutcome::NotApplied {
-                    reason: "installed resource limits could not be observed after exit".into(),
+        {
+            if matches!(setup.resources, ResourceSetupOutcome::Applied { .. }) {
+                let requested = &request.resources;
+                let unobserved = if matches!(requested.memory_bytes, Requirement::NotRequested) {
+                    false
+                } else {
+                    resource_unobserved.contains(&eggwork_core::ResourceDimension::Memory)
+                } || if matches!(requested.pids, Requirement::NotRequested) {
+                    false
+                } else {
+                    resource_unobserved.contains(&eggwork_core::ResourceDimension::Pids)
                 };
+                if unobserved {
+                    let reason = "installed resource limits could not be observed after exit";
+                    setup.resources = ResourceSetupOutcome::NotApplied {
+                        reason: reason.into(),
+                    };
+                    // This degradation is a post-mortem fact: the helper
+                    // reports the unobservable counter only after the target
+                    // exited, so the diagnostic cannot precede the target's
+                    // output the way a setup-time degradation does. It still
+                    // precedes the terminal event, because the server drains
+                    // the output channel before it publishes the terminal
+                    // state.
+                    for dimension in unobserved_resource_dimensions(requested, &resource_unobserved)
+                    {
+                        send_diagnostic(&diagnostic_tx, resources_diagnostic(dimension, reason))
+                            .await;
+                    }
+                }
             }
+            // The sender is released here, so the output channel keeps closing
+            // exactly when the readers finish.
+            drop(diagnostic_tx);
         }
         #[cfg(target_os = "linux")]
         let resource_cleanup_warning = if let Some(unit) = resource_unit.as_deref() {
@@ -2044,13 +2306,12 @@ fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
                 let _ = overflow_tx.send(true);
             }
             for bytes in buffer[..count].chunks(chunk_limit) {
-                if output_tx
-                    .try_send(OutputChunk {
-                        stderr,
-                        bytes: bytes.to_vec(),
-                    })
-                    .is_err()
-                {
+                let chunk = if stderr {
+                    OutputChunk::Stderr(bytes.to_vec())
+                } else {
+                    OutputChunk::Stdout(bytes.to_vec())
+                };
+                if output_tx.try_send(chunk).is_err() {
                     dropped += bytes.len() as u64;
                 }
             }

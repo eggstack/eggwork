@@ -26,8 +26,8 @@ use eggwork_core::{
     ProtocolVersionRange,
 };
 use eggwork_runner::{
-    ExecutionProvenance, LocalProcessRunner, ResourceSetupRequest, RunnerError, RunnerRequest,
-    SandboxRequest,
+    ExecutionProvenance, LocalProcessRunner, OutputChunk, ResourceSetupRequest, RunnerError,
+    RunnerRequest, SandboxRequest,
 };
 use futures_util::stream;
 use serde::{Deserialize, Serialize};
@@ -2471,11 +2471,23 @@ async fn run_execution(
             biased;
             output = output_rx.recv(), if !output_closed => {
                 if let Some(output) = output {
-                    let kind = if output.stderr { ExecutionEventKind::Stderr(output.bytes) } else { ExecutionEventKind::Stdout(output.bytes) };
+                    // A diagnostic rides the same channel as the target's
+                    // output and is forwarded in the order it was received, so
+                    // a degradation the runner reported before it spawned the
+                    // target is published before anything the target wrote.
+                    let kind = match output {
+                        OutputChunk::Stdout(bytes) => ExecutionEventKind::Stdout(bytes),
+                        OutputChunk::Stderr(bytes) => ExecutionEventKind::Stderr(bytes),
+                        OutputChunk::Diagnostic(payload) => ExecutionEventKind::Diagnostic(payload),
+                    };
                     publish(&record, ExecutionState::Running, None, kind).await;
                 } else {
                     output_closed = true;
-                    if result.is_some() { break; }
+                    // The channel is closed and drained, so no further output
+                    // can arrive. The runner's outcome may still be unknown, in
+                    // which case the `joined` branch below is still enabled and
+                    // the loop waits for it.
+                    if result.is_some() || runner_error.is_some() { break; }
                 }
             }
             joined = &mut runner_task, if result.is_none() && runner_error.is_none() => {
@@ -2489,10 +2501,10 @@ async fn run_execution(
         }
     }
     while let Ok(output) = output_rx.try_recv() {
-        let kind = if output.stderr {
-            ExecutionEventKind::Stderr(output.bytes)
-        } else {
-            ExecutionEventKind::Stdout(output.bytes)
+        let kind = match output {
+            OutputChunk::Stdout(bytes) => ExecutionEventKind::Stdout(bytes),
+            OutputChunk::Stderr(bytes) => ExecutionEventKind::Stderr(bytes),
+            OutputChunk::Diagnostic(payload) => ExecutionEventKind::Diagnostic(payload),
         };
         publish(&record, ExecutionState::Running, None, kind).await;
     }
@@ -5286,6 +5298,356 @@ mod tests {
         server.wait().await.unwrap();
     }
 
+    /// A setup that advertises the Landlock capability but cannot enforce it.
+    ///
+    /// The admission gate refuses a `Required` isolation request on a node that
+    /// does not advertise the capability, so the runner's own fail-closed
+    /// refusal would be unreachable from a server test without this fixture.
+    /// The fixture is deliberately inconsistent — it advertises what it cannot
+    /// deliver — and exists only to reach that refusal.
+    struct AdvertisesLandlockButCannotEnforce;
+
+    #[async_trait::async_trait]
+    impl eggwork_runner::ExecutionSetup for AdvertisesLandlockButCannotEnforce {
+        async fn prepare(
+            &self,
+            sandbox: &SandboxRequest,
+            resources: &ResourceSetupRequest,
+            root: &std::path::Path,
+        ) -> Result<eggwork_runner::SetupOutcome, RunnerError> {
+            eggwork_runner::ExecutionSetup::prepare(
+                &eggwork_runner::NoExecutionSetup,
+                sandbox,
+                resources,
+                root,
+            )
+            .await
+        }
+
+        async fn execution_capabilities(&self) -> Vec<String> {
+            vec![eggwork_runner::LANDLOCK_WORKSPACE_RW_CAPABILITY.to_owned()]
+        }
+    }
+
+    /// Starts a node with the given runner and returns it with a connected
+    /// client. The runner is injected explicitly so a test can pin what the
+    /// node is able to enforce.
+    async fn node_with_runner(
+        runner: Arc<LocalProcessRunner>,
+        node_id: &str,
+        temp: &TempDir,
+    ) -> (NodeServer, NodeClient) {
+        let (root, server_identity, client_identity, _) = tls_material();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let server = NodeServer::start(
+            NodeConfig {
+                host_telemetry: None,
+                node_id: NodeId::new(node_id).unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(30),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            runner,
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+        (server, client)
+    }
+
+    /// The sequence number of the terminal state event.
+    fn terminal_sequence(events: &[eggwork_core::ExecutionEvent]) -> EventSequence {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                ExecutionEventKind::State(state) if *state != ExecutionState::Running => {
+                    Some(event.sequence)
+                }
+                _ => None,
+            })
+            .expect("the execution must reach a terminal state")
+    }
+
+    /// The diagnostic events of a page, in order.
+    fn diagnostic_payloads(events: &[eggwork_core::ExecutionEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ExecutionEventKind::Diagnostic(payload) => Some(payload.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// M005a: a degraded best-effort execution says so in the stream, before
+    /// the target writes anything and before the terminal event. The terminal
+    /// state alone is not enough — a caller watching the stream has to be able
+    /// to see that the execution ran without the enforcement it asked for.
+    #[tokio::test]
+    async fn a_degraded_best_effort_execution_publishes_its_diagnostic_before_output_and_terminal()
+    {
+        init_tls();
+        let temp = TempDir::new().unwrap();
+        // `NoExecutionSetup` is chosen explicitly: the default setup depends on
+        // the environment, and this test needs a node that cannot enforce
+        // anything.
+        let runner = Arc::new(LocalProcessRunner::new(eggwork_runner::NoExecutionSetup));
+        let (server, client) = node_with_runner(runner, "node-degraded-best-effort", &temp).await;
+
+        let mut spec = execution_spec(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "echo target-output".into(),
+        ]);
+        spec.command.isolation = IsolationRequirement::BestEffort;
+        let handle = execution_handle("degraded-best-effort");
+        let stream = client.execute(&spec, &handle).await.unwrap();
+        let events = tokio::time::timeout(
+            ROUND_TRIP_BUDGET,
+            stream.into_events().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("best-effort execution must terminate")
+        .unwrap();
+
+        let payloads = diagnostic_payloads(&events);
+        assert_eq!(
+            payloads.len(),
+            1,
+            "one degraded dimension produces exactly one diagnostic; got {payloads:?}"
+        );
+        let payload = payloads[0];
+        assert!(
+            payload.starts_with("eggwork.diagnostic.isolation.degraded.v1 "),
+            "unexpected diagnostic payload: {payload}"
+        );
+        assert!(payload.contains(" requirement=best_effort"));
+        assert!(payload.contains(" reason="));
+        assert!(
+            eggwork_core::DiagnosticPayload::parse(payload).is_ok(),
+            "the payload must match the documented grammar: {payload}"
+        );
+
+        let diagnostic_sequence = events
+            .iter()
+            .find(|event| matches!(event.kind, ExecutionEventKind::Diagnostic(_)))
+            .expect("a diagnostic event")
+            .sequence;
+        let first_output_sequence = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.kind,
+                    ExecutionEventKind::Stdout(_) | ExecutionEventKind::Stderr(_)
+                )
+            })
+            .expect("the target produced output")
+            .sequence;
+        assert!(
+            diagnostic_sequence < first_output_sequence,
+            "the diagnostic has to precede the target's first output; got {events:?}"
+        );
+        let terminal = terminal_sequence(&events);
+        assert!(
+            diagnostic_sequence < terminal,
+            "the diagnostic has to precede the terminal event; got {events:?}"
+        );
+
+        // The terminal evidence still records the degradation, so the stream
+        // and the snapshot cannot disagree.
+        let snapshot = client
+            .observe_generation(&handle.execution_id, handle.generation.get())
+            .await
+            .unwrap();
+        assert!(matches!(
+            snapshot.result.unwrap().sandbox,
+            Some(eggwork_core::SandboxResult::NotApplied { .. })
+        ));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// M005a: the diagnostic is durable. It is committed to the journal, so a
+    /// later read of the event page replays it — it was not merely broadcast to
+    /// a live subscriber.
+    #[tokio::test]
+    async fn the_diagnostic_is_replayed_from_the_journal_after_the_execution_ended() {
+        init_tls();
+        let temp = TempDir::new().unwrap();
+        let runner = Arc::new(LocalProcessRunner::new(eggwork_runner::NoExecutionSetup));
+        let (server, client) = node_with_runner(runner, "node-diagnostic-replay", &temp).await;
+
+        let mut spec = execution_spec(vec!["/bin/true".into()]);
+        spec.command.isolation = IsolationRequirement::BestEffort;
+        let handle = execution_handle("diagnostic-replay");
+        let stream = client.execute(&spec, &handle).await.unwrap();
+        let events = tokio::time::timeout(
+            ROUND_TRIP_BUDGET,
+            stream.into_events().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("best-effort execution must terminate")
+        .unwrap();
+        let payloads = diagnostic_payloads(&events);
+        assert_eq!(payloads.len(), 1, "got {payloads:?}");
+
+        // The execution is over; a fresh read of the event page has to carry
+        // the diagnostic.
+        let page = client.events(&handle, 0).await.unwrap();
+        let bytes = tokio::time::timeout(ROUND_TRIP_BUDGET, page.try_collect::<Vec<_>>())
+            .await
+            .expect("the event page must terminate")
+            .unwrap();
+        let page = bytes
+            .iter()
+            .flat_map(|chunk| chunk.to_vec())
+            .collect::<Vec<u8>>();
+        let page = String::from_utf8_lossy(&page);
+        assert!(
+            page.contains(payloads[0]),
+            "the replayed page must carry the committed diagnostic; got {page}"
+        );
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// M005a: a required request is refused, not degraded. The target never
+    /// runs, and the refusal is never dressed up as a degradation.
+    #[tokio::test]
+    async fn a_required_sandbox_never_reaches_the_target_and_is_not_reported_as_a_degradation() {
+        init_tls();
+        let temp = TempDir::new().unwrap();
+        let marker = temp.path().join("marker");
+        let runner = Arc::new(LocalProcessRunner::new(AdvertisesLandlockButCannotEnforce));
+        let (server, client) = node_with_runner(runner, "node-required-refusal", &temp).await;
+
+        let mut spec = execution_spec(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("touch {}", marker.display()),
+        ]);
+        spec.command.isolation = IsolationRequirement::Required;
+        let handle = execution_handle("required-refusal");
+        let stream = client.execute(&spec, &handle).await.unwrap();
+        let events = tokio::time::timeout(
+            ROUND_TRIP_BUDGET,
+            stream.into_events().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the refused execution must terminate")
+        .unwrap();
+
+        // The observable side effect: the child never ran.
+        assert!(
+            !marker.exists(),
+            "the target must not have run for a refused required request"
+        );
+        // The terminal classification is unchanged: a refusal is a failure with
+        // an internal cause, and the sandbox result says the requirement could
+        // not be met.
+        let snapshot = client
+            .observe_generation(&handle.execution_id, handle.generation.get())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.state, ExecutionState::Failed);
+        let result = snapshot.result.unwrap();
+        assert_eq!(result.failure, Some(ExecutionFailure::Internal));
+        assert!(matches!(
+            result.sandbox,
+            Some(eggwork_core::SandboxResult::Failed { .. })
+        ));
+        // And it is never reported as a degradation.
+        assert!(
+            diagnostic_payloads(&events).is_empty(),
+            "a refusal is not a degradation; got {:?}",
+            diagnostic_payloads(&events)
+        );
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// M005a: an execution with nothing degraded publishes no diagnostic.
+    #[tokio::test]
+    async fn an_execution_with_nothing_degraded_publishes_no_diagnostic() {
+        init_tls();
+        let temp = TempDir::new().unwrap();
+        let runner = Arc::new(LocalProcessRunner::new(eggwork_runner::NoExecutionSetup));
+        let (server, client) = node_with_runner(runner, "node-nothing-degraded", &temp).await;
+
+        let spec = execution_spec(vec!["/bin/true".into()]);
+        let handle = execution_handle("nothing-degraded");
+        let stream = client.execute(&spec, &handle).await.unwrap();
+        let events = tokio::time::timeout(
+            ROUND_TRIP_BUDGET,
+            stream.into_events().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the execution must terminate")
+        .unwrap();
+        assert!(
+            diagnostic_payloads(&events).is_empty(),
+            "an execution with no degradation must publish no diagnostic; got {:?}",
+            diagnostic_payloads(&events)
+        );
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// M005a: a degraded best-effort resource request publishes a diagnostic
+    /// that names the affected dimension.
+    #[tokio::test]
+    async fn a_degraded_best_effort_resource_request_publishes_a_dimension_scoped_diagnostic() {
+        init_tls();
+        let temp = TempDir::new().unwrap();
+        let runner = Arc::new(LocalProcessRunner::new(eggwork_runner::NoExecutionSetup));
+        let (server, client) = node_with_runner(runner, "node-degraded-resources", &temp).await;
+
+        let mut spec = execution_spec(vec!["/bin/true".into()]);
+        spec.command.resources.memory_bytes = Requirement::BestEffort(64 * 1024 * 1024);
+        let handle = execution_handle("degraded-resources");
+        let stream = client.execute(&spec, &handle).await.unwrap();
+        let events = tokio::time::timeout(
+            ROUND_TRIP_BUDGET,
+            stream.into_events().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the execution must terminate")
+        .unwrap();
+
+        let payloads = diagnostic_payloads(&events);
+        assert_eq!(payloads.len(), 1, "got {payloads:?}");
+        assert!(
+            payloads[0].starts_with("eggwork.diagnostic.resources.degraded.v1 "),
+            "unexpected diagnostic payload: {}",
+            payloads[0]
+        );
+        assert!(payloads[0].contains(" dimension=memory"));
+        assert!(payloads[0].contains(" requirement=best_effort"));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
     #[tokio::test]
     async fn required_resource_admission_rejects_with_capability_mismatch_when_dimension_unavailable()
      {
@@ -6315,11 +6677,10 @@ mod tests {
             Ok(_) => panic!("required isolation without a helper must be rejected"),
         }
         // Debug rendering of output and environment types redacts content.
-        let chunk = eggwork_runner::OutputChunk {
-            stderr: false,
-            bytes: sentinel.as_bytes().to_vec(),
-        };
+        let chunk = eggwork_runner::OutputChunk::Stdout(sentinel.as_bytes().to_vec());
         assert!(!format!("{chunk:?}").contains(sentinel));
+        let diagnostic = eggwork_runner::OutputChunk::Diagnostic(sentinel.to_owned());
+        assert!(!format!("{diagnostic:?}").contains(sentinel));
         let entry = eggwork_core::EnvironmentEntry::new("DEPLOY_TOKEN", sentinel).unwrap();
         assert!(!format!("{entry:?}").contains(sentinel));
         server.shutdown().await;
