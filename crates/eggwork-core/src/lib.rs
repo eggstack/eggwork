@@ -1157,6 +1157,89 @@ pub enum ExecutionState {
     TimedOut,
     Interrupted,
 }
+
+/// Every [`ExecutionState`] variant, in declaration order.
+///
+/// The classification below is written as exhaustive matches over the enum, so
+/// a tenth variant is a compile error in this crate rather than a state the
+/// server has never been told about. This array is the range the contract
+/// tests enumerate, which keeps those tests from being satisfiable by a
+/// hand-written list of nine variants that a new one could join unnoticed.
+pub const ALL_EXECUTION_STATES: [ExecutionState; 9] = [
+    ExecutionState::Accepted,
+    ExecutionState::Preparing,
+    ExecutionState::Running,
+    ExecutionState::Cancelling,
+    ExecutionState::Succeeded,
+    ExecutionState::Failed,
+    ExecutionState::Cancelled,
+    ExecutionState::TimedOut,
+    ExecutionState::Interrupted,
+];
+
+impl ExecutionState {
+    /// Whether this state is terminal.
+    ///
+    /// Terminal means the execution has finished and its outcome is settled:
+    /// no later event can change it. The set is spelled out with nine
+    /// exhaustive arms and no wildcard, so adding a variant to
+    /// [`ExecutionState`] breaks the build here instead of producing a state
+    /// that every consumer silently classifies as still running.
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            ExecutionState::Succeeded
+            | ExecutionState::Failed
+            | ExecutionState::Cancelled
+            | ExecutionState::TimedOut
+            | ExecutionState::Interrupted => true,
+            ExecutionState::Accepted
+            | ExecutionState::Preparing
+            | ExecutionState::Running
+            | ExecutionState::Cancelling => false,
+        }
+    }
+
+    /// Whether this state is still in flight.
+    ///
+    /// The exact complement of [`ExecutionState::is_terminal`]. Both are
+    /// exhaustive over the same nine arms, so the two can never disagree
+    /// about a variant — and a variant added to the enum has to be placed in
+    /// one arm of each.
+    pub fn is_non_terminal(&self) -> bool {
+        match self {
+            ExecutionState::Accepted
+            | ExecutionState::Preparing
+            | ExecutionState::Running
+            | ExecutionState::Cancelling => true,
+            ExecutionState::Succeeded
+            | ExecutionState::Failed
+            | ExecutionState::Cancelled
+            | ExecutionState::TimedOut
+            | ExecutionState::Interrupted => false,
+        }
+    }
+
+    /// The canonical wire spelling of this state.
+    ///
+    /// This is the PascalCase spelling `serde` derives for the enum, and it is
+    /// the value a server stores in its journal's `state` column. The store
+    /// reads that column back as text, so the spelling has to be one fact
+    /// rather than two: the enum owns it here and the store asks for it.
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            ExecutionState::Accepted => "Accepted",
+            ExecutionState::Preparing => "Preparing",
+            ExecutionState::Running => "Running",
+            ExecutionState::Cancelling => "Cancelling",
+            ExecutionState::Succeeded => "Succeeded",
+            ExecutionState::Failed => "Failed",
+            ExecutionState::Cancelled => "Cancelled",
+            ExecutionState::TimedOut => "TimedOut",
+            ExecutionState::Interrupted => "Interrupted",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionRejection {
     Busy,
@@ -1605,6 +1688,26 @@ pub struct HostTelemetry {
 /// payload and refuses a version it does not know, rather than guessing.
 pub const NODE_TELEMETRY_SCHEMA_VERSION: u16 = 1;
 
+/// Wire schema version of the control-plane request and response bodies.
+///
+/// Every producer and every consumer of a versioned control-plane body refers
+/// to this one constant: a client stamps it into the request bodies it
+/// authors, a server refuses a body that does not carry it (HTTP 426
+/// `protocol_version`), and a stored execution snapshot records it. The value
+/// is frozen for schema version 1 — it may not change without an ADR — and
+/// this declaration is the only one in the workspace, because a second copy in
+/// an endpoint crate would let a future bump desynchronise the producer and
+/// the consumer with neither the compiler nor the test suite objecting.
+pub const API_SCHEMA_VERSION: u16 = 1;
+
+/// Capability feature name for argv-based execution.
+///
+/// A node advertises this feature in `NodeCapabilities.features` and a client
+/// requires it before it will submit an execution, so the spelling is a
+/// contract fact between two crates rather than a string each side types for
+/// itself. The value is frozen and may not change without an ADR.
+pub const EXEC_ARGV_CAPABILITY: &str = "exec.argv.v1";
+
 /// The node's host-wide telemetry observation, as served to an authorized caller.
 ///
 /// This is the frozen wire contract for the node telemetry response. It is
@@ -1971,7 +2074,7 @@ mod tests {
     }
     fn spec() -> ExecutionSpec {
         ExecutionSpec {
-            schema_version: 1,
+            schema_version: API_SCHEMA_VERSION,
             command: CommandSpec {
                 argv: vec!["echo".into(), "hi".into()],
                 cwd: Some(RelativePath::new("work").unwrap()),

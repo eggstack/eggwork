@@ -58,10 +58,13 @@ PRAGMA foreign_keys=ON;
 ```
 
 There is no `PRAGMA user_version` read or write, and no `schema_version` column.
-`ExecutionSnapshot.schema_version` (`eggwork-core/src/lib.rs:1117-1123`) is
-*inside* the JSON blob, is set to `API_SCHEMA_VERSION` (`1`, `lib.rs:48`) at
+`ExecutionSnapshot.schema_version` is
+*inside* the JSON blob, is set to `eggwork_core::API_SCHEMA_VERSION` (`1`) at
 construction, and is not validated on read — `serde_json::from_slice` will
-deserialize any `u16` into it.
+deserialize any `u16` into it. That constant is core-owned: the server, the
+client, and the snapshot all read the same number from
+`eggwork_core::API_SCHEMA_VERSION`, so the value that is stored is the value
+the node accepts.
 
 On a version mismatch there is no explicit handling: a database whose
 `executions` table lacks a column the current DDL expects fails at first
@@ -307,17 +310,20 @@ lease state; the store only supplies the durable deadline.
 
 ## State machine persistence
 
-`ExecutionState` (`eggwork-core/src/lib.rs:878-887`) has nine variants.
-`state_name` (`store.rs:644-656`) maps each to its SQLite spelling verbatim
-(`Accepted`, `Preparing`, `Running`, `Cancelling`, `Succeeded`, `Failed`,
-`Cancelled`, `TimedOut`, `Interrupted`) and `is_terminal_name` (`store.rs:658-663`)
-recognizes the last five.
+`ExecutionState` has nine variants. Its SQLite spelling and its terminal
+classification are both **core-owned**: `ExecutionState::wire_name` is the
+PascalCase spelling the column stores verbatim (`Accepted`, `Preparing`,
+`Running`, `Cancelling`, `Succeeded`, `Failed`, `Cancelled`, `TimedOut`,
+`Interrupted`), and `ExecutionState::is_terminal` recognizes the last five.
+The store no longer keeps a list of either; it asks the core for both. The
+spellings are also the strings the derived `Serialize` emits, so the column
+cannot drift away from the enum.
 
 In-memory `ExecutionSnapshot` (`{ schema_version, execution_id, generation,
 state, result: Option<ExecutionResult> }`) is serialized whole into
 `snapshot_json`; the `state` column is written from the *caller's* proposed
-snapshot via `state_name(&snapshot.state)`, never from the row that was read
-back (`store.rs:326-337`). So the stored snapshot and the stored state column
+snapshot via `ExecutionState::wire_name`, never from the row that was read
+back. So the stored snapshot and the stored state column
 are always consistent with each other by construction.
 
 ### Which transitions the store actually enforces
@@ -325,7 +331,7 @@ are always consistent with each other by construction.
 `store.rs` enforces only three things, all as *predicates*, not a state machine:
 
 1. **No mutation after terminal** — `commit_event` returns `Ok(None)` if the
-   stored `state` `is_terminal_name` (`store.rs:310-313`); `update_lease`
+   stored `state` is terminal under `ExecutionState::is_terminal`; `update_lease`
    returns `None` on a terminal row; `reserve` requires the previous
    generation to be terminal before advancing.
 2. **Generation ordering** as described above.
@@ -347,18 +353,19 @@ only production writer. The sequence it actually produces:
 | output chunks | `run_execution` → `publish` | `Running` (re-asserted) | `Stdout`/`Stderr`/`Diagnostic` | interleaved, each consuming one sequence |
 | outcome | `run_execution` → `publish_terminal` | terminal + `result` | `State(terminal)` | last |
 
-`Preparing` is never written by the server; it exists in `state_name`, in
-`recover()`'s `IN` list, and in the `operations.rs` active filters, so a
+`Preparing` is never written by the server; it exists in the core-owned
+non-terminal set, and therefore in `recover()`'s `IN` list and in the
+`operations.rs` active filters, so a
 hand-seeded or future row can carry it.
 
 ### Terminal state is recorded exactly once
 
 Two independent guards, in order: `publish` takes `record.snapshot.write()` and
-returns early if the in-memory state `is_terminal` (`lib.rs:2575-2578`); then
+returns early if the in-memory state `is_terminal()`; then
 `commit_event` re-reads the stored `state` inside the transaction and returns
-`Ok(None)` if it is terminal (`store.rs:306-313`), rolling back, with `publish`
+`Ok(None)` if it is terminal, rolling back, with `publish`
 treating `Ok(None)` as "already terminal — do not touch memory, do not
-broadcast".
+broadcast". Both guards ask the same core-owned classification.
 
 The terminal `UPDATE` of `executions.state`/`snapshot_json` and the `INSERT` of
 the terminal event are the **same `Immediate` transaction**
@@ -410,7 +417,7 @@ EventMetadata { fields: vec![] } }` - metadata is always empty, the store never
 accepts caller-supplied metadata; (3) `event.validate()`, then
 `serde_json::to_vec`, rejecting `encoded.len() > MAX_RETAINED_EVENT_BYTES` with
 `StoreError::InvalidEvent` (the transaction is dropped, i.e. rolled back);
-(4) `UPDATE executions SET state = state_name(&snapshot.state), next_sequence =
+(4) `UPDATE executions SET state = <ExecutionState::wire_name>, next_sequence =
 sequence + 1, snapshot_json = to_vec(&snapshot), updated_unix_ms = now`;
 (5) `INSERT INTO execution_events (execution_id, generation, sequence, encoded)`;
 (6) `trim_events`; (7) `commit`, returning `Some(event)`. The event is broadcast
@@ -756,7 +763,7 @@ individually atomic, so a multi-row snapshot can straddle a commit.
 | Only the lease holder may renew or cancel | `update_lease` `current_hash != lease_token_hash => None` plus `UPDATE … AND lease_token_hash = ?3`; `control` compares `existing.lease_token_hash` and `record.lease_hash` | `cross_principal_execution_fencing_without_lease_oracle` |
 | Renewal is idempotent and never double-extends | `last_renewal_id == Some(renewal_id) => return current_expiry`; `expires = current_expiry.max(requested)` (`store.rs:383-387`) | `lease_renewal_replay_is_idempotent` |
 | An expired lease cannot be renewed | `current_expiry <= unix_millis() => None` (`store.rs:378`) | `expired_lease_terminates_process_with_a_typed_terminal_result`; in-memory mirror at `lib.rs:2117-2124, 2154-2161` |
-| Terminal state is single-assignment | `commit_event` `is_terminal_name(&state) => rollback, Ok(None)`; `publish`'s in-memory `is_terminal` early return | repeated-cancel case in the lifecycle integration test (one `Cancelling`, one `Cancelled`) |
+| Terminal state is single-assignment | `commit_event`'s `ExecutionState::is_terminal` check `=> rollback, Ok(None)`; `publish`'s in-memory `is_terminal()` early return | repeated-cancel case in the lifecycle integration test (one `Cancelling`, one `Cancelled`) |
 | State and its event commit atomically | one `Immediate` transaction around `UPDATE` + `INSERT` (`store.rs:294-344`) | `recovery_marks_uncertain_work_interrupted_and_never_replays_it` (asserts the appended event and the advanced sequence) |
 | Event sequences are gap-free within a generation | read `next_sequence` + write `next_sequence = sequence + 1` in one `Immediate` transaction; `PRIMARY KEY (id, gen, sequence)` | `recovery_...` asserts `events[2].sequence.get() == 3`; `event_journal_trims_...` asserts the retained head equals `base_sequence` |
 | Events are scoped to a generation | `load_page` filters on `execution_id` **and** `generation` | `event_journal_trims_by_count_and_bytes_with_explicit_base_cursor` |
@@ -839,11 +846,13 @@ Honest gaps:
   process — confirm that invariant is never relaxed.
 - **The state machine is not enforced by the store.** `commit_event` accepts any
   non-terminal → non-terminal transition; all legality lives in `publish` and
-  its callers, so a new call site could persist an illegal transition. Compounding
-  this, the nonterminal/terminal sets are spelled out in at least four places —
-  `store::is_terminal_name`, `recover()`'s SQL `IN` list, `lib.rs::is_terminal`,
-  and the `operations.rs` active filters — with nothing enforcing agreement when
-  a state variant is added.
+  its callers, so a new call site could persist an illegal transition. The
+  nonterminal/terminal *classification* itself is no longer duplicated: since
+  ADR-0008 it is owned by `eggwork-core`'s `ExecutionState::is_terminal` /
+  `is_non_terminal`, and `store::stored_state_is_terminal`,
+  `recover()`'s SQL `IN` list, and the `operations.rs` active filters all
+  derive from it, so adding a state variant cannot make them disagree. What
+  remains unenforced is the *legality* of a transition, not the vocabulary.
 - **Unchecked integer narrowing.** `ExecutionGeneration::new` only rejects `0`
   (`eggwork-core/src/lib.rs:113-120`), yet the store does
   `snapshot.generation.get() as i64` in **eleven** places (an earlier revision of this

@@ -9,7 +9,7 @@
 //! dev-only workspace member, and the release contract enumerates workspace
 //! members.
 
-use eggwork_runner::{LocalProcessRunner, TrustedLandlockSetup};
+use eggwork_runner::{LANDLOCK_WORKSPACE_RW_CAPABILITY, LocalProcessRunner, TrustedLandlockSetup};
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
@@ -44,7 +44,7 @@ async fn trusted_helper_advertises_landlock_workspace_rw_capability() {
     assert!(
         capabilities
             .iter()
-            .any(|feature| feature == "isolation.landlock.workspace-rw.v1"),
+            .any(|feature| feature == LANDLOCK_WORKSPACE_RW_CAPABILITY),
         "expected Landlock workspace-rw capability on a kernel with ABI V4; got {capabilities:?}"
     );
 }
@@ -61,7 +61,7 @@ async fn missing_helper_advertises_no_landlock_capability() {
     assert!(
         !capabilities
             .iter()
-            .any(|feature| feature == "isolation.landlock.workspace-rw.v1"),
+            .any(|feature| feature == LANDLOCK_WORKSPACE_RW_CAPABILITY),
         "missing helper must not advertise Landlock capability; got {capabilities:?}"
     );
 }

@@ -101,11 +101,13 @@ SQLite journal and the same drain marker.
 12. Build the server, `start_with_service(NodeHttpService)`, then `handle.ready().await` so a
     successful `start` means the listener is live, not merely scheduled.
 
-**Capabilities are derived once, at start.** `static_capability_features()` (`lib.rs:563-578`) is a
-fixed list of protocol/transport/workspace/artifact features plus `network.unrestricted.v1`.
-`server_capability_features` (`lib.rs:583-592`) merges the runner-reported dynamic features, then
+**Capabilities are derived once, at start.** `static_capability_features()` is a
+fixed list of protocol/transport/workspace/artifact features plus `network.unrestricted.v1`. The
+argv feature in that list is `eggwork_core::EXEC_ARGV_CAPABILITY` (`exec.argv.v1`) — the core-owned
+constant the client also demands, so the advertised name and the demanded name are one fact.
+`server_capability_features` merges the runner-reported dynamic features, then
 sorts and dedups. Both `Route::Capabilities` and `node_status().capabilities` route through
-`node_capabilities_for` (`lib.rs:595-604`) — the doc comment at `lib.rs:580-582` states this MUST
+`node_capabilities_for` — its doc comment states this MUST
 stay true so a node never reports two different answers to the same question.
 `node_capabilities_for` also hard-pins the protocol range to `{1.0 … 1.0}`.
 
@@ -326,18 +328,22 @@ fail-fast checks followed by a non-blocking permit acquisition.
 `IsolationRequirement` mirrors it as `None | BestEffort | Required` (`eggwork-core/src/lib.rs:446`).
 The node treats them as follows:
 
-- `check_isolation_supported` (`lib.rs:606-618`): `None` and `BestEffort` are *always* accepted;
+- `check_isolation_supported`: `None` and `BestEffort` are *always* accepted;
   only `Required` demands `eggwork_runner::LANDLOCK_WORKSPACE_RW_CAPABILITY`
-  (`isolation.landlock.workspace-rw.v1`). Best-effort is permitted to degrade at run time, which
+  (`isolation.landlock.workspace-rw.v1`). The name is the runner's exported constant rather than a
+  literal, so the producer of the feature name and its consumer cannot drift apart. Best-effort is
+  permitted to degrade at run time, which
   `failed_result` reports honestly as `SandboxResult::NotApplied { reason: "best-effort sandbox
-  setup was unavailable" }` (`lib.rs:2542-2544`).
-- `check_resources_supported` (`lib.rs:620-634`): each of `memory_bytes`/`cpu_millis`/`pids` gates
+  setup was unavailable" }`.
+- `check_resources_supported`: each of `memory_bytes`/`cpu_millis`/`pids` gates
   on `matches!(requirement, Requirement::Required(_))` only; `Required` requires the corresponding
-  `resources.cgroups-v2.{memory,cpu,pids}` feature. `failed_result::requested` (`lib.rs:2521-2528`)
-  then reports any non-`NotRequested` dimension as `NotApplied { reason: "requested resource
+  `eggwork_runner::CGROUPS_V2_MEMORY_CAPABILITY`, `CGROUPS_V2_CPU_CAPABILITY`, or
+  `CGROUPS_V2_PIDS_CAPABILITY` (`resources.cgroups-v2.{memory,cpu,pids}`) — again the runner's
+  exported constants, not names re-typed here. `failed_result::requested` then reports any
+  non-`NotRequested` dimension as `NotApplied { reason: "requested resource
   enforcement failed before execution" }` — never as "applied".
-- `check_network_supported` (`lib.rs:636-638`): accepts `NetworkRequirement::Unrestricted` only.
-  The `static_capability_features` doc comment (`lib.rs:558-562`) is explicit that this is a
+- `check_network_supported`: accepts `NetworkRequirement::Unrestricted` only.
+  The `static_capability_features` doc comment is explicit that this is a
   deliberate refusal to fake capability: Eggwork has no network-restriction backend, so the node
   advertises `network.unrestricted.v1` and the gate rejects `Disabled`/`AllowListed` with
   `capability_mismatch` rather than silently downgrading. The alternative would be advertising
@@ -346,13 +352,14 @@ The node treats them as follows:
 `Required` is therefore a *refusal* signal, not a degradation signal: no request whose enforcement
 would be skipped is ever admitted. The invariant to hold is: **a node never advertises a capability
 its enforcement path would refuse.** It is enforced structurally by deriving the advertised set from
-`runner.execution_capabilities()` at start (`lib.rs:351-352`) rather than configuring it by hand,
-and it is pinned by `static_capability_features_do_not_advertise_unsupported_network_modes`
-(`lib.rs:5704`), `admission_helpers_keep_required_capability_gating_active` (`lib.rs:5719`),
-`required_landlock_rejects_with_capability_mismatch_when_helper_is_missing` (`lib.rs:4998`),
-`required_resource_admission_rejects_with_capability_mismatch_when_dimension_unavailable`
-(`lib.rs:5144`), and `disabled_or_allowlisted_network_requests_are_rejected_with_capability_mismatch`
-(`lib.rs:5355`).
+`runner.execution_capabilities()` at start rather than configuring it by hand,
+and it is pinned by `static_capability_features_do_not_advertise_unsupported_network_modes`,
+`admission_helpers_keep_required_capability_gating_active`,
+`required_landlock_rejects_with_capability_mismatch_when_helper_is_missing`,
+`required_resource_admission_rejects_with_capability_mismatch_when_dimension_unavailable`,
+`disabled_or_allowlisted_network_requests_are_rejected_with_capability_mismatch`, and
+`the_resource_admission_rule_reads_the_runner_constants` — the last of which refuses a required
+dimension whose advertised feature name differs from the runner's constant by one character.
 
 **What the caller learns.** Acceptance is `202 Accepted` — an `application/x-ndjson` event stream
 from `event_response(state, id, generation, 0, record)` (`lib.rs:1883`) that begins with the
@@ -889,9 +896,9 @@ echoes its address: a node whose provider happens to be down is still a healthy 
 | Only a transport-verified, known peer is admitted | `authenticated_principal` (`lib.rs:823-833`) | `request_payload_cannot_supply_authoritative_principal` (2993), `mtls_execution_streams_output_and_missing_certificate_is_rejected` (3724) |
 | Identity is the SHA-256 of the leaf DER, nothing else | `FingerprintPrincipalResolver::fingerprint` (`lib.rs:107-109`) | `fingerprint_mapping_uses_leaf_der_only` (2924) |
 | TLS must require client auth and a server identity | `NodeServer::start` (`lib.rs:307-311`) | `mtls_authorization_and_fixed_target_execution` (3137) |
-| A node never advertises an unenforceable capability | `server_capability_features` / `check_*_supported` (`lib.rs:583`, `606`, `620`, `636`) | `static_capability_features_do_not_advertise_unsupported_network_modes` (5704), `admission_helpers_keep_required_capability_gating_active` (5719) |
+| A node never advertises an unenforceable capability | `server_capability_features` / `check_isolation_supported` / `check_resources_supported` / `check_network_supported` | `static_capability_features_do_not_advertise_unsupported_network_modes`, `admission_helpers_keep_required_capability_gating_active`, `the_resource_admission_rule_reads_the_runner_constants` |
 | Capabilities and status never disagree | single `node_capabilities_for` (`lib.rs:595`, `580-582`) | `capabilities_and_status_features_agree_with_a_unified_snapshot` (4617) |
-| The feature list is single-canonical and deduped | `static_capability_features` + sort/dedup (`lib.rs:563`, `583`) | `static_capability_features_are_a_single_canonical_list` (5667), `server_capability_features_do_not_duplicate_static_dynamic_overlap` (5682) |
+| The feature list is single-canonical and deduped | `static_capability_features` + sort/dedup | `static_capability_features_are_a_single_canonical_list`, `server_capability_features_do_not_duplicate_static_dynamic_overlap`, `the_advertised_argv_feature_is_the_one_the_owner_declares` |
 | Only the fixed, versioned route set exists | `operation_for` (`lib.rs:640-700`) | `route_contract_is_fixed_target_and_versioned` (2934) |
 | An authorized op on a different resource is still denied | `authorize_resource` re-checks (`lib.rs:808`, `928`, `983`, `1038`, `1159`, `1518`) | `resource_aware_authorizer_can_scope_blob_capability` (3039), `derived_workspace_denied_and_oversized_bodies_are_typed` (4499) |
 | A repeat submit never starts a second execution | `store.lookup` pre-check + `ReserveResult::Existing` (`lib.rs:1664`, `1793`) | `blob_protocol_streams_verifies_deduplicates_and_enforces_quota` (3399) |
@@ -1051,5 +1058,7 @@ Decision record consulted for idempotency, leases, and fencing:
 Source anchors in this file: `crates/eggwork-server/src/lib.rs`; sibling
 `crates/eggwork-server/src/operations.rs` (`GrantAuthorizer`, `principals`, `operation`);
 `crates/eggwork-core/src/lib.rs` (`Requirement<T>`, `IsolationRequirement`, `NetworkRequirement`,
-`request_digest_with_workspace`, `MAX_ID_BYTES`); `crates/eggwork-runner/src/lib.rs`
-(`LANDLOCK_WORKSPACE_RW_CAPABILITY`).
+`request_digest_with_workspace`, `MAX_ID_BYTES`, `API_SCHEMA_VERSION`, `EXEC_ARGV_CAPABILITY`);
+`crates/eggwork-runner/src/lib.rs`
+(`LANDLOCK_WORKSPACE_RW_CAPABILITY`, `CGROUPS_V2_MEMORY_CAPABILITY`, `CGROUPS_V2_CPU_CAPABILITY`,
+`CGROUPS_V2_PIDS_CAPABILITY`).

@@ -1,6 +1,6 @@
 # Control-Plane Protocol Roadmap
 
-Status: active roadmap; M001-M003 closed; M004 shared-contract corrective proposed
+Status: active roadmap; M001-M004 closed; no milestone in flight
 
 Canonical authority:
 
@@ -127,7 +127,7 @@ Exit conditions:
 
 Class: invariant
 
-Status: proposed
+Status: closed
 
 Corrective addendum:
 
@@ -136,6 +136,14 @@ Corrective addendum:
 Implementation plan:
 
 - `plans/implementation/control-plane-protocol/004-shared-protocol-contract-corrective.md`
+
+Decision record:
+
+- `plans/adrs/ADR-0008-core-protocol-contract-ownership.md`
+
+Closure record:
+
+- `plans/closure/control-plane-protocol/004-status.md`
 
 Objective:
 

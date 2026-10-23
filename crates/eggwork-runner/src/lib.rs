@@ -637,7 +637,7 @@ impl ExecutionSetup for TrustedLandlockSetup {
         let outcome = match sandbox {
             SandboxRequest::None => SandboxOutcome::NotRequested,
             SandboxRequest::BestEffort { profile } | SandboxRequest::Required { profile } => {
-                if profile != "workspace_rw" {
+                if profile != WORKSPACE_RW_PROFILE {
                     let reason = "unsupported sandbox profile".to_owned();
                     if matches!(sandbox, SandboxRequest::BestEffort { .. }) {
                         return Ok(SetupOutcome {
@@ -667,35 +667,9 @@ impl ExecutionSetup for TrustedLandlockSetup {
     async fn execution_capabilities(&self) -> Vec<String> {
         let mut capabilities = Vec::new();
         if verify_trusted_helper(&self.helper_path).is_ok() && probe_landlock_ruleset() {
-            capabilities.push("isolation.landlock.workspace-rw.v1".into());
+            capabilities.push(LANDLOCK_WORKSPACE_RW_CAPABILITY.into());
         }
-        let probes = [
-            (
-                "resources.cgroups-v2.memory",
-                ResourceSetupRequest {
-                    memory_bytes: Requirement::BestEffort(32 * 1024 * 1024),
-                    cpu_millis: Requirement::NotRequested,
-                    pids: Requirement::NotRequested,
-                },
-            ),
-            (
-                "resources.cgroups-v2.cpu",
-                ResourceSetupRequest {
-                    memory_bytes: Requirement::NotRequested,
-                    cpu_millis: Requirement::BestEffort(100),
-                    pids: Requirement::NotRequested,
-                },
-            ),
-            (
-                "resources.cgroups-v2.pids",
-                ResourceSetupRequest {
-                    memory_bytes: Requirement::NotRequested,
-                    cpu_millis: Requirement::NotRequested,
-                    pids: Requirement::BestEffort(16),
-                },
-            ),
-        ];
-        for (feature, request) in probes {
+        for (feature, request) in CGROUP_PROBE_TABLE {
             if SystemdCgroupBackend::probe(&request).await.is_ok() {
                 capabilities.push(feature.into());
             }
@@ -711,6 +685,78 @@ impl ExecutionSetup for TrustedLandlockSetup {
 /// Public capability feature name advertised for the closed Landlock
 /// `workspace_rw` profile used by `IsolationRequirement::{BestEffort, Required}`.
 pub const LANDLOCK_WORKSPACE_RW_CAPABILITY: &str = "isolation.landlock.workspace-rw.v1";
+
+/// Public capability feature name advertised when the cgroup v2 memory
+/// controller is enforced.
+///
+/// The value is the frozen public feature name for the memory dimension and
+/// must not change without an ADR: a node advertises it and a server admits
+/// a required memory dimension only when the advertised name matches, so a
+/// renamed byte would turn every memory-limited request into a
+/// capability refusal.
+pub const CGROUPS_V2_MEMORY_CAPABILITY: &str = "resources.cgroups-v2.memory";
+
+/// Public capability feature name advertised when the cgroup v2 CPU
+/// controller is enforced.
+///
+/// The value is the frozen public feature name for the CPU dimension and must
+/// not change without an ADR, for the same reason as
+/// [`CGROUPS_V2_MEMORY_CAPABILITY`].
+pub const CGROUPS_V2_CPU_CAPABILITY: &str = "resources.cgroups-v2.cpu";
+
+/// Public capability feature name advertised when the cgroup v2 pids
+/// controller is enforced.
+///
+/// The value is the frozen public feature name for the pids dimension and must
+/// not change without an ADR, for the same reason as
+/// [`CGROUPS_V2_MEMORY_CAPABILITY`].
+pub const CGROUPS_V2_PIDS_CAPABILITY: &str = "resources.cgroups-v2.pids";
+
+/// The only sandbox profile the protocol can request.
+///
+/// `SandboxRequest::{BestEffort, Required}` carry a profile name, and
+/// `workspace_rw` is the only one the runner will run and the only one the
+/// trusted helper will grant — the helper is a standalone binary with no
+/// workspace-crate dependency, so it keeps its own literal and the test in
+/// `crates/eggwork-sandbox-helper/tests/landlock_runner.rs` pins that literal
+/// to this constant. The value must not change without an ADR: a rename would
+/// make the runner ask for a profile the helper refuses, which fails closed
+/// as "unsupported sandbox profile" rather than silently degrading.
+pub const WORKSPACE_RW_PROFILE: &str = "workspace_rw";
+
+/// The cgroup v2 probes the runner runs before it advertises a resource
+/// feature, paired with the feature name each probe earns.
+///
+/// The table is a `const` so a test can read the names it would advertise
+/// without running the probes: the names here are the exported constants, and
+/// a literal typed into the table would show up as a name that is not one of
+/// them.
+const CGROUP_PROBE_TABLE: [(&str, ResourceSetupRequest); 3] = [
+    (
+        CGROUPS_V2_MEMORY_CAPABILITY,
+        ResourceSetupRequest {
+            memory_bytes: Requirement::BestEffort(32 * 1024 * 1024),
+            cpu_millis: Requirement::NotRequested,
+            pids: Requirement::NotRequested,
+        },
+    ),
+    (
+        CGROUPS_V2_CPU_CAPABILITY,
+        ResourceSetupRequest {
+            memory_bytes: Requirement::NotRequested,
+            cpu_millis: Requirement::BestEffort(100),
+            pids: Requirement::NotRequested,
+        },
+    ),
+    (
+        CGROUPS_V2_PIDS_CAPABILITY,
+        ResourceSetupRequest {
+            memory_bytes: Requirement::NotRequested,
+            cpu_millis: Requirement::NotRequested,
+            pids: Requirement::BestEffort(16),
+        },
+    ),
+];
 
 /// Probe the kernel Landlock ABI V4 with the same set of handles and rules
 /// the trusted helper uses for `workspace_rw`. Returns `true` only if the
@@ -1160,10 +1206,10 @@ impl RunnerRequest {
         let sandbox = match isolation {
             eggwork_core::IsolationRequirement::None => SandboxRequest::None,
             eggwork_core::IsolationRequirement::BestEffort => SandboxRequest::BestEffort {
-                profile: "workspace_rw".into(),
+                profile: WORKSPACE_RW_PROFILE.into(),
             },
             eggwork_core::IsolationRequirement::Required => SandboxRequest::Required {
-                profile: "workspace_rw".into(),
+                profile: WORKSPACE_RW_PROFILE.into(),
             },
         };
         Ok(Self {
@@ -2213,7 +2259,7 @@ impl SandboxChannel {
     ) -> Result<Self, RunnerError> {
         let profile = match &request.sandbox {
             SandboxRequest::BestEffort { profile } | SandboxRequest::Required { profile }
-                if profile == "workspace_rw" =>
+                if profile == WORKSPACE_RW_PROFILE =>
             {
                 Some(profile.clone())
             }
@@ -2877,6 +2923,53 @@ mod tests {
         assert_eq!(
             LANDLOCK_WORKSPACE_RW_CAPABILITY,
             "isolation.landlock.workspace-rw.v1"
+        );
+    }
+
+    /// The three cgroup feature names are frozen byte-for-byte.
+    ///
+    /// A node advertises these and a server admits a required resource
+    /// dimension only when the advertised name matches, so a renamed byte
+    /// turns every memory-, CPU- or pids-limited request into a capability
+    /// refusal. The values are asserted here rather than only through the
+    /// constants, so a value change is a test failure even when the constant
+    /// and its consumer are edited together.
+    #[test]
+    fn cgroup_capability_feature_strings_are_frozen() {
+        assert_eq!(CGROUPS_V2_MEMORY_CAPABILITY, "resources.cgroups-v2.memory");
+        assert_eq!(CGROUPS_V2_CPU_CAPABILITY, "resources.cgroups-v2.cpu");
+        assert_eq!(CGROUPS_V2_PIDS_CAPABILITY, "resources.cgroups-v2.pids");
+    }
+
+    /// The sandbox profile name is frozen byte-for-byte.
+    ///
+    /// The helper is a standalone binary with its own literal, so the two
+    /// spellings are pinned together by the helper's test rather than by a
+    /// shared constant. This assertion is the runner's half of that pair.
+    #[test]
+    fn the_workspace_rw_profile_name_is_frozen() {
+        assert_eq!(WORKSPACE_RW_PROFILE, "workspace_rw");
+    }
+
+    /// The advertisement site cannot invent a feature name.
+    ///
+    /// The probe table is the source of every resource feature the runner can
+    /// advertise, and it names them with the exported constants. A literal
+    /// typed back into the table would fail this on any host, because the
+    /// check reads the table rather than a list of names written here.
+    #[test]
+    fn the_probe_table_advertises_exactly_the_exported_constants() {
+        let names: Vec<&str> = CGROUP_PROBE_TABLE
+            .iter()
+            .map(|(feature, _)| *feature)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                CGROUPS_V2_MEMORY_CAPABILITY,
+                CGROUPS_V2_CPU_CAPABILITY,
+                CGROUPS_V2_PIDS_CAPABILITY,
+            ]
         );
     }
 

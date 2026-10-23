@@ -691,15 +691,7 @@ pub async fn execution_page(
     let total = executions.len();
     let active_executions = executions
         .iter()
-        .filter(|snapshot| {
-            matches!(
-                snapshot.state,
-                eggwork_core::ExecutionState::Accepted
-                    | eggwork_core::ExecutionState::Preparing
-                    | eggwork_core::ExecutionState::Running
-                    | eggwork_core::ExecutionState::Cancelling
-            )
-        })
+        .filter(|snapshot| snapshot.state.is_non_terminal())
         .count();
     let mut states = BTreeMap::new();
     let mut stdout_bytes = 0u64;
@@ -755,16 +747,21 @@ pub fn active_execution_count(config: &OperatorConfig) -> usize {
 /// connection and `serde_json`-decoded up to 2048 durable snapshots on every
 /// poll — thousands of connections and millions of decodes over one update —
 /// only to filter four state values that `executions.state` already stores as a
-/// real column. The literals below are the `store::state_name` spellings, which
-/// are PascalCase, not the snake_case used by `state_label` for display.
+/// real column. The names bound below are the core-owned wire spellings of the
+/// shared non-terminal classification, not the snake_case used by `state_label`
+/// for display, and they are bound as parameters so the runtime-assembled list
+/// never becomes SQL text.
 fn count_active_executions(config: &OperatorConfig) -> Result<usize, OperationsError> {
     require_regular_file(&config.database_path)?;
     let db = read_only_database(&config.database_path)?;
+    let states = crate::store::non_terminal_state_names();
+    let placeholders = std::iter::repeat_n("?", states.len())
+        .collect::<Vec<_>>()
+        .join(",");
     let count: i64 = db
         .query_row(
-            "SELECT COUNT(*) FROM executions
-             WHERE state IN ('Accepted','Preparing','Running','Cancelling')",
-            [],
+            &format!("SELECT COUNT(*) FROM executions WHERE state IN ({placeholders})"),
+            rusqlite::params_from_iter(states.iter()),
             |row| row.get(0),
         )
         .map_err(|_| OperationsError::Data)?;
@@ -832,6 +829,15 @@ fn load_snapshots(
     Ok(snapshots)
 }
 
+/// The operator-facing label for an execution state.
+///
+/// This is a *display* projection, not a protocol fact. The protocol spelling
+/// is `eggwork_core::ExecutionState::wire_name`, and the terminal
+/// classification is `eggwork_core::ExecutionState::is_terminal`; this map
+/// deliberately stays in the operator crate because snake_case is an
+/// operator-facing convention rather than something the protocol-neutral core
+/// should carry. The match is exhaustive with no wildcard arm, so a new state
+/// variant has to be given a label here instead of falling back to a default.
 fn state_label(state: &eggwork_core::ExecutionState) -> &'static str {
     use eggwork_core::ExecutionState::*;
     match state {
@@ -1406,6 +1412,65 @@ mod tests {
         assert_eq!(tree_bytes(&root).unwrap(), 0);
     }
 
+    /// The active-execution count selects exactly the non-terminal states.
+    ///
+    /// The list behind the drain and quiescence query is derived from the shared
+    /// classification at runtime and bound as SQL parameters, so this test reads
+    /// the same four names the drain path counts: `Accepted`, `Preparing`,
+    /// `Running` and `Cancelling`. A fifth name, or a missing one, changes the
+    /// count and fails here.
+    #[test]
+    fn the_active_execution_count_selects_exactly_the_non_terminal_states() {
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        fs::create_dir_all(config.database_path.parent().unwrap()).unwrap();
+        let db = rusqlite::Connection::open(&config.database_path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE executions(
+                 execution_id TEXT,
+                 generation INTEGER,
+                 state TEXT,
+                 snapshot_json BLOB
+             );",
+        )
+        .unwrap();
+        for state in eggwork_core::ALL_EXECUTION_STATES {
+            db.execute(
+                "INSERT INTO executions VALUES (?1,1,?2,NULL)",
+                rusqlite::params![format!("exec-{}", state.wire_name()), state.wire_name()],
+            )
+            .unwrap();
+        }
+        drop(db);
+
+        assert_eq!(
+            count_active_executions(&config).unwrap(),
+            4,
+            "exactly Accepted, Preparing, Running and Cancelling must be counted as active"
+        );
+        let names: Vec<&str> = crate::store::non_terminal_state_names();
+        assert_eq!(names, ["Accepted", "Preparing", "Running", "Cancelling"]);
+    }
+
+    /// The operator-facing state labels are unchanged.
+    ///
+    /// These labels are a display projection, not a protocol fact, and the
+    /// snake_case they use is what an operator sees. The test pins all nine so a
+    /// rename of a label is a deliberate change rather than an accident.
+    #[test]
+    fn the_operator_state_labels_are_unchanged() {
+        use eggwork_core::ExecutionState::*;
+        assert_eq!(state_label(&Accepted), "accepted");
+        assert_eq!(state_label(&Preparing), "preparing");
+        assert_eq!(state_label(&Running), "running");
+        assert_eq!(state_label(&Cancelling), "cancelling");
+        assert_eq!(state_label(&Succeeded), "succeeded");
+        assert_eq!(state_label(&Failed), "failed");
+        assert_eq!(state_label(&Cancelled), "cancelled");
+        assert_eq!(state_label(&TimedOut), "timed_out");
+        assert_eq!(state_label(&Interrupted), "interrupted");
+    }
+
     #[tokio::test]
     async fn execution_listing_is_bounded_and_paginates_over_durable_records() {
         let temp = TempDir::new().unwrap();
@@ -1419,7 +1484,7 @@ mod tests {
         for index in 0..3u64 {
             let id = ExecutionId::new(format!("exec-{index}")).unwrap();
             let snapshot = eggwork_core::ExecutionSnapshot {
-                schema_version: 1,
+                schema_version: eggwork_core::API_SCHEMA_VERSION,
                 execution_id: id.clone(),
                 generation: ExecutionGeneration::new(1).unwrap(),
                 state: if index == 1 {

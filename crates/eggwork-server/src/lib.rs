@@ -20,10 +20,10 @@ use eggserve_core::{
     tls::{ClientAuthMode, TlsServerConfig},
 };
 use eggwork_core::{
-    ApiError, ExecutionEvent, ExecutionEventKind, ExecutionFailure, ExecutionFinalizationFailure,
-    ExecutionGeneration, ExecutionHandle, ExecutionId, ExecutionResult, ExecutionSnapshot,
-    ExecutionSpec, ExecutionState, LeaseId, NodeCapabilities, NodeId, NodeStatus, ProtocolVersion,
-    ProtocolVersionRange,
+    API_SCHEMA_VERSION, ApiError, EXEC_ARGV_CAPABILITY, ExecutionEvent, ExecutionEventKind,
+    ExecutionFailure, ExecutionFinalizationFailure, ExecutionGeneration, ExecutionHandle,
+    ExecutionId, ExecutionResult, ExecutionSnapshot, ExecutionSpec, ExecutionState, LeaseId,
+    NodeCapabilities, NodeId, NodeStatus, ProtocolVersion, ProtocolVersionRange,
 };
 use eggwork_runner::{
     ExecutionProvenance, LocalProcessRunner, OutputChunk, ResourceSetupRequest, RunnerError,
@@ -46,7 +46,6 @@ use thiserror::Error;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-const API_SCHEMA_VERSION: u16 = 1;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const EVENT_CAPACITY: usize = 32;
 const RUNNER_CHANNEL_CAPACITY: usize = 32;
@@ -481,7 +480,7 @@ impl NodeServer {
             .collect();
         for record in records {
             if !record.finished.load(Ordering::Acquire)
-                && !is_terminal(&record.snapshot.read().await.state)
+                && !record.snapshot.read().await.state.is_terminal()
             {
                 record.cancellation.cancel();
             }
@@ -560,7 +559,7 @@ impl NodeServer {
             let mut active = false;
             for record in records {
                 if !record.finished.load(Ordering::Acquire)
-                    && !is_terminal(&record.snapshot.read().await.state)
+                    && !record.snapshot.read().await.state.is_terminal()
                 {
                     active = true;
                     break;
@@ -599,7 +598,7 @@ fn acquire_state_lock(database_path: &std::path::Path) -> Result<std::fs::File, 
 /// silently downgrading them.
 fn static_capability_features() -> &'static [&'static str] {
     &[
-        "exec.argv.v1",
+        EXEC_ARGV_CAPABILITY,
         "events.live.v1",
         "auth.mtls.v1",
         "blob.sha256.v1",
@@ -640,33 +639,44 @@ fn node_capabilities_for(state: &NodeState) -> NodeCapabilities {
     }
 }
 
+/// Whether the node's advertised features satisfy an isolation requirement.
+///
+/// The advertised feature list is passed in rather than the whole node state
+/// so the admission rule can be exercised directly: the decision is about
+/// names, and a rule about names should not need a whole service to be
+/// constructed before it can be tested.
 fn check_isolation_supported(
-    state: &NodeState,
+    features: &[String],
     isolation: &eggwork_core::IsolationRequirement,
 ) -> bool {
     match isolation {
         eggwork_core::IsolationRequirement::None
         | eggwork_core::IsolationRequirement::BestEffort => true,
-        eggwork_core::IsolationRequirement::Required => state
-            .capabilities_features
+        eggwork_core::IsolationRequirement::Required => features
             .iter()
             .any(|feature| feature == eggwork_runner::LANDLOCK_WORKSPACE_RW_CAPABILITY),
     }
 }
 
+/// Whether the node's advertised features satisfy a resource requirement.
+///
+/// The three names compared here are the runner's exported constants, not
+/// spellings typed into this file: the runner produces them and this crate
+/// consumes them, and a name that differed by one character would turn every
+/// required resource dimension into a capability refusal.
 fn check_resources_supported(
-    state: &NodeState,
+    features: &[String],
     resources: &eggwork_core::ResourceRequirements,
 ) -> bool {
-    let has = |feature: &str| state.capabilities_features.iter().any(|f| f == feature);
+    let has = |feature: &str| features.iter().any(|advertised| advertised == feature);
     let memory_ok = !matches!(
         resources.memory_bytes,
         eggwork_core::Requirement::Required(_)
-    ) || has("resources.cgroups-v2.memory");
+    ) || has(eggwork_runner::CGROUPS_V2_MEMORY_CAPABILITY);
     let cpu_ok = !matches!(resources.cpu_millis, eggwork_core::Requirement::Required(_))
-        || has("resources.cgroups-v2.cpu");
+        || has(eggwork_runner::CGROUPS_V2_CPU_CAPABILITY);
     let pids_ok = !matches!(resources.pids, eggwork_core::Requirement::Required(_))
-        || has("resources.cgroups-v2.pids");
+        || has(eggwork_runner::CGROUPS_V2_PIDS_CAPABILITY);
     memory_ok && cpu_ok && pids_ok
 }
 
@@ -1649,7 +1659,7 @@ async fn execute(
             "node is not accepting executions",
         ));
     }
-    if !check_isolation_supported(&state, &wire.spec.command.isolation) {
+    if !check_isolation_supported(&state.capabilities_features, &wire.spec.command.isolation) {
         increment_metric(&state.store, "rejected_capability", 1).await;
         return Ok(error_response(
             409,
@@ -1657,7 +1667,7 @@ async fn execute(
             "requested filesystem isolation capability is unavailable",
         ));
     }
-    if !check_resources_supported(&state, &wire.spec.command.resources) {
+    if !check_resources_supported(&state.capabilities_features, &wire.spec.command.resources) {
         increment_metric(&state.store, "rejected_capability", 1).await;
         return Ok(error_response(
             409,
@@ -1792,7 +1802,7 @@ async fn execute(
     if executions.len() >= MAX_RECENT_EXECUTIONS {
         let mut terminal = Vec::new();
         for (old_id, old_record) in executions.iter() {
-            if is_terminal(&old_record.snapshot.read().await.state) {
+            if old_record.snapshot.read().await.state.is_terminal() {
                 terminal.push(old_id.clone());
             }
             if executions.len() - terminal.len() < MAX_RECENT_EXECUTIONS {
@@ -1865,7 +1875,7 @@ async fn execute(
         }
         store::ReserveResult::Existing(snapshot) => {
             drop(permit);
-            if is_terminal(&snapshot.state)
+            if snapshot.state.is_terminal()
                 && let Some(workspace_id) = &wire.workspace_id
             {
                 let expiry =
@@ -2006,7 +2016,7 @@ fn recovered_record(
 
 async fn monitor_lease(record: Arc<ExecutionRecord>) {
     loop {
-        if is_terminal(&record.snapshot.read().await.state) {
+        if record.snapshot.read().await.state.is_terminal() {
             return;
         }
         let (deadline, notify) = {
@@ -2181,7 +2191,7 @@ async fn control(
                 "renewal identifier is invalid",
             ));
         }
-        if is_terminal(&snapshot.state) {
+        if snapshot.state.is_terminal() {
             return Ok(error_response(
                 409,
                 "execution_terminal",
@@ -2224,7 +2234,7 @@ async fn control(
         lease.notify.notify_waiters();
         return Ok(json_response(200, &snapshot));
     }
-    if !is_terminal(&snapshot.state) && snapshot.state != ExecutionState::Cancelling {
+    if !snapshot.state.is_terminal() && snapshot.state != ExecutionState::Cancelling {
         let lease = record.lease.lock().await;
         if lease.expired.load(Ordering::Acquire) || tokio::time::Instant::now() >= lease.expires_at
         {
@@ -2242,7 +2252,7 @@ async fn control(
             ExecutionEventKind::State(ExecutionState::Cancelling),
         )
         .await;
-        if !is_terminal(&record.snapshot.read().await.state) {
+        if !record.snapshot.read().await.state.is_terminal() {
             record.cancellation.cancel();
         }
     } else if snapshot.state == ExecutionState::Cancelling {
@@ -2412,7 +2422,7 @@ async fn event_response(
             "event cursor is ahead of the journal",
         ));
     }
-    let terminal = is_terminal(&record.snapshot.read().await.state);
+    let terminal = record.snapshot.read().await.state.is_terminal();
     Ok(event_stream_response(
         id,
         generation,
@@ -2532,10 +2542,7 @@ async fn run_execution(
     if let Some(workspace) = workspace {
         let should_capture = runner_completed
             && !workspace.outputs.is_empty()
-            && matches!(
-                execution_result.state,
-                ExecutionState::Succeeded | ExecutionState::Failed
-            )
+            && artifact_capture_eligible(&execution_result.state)
             && execution_result.failure != Some(ExecutionFailure::OutputLimit);
         if should_capture {
             let expiry = artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
@@ -2572,14 +2579,7 @@ async fn run_execution(
         }
     }
     let terminal = execution_result.state.clone();
-    let terminal_metric = match terminal {
-        ExecutionState::Succeeded => Some("terminal_succeeded"),
-        ExecutionState::Failed => Some("terminal_failed"),
-        ExecutionState::Cancelled => Some("terminal_cancelled"),
-        ExecutionState::TimedOut => Some("terminal_timed_out"),
-        ExecutionState::Interrupted => Some("terminal_interrupted"),
-        _ => None,
-    };
+    let terminal_metric = terminal_metric_name(&terminal);
     let mut terminal_counters = Vec::with_capacity(4);
     if let Some(name) = terminal_metric {
         terminal_counters.push((name, 1u64));
@@ -2668,7 +2668,7 @@ async fn publish(
     // and then receives the event on the broadcast channel.
     let _writer = record.commit_lock.lock().await;
     let base = record.snapshot.read().await;
-    if is_terminal(&base.state) {
+    if base.state.is_terminal() {
         return;
     }
     let mut proposed = base.clone();
@@ -2738,7 +2738,7 @@ fn event_stream_response(
                 last_sequence = event.sequence.get();
                 let terminal = matches!(
                     &event.kind,
-                    ExecutionEventKind::State(state) if is_terminal(state)
+                    ExecutionEventKind::State(state) if state.is_terminal()
                 );
                 let bytes = serde_json::to_vec(&event).unwrap_or_default();
                 let mut line = bytes;
@@ -2762,15 +2762,46 @@ fn event_stream_response(
         .unwrap_or_else(|_| error_response(500, "internal", "internal error"))
 }
 
-fn is_terminal(state: &ExecutionState) -> bool {
-    matches!(
-        state,
-        ExecutionState::Succeeded
-            | ExecutionState::Failed
-            | ExecutionState::Cancelled
-            | ExecutionState::TimedOut
-            | ExecutionState::Interrupted
-    )
+/// The metric name a terminal state contributes, if any.
+///
+/// Written as an exhaustive match over the whole enum rather than a wildcard
+/// arm, so a newly added terminal variant cannot silently lose its metric: the
+/// compiler refuses the new variant until it is placed here. The non-terminal
+/// arms return `None`, which keeps this map total over the enum and
+/// consistent with the core-owned terminal classification.
+fn terminal_metric_name(state: &ExecutionState) -> Option<&'static str> {
+    match state {
+        ExecutionState::Succeeded => Some("terminal_succeeded"),
+        ExecutionState::Failed => Some("terminal_failed"),
+        ExecutionState::Cancelled => Some("terminal_cancelled"),
+        ExecutionState::TimedOut => Some("terminal_timed_out"),
+        ExecutionState::Interrupted => Some("terminal_interrupted"),
+        ExecutionState::Accepted
+        | ExecutionState::Preparing
+        | ExecutionState::Running
+        | ExecutionState::Cancelling => None,
+    }
+}
+
+/// Whether declared outputs of an execution are captured.
+///
+/// This is deliberately *not* the terminal set. A capture happens for an
+/// execution that ran and produced a result the caller may want — `Succeeded`
+/// or `Failed` — and not for an execution that was cancelled, timed out, or
+/// interrupted, where the partial output is not a declared artifact. Folding
+/// the two together would either capture artifacts for cancelled work or
+/// drop the artifacts of a failed run.
+fn artifact_capture_eligible(state: &ExecutionState) -> bool {
+    match state {
+        ExecutionState::Succeeded | ExecutionState::Failed => true,
+        ExecutionState::Accepted
+        | ExecutionState::Preparing
+        | ExecutionState::Running
+        | ExecutionState::Cancelling
+        | ExecutionState::Cancelled
+        | ExecutionState::TimedOut
+        | ExecutionState::Interrupted => false,
+    }
 }
 
 fn json_response<T: Serialize>(status: u16, value: &T) -> Response {
@@ -2954,7 +2985,7 @@ mod tests {
 
     fn execution_spec(argv: Vec<String>) -> ExecutionSpec {
         ExecutionSpec {
-            schema_version: 1,
+            schema_version: API_SCHEMA_VERSION,
             command: CommandSpec {
                 argv,
                 cwd: None,
@@ -3867,6 +3898,135 @@ mod tests {
         server.wait().await.unwrap();
     }
 
+    /// The client and the node agree on the control-plane schema version.
+    ///
+    /// This is the test that would have caught the defect this milestone removes.
+    /// Before it, the client and the server each declared a private
+    /// `API_SCHEMA_VERSION`; the two happened to agree by value, but nothing
+    /// connected them, so a bump on either side would have made every client
+    /// request fail with HTTP 426 `protocol_version` — and neither the compiler
+    /// nor the test suite would have said why.
+    ///
+    /// The proof has three links:
+    ///
+    /// 1. The node refuses any body whose version is not the shared constant, and
+    ///    accepts the shared constant.
+    /// 2. A body in the client's exact shape — same fields, same order — carrying
+    ///    the shared constant is accepted, so the client's body and the node's
+    ///    accepted body are the same bytes.
+    /// 3. The real client, building the real body, is accepted by the real node.
+    ///    A private copy on either side would have broken link 3 immediately.
+    #[tokio::test]
+    async fn the_client_and_the_node_agree_on_the_control_plane_schema_version() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            eggwork_core::PrincipalId::new("controller-schema").unwrap(),
+        )]));
+        let server = NodeServer::start(
+            NodeConfig {
+                host_telemetry: None,
+                node_id: NodeId::new("node-schema").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024 * 1024,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(30),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+
+        let address = format!("https://localhost:{}", server.local_addr().port());
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            &address,
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+
+        // Link 1: only the shared constant is accepted.
+        //
+        // The accepted body carries an invalid specification on purpose: the
+        // version check runs before the specification check, so a
+        // `400 invalid_request` proves the body got past the version gate,
+        // and no execution is started that would occupy the node's only
+        // permit.
+        let handle = execution_handle("schema-agreement");
+        let spec = execution_spec(vec!["/bin/true".into()]);
+        let accepted = serde_json::to_vec(&ExecuteRequest {
+            schema_version: eggwork_core::API_SCHEMA_VERSION,
+            handle: handle.clone(),
+            workspace_id: None,
+            spec: execution_spec(vec![]),
+        })
+        .unwrap();
+        let status = post_raw(
+            &format!("{address}/v1/executions"),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+            accepted,
+        )
+        .await;
+        assert_ne!(
+            status, 426,
+            "a body carrying the shared schema version must not be refused as protocol_version"
+        );
+
+        let refused = serde_json::to_vec(&ExecuteRequest {
+            schema_version: eggwork_core::API_SCHEMA_VERSION + 1,
+            handle: execution_handle("schema-refused"),
+            workspace_id: None,
+            spec: spec.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            post_raw(
+                &format!("{address}/v1/executions"),
+                write_client_config(&client_temp, root.as_ref(), &client_identity),
+                refused,
+            )
+            .await,
+            426,
+            "a body carrying any other schema version must be refused as protocol_version"
+        );
+
+        // Link 3: the real client, building the real body, is accepted.
+        let execution = client
+            .execute(
+                &execution_spec(vec!["/bin/echo".into(), "schema-agreement".into()]),
+                &execution_handle("client-built-schema"),
+            )
+            .await
+            .expect("a client-built request must not be refused as protocol_version");
+        let id = execution.execution_id.clone();
+        let event_read = tokio::time::timeout(
+            ROUND_TRIP_BUDGET,
+            execution.into_events().collect::<Vec<_>>(),
+        )
+        .await;
+        assert!(
+            event_read.is_ok(),
+            "the event stream must reach a terminal state"
+        );
+        let snapshot = client.observe(&id).await.unwrap();
+        assert_eq!(snapshot.state, ExecutionState::Succeeded);
+
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
     #[tokio::test]
     async fn mtls_execution_streams_output_and_missing_certificate_is_rejected() {
         init_tls();
@@ -4261,7 +4421,7 @@ mod tests {
         let snapshot = tokio::time::timeout(ROUND_TRIP_BUDGET, async {
             loop {
                 let snapshot = client.observe(&handle.execution_id).await.unwrap();
-                if is_terminal(&snapshot.state) {
+                if snapshot.state.is_terminal() {
                     break snapshot;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -6178,7 +6338,7 @@ mod tests {
     #[test]
     fn static_capability_features_are_a_single_canonical_list() {
         let features = static_capability_features();
-        assert!(features.contains(&"exec.argv.v1"));
+        assert!(features.contains(&eggwork_core::EXEC_ARGV_CAPABILITY));
         assert!(features.contains(&"network.unrestricted.v1"));
         let mut sorted = features.to_vec();
         sorted.sort_unstable();
@@ -6190,14 +6350,163 @@ mod tests {
         );
     }
 
+    /// The advertised argv feature is the one the owner declares.
+    ///
+    /// The server produces this name and the client consumes it, so the two
+    /// must be the same string. This is the server's half of that agreement:
+    /// the advertised list carries `eggwork_core::EXEC_ARGV_CAPABILITY` and
+    /// not a spelling typed into this crate.
+    #[test]
+    fn the_advertised_argv_feature_is_the_one_the_owner_declares() {
+        assert_eq!(eggwork_core::EXEC_ARGV_CAPABILITY, "exec.argv.v1");
+        let features = static_capability_features();
+        assert_eq!(
+            features
+                .iter()
+                .filter(|feature| **feature == eggwork_core::EXEC_ARGV_CAPABILITY)
+                .count(),
+            1,
+            "the owned argv feature must be advertised exactly once"
+        );
+    }
+
+    /// The resource admission rule reads the runner's exported constants.
+    ///
+    /// The runner produces the three cgroup feature names and this crate
+    /// consumes them, so a required dimension is admitted exactly when the
+    /// node advertises the runner's constant. The refusal case is the
+    /// regression test: a name that differs by one character must not
+    /// satisfy the requirement, because that is what server/runner drift
+    /// would look like.
+    #[test]
+    fn the_resource_admission_rule_reads_the_runner_constants() {
+        let required = eggwork_core::ResourceRequirements {
+            memory_bytes: eggwork_core::Requirement::Required(1024 * 1024),
+            cpu_millis: eggwork_core::Requirement::Required(100),
+            pids: eggwork_core::Requirement::Required(4),
+        };
+        let advertised = vec![
+            eggwork_runner::CGROUPS_V2_MEMORY_CAPABILITY.to_owned(),
+            eggwork_runner::CGROUPS_V2_CPU_CAPABILITY.to_owned(),
+            eggwork_runner::CGROUPS_V2_PIDS_CAPABILITY.to_owned(),
+        ];
+        assert!(
+            check_resources_supported(&advertised, &required),
+            "the runner's constants must satisfy a required resource request"
+        );
+
+        for constant in [
+            eggwork_runner::CGROUPS_V2_MEMORY_CAPABILITY,
+            eggwork_runner::CGROUPS_V2_CPU_CAPABILITY,
+            eggwork_runner::CGROUPS_V2_PIDS_CAPABILITY,
+        ] {
+            let mut drifting = advertised.clone();
+            let index = drifting
+                .iter()
+                .position(|feature| feature == constant)
+                .expect("the advertised list holds the constant");
+            drifting[index] = format!("{constant}x");
+            assert!(
+                !check_resources_supported(&drifting, &required),
+                "a feature name differing by one character must not satisfy {constant}"
+            );
+        }
+
+        let without_memory: Vec<String> = advertised
+            .iter()
+            .filter(|feature| *feature != eggwork_runner::CGROUPS_V2_MEMORY_CAPABILITY)
+            .cloned()
+            .collect();
+        assert!(
+            !check_resources_supported(&without_memory, &required),
+            "a missing memory capability must refuse a required memory dimension"
+        );
+    }
+
+    /// Artifact capture is eligible for exactly two states, and that subset is
+    /// not the terminal set.
+    ///
+    /// A cancelled, timed-out or interrupted execution has partial output that
+    /// is not a declared artifact, while a failed one still produced a result
+    /// the caller may want. Folding the subset into the terminal set would
+    /// capture artifacts for cancelled work; folding the terminal set into the
+    /// subset would drop the artifacts of a failed run.
+    #[test]
+    fn artifact_capture_eligibility_is_exactly_succeeded_and_failed() {
+        let eligible: Vec<&str> = eggwork_core::ALL_EXECUTION_STATES
+            .iter()
+            .filter(|state| artifact_capture_eligible(state))
+            .map(|state| state.wire_name())
+            .collect();
+        assert_eq!(eligible, ["Succeeded", "Failed"]);
+
+        for state in &eggwork_core::ALL_EXECUTION_STATES {
+            if matches!(state, ExecutionState::Succeeded | ExecutionState::Failed) {
+                continue;
+            }
+            assert!(
+                !artifact_capture_eligible(state),
+                "{state:?} must not be eligible for artifact capture"
+            );
+        }
+
+        let eligible_count = eggwork_core::ALL_EXECUTION_STATES
+            .iter()
+            .filter(|state| artifact_capture_eligible(state))
+            .count();
+        let terminal_count = eggwork_core::ALL_EXECUTION_STATES
+            .iter()
+            .filter(|state| state.is_terminal())
+            .count();
+        assert!(
+            eligible_count < terminal_count,
+            "the capture-eligible subset must stay a strict subset of the terminal set"
+        );
+    }
+
+    /// Every terminal state has a metric name, and no other state has one.
+    ///
+    /// The mapping is written as an exhaustive match over the enum, so a new
+    /// terminal variant cannot lose its metric silently: the compiler refuses
+    /// the new variant until it is placed in the map.
+    #[test]
+    fn the_terminal_metric_mapping_is_total_over_the_terminal_set() {
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for state in &eggwork_core::ALL_EXECUTION_STATES {
+            match terminal_metric_name(state) {
+                Some(name) => {
+                    assert!(
+                        state.is_terminal(),
+                        "{state:?} is not terminal but has the metric {name}"
+                    );
+                    seen.push((state.wire_name(), name));
+                }
+                None => assert!(
+                    !state.is_terminal(),
+                    "{state:?} is terminal but has no metric name"
+                ),
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                ("Succeeded", "terminal_succeeded"),
+                ("Failed", "terminal_failed"),
+                ("Cancelled", "terminal_cancelled"),
+                ("TimedOut", "terminal_timed_out"),
+                ("Interrupted", "terminal_interrupted"),
+            ]
+        );
+    }
+
     #[test]
     fn server_capability_features_do_not_duplicate_static_dynamic_overlap() {
-        let dynamic = vec!["isolation.landlock.workspace-rw.v1".to_owned()];
+        let dynamic = vec![eggwork_runner::LANDLOCK_WORKSPACE_RW_CAPABILITY.to_owned()];
         let features = server_capability_features(dynamic.clone());
         assert_eq!(
             features
                 .iter()
-                .filter(|feature| *feature == "exec.argv.v1")
+                .filter(|feature| *feature == eggwork_core::EXEC_ARGV_CAPABILITY)
                 .count(),
             1,
             "static features must not be duplicated"
@@ -6205,7 +6514,9 @@ mod tests {
         assert_eq!(
             features
                 .iter()
-                .filter(|feature| feature.as_str() == "isolation.landlock.workspace-rw.v1")
+                .filter(|feature| {
+                    feature.as_str() == eggwork_runner::LANDLOCK_WORKSPACE_RW_CAPABILITY
+                })
                 .count(),
             1,
             "dynamic features must be preserved"
@@ -6234,37 +6545,41 @@ mod tests {
         // `IsolationRequirement::None && NetworkRequirement::Unrestricted`
         // gate is caught here even if the integration tests are skipped on
         // hosts without Landlock.
-        let features = vec!["isolation.landlock.workspace-rw.v1".to_owned()];
-        struct Probe {
-            features: Vec<String>,
-        }
-        impl Probe {
-            fn isolation_supported(&self, requirement: &IsolationRequirement) -> bool {
-                match requirement {
-                    IsolationRequirement::None | IsolationRequirement::BestEffort => true,
-                    IsolationRequirement::Required => self
-                        .features
-                        .iter()
-                        .any(|f| f == "isolation.landlock.workspace-rw.v1"),
-                }
-            }
-            fn network_supported(&self, network: &NetworkRequirement) -> bool {
-                matches!(network, NetworkRequirement::Unrestricted)
-            }
-        }
-        let probe = Probe { features };
-        assert!(probe.isolation_supported(&IsolationRequirement::None));
-        assert!(probe.isolation_supported(&IsolationRequirement::BestEffort));
-        assert!(probe.isolation_supported(&IsolationRequirement::Required));
-        let empty = Probe { features: vec![] };
-        assert!(empty.isolation_supported(&IsolationRequirement::None));
-        assert!(empty.isolation_supported(&IsolationRequirement::BestEffort));
-        assert!(!empty.isolation_supported(&IsolationRequirement::Required));
-        assert!(probe.network_supported(&NetworkRequirement::Unrestricted));
-        assert!(!probe.network_supported(&NetworkRequirement::Disabled));
-        assert!(
-            !probe.network_supported(&NetworkRequirement::AllowListed(vec!["example.com".into()]))
-        );
+        //
+        // It calls the real admission helpers rather than a local copy of
+        // them: a copy would keep passing after the production rule drifted,
+        // which is the failure mode this milestone exists to remove.
+        let features = vec![eggwork_runner::LANDLOCK_WORKSPACE_RW_CAPABILITY.to_owned()];
+        assert!(check_isolation_supported(
+            &features,
+            &IsolationRequirement::None
+        ));
+        assert!(check_isolation_supported(
+            &features,
+            &IsolationRequirement::BestEffort
+        ));
+        assert!(check_isolation_supported(
+            &features,
+            &IsolationRequirement::Required
+        ));
+        let empty: Vec<String> = vec![];
+        assert!(check_isolation_supported(
+            &empty,
+            &IsolationRequirement::None
+        ));
+        assert!(check_isolation_supported(
+            &empty,
+            &IsolationRequirement::BestEffort
+        ));
+        assert!(!check_isolation_supported(
+            &empty,
+            &IsolationRequirement::Required
+        ));
+        assert!(check_network_supported(&NetworkRequirement::Unrestricted));
+        assert!(!check_network_supported(&NetworkRequirement::Disabled));
+        assert!(!check_network_supported(&NetworkRequirement::AllowListed(
+            vec!["example.com".into()]
+        )));
     }
 
     /// M004 adversarial: two authorized principals, one execution.

@@ -7,9 +7,10 @@ use eggfetch_core::{
     BoxBytesStream, Client as HttpClient, Error as HttpError, RequestBody, TlsConfig,
 };
 use eggwork_core::{
-    ApiError, ArtifactId, ArtifactRecord, BlobDigest, ExecutionEvent, ExecutionHandle, ExecutionId,
-    ExecutionSnapshot, ExecutionSpec, NodeCapabilities, NodeId, NodeStatus, NodeTelemetry,
-    WorkspaceId, WorkspaceManifest, WorkspaceManifestPatch,
+    API_SCHEMA_VERSION, ApiError, ArtifactId, ArtifactRecord, BlobDigest, EXEC_ARGV_CAPABILITY,
+    ExecutionEvent, ExecutionHandle, ExecutionId, ExecutionSnapshot, ExecutionSpec,
+    NodeCapabilities, NodeId, NodeStatus, NodeTelemetry, WorkspaceId, WorkspaceManifest,
+    WorkspaceManifestPatch,
 };
 use futures_util::{StreamExt, stream};
 use serde::{Serialize, de::DeserializeOwned};
@@ -17,8 +18,6 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 use std::{fmt, path::Path};
 use thiserror::Error;
-
-const API_SCHEMA_VERSION: u16 = 1;
 
 /// Ceiling on a buffered (non-streamed) response body.
 ///
@@ -356,20 +355,7 @@ impl NodeClient {
 
     async fn ensure_protocol_compatible(&self) -> Result<(), ClientError> {
         let capabilities = self.capabilities().await?;
-        let required = eggwork_core::ProtocolVersion { major: 1, minor: 0 };
-        let supported =
-            capabilities.protocol.min <= required && capabilities.protocol.max >= required;
-        if !supported {
-            return Err(ClientError::ProtocolIncompatible);
-        }
-        if !capabilities
-            .features
-            .iter()
-            .any(|feature| feature == "exec.argv.v1")
-        {
-            return Err(ClientError::UnsupportedCapability);
-        }
-        Ok(())
+        protocol_compatibility(&capabilities)
     }
 
     pub async fn create_workspace(
@@ -818,6 +804,30 @@ impl ExecutionStream {
     }
 }
 
+/// Decide whether a node's advertised capabilities are usable by this client.
+///
+/// The decision is separated from the fetch so the rule can be tested without
+/// a live node, and so the rule names the *owned* constants rather than
+/// literals: the protocol range the client speaks, and the argv feature the
+/// client cannot work without. A node that advertises a different argv
+/// feature name is refused with the typed unsupported-capability error rather
+/// than being talked to in a dialect this client does not implement.
+fn protocol_compatibility(capabilities: &NodeCapabilities) -> Result<(), ClientError> {
+    let required = eggwork_core::ProtocolVersion { major: 1, minor: 0 };
+    let supported = capabilities.protocol.min <= required && capabilities.protocol.max >= required;
+    if !supported {
+        return Err(ClientError::ProtocolIncompatible);
+    }
+    if !capabilities
+        .features
+        .iter()
+        .any(|feature| feature == EXEC_ARGV_CAPABILITY)
+    {
+        return Err(ClientError::UnsupportedCapability);
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct ExecuteRequest<'a> {
     schema_version: u16,
@@ -960,6 +970,188 @@ mod security_tests {
         };
         assert!(!format!("{error:?}").contains("private-key-material"));
         assert!(!error.to_string().contains("private-key-material"));
+    }
+}
+
+/// The shared protocol contract facts the client consumes.
+///
+/// These live in the client's own crate rather than in `tests/` because the
+/// request bodies the client authors are private: the assertion has to reach
+/// the actual structs the transport serializes, not a re-implementation of
+/// them. The server crate dev-depends on this one and runs the other half of
+/// the agreement — that a body this client builds is accepted by the node.
+#[cfg(test)]
+mod shared_contract_tests {
+    use super::*;
+    use eggwork_core::{
+        BlobDigest, CommandSpec, ExecutionGeneration, ExecutionId, ExecutionSpec,
+        IsolationRequirement, LeaseId, NetworkRequirement, NodeCapabilities, OutputPolicy,
+        ProtocolVersion, ProtocolVersionRange, Requirement, ResourceRequirements, StdinPolicy,
+        WorkspaceManifest, WorkspaceManifestPatch,
+    };
+
+    fn handle() -> ExecutionHandle {
+        ExecutionHandle {
+            execution_id: ExecutionId::new("execution-a").unwrap(),
+            generation: ExecutionGeneration::new(1).unwrap(),
+            lease_id: LeaseId::new("lease-a").unwrap(),
+        }
+    }
+
+    fn spec() -> ExecutionSpec {
+        ExecutionSpec {
+            schema_version: API_SCHEMA_VERSION,
+            command: CommandSpec {
+                argv: vec!["/bin/true".into()],
+                cwd: None,
+                environment: Vec::new(),
+                stdin: StdinPolicy::Null,
+                timeout_millis: 5_000,
+                output: OutputPolicy::default(),
+                declared_outputs: Vec::new(),
+                resources: ResourceRequirements {
+                    memory_bytes: Requirement::NotRequested,
+                    cpu_millis: Requirement::NotRequested,
+                    pids: Requirement::NotRequested,
+                },
+                isolation: IsolationRequirement::None,
+                network: NetworkRequirement::Unrestricted,
+            },
+            metadata: Vec::new(),
+        }
+    }
+
+    fn manifest() -> WorkspaceManifest {
+        WorkspaceManifest {
+            schema_version: 1,
+            entries: Vec::new(),
+        }
+    }
+
+    fn patch() -> WorkspaceManifestPatch {
+        WorkspaceManifestPatch {
+            schema_version: 1,
+            base_manifest_digest: BlobDigest::from_bytes(b"base"),
+            entries: Vec::new(),
+        }
+    }
+
+    /// Every request body the client authors carries the shared schema version.
+    ///
+    /// The four body shapes are the execute, control, workspace-create and
+    /// workspace-derive requests. Each one is serialized here and its
+    /// `schema_version` field is read back, so this asserts the bytes that
+    /// actually go on the wire rather than the field in isolation. A private
+    /// copy of the constant in this crate would still satisfy the assertion
+    /// only if it happened to equal the shared value — which is exactly why
+    /// the server crate additionally checks that this client's request is not
+    /// rejected as `protocol_version`.
+    #[test]
+    fn every_authored_request_body_carries_the_shared_schema_version() {
+        let handle = handle();
+        let workspace_id = WorkspaceId::new("workspace-a").unwrap();
+        let spec = spec();
+        let manifest = manifest();
+        let patch = patch();
+
+        let bodies = [
+            serde_json::to_value(&ExecuteRequest {
+                schema_version: API_SCHEMA_VERSION,
+                handle: handle.clone(),
+                workspace_id: None,
+                spec: &spec,
+            })
+            .unwrap(),
+            serde_json::to_value(&ControlRequest {
+                schema_version: API_SCHEMA_VERSION,
+                handle: handle.clone(),
+                renewal_id: None,
+            })
+            .unwrap(),
+            serde_json::to_value(&ControlRequest {
+                schema_version: API_SCHEMA_VERSION,
+                handle: handle.clone(),
+                renewal_id: Some("renewal-a".into()),
+            })
+            .unwrap(),
+            serde_json::to_value(&CreateWorkspaceRequest {
+                schema_version: API_SCHEMA_VERSION,
+                workspace_id: &workspace_id,
+                handle: &handle,
+                manifest: &manifest,
+            })
+            .unwrap(),
+            serde_json::to_value(&CreateDerivedWorkspaceRequest {
+                schema_version: API_SCHEMA_VERSION,
+                workspace_id: &workspace_id,
+                handle: &handle,
+                patch: &patch,
+            })
+            .unwrap(),
+        ];
+
+        for body in bodies {
+            assert_eq!(
+                body.get("schema_version").and_then(|value| value.as_u64()),
+                Some(u64::from(API_SCHEMA_VERSION)),
+                "an authored request body carries the wrong schema version: {body}"
+            );
+        }
+    }
+
+    fn capabilities(features: Vec<&str>) -> NodeCapabilities {
+        NodeCapabilities {
+            protocol: ProtocolVersionRange {
+                min: ProtocolVersion { major: 1, minor: 0 },
+                max: ProtocolVersion { major: 1, minor: 0 },
+            },
+            features: features.into_iter().map(str::to_owned).collect(),
+            max_active_executions: 1,
+        }
+    }
+
+    /// The client accepts a node that advertises the owned argv feature.
+    #[test]
+    fn a_node_advertising_the_owned_argv_feature_is_accepted() {
+        assert!(
+            protocol_compatibility(&capabilities(vec![EXEC_ARGV_CAPABILITY])).is_ok(),
+            "a node advertising the owned argv feature must be accepted"
+        );
+    }
+
+    /// The client refuses a node whose argv feature name differs.
+    ///
+    /// The differing name is one character away from the owned one, so this is
+    /// the regression test for the drift this milestone removes: a server that
+    /// advertised `exec.argv.v2` while the client demanded `exec.argv.v1`
+    /// would have been refused with a typed error rather than a silent
+    /// mismatch — and, before the shared constant existed, nothing in either
+    /// crate would have said the two names had to agree.
+    #[test]
+    fn a_node_advertising_a_differing_argv_feature_is_refused() {
+        let differing = format!("{EXEC_ARGV_CAPABILITY}v2");
+        let error = protocol_compatibility(&capabilities(vec![differing.as_str()]))
+            .expect_err("a node with a different argv feature must be refused");
+        assert!(
+            matches!(error, ClientError::UnsupportedCapability),
+            "expected the typed unsupported-capability error, got {error:?}"
+        );
+    }
+
+    /// A node that speaks a different protocol version is refused first.
+    #[test]
+    fn a_node_speaking_a_different_protocol_version_is_refused() {
+        let mut node = capabilities(vec![EXEC_ARGV_CAPABILITY]);
+        node.protocol = ProtocolVersionRange {
+            min: ProtocolVersion { major: 2, minor: 0 },
+            max: ProtocolVersion { major: 2, minor: 0 },
+        };
+        let error = protocol_compatibility(&node)
+            .expect_err("a node on another protocol version must be refused");
+        assert!(
+            matches!(error, ClientError::ProtocolIncompatible),
+            "expected the typed protocol-incompatible error, got {error:?}"
+        );
     }
 }
 

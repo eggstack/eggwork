@@ -166,11 +166,7 @@ impl ExecutionStore {
             match latest {
                 None if generation != 1 => return Ok(ReserveResult::StaleGeneration),
                 Some((latest_generation, latest_state)) => {
-                    if generation != latest_generation + 1
-                        || !matches!(
-                            latest_state.as_str(),
-                            "Succeeded" | "Failed" | "Cancelled" | "TimedOut" | "Interrupted"
-                        )
+                    if generation != latest_generation + 1 || !stored_state_is_terminal(&latest_state)
                     {
                         return Ok(ReserveResult::StaleGeneration);
                     }
@@ -200,7 +196,7 @@ impl ExecutionStore {
                     principal_id,
                     lease_token_hash,
                     lease_expires_unix_ms,
-                    state_name(&snapshot.state),
+                    snapshot.state.wire_name(),
                     encoded,
                     now,
                 ],
@@ -307,7 +303,7 @@ impl ExecutionStore {
                 transaction.rollback()?;
                 return Ok(None);
             };
-            if is_terminal_name(&state) {
+            if stored_state_is_terminal(&state) {
                 transaction.rollback()?;
                 return Ok(None);
             }
@@ -329,7 +325,7 @@ impl ExecutionStore {
                 params![
                     id,
                     generation,
-                    state_name(&snapshot.state),
+                    snapshot.state.wire_name(),
                     sequence + 1,
                     serde_json::to_vec(&snapshot)?,
                     now,
@@ -374,7 +370,7 @@ impl ExecutionStore {
                 return Ok(None);
             };
             if current_hash != lease_token_hash
-                || is_terminal_name(&state)
+                || stored_state_is_terminal(&state)
                 || current_expiry <= unix_millis()
             {
                 transaction.rollback()?;
@@ -563,10 +559,21 @@ impl ExecutionStore {
         tokio::task::spawn_blocking(move || {
             let mut connection = connection.lock().map_err(|_| StoreError::Worker)?;
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let mut statement = transaction.prepare(
-                "SELECT snapshot_json FROM executions WHERE state IN ('Accepted', 'Preparing', 'Running', 'Cancelling')",
-            )?;
-            let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            // The in-flight states come from the shared classification, and the
+            // names are bound as parameters rather than spliced into the
+            // statement: the list is assembled at runtime, and a value written
+            // into SQL text would turn a protocol fact into an injection
+            // surface.
+            let states = non_terminal_state_names();
+            let placeholders = std::iter::repeat_n("?", states.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut statement = transaction.prepare(&format!(
+                "SELECT snapshot_json FROM executions WHERE state IN ({placeholders})"
+            ))?;
+            let rows = statement.query_map(rusqlite::params_from_iter(states.iter()), |row| {
+                row.get::<_, Vec<u8>>(0)
+            })?;
             let mut snapshots = rows
                 .map(|row| serde_json::from_slice::<ExecutionSnapshot>(&row?).map_err(StoreError::from))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -599,12 +606,19 @@ impl ExecutionStore {
                     metadata: EventMetadata { fields: vec![] },
                 };
                 transaction.execute(
-                    "UPDATE executions SET state = 'Interrupted', next_sequence = ?3,
-                       snapshot_json = ?4, updated_unix_ms = ?5
+                    // The recovered state is bound from the core-owned wire
+                    // spelling rather than typed into the statement. The
+                    // stored bytes are unchanged — the column still receives
+                    // `Interrupted` — but the journal's vocabulary now has a
+                    // single owner instead of a literal here and a list
+                    // there.
+                    "UPDATE executions SET state = ?3, next_sequence = ?4,
+                       snapshot_json = ?5, updated_unix_ms = ?6
                      WHERE execution_id = ?1 AND generation = ?2",
                     params![
                         snapshot.execution_id.as_str(),
                         generation,
+                        ExecutionState::Interrupted.wire_name(),
                         sequence + 1,
                         serde_json::to_vec(snapshot)?,
                         unix_millis(),
@@ -667,27 +681,33 @@ pub fn unix_millis() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
-fn state_name(state: &ExecutionState) -> &'static str {
-    match state {
-        ExecutionState::Accepted => "Accepted",
-        ExecutionState::Preparing => "Preparing",
-        ExecutionState::Running => "Running",
-        ExecutionState::Cancelling => "Cancelling",
-        ExecutionState::Succeeded => "Succeeded",
-        ExecutionState::Failed => "Failed",
-        ExecutionState::Cancelled => "Cancelled",
-        ExecutionState::TimedOut => "TimedOut",
-        ExecutionState::Interrupted => "Interrupted",
-    }
+/// The wire spelling of every state that is still in flight.
+///
+/// Derived from the core-owned classification so the journal's vocabulary and
+/// the in-memory classification cannot drift apart. Callers bind these names
+/// as SQL parameters; they are never interpolated into a statement.
+pub(crate) fn non_terminal_state_names() -> Vec<&'static str> {
+    eggwork_core::ALL_EXECUTION_STATES
+        .iter()
+        .filter(|state| state.is_non_terminal())
+        .map(|state| state.wire_name())
+        .collect()
 }
 
-fn is_terminal_name(state: &str) -> bool {
-    matches!(
-        state,
-        "Succeeded" | "Failed" | "Cancelled" | "TimedOut" | "Interrupted"
-    )
+/// Whether a stored `state` column value names a terminal state.
+///
+/// The column holds the core-owned wire spelling, so a stored row's
+/// terminality is answered by the same core-owned classification the
+/// in-memory paths use. The spelling is resolved back to its state rather
+/// than being matched against a second list of names here, so a new variant
+/// is classified correctly without any change to this function. A value that
+/// names no known state is not terminal, exactly as before.
+fn stored_state_is_terminal(stored: &str) -> bool {
+    eggwork_core::ALL_EXECUTION_STATES
+        .iter()
+        .find(|state| state.wire_name() == stored)
+        .is_some_and(|state| state.is_terminal())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,7 +715,7 @@ mod tests {
 
     fn snapshot(id: &str, generation: u64, state: ExecutionState) -> ExecutionSnapshot {
         ExecutionSnapshot {
-            schema_version: 1,
+            schema_version: eggwork_core::API_SCHEMA_VERSION,
             execution_id: ExecutionId::new(id).unwrap(),
             generation: ExecutionGeneration::new(generation).unwrap(),
             state,
@@ -748,6 +768,57 @@ mod tests {
                 .unwrap(),
             Some(accepted)
         );
+    }
+
+    /// The `state` column still stores the same PascalCase spellings.
+    ///
+    /// The column's vocabulary is now derived from the core-owned wire spelling
+    /// rather than from a hand-maintained list in this file, so this test is what
+    /// proves the stored bytes did not move: the column still receives exactly
+    /// the spellings it received before.
+    #[tokio::test]
+    async fn the_state_column_stores_the_pascal_case_wire_spelling() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("state.sqlite");
+        let store = ExecutionStore::open(&path).unwrap();
+
+        for (state, expected) in [
+            (ExecutionState::Running, "Running"),
+            (ExecutionState::TimedOut, "TimedOut"),
+            (ExecutionState::Interrupted, "Interrupted"),
+        ] {
+            // One execution per state: a stored terminal state refuses further
+            // events, so a second commit on the same row would be rolled back
+            // and would never reach the column.
+            let accepted = snapshot(
+                &format!("column-spelling-{expected}"),
+                1,
+                ExecutionState::Accepted,
+            );
+            reserve(&store, accepted.clone()).await;
+            let proposed = ExecutionSnapshot {
+                state: state.clone(),
+                ..accepted
+            };
+            store
+                .commit_event(proposed.clone(), ExecutionEventKind::State(state.clone()))
+                .await
+                .unwrap();
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            let stored: String = connection
+                .query_row(
+                    "SELECT state FROM executions WHERE execution_id = ?1",
+                    [proposed.execution_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            drop(connection);
+            assert_eq!(
+                stored, expected,
+                "the state column must store the core-owned wire spelling"
+            );
+            assert_eq!(stored, state.wire_name());
+        }
     }
 
     #[tokio::test]

@@ -101,6 +101,7 @@ and deliberate. Deep dives:
 7. **`.github/workflows/release.yml` is generated** by `eggpack ci generate`. Never hand-edit; `eggpack ci check` fails on drift.
 8. **Never set `RUSTFLAGS`/`CARGO_*RUSTFLAGS`** — the env would silently replace the target-scoped Windows link policy in `.cargo/config.toml` (`/BREPRO`, `/DEBUG:NONE`) that makes MSVC release binaries reproducible.
 9. **Windows service management fails closed.** `deployment::windows_scm_manager` is retained but refuses before any mutation; daemon has no SCM dispatcher.
+10. **Protocol contract facts have one owner.** The control-plane API schema version and the `exec.argv.v1` capability name are declared once, publicly, in `eggwork-core`; the runner owns the capability names it produces (`LANDLOCK_WORKSPACE_RW_CAPABILITY`, `CGROUPS_V2_{MEMORY,CPU,PIDS}_CAPABILITY`, `WORKSPACE_RW_PROFILE`); the terminal/non-terminal classification of `ExecutionState` is owned by `eggwork-core`'s `ExecutionState::is_terminal` / `is_non_terminal`. A second copy of any of these in an endpoint crate is a defect, not a convenience. See [ADR-0008](plans/adrs/ADR-0008-core-protocol-contract-ownership.md).
 
 ## Code style
 

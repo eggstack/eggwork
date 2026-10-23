@@ -47,7 +47,9 @@ production graph is what stops client convenience from constraining server desig
 - Interpreting `NodeStatus` or `NodeCapabilities` into a decision. `capabilities()` and `status()`
   return the facts; the caller decides what they mean. The single exception is
   `ensure_protocol_compatible`, which rejects a node whose protocol range excludes `1.0` or which
-  does not advertise `exec.argv.v1` — a compatibility gate, not a placement policy.
+  does not advertise `eggwork_core::EXEC_ARGV_CAPABILITY` (`exec.argv.v1`) — a compatibility gate,
+  not a placement policy. The name is the core-owned constant rather than a literal, so the node's
+  advertisement and the client's demand cannot drift apart.
 - Node-side admission, process lifecycle, workspace/blob storage semantics, or event retention.
 - Principal identity. The client presents a certificate and nothing else; it never asserts who it
   is in a payload.
@@ -283,9 +285,10 @@ call one.
 All request bodies except the blob PUT are produced by `serde_json::to_vec` with
 `content-type: application/json`; a serialization failure maps to `InvalidResponse`. The blob PUT
 uses `content-type: application/octet-stream` and a streamed `RequestBody`. The client sends
-`schema_version: API_SCHEMA_VERSION` (`1`, `lib.rs:21`) in the execute, control, workspace-create,
-and workspace-derive bodies — matching the server's own `API_SCHEMA_VERSION = 1`
-(`crates/eggwork-server/src/lib.rs:48`). It is not sent in the two blob request bodies, whose
+`schema_version: eggwork_core::API_SCHEMA_VERSION` (`1`) in the execute, control, workspace-create,
+and workspace-derive bodies. That is the *same* constant the server compares the received value
+against — one core-owned number, not a copy in each endpoint crate — so a bump cannot desynchronise
+the producer and the consumer. It is not sent in the two blob request bodies, whose
 server counterparts do not declare one either.
 
 Server-side request structs are all `#[serde(deny_unknown_fields)]` (`ExecuteRequest`,
@@ -394,7 +397,7 @@ makes a foreign base look *missing* (`409 base_manifest_missing`) rather than *f
 | `Api { status, code, message }` | `node returned HTTP {status}: {code}` | Any non-2xx response, typed by the node. | Depends entirely on `code` — the client takes no position. | `status`, node `code`, and node `message` as public fields. |
 | `InvalidResponse` | `node response was malformed` | Response did not match the expected contract (see below). | Caller's judgement; usually a hard stop for that response. | Nothing beyond the variant. |
 | `ProtocolIncompatible` | `node protocol is incompatible` | `ensure_protocol_compatible`: the node's `[min, max]` does not contain `1.0`. | No — retrying the same node cannot help. | Nothing; the node's actual range is not carried. |
-| `UnsupportedCapability` | `node does not support a required protocol capability` | Node does not advertise `exec.argv.v1`. | No. | Nothing; the advertised feature list is not carried. |
+| `UnsupportedCapability` | `node does not support a required protocol capability` | Node does not advertise `eggwork_core::EXEC_ARGV_CAPABILITY` (`exec.argv.v1`). | No. | Nothing; the advertised feature list is not carried. |
 | `TelemetryUnsupported` | `node does not implement the node telemetry contract` | `GET /v1/node/telemetry` answered 404: the node predates the contract. | No. | Nothing. |
 
 `InvalidResponse` is produced in every one of these situations: `serde_json::from_slice` failure on
@@ -480,8 +483,11 @@ All three drive `EggressDialer` directly; none constructs a `NodeClient` or perf
   `event.validate()` rejection, or the trailing-partial-line tail.
 - No test for the response identity headers (execution-id mismatch, blob digest mismatch, artifact
   id/digest mismatch) in this file.
-- No test for `ensure_protocol_compatible` rejecting an incompatible range or a missing
-  `exec.argv.v1`.
+- `ensure_protocol_compatible`'s decision is separated from its fetch into `protocol_compatibility`,
+  so the rule is tested directly: a node advertising `eggwork_core::EXEC_ARGV_CAPABILITY` is
+  accepted, a node whose argv feature name differs by one character is refused with
+  `UnsupportedCapability`, and a node on another protocol version is refused with
+  `ProtocolIncompatible`.
 - `normalize_endpoint` is not tested against a fragment, a host-less URL, or a multi-slash
   trailing form.
 - No test that dropping an `ExecutionStream` leaves the execution running.
