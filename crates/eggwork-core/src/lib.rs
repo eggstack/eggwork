@@ -58,12 +58,21 @@ pub const DIAGNOSTIC_CLASS_ISOLATION_DEGRADED: &str = "isolation.degraded";
 /// enforcement that was not applied.
 pub const DIAGNOSTIC_CLASS_RESOURCES_DEGRADED: &str = "resources.degraded";
 
+/// The class of a diagnostic that reports declared outputs the node could not
+/// capture.
+///
+/// A capture failure is not a degradation of a best-effort request: the caller
+/// declared the outputs and the node owns delivering them, so the diagnostic
+/// names the failure instead of reporting a `NotApplied` outcome.
+pub const DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED: &str = "artifact.capture.failed";
+
 /// The closed set of diagnostic classes. A payload naming anything else is
 /// refused rather than guessed at, because a class is what a consumer
 /// dispatches on.
-pub const DIAGNOSTIC_CLASSES: [&str; 2] = [
+pub const DIAGNOSTIC_CLASSES: [&str; 3] = [
     DIAGNOSTIC_CLASS_ISOLATION_DEGRADED,
     DIAGNOSTIC_CLASS_RESOURCES_DEGRADED,
+    DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED,
 ];
 
 /// Ceiling on a whole diagnostic payload.
@@ -1286,6 +1295,54 @@ pub enum ExecutionFinalizationFailure {
     ArtifactCapture,
     Retention,
 }
+
+/// The disposition of a declared-artifact capture on a terminal execution.
+///
+/// The disposition is the first-class answer to "did the declared outputs
+/// arrive?". It exists because a caller cannot answer that question from the
+/// artifact count alone: the count says how many artifacts exist, not how many
+/// were asked for, so a caller would have to compare the count against a
+/// declared-output count it does not have. Worse, a count of zero is
+/// indistinguishable from "the outputs were silently dropped", which is the
+/// failure this type exists to make impossible to read as success.
+///
+/// The states are:
+///
+/// * `NotRequested` — the execution declared no outputs. Nothing was asked
+///   for, so nothing was lost.
+/// * `Completed` — the capture completed and the declared outputs were
+///   published as artifacts.
+/// * `Failed` — the execution declared outputs and the capture did not
+///   complete, so the declared outputs are not all available. The terminal
+///   state says why: an execution that ended in a state where capture is not
+///   performed keeps that state, and a capture that fails after a successful
+///   target moves the terminal state to `Failed`.
+/// * `Unknown` — the node reported no disposition. A snapshot written before
+///   this field existed decodes this way, so a caller must fall back to the
+///   legacy `finalization_failure` marker and the artifact count rather than
+///   read an absence as a fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactCaptureDisposition {
+    NotRequested,
+    Completed,
+    Failed,
+    Unknown,
+}
+
+impl Default for ArtifactCaptureDisposition {
+    /// The default is `Unknown`, not `NotRequested`.
+    ///
+    /// A snapshot written before this field existed says nothing about its
+    /// capture, and `NotRequested` would be a claim — that the caller asked for
+    /// nothing — that the snapshot cannot support. `Unknown` keeps the
+    /// absence an absence, so a caller falls back to the legacy signals
+    /// instead of believing a fabricated one.
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionResult {
     pub state: ExecutionState,
@@ -1300,6 +1357,14 @@ pub struct ExecutionResult {
     pub finalization_failure: Option<ExecutionFinalizationFailure>,
     #[serde(default)]
     pub artifact_count: u32,
+    /// The disposition of the declared-artifact capture.
+    ///
+    /// `#[serde(default)]` keeps the field additive in both directions: a peer
+    /// that predates it ignores it (the struct does not deny unknown fields),
+    /// and a peer that has it decodes a snapshot written before it existed as
+    /// `Unknown` rather than refusing the snapshot.
+    #[serde(default)]
+    pub artifact_capture: ArtifactCaptureDisposition,
     #[serde(default)]
     pub sandbox: Option<SandboxResult>,
     #[serde(default)]
@@ -2071,6 +2136,90 @@ mod tests {
             .is_err()
         );
         assert!(DiagnosticPayload::new("isolation.degraded.other").is_err());
+    }
+    /// The capture-failure class joins the closed set, and a class outside it
+    /// is still refused.
+    ///
+    /// The class is what a consumer dispatches on, so adding one is a
+    /// deliberate act and the set stays closed.
+    #[test]
+    fn the_capture_failure_class_is_in_the_closed_class_set() {
+        assert!(DIAGNOSTIC_CLASSES.contains(&DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED));
+        let mut payload = DiagnosticPayload::new(DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED).unwrap();
+        payload.set("requirement", "declared").unwrap();
+        payload.set("outcome", "platform_unavailable").unwrap();
+        payload
+            .set(
+                "reason",
+                "safe artifact capture is unavailable on this platform",
+            )
+            .unwrap();
+        let built = payload.build();
+        assert!(built.starts_with("eggwork.diagnostic.artifact.capture.failed.v1 "));
+        assert!(built.len() <= MAX_DIAGNOSTIC_PAYLOAD_BYTES);
+        // The diagnostic rides inside an event, so its bound has to stay
+        // inside the event envelope. The relationship is a compile-time fact,
+        // not a runtime check.
+        const _: () = assert!(MAX_DIAGNOSTIC_PAYLOAD_BYTES <= MAX_EVENT_CHUNK_BYTES);
+        let parsed = DiagnosticPayload::parse(&built).unwrap();
+        assert_eq!(parsed.class(), DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED);
+    }
+    /// A terminal snapshot written before the capture disposition existed
+    /// still decodes, and decodes as "no disposition reported".
+    ///
+    /// The field is additive, so a peer that has it must not refuse a
+    /// snapshot that lacks it. The default is `Unknown` rather than
+    /// `NotRequested`: an absent field is an absence, and reading it as "the
+    /// caller asked for nothing" would be a claim the snapshot cannot support.
+    #[test]
+    fn a_snapshot_without_the_capture_disposition_decodes_as_unknown() {
+        let legacy = serde_json::json!({
+            "state": "Succeeded",
+            "exit_code": 0,
+            "failure": null,
+            "stdout_bytes": 0,
+            "stderr_bytes": 0,
+            "stdout_omitted": 0,
+            "stderr_omitted": 0,
+            "cleanup_warning": null,
+            "finalization_failure": null,
+            "artifact_count": 0
+        });
+        let decoded: ExecutionResult = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            decoded.artifact_capture,
+            ArtifactCaptureDisposition::Unknown
+        );
+        assert_eq!(
+            ArtifactCaptureDisposition::default(),
+            ArtifactCaptureDisposition::Unknown
+        );
+    }
+    /// The disposition is carried on the wire and survives a round trip.
+    #[test]
+    fn the_capture_disposition_round_trips() {
+        for disposition in [
+            ArtifactCaptureDisposition::NotRequested,
+            ArtifactCaptureDisposition::Completed,
+            ArtifactCaptureDisposition::Failed,
+            ArtifactCaptureDisposition::Unknown,
+        ] {
+            let encoded = serde_json::to_string(&disposition).unwrap();
+            let decoded: ArtifactCaptureDisposition = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, disposition);
+        }
+        assert_eq!(
+            serde_json::to_string(&ArtifactCaptureDisposition::NotRequested).unwrap(),
+            "\"not_requested\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ArtifactCaptureDisposition::Completed).unwrap(),
+            "\"completed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ArtifactCaptureDisposition::Failed).unwrap(),
+            "\"failed\""
+        );
     }
     fn spec() -> ExecutionSpec {
         ExecutionSpec {

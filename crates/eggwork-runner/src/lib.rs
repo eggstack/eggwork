@@ -1401,6 +1401,10 @@ impl RunnerResult {
                 .or_else(|| self.cleanup.stdin_error.clone()),
             finalization_failure: None,
             artifact_count: 0,
+            // The runner owns the process, not the capture: the server's
+            // finalization decides the capture disposition and replaces this
+            // placeholder. The placeholder claims nothing.
+            artifact_capture: eggwork_core::ArtifactCaptureDisposition::Unknown,
             sandbox: Some(match &self.setup.sandbox {
                 SandboxOutcome::NotRequested => eggwork_core::SandboxResult::NotRequested,
                 SandboxOutcome::NotApplied { reason } => eggwork_core::SandboxResult::NotApplied {

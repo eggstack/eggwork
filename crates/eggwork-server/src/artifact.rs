@@ -436,6 +436,43 @@ async fn capture_blob(
     Ok((digest, size, executable))
 }
 
+/// Whether the running platform can capture declared outputs safely.
+///
+/// The fact is owned by the data plane, because the data plane owns the
+/// capture. A caller that wants to know whether a node can capture declared
+/// outputs asks the node's platform; it does not infer the answer from its own
+/// `cfg`, because the node's platform and the caller's platform are not
+/// necessarily the same one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactCaptureCapability {
+    /// Declared outputs can be captured: files can be opened beneath the
+    /// workspace root without traversing a symlink.
+    Available,
+    /// Declared outputs cannot be captured on this platform. The node refuses
+    /// the capture instead of dropping the declared outputs silently.
+    Unavailable,
+}
+
+/// The running platform's declared-artifact capture capability.
+///
+/// The fact is stated next to the platform-specific `open_file_beneath`, which
+/// is the only place that can refuse a capture, so the two cannot drift: the
+/// platform that cannot open a file beneath the workspace root safely is the
+/// platform that reports itself unable to capture.
+#[cfg(unix)]
+pub const fn capture_capability() -> ArtifactCaptureCapability {
+    ArtifactCaptureCapability::Available
+}
+
+/// The running platform's declared-artifact capture capability.
+///
+/// See the Unix variant: the fact and the capture implementation are stated
+/// together so they cannot disagree.
+#[cfg(not(unix))]
+pub const fn capture_capability() -> ArtifactCaptureCapability {
+    ArtifactCaptureCapability::Unavailable
+}
+
 #[cfg(unix)]
 fn open_file_beneath(root: &Path, relative: &str) -> io::Result<fs::File> {
     use rustix::fs::{Mode, OFlags, open, openat};

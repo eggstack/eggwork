@@ -232,6 +232,22 @@ error, and never reveals whether a different id exists — authorization runs
 before resource resolution, so a denied caller cannot distinguish an existing
 resource from an absent one.
 
+`executions show` prints the terminal snapshot, including the result's
+`artifact_capture` field. It is the field to read when an execution declared
+outputs:
+
+| `artifact_capture` | Meaning | What the operator sees |
+|---|---|---|
+| `not_requested` | The execution declared no outputs | Nothing was asked for, so nothing was lost |
+| `completed` | The declared outputs were captured and published | The execution's artifacts are listed and downloadable |
+| `failed` | The execution declared outputs and they were **not** captured | The terminal state is not `Succeeded`; the diagnostic in the event stream says whether the platform refused the capture or an attempted capture failed |
+| `unknown` | The node reported no disposition (an execution recovered after a crash) | The terminal state is `Interrupted`; the declared outputs, if any, are gone |
+
+A declared output that could not be captured fails the execution rather than
+leaving a successful execution with nothing in it, so a `Succeeded` execution
+never hides a dropped declared output. The legacy `finalization_failure`
+marker stays on the result as a secondary signal.
+
 ## Redaction
 
 `config print` prints the effective config with the private key path and every

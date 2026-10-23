@@ -212,11 +212,15 @@ A second job in the same workflow, on `windows-latest`, added by Foundation M004
         run: cargo clippy --locked -p eggwork-runner --all-targets --all-features -- -D warnings
       - name: Windows process-tree lifecycle suite
         run: cargo test --locked -p eggwork-runner --all-targets -- --nocapture
+      - name: declared-artifact capture disposition suite
+        run: cargo test --locked -p eggwork-server --test artifact_capture_disposition
 ```
 
 **Why it exists.** The Windows process-tree backend cannot be observed from Linux. Job Object ownership, descendant convergence after leader exit, and pipe inheritance across a process tree only mean something on a real Windows kernel, and a green Linux run must never be readable as Windows coverage. Foundation M004's `runner` tests are `#![cfg(windows)]`, so without this job the entire suite would silently not exist in CI.
 
 **What it deliberately does not run.** `cargo test --workspace` is not used, and test-target clippy is scoped to `eggwork-runner`. The server's and client's unit tests are Linux-shaped: they spawn `/bin/sh` and set `0700`/`0600` modes through `std::os::unix::fs`, so several test helpers do not even *compile* for Windows (`place_trusted_helper` in `crates/eggwork-server/src/lib.rs`, the `PermissionsExt` uses in `artifact.rs`, `blob.rs`, `operations.rs`, and `deployment.rs`). Making them portable is its own milestone.
+
+One server integration target **is** portable and **is** run: the declared-artifact capture disposition, `cargo test --locked -p eggwork-server --test artifact_capture_disposition`. It is a contract about the *decision* rather than about the host, so it compiles for Windows without a Linux-shaped harness, and it is the native evidence that a node which cannot capture declared outputs refuses them and ends the execution in a state that is not a success. The rest of the server's test surface is still Linux-only and is not claimed here.
 
 That gap is stated rather than papered over, and the split is deliberate:
 

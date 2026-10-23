@@ -1,6 +1,6 @@
 # Workspace and Artifact Transport Roadmap
 
-Status: active roadmap; M001-M004 closed; M005a data-plane corrective proposed; M005b data-plane corrective implemented
+Status: active roadmap; M001-M004 closed; M005a data-plane corrective implemented; M005b data-plane corrective implemented
 
 Canonical authority:
 
@@ -136,7 +136,7 @@ Exit conditions:
 
 Class: invariant
 
-Status: proposed
+Status: implemented
 
 Corrective addendum:
 
@@ -145,6 +145,10 @@ Corrective addendum:
 Implementation plan:
 
 - `plans/implementation/workspace-artifact-transport/005a-declared-artifact-capture-fail-closed-corrective.md`
+
+Closure record:
+
+- `plans/closure/workspace-artifact-transport/005a-status.md`
 
 Objective:
 
@@ -156,6 +160,16 @@ Exit conditions:
 - the caller can distinguish "no declared outputs" from "declared outputs that were not captured";
 - the platform claim in the README and in the divergences table matches the code;
 - the required-isolation and fail-closed rules are unchanged.
+
+Implemented:
+
+- the terminal result carries a first-class capture disposition, `ExecutionResult.artifact_capture` (`eggwork_core::ArtifactCaptureDisposition`), so the caller reads "did the declared outputs arrive" from the result instead of comparing an artifact count against a declared-output count it does not have;
+- the mapping from a capture attempt to the terminal facts is one decision, `eggwork_server::decide_artifact_capture`, reachable from outside the crate: a declared output that was not captured never leaves the execution `Succeeded`, and the target's own failure is never overwritten by the node's;
+- the platform's capture capability is one fact, `artifact::capture_capability`, stated next to the platform-specific `open_file_beneath` that can refuse a capture, and re-exported from the crate root as `artifact_capture_capability`;
+- the `artifact.declared.v1` capability name is unchanged and its advertisement follows the fact: a node whose platform cannot capture does not advertise it;
+- the capture failure is published on the server's existing event-publishing path as a diagnostic of class `artifact.capture.failed`, with the grammar, the bound, and the truncation rule in `architecture/protocol.md`;
+- the capture-eligibility rule is unchanged: a cancelled, timed-out, interrupted, or output-limit-killed execution still captures nothing, and it reports its own terminal state;
+- the terminal snapshot is not byte-identical across the change: the result gained a field, and a capture that did not complete no longer reports `Succeeded`.
 
 ### M005b — GC preview and store ownership corrective
 

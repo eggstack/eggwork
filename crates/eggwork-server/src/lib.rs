@@ -20,10 +20,12 @@ use eggserve_core::{
     tls::{ClientAuthMode, TlsServerConfig},
 };
 use eggwork_core::{
-    API_SCHEMA_VERSION, ApiError, EXEC_ARGV_CAPABILITY, ExecutionEvent, ExecutionEventKind,
-    ExecutionFailure, ExecutionFinalizationFailure, ExecutionGeneration, ExecutionHandle,
-    ExecutionId, ExecutionResult, ExecutionSnapshot, ExecutionSpec, ExecutionState, LeaseId,
-    NodeCapabilities, NodeId, NodeStatus, ProtocolVersion, ProtocolVersionRange,
+    API_SCHEMA_VERSION, ApiError, ArtifactCaptureDisposition,
+    DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED, DiagnosticPayload, EXEC_ARGV_CAPABILITY,
+    ExecutionEvent, ExecutionEventKind, ExecutionFailure, ExecutionFinalizationFailure,
+    ExecutionGeneration, ExecutionHandle, ExecutionId, ExecutionResult, ExecutionSnapshot,
+    ExecutionSpec, ExecutionState, LeaseId, NodeCapabilities, NodeId, NodeStatus, ProtocolVersion,
+    ProtocolVersionRange,
 };
 use eggwork_runner::{
     ExecutionProvenance, LocalProcessRunner, OutputChunk, ResourceSetupRequest, RunnerError,
@@ -52,6 +54,115 @@ const RUNNER_CHANNEL_CAPACITY: usize = 32;
 const MAX_RECENT_EXECUTIONS: usize = 1024;
 const MAX_BLOB_FIND_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_WORKSPACE_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
+/// The declared-artifact capture capability of the running platform.
+///
+/// The re-export is the crate's public answer to "can this node capture
+/// declared outputs?". The data plane owns the fact because it owns the
+/// capture, and the fact is re-exported rather than reimplemented here so a
+/// caller cannot answer it from its own `cfg` and disagree with the node.
+pub use artifact::ArtifactCaptureCapability;
+
+/// The declared-artifact capture capability of the running platform.
+///
+/// See [`ArtifactCaptureCapability`].
+pub use artifact::capture_capability as artifact_capture_capability;
+
+/// What a declared-artifact capture attempt produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactCaptureAttempt {
+    /// No capture was attempted: either the execution declared no outputs, or
+    /// the execution ended in a state where a capture is not performed.
+    NotAttempted,
+    /// The capture completed and published its artifacts.
+    Completed,
+    /// The capture was attempted and did not complete.
+    Failed,
+}
+
+/// The facts the terminal disposition of a declared-artifact capture is
+/// decided from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactCaptureFacts {
+    /// The running platform's capture capability.
+    pub capability: ArtifactCaptureCapability,
+    /// Whether the execution declared any outputs.
+    pub declared_outputs: bool,
+    /// The terminal state the target produced.
+    pub target_state: ExecutionState,
+    /// The failure the target produced, if any.
+    pub target_failure: Option<ExecutionFailure>,
+    /// What the capture attempt produced.
+    pub attempt: ArtifactCaptureAttempt,
+}
+
+/// The terminal facts a declared-artifact capture produces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactCaptureDecision {
+    /// The terminal state the execution reports.
+    pub state: ExecutionState,
+    /// The failure the execution reports, if any.
+    pub failure: Option<ExecutionFailure>,
+    /// The capture disposition the execution reports.
+    pub disposition: ArtifactCaptureDisposition,
+}
+
+/// The one mapping from a capture attempt to the terminal facts of the
+/// execution.
+///
+/// The mapping lives here, and not in the finalization's match arms, because
+/// it is a contract rather than an implementation detail: a node must not
+/// report a successful execution whose declared outputs were dropped, and a
+/// contract that is only reachable through a live execution cannot be checked
+/// on a platform where the capture is impossible.
+///
+/// The rules are:
+///
+/// * an execution that declared no outputs reports
+///   [`ArtifactCaptureDisposition::NotRequested`] and keeps the target's own
+///   terminal facts — nothing was asked for, so nothing was lost;
+/// * a capture that completed reports
+///   [`ArtifactCaptureDisposition::Completed`] and keeps the target's own
+///   terminal facts;
+/// * a declared output that was not captured reports
+///   [`ArtifactCaptureDisposition::Failed`], and a target that had succeeded
+///   becomes [`ExecutionState::Failed`] with the node's own
+///   [`ExecutionFailure::Internal`]. The target's failure is never overwritten:
+///   a target that failed for its own reason keeps that failure, so a caller
+///   can still tell "the target failed" from "the target succeeded and its
+///   declared outputs could not be collected";
+/// * a platform that cannot capture safely fails every declared output, so the
+///   capability decides the disposition before the attempt does.
+pub fn decide_artifact_capture(facts: ArtifactCaptureFacts) -> ArtifactCaptureDecision {
+    if !facts.declared_outputs {
+        return ArtifactCaptureDecision {
+            state: facts.target_state,
+            failure: facts.target_failure,
+            disposition: ArtifactCaptureDisposition::NotRequested,
+        };
+    }
+    let disposition = match (facts.capability, facts.attempt) {
+        (ArtifactCaptureCapability::Unavailable, _) => ArtifactCaptureDisposition::Failed,
+        (ArtifactCaptureCapability::Available, ArtifactCaptureAttempt::Completed) => {
+            ArtifactCaptureDisposition::Completed
+        }
+        (ArtifactCaptureCapability::Available, _) => ArtifactCaptureDisposition::Failed,
+    };
+    if disposition == ArtifactCaptureDisposition::Failed
+        && facts.target_state == ExecutionState::Succeeded
+    {
+        return ArtifactCaptureDecision {
+            state: ExecutionState::Failed,
+            failure: Some(facts.target_failure.unwrap_or(ExecutionFailure::Internal)),
+            disposition,
+        };
+    }
+    ArtifactCaptureDecision {
+        state: facts.target_state,
+        failure: facts.target_failure,
+        disposition,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Operation {
@@ -591,6 +702,14 @@ fn acquire_state_lock(database_path: &std::path::Path) -> Result<std::fs::File, 
     Ok(file)
 }
 
+/// The declared-artifact capture capability name.
+///
+/// The name is a wire value and does not change. Whether a node advertises it
+/// does: a node whose platform cannot capture declared outputs must not
+/// advertise a capability it does not have, because the advertisement is what
+/// a caller uses to decide whether to declare outputs at all.
+const ARTIFACT_DECLARED_CAPABILITY: &str = "artifact.declared.v1";
+
 /// Static protocol/transport/workspace/artifact feature list. Network is
 /// always advertised as unrestricted because Eggwork does not yet implement a
 /// network-restriction backend; the admission gate therefore rejects
@@ -606,7 +725,7 @@ fn static_capability_features() -> &'static [&'static str] {
         "workspace.manifest.v1",
         "workspace.materialize.v1",
         "workspace.derive.v1",
-        "artifact.declared.v1",
+        ARTIFACT_DECLARED_CAPABILITY,
         "artifact.stream.v1",
         "artifact.retention.v1",
         "network.unrestricted.v1",
@@ -616,9 +735,18 @@ fn static_capability_features() -> &'static [&'static str] {
 /// One capability feature construction. Both `Route::Capabilities` and
 /// `NodeStatus.capabilities` MUST go through this function so a single node
 /// always reports the same execution-capability feature set.
+///
+/// The declared-artifact capability is conditional on the platform's capture
+/// capability: a node that cannot capture declared outputs safely must not
+/// advertise that it can. The capability name is a wire value and is
+/// unchanged; only its advertisement follows the fact.
 fn server_capability_features(dynamic: Vec<String>) -> Vec<String> {
     let mut features: Vec<String> = static_capability_features()
         .iter()
+        .filter(|feature| {
+            **feature != ARTIFACT_DECLARED_CAPABILITY
+                || artifact_capture_capability() == ArtifactCaptureCapability::Available
+        })
         .map(|feature| (*feature).to_owned())
         .collect();
     features.extend(dynamic);
@@ -2540,35 +2668,79 @@ async fn run_execution(
         failed_result(terminal, failure, sandbox_request, resource_request)
     };
     if let Some(workspace) = workspace {
-        let should_capture = runner_completed
-            && !workspace.outputs.is_empty()
+        let declared_outputs = !workspace.outputs.is_empty();
+        // The capture rule is unchanged: the runner completed, the execution
+        // declared outputs, the terminal state is eligible, and the target was
+        // not killed for its output volume. What changed is what an execution
+        // reports when a capture that was required did not complete.
+        let eligible = runner_completed
+            && declared_outputs
             && artifact_capture_eligible(&execution_result.state)
             && execution_result.failure != Some(ExecutionFailure::OutputLimit);
-        if should_capture {
-            let expiry = artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
-            let (execution_id, generation) = {
-                let snapshot = record.snapshot.read().await;
-                (snapshot.execution_id.clone(), snapshot.generation)
-            };
-            match artifact::capture_declared(
-                &state.artifacts,
-                &state.blobs,
-                &workspace.root,
-                &workspace.outputs,
-                &execution_id,
-                generation,
-                &workspace.principal,
-                expiry,
-            )
-            .await
-            {
-                Ok(count) => execution_result.artifact_count = count,
-                Err(_) => {
-                    execution_result.finalization_failure =
-                        Some(ExecutionFinalizationFailure::ArtifactCapture);
+        let mut attempt = ArtifactCaptureAttempt::NotAttempted;
+        if eligible {
+            if artifact_capture_capability() == ArtifactCaptureCapability::Unavailable {
+                // The platform cannot open a file beneath the workspace root
+                // safely, so the capture is refused instead of attempted. A
+                // refused capture must not read like a capture that found
+                // nothing, so the refusal is reported and the execution ends
+                // in a state that is not a success.
+                attempt = ArtifactCaptureAttempt::Failed;
+                execution_result.finalization_failure =
+                    Some(ExecutionFinalizationFailure::ArtifactCapture);
+                publish_capture_diagnostic(
+                    &record,
+                    "platform_unavailable",
+                    "safe artifact capture is unavailable on this platform",
+                )
+                .await;
+            } else {
+                let expiry =
+                    artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
+                let (execution_id, generation) = {
+                    let snapshot = record.snapshot.read().await;
+                    (snapshot.execution_id.clone(), snapshot.generation)
+                };
+                match artifact::capture_declared(
+                    &state.artifacts,
+                    &state.blobs,
+                    &workspace.root,
+                    &workspace.outputs,
+                    &execution_id,
+                    generation,
+                    &workspace.principal,
+                    expiry,
+                )
+                .await
+                {
+                    Ok(count) => {
+                        execution_result.artifact_count = count;
+                        attempt = ArtifactCaptureAttempt::Completed;
+                    }
+                    Err(_) => {
+                        execution_result.finalization_failure =
+                            Some(ExecutionFinalizationFailure::ArtifactCapture);
+                        attempt = ArtifactCaptureAttempt::Failed;
+                        publish_capture_diagnostic(
+                            &record,
+                            "capture_failed",
+                            "a declared output could not be captured",
+                        )
+                        .await;
+                    }
                 }
             }
         }
+        let decision = decide_artifact_capture(ArtifactCaptureFacts {
+            capability: artifact_capture_capability(),
+            declared_outputs,
+            target_state: execution_result.state.clone(),
+            target_failure: execution_result.failure.clone(),
+            attempt,
+        });
+        execution_result.state = decision.state;
+        execution_result.failure = decision.failure;
+        execution_result.artifact_capture = decision.disposition;
         let expiry = artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
         if state
             .workspaces
@@ -2577,6 +2749,10 @@ async fn run_execution(
         {
             execution_result.finalization_failure = Some(ExecutionFinalizationFailure::Retention);
         }
+    } else {
+        // No workspace means the execution declared no outputs, so there was
+        // nothing to capture and nothing that could be lost.
+        execution_result.artifact_capture = ArtifactCaptureDisposition::NotRequested;
     }
     let terminal = execution_result.state.clone();
     let terminal_metric = terminal_metric_name(&terminal);
@@ -2626,6 +2802,9 @@ fn failed_result(
         cleanup_warning: None,
         finalization_failure: None,
         artifact_count: 0,
+        // The runner produced no result, so the finalization has not decided
+        // the capture disposition yet. The placeholder claims nothing.
+        artifact_capture: ArtifactCaptureDisposition::Unknown,
         sandbox: Some(match sandbox_request {
             SandboxRequest::None => eggwork_core::SandboxResult::NotRequested,
             SandboxRequest::BestEffort { .. } => eggwork_core::SandboxResult::NotApplied {
@@ -2653,6 +2832,40 @@ fn failure_for_runner_error(
         Some(RunnerError::CancelledBeforeSpawn) => ExecutionFailure::Interrupted,
         _ => ExecutionFailure::Internal,
     }
+}
+
+/// Publishes the diagnostic that reports a declared-artifact capture that did
+/// not complete.
+///
+/// The diagnostic rides the server's existing event-publishing path: a
+/// diagnostic is an `ExecutionEventKind::Diagnostic`, and this is the one
+/// place the server produces one, so a consumer reads every diagnostic from
+/// the same stream and under the same grammar.
+///
+/// The payload is bounded by the diagnostic grammar itself
+/// (`MAX_DIAGNOSTIC_PAYLOAD_BYTES`), which is well inside the event envelope
+/// (`MAX_EVENT_CHUNK_BYTES`), so a diagnostic can never overflow the event it
+/// rides in.
+async fn publish_capture_diagnostic(record: &ExecutionRecord, outcome: &str, reason: &str) {
+    let Ok(mut payload) = DiagnosticPayload::new(DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED) else {
+        return;
+    };
+    // `requirement` and `reason` are the minimum key set the diagnostic
+    // grammar requires, and `outcome` says which of the two capture failures
+    // this is. The keys are fixed so a consumer can dispatch on them.
+    if payload.set("requirement", "declared").is_err()
+        || payload.set("outcome", outcome).is_err()
+        || payload.set("reason", reason).is_err()
+    {
+        return;
+    }
+    publish(
+        record,
+        ExecutionState::Running,
+        None,
+        ExecutionEventKind::Diagnostic(payload.build()),
+    )
+    .await;
 }
 
 async fn publish(
@@ -3761,6 +3974,11 @@ mod tests {
         let result = final_snapshot.result.unwrap();
         assert_eq!(result.artifact_count, 1);
         assert_eq!(result.finalization_failure, None);
+        assert_eq!(
+            result.artifact_capture,
+            ArtifactCaptureDisposition::Completed,
+            "a capture that produced the declared artifact reports a completed capture"
+        );
         let artifacts = client
             .artifacts(
                 &workspace_handle.execution_id,
@@ -3800,7 +4018,7 @@ mod tests {
             path: eggwork_core::RelativePath::new("required-missing.txt").unwrap(),
             required: true,
         }];
-        client
+        let missing_events = client
             .execute_in_workspace(&missing_output_spec, &missing_handle, &missing_workspace)
             .await
             .unwrap()
@@ -3817,9 +4035,50 @@ mod tests {
             .unwrap()
             .result
             .unwrap();
-        assert_eq!(failed_finalization.state, ExecutionState::Succeeded);
+        // The terminal event and the terminal result agree about the failure,
+        // and the diagnostic that explains it is published before the terminal
+        // state event, so a consumer reading the stream sees the reason before
+        // the outcome.
+        let diagnostic_position = missing_events.iter().position(|event| {
+            matches!(
+                &event.kind,
+                ExecutionEventKind::Diagnostic(payload)
+                    if payload.contains(eggwork_core::DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED)
+            )
+        });
+        let terminal_position = missing_events.iter().position(|event| {
+            matches!(&event.kind, ExecutionEventKind::State(state) if *state == ExecutionState::Failed)
+        });
+        assert!(
+            diagnostic_position.is_some(),
+            "a capture failure must be visible in the event stream: {missing_events:?}"
+        );
+        assert!(
+            terminal_position.is_some(),
+            "the terminal state event must report the failure: {missing_events:?}"
+        );
+        assert!(
+            diagnostic_position < terminal_position,
+            "the capture diagnostic must be published before the terminal state event"
+        );
+        // A declared output that could not be captured is a failed execution,
+        // not a successful one with nothing in it. The target's own outcome
+        // is still reported (its exit code stays), and the capture failure is
+        // reported separately so a caller can tell "the target failed" from
+        // "the target succeeded and its declared outputs could not be
+        // collected".
+        assert_eq!(failed_finalization.state, ExecutionState::Failed);
         assert_eq!(failed_finalization.exit_code, Some(0));
         assert_eq!(failed_finalization.artifact_count, 0);
+        assert_eq!(
+            failed_finalization.failure,
+            Some(ExecutionFailure::Internal),
+            "the node owns a capture failure, so the failure is the node's own"
+        );
+        assert_eq!(
+            failed_finalization.artifact_capture,
+            ArtifactCaptureDisposition::Failed
+        );
         assert_eq!(
             failed_finalization.finalization_failure,
             Some(ExecutionFinalizationFailure::ArtifactCapture)
@@ -3867,6 +4126,12 @@ mod tests {
             .unwrap();
         assert_eq!(timed_out.state, ExecutionState::TimedOut);
         assert_eq!(timed_out.artifact_count, 0);
+        assert_eq!(
+            timed_out.artifact_capture,
+            ArtifactCaptureDisposition::Failed,
+            "the execution declared an output and the capture did not complete, \
+             so the declared output is not available"
+        );
         assert!(
             client
                 .artifacts(
@@ -6535,6 +6800,171 @@ mod tests {
                 .iter()
                 .any(|feature| feature.starts_with("network.allow")),
             "network allow-list features are unsupported and must not be advertised"
+        );
+    }
+
+    /// The declared-artifact capability follows the platform's capture fact.
+    ///
+    /// The name is a wire value and never changes; whether the node advertises
+    /// it does. A node that cannot capture declared outputs must not claim
+    /// that it can, because the advertisement is what a caller uses to decide
+    /// whether to declare outputs at all.
+    #[test]
+    fn the_declared_artifact_capability_is_advertised_only_when_the_platform_can_capture() {
+        let features = server_capability_features(Vec::new());
+        let advertised = features
+            .iter()
+            .filter(|feature| feature.as_str() == ARTIFACT_DECLARED_CAPABILITY)
+            .count();
+        match artifact_capture_capability() {
+            ArtifactCaptureCapability::Available => assert_eq!(
+                advertised, 1,
+                "a platform that can capture must advertise the declared-artifact capability"
+            ),
+            ArtifactCaptureCapability::Unavailable => assert_eq!(
+                advertised, 0,
+                "a platform that cannot capture must not advertise the \
+                 declared-artifact capability"
+            ),
+        }
+    }
+
+    /// A declared output that was not captured is never a success.
+    ///
+    /// This is the regression the corrective exists for: the terminal state of
+    /// an execution whose declared outputs could not be collected must not
+    /// read as a successful execution with nothing in it.
+    #[test]
+    fn a_declared_output_that_was_not_captured_never_reports_success() {
+        for capability in [
+            ArtifactCaptureCapability::Available,
+            ArtifactCaptureCapability::Unavailable,
+        ] {
+            for attempt in [
+                ArtifactCaptureAttempt::NotAttempted,
+                ArtifactCaptureAttempt::Failed,
+            ] {
+                let decision = decide_artifact_capture(ArtifactCaptureFacts {
+                    capability,
+                    declared_outputs: true,
+                    target_state: ExecutionState::Succeeded,
+                    target_failure: None,
+                    attempt,
+                });
+                assert_ne!(
+                    decision.state,
+                    ExecutionState::Succeeded,
+                    "a capture that did not complete must not leave the execution successful"
+                );
+                assert_eq!(decision.state, ExecutionState::Failed);
+                assert_eq!(
+                    decision.failure,
+                    Some(ExecutionFailure::Internal),
+                    "the capture failure is the node's own failure"
+                );
+                assert_eq!(decision.disposition, ArtifactCaptureDisposition::Failed);
+            }
+        }
+    }
+
+    /// A capture that completed leaves the target's own outcome alone.
+    #[test]
+    fn a_completed_capture_keeps_the_targets_own_outcome() {
+        let decision = decide_artifact_capture(ArtifactCaptureFacts {
+            capability: ArtifactCaptureCapability::Available,
+            declared_outputs: true,
+            target_state: ExecutionState::Succeeded,
+            target_failure: None,
+            attempt: ArtifactCaptureAttempt::Completed,
+        });
+        assert_eq!(decision.state, ExecutionState::Succeeded);
+        assert_eq!(decision.failure, None);
+        assert_eq!(decision.disposition, ArtifactCaptureDisposition::Completed);
+    }
+
+    /// A failed target keeps its own failure.
+    ///
+    /// A capture failure must not overwrite the target's failure: a caller has
+    /// to be able to tell "the target failed" from "the target succeeded and
+    /// its declared outputs could not be collected".
+    #[test]
+    fn a_failed_target_keeps_its_own_failure_when_the_capture_also_fails() {
+        let decision = decide_artifact_capture(ArtifactCaptureFacts {
+            capability: ArtifactCaptureCapability::Available,
+            declared_outputs: true,
+            target_state: ExecutionState::Failed,
+            target_failure: Some(ExecutionFailure::Spawn),
+            attempt: ArtifactCaptureAttempt::Failed,
+        });
+        assert_eq!(decision.state, ExecutionState::Failed);
+        assert_eq!(
+            decision.failure,
+            Some(ExecutionFailure::Spawn),
+            "the target's own failure must survive a capture failure"
+        );
+        assert_eq!(decision.disposition, ArtifactCaptureDisposition::Failed);
+    }
+
+    /// An execution that declared nothing reports that nothing was requested.
+    #[test]
+    fn an_execution_without_declared_outputs_reports_not_requested() {
+        for capability in [
+            ArtifactCaptureCapability::Available,
+            ArtifactCaptureCapability::Unavailable,
+        ] {
+            let decision = decide_artifact_capture(ArtifactCaptureFacts {
+                capability,
+                declared_outputs: false,
+                target_state: ExecutionState::Succeeded,
+                target_failure: None,
+                attempt: ArtifactCaptureAttempt::NotAttempted,
+            });
+            assert_eq!(decision.state, ExecutionState::Succeeded);
+            assert_eq!(decision.failure, None);
+            assert_eq!(
+                decision.disposition,
+                ArtifactCaptureDisposition::NotRequested
+            );
+        }
+    }
+
+    /// The capture diagnostic is a bounded payload in the closed class set.
+    ///
+    /// The diagnostic rides inside an event, so it has to satisfy the event
+    /// envelope as well as the diagnostic grammar, and a consumer has to be
+    /// able to parse it back.
+    #[test]
+    fn the_capture_diagnostic_is_a_bounded_payload_in_the_closed_class_set() {
+        let mut payload = eggwork_core::DiagnosticPayload::new(
+            eggwork_core::DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED,
+        )
+        .expect("the capture failure class is in the closed class set");
+        payload
+            .set("requirement", "declared")
+            .expect("requirement is a valid diagnostic key");
+        payload
+            .set("outcome", "platform_unavailable")
+            .expect("outcome is a valid diagnostic key");
+        payload
+            .set(
+                "reason",
+                "safe artifact capture is unavailable on this platform",
+            )
+            .expect("reason is a valid diagnostic key");
+        let built = payload.build();
+        assert!(
+            built.len() <= eggwork_core::MAX_DIAGNOSTIC_PAYLOAD_BYTES,
+            "the diagnostic payload must stay inside its bound"
+        );
+        assert!(
+            built.len() <= eggwork_core::MAX_EVENT_CHUNK_BYTES,
+            "the diagnostic payload must stay inside the event envelope"
+        );
+        let parsed = eggwork_core::DiagnosticPayload::parse(&built)
+            .expect("the built diagnostic must parse back");
+        assert_eq!(
+            parsed.class(),
+            eggwork_core::DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED
         );
     }
 

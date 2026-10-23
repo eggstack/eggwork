@@ -36,9 +36,10 @@ use std::{
 
 use eggwork_client::NodeClient;
 use eggwork_core::{
-    CommandSpec, EnvironmentEntry, ExecutionGeneration, ExecutionHandle, ExecutionId,
-    ExecutionSpec, ExecutionState, IsolationRequirement, LeaseId, NetworkRequirement, OutputPolicy,
-    Requirement, ResourceRequirements, StdinPolicy,
+    ArtifactCaptureDisposition, CommandSpec, DeclaredOutput, EnvironmentEntry, ExecutionGeneration,
+    ExecutionHandle, ExecutionId, ExecutionSpec, ExecutionState, IsolationRequirement, LeaseId,
+    NetworkRequirement, OutputPolicy, RelativePath, Requirement, ResourceRequirements, StdinPolicy,
+    WorkspaceId, WorkspaceManifest,
 };
 use serde_json::{Value as Json, json};
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -340,6 +341,28 @@ fn marker_command(marker: &Path, required: bool) -> Vec<String> {
             "printf 'eggwork-qualification\\n'".to_owned()
         };
         vec!["/bin/sh".to_owned(), "-c".to_owned(), script]
+    }
+}
+
+/// A command that creates the declared output inside the execution's working
+/// directory, which is the workspace root for a workspace execution.
+///
+/// The file has to exist before the capture runs: a declared output that the
+/// target never produced is a *missing* output, which is a different
+/// failure from a platform that cannot capture one.
+fn declared_output_command() -> Vec<String> {
+    if cfg!(windows) {
+        vec![
+            target_shell().to_owned(),
+            "/C".to_owned(),
+            "echo eggwork-qualification > declared.txt".to_owned(),
+        ]
+    } else {
+        vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "printf 'eggwork-qualification\\n' > declared.txt".to_owned(),
+        ]
     }
 }
 
@@ -806,4 +829,185 @@ async fn installed_release_admits_execution_and_refuses_unsupported_isolation() 
         serde_json::to_string_pretty(&report).unwrap_or_default()
     );
     Ok(())
+}
+
+/// The declared-artifact disposition of an installed release binary.
+///
+/// This is the property the corrective establishes, checked on the real host
+/// rather than by inspection: where the node can capture declared outputs it
+/// must capture them and say so, and where it cannot it must refuse them and
+/// end the execution in a state that is not a success. Windows is the case
+/// that matters — there is no descriptor-relative open beneath the workspace
+/// root there — so the qualification proves the refusal path on the real
+/// Windows host instead of asserting it from a Linux one.
+#[tokio::test]
+#[ignore = "qualifies an installed release binary; run with --ignored"]
+async fn installed_release_reports_a_truthful_declared_artifact_disposition() -> Result<(), String>
+{
+    let subject = Subject::from_environment().expect("qualification subject");
+    let mut facts: BTreeMap<String, Json> = BTreeMap::new();
+    let node = start_installed_node(&subject, reserve_loopback_port())
+        .await
+        .expect("the installed node starts and reports ready");
+    let client = client(&subject, &node).expect("the production client builds");
+
+    // The advertisement follows the platform's capture capability: a node that
+    // cannot capture declared outputs must not claim that it can.
+    let capabilities = client.capabilities().await.expect("capabilities");
+    let declared_capable = capabilities
+        .features
+        .iter()
+        .any(|feature| feature == "artifact.declared.v1");
+    if cfg!(unix) {
+        assert!(
+            declared_capable,
+            "a Unix node can capture declared outputs and must advertise the \
+             capability: {capabilities:?}"
+        );
+    } else {
+        assert!(
+            !declared_capable,
+            "a node that cannot capture declared outputs must not advertise the \
+             capability: {capabilities:?}"
+        );
+    }
+    facts.insert(
+        "declared_artifact_capable".to_owned(),
+        json!(declared_capable),
+    );
+
+    // A declared output is read from the workspace root, so the execution
+    // needs a workspace.
+    let workspace_id = WorkspaceId::new(qualified_id("artifact-workspace"))
+        .map_err(|_| "the qualification workspace id is not usable".to_owned())?;
+    let execution_id = qualified_id("artifact-declared");
+    client
+        .create_workspace(
+            &workspace_id,
+            &handle(&execution_id),
+            &WorkspaceManifest {
+                schema_version: 1,
+                entries: vec![],
+            },
+        )
+        .await
+        .map_err(|error| format!("creating the qualification workspace failed: {error}"))?;
+    let mut declared_spec = spec(declared_output_command(), IsolationRequirement::None);
+    declared_spec.command.declared_outputs = vec![DeclaredOutput {
+        path: RelativePath::new("declared.txt").map_err(|_| "the declared path is not usable")?,
+        required: true,
+    }];
+    let stream = client
+        .execute_in_workspace(&declared_spec, &handle(&execution_id), &workspace_id)
+        .await
+        .map_err(|error| {
+            format!("the installed node refused the declared-output execution: {error}")
+        })?;
+    use futures_util::StreamExt;
+    let mut events = Box::pin(stream.into_events());
+    while let Some(event) = events.next().await {
+        event.map_err(|error| format!("reading execution events failed: {error}"))?;
+    }
+    let observed = ExecutionId::new(&execution_id)
+        .map_err(|_| "the qualification execution id is not usable".to_owned())?;
+    let snapshot = wait_for_terminal(&client, &observed).await?;
+    let result = snapshot
+        .result
+        .clone()
+        .ok_or("the installed node reported no terminal result".to_owned())?;
+    let artifacts = client
+        .artifacts(&observed, 1)
+        .await
+        .map_err(|error| format!("listing the declared artifacts failed: {error}"))?;
+
+    if declared_capable {
+        assert_eq!(
+            snapshot.state,
+            ExecutionState::Succeeded,
+            "a node that can capture declared outputs must complete the execution: {snapshot:?}"
+        );
+        assert_eq!(
+            result.artifact_capture,
+            ArtifactCaptureDisposition::Completed,
+            "a completed capture must be reported as completed: {result:?}"
+        );
+        assert_eq!(
+            artifacts.len(),
+            1,
+            "the declared output must be published as an artifact: {artifacts:?}"
+        );
+    } else {
+        // The refusal path: the declared output is refused, and the execution
+        // must not read as a success with the output silently dropped.
+        assert_ne!(
+            snapshot.state,
+            ExecutionState::Succeeded,
+            "a node that cannot capture declared outputs must not report a \
+             successful execution: {snapshot:?}"
+        );
+        assert_eq!(
+            result.artifact_capture,
+            ArtifactCaptureDisposition::Failed,
+            "a refused capture must be reported as a failed capture: {result:?}"
+        );
+        assert_eq!(
+            result.artifact_count, 0,
+            "a refused capture must not report any captured artifact: {result:?}"
+        );
+        assert!(
+            artifacts.is_empty(),
+            "a refused capture must not publish artifacts: {artifacts:?}"
+        );
+    }
+    facts.insert(
+        "declared_artifact".to_owned(),
+        json!({
+            "capable": declared_capable,
+            "state": format!("{:?}", snapshot.state),
+            "artifact_capture": format!("{:?}", result.artifact_capture),
+            "artifact_count": result.artifact_count,
+            "artifacts": artifacts.len(),
+        }),
+    );
+
+    let report = json!({
+        "schema_version": 1,
+        "stage": format!("declared-artifact:{}", subject.platform),
+        "installed_daemon": subject.daemon.display().to_string(),
+        "facts": facts,
+    });
+    if let Some(path) = declared_artifact_receipt(&subject) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// The receipt path for the declared-artifact qualification.
+///
+/// It is a sibling of the subject's receipt, not the receipt itself: the
+/// execution qualification writes its own receipt to the same environment
+/// path, and two suites writing one file would leave whichever ran last as
+/// the only evidence.
+fn declared_artifact_receipt(subject: &Subject) -> Option<PathBuf> {
+    let path = subject.receipt.as_ref()?;
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    let extension = path
+        .extension()
+        .map(|value| value.to_string_lossy().into_owned());
+    let name = match extension {
+        Some(extension) => format!("{stem}-declared-artifact.{extension}"),
+        None => format!("{stem}-declared-artifact"),
+    };
+    Some(path.with_file_name(name))
 }

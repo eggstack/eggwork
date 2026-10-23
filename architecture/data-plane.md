@@ -608,6 +608,78 @@ so `insert_many` is not silently idempotent. The execution journal carries only 
 `ArtifactType` has exactly one variant, `File` (`core:970-974`). Directories are not artifacts;
 they exist only as entries in the capture preflight manifest so the tree validates.
 
+### The capture-failure contract and the platform claim
+
+A capture can fail for two different reasons, and the node must not conflate them
+with a capture that found nothing.
+
+**The platform claim.** `artifact::capture_capability` is the single owner of the
+fact "can this platform capture declared outputs safely?". It is stated next to
+`open_file_beneath`, which is the only place that can refuse a capture, so the
+platform that cannot open a file beneath the workspace root safely is the
+platform that reports itself unable to capture. The fact is re-exported from the
+`eggwork-server` crate root as `artifact_capture_capability`, because a caller
+must ask the *node's* platform rather than infer the answer from its own `cfg`.
+
+**The capability follows the fact.** The `artifact.declared.v1` capability name is
+a wire value and does not change; whether a node advertises it does. The server's
+`server_capability_features` adds it only when the capture capability is
+`Available`, so a node that cannot capture declared outputs never claims that it
+can. The advertisement is what a caller uses to decide whether to declare outputs
+at all, which is why it has to be true.
+
+**The disposition is first-class.** `ExecutionResult.artifact_capture`
+(`eggwork_core::ArtifactCaptureDisposition`) is the terminal answer to "did the
+declared outputs arrive?". It has four states:
+
+| State | Meaning |
+| --- | --- |
+| `NotRequested` | The execution declared no outputs. Nothing was asked for, so nothing was lost. |
+| `Completed` | The capture completed and the declared outputs were published as artifacts. |
+| `Failed` | The execution declared outputs and the capture did not complete, so the declared outputs are not all available. |
+| `Unknown` | The node reported no disposition. A snapshot written before the field existed decodes this way, and so does a crash-recovered execution, whose declared outputs the recovery path cannot know. |
+
+The field is `#[serde(default)]`, so it is additive in both directions: a peer
+that predates it ignores it (the struct does not deny unknown fields), and a peer
+that has it decodes an older snapshot as `Unknown` rather than refusing it. The
+default is `Unknown` and not `NotRequested` on purpose: an absent field is an
+absence, and reading it as "the caller asked for nothing" would be a claim the
+snapshot cannot support.
+
+**A capture that did not complete is never a success.** The mapping from a
+capture attempt to the terminal facts lives in exactly one place,
+`eggwork_server::decide_artifact_capture`, and it is a public function so that
+the contract can be checked from outside the crate on a platform where the
+capture cannot run at all:
+
+- an execution that declared no outputs reports `NotRequested` and keeps the
+  target's own terminal facts;
+- a capture that completed reports `Completed` and keeps the target's own
+  terminal facts;
+- a declared output that was not captured reports `Failed`, and a target that
+  had succeeded becomes `ExecutionState::Failed` with the node's own
+  `ExecutionFailure::Internal`. The target's failure is never overwritten, so a
+  caller can still tell "the target failed" from "the target succeeded and its
+  declared outputs could not be collected";
+- a platform whose capture capability is `Unavailable` fails every declared
+  output, so the capability decides the disposition before the attempt does.
+
+**The failure is visible in the event stream too.** The server publishes one
+diagnostic of class `artifact.capture.failed` on the same event-publishing path
+every other diagnostic uses, with `outcome=platform_unavailable` when the
+platform refused the capture and `outcome=capture_failed` when an attempted
+capture did not complete. The grammar, the bound, and the truncation rule are
+in [protocol.md](protocol.md). `ExecutionResult.finalization_failure` stays as a
+secondary marker; it is not the only signal, and it can still be overwritten by
+the retention marker, which is why the disposition is the first-class one.
+
+**The eligibility rule is unchanged.** A cancelled, timed-out, interrupted, or
+output-limit-killed execution still captures nothing, and
+`artifact_capture_eligible` still accepts exactly `Succeeded` and `Failed`. Such
+an execution reports `Failed` as its disposition, because it did declare outputs
+and they were not captured, and it keeps its own terminal state — which is not
+`Succeeded`, so no caller is told a success it did not get.
+
 ### Retention
 
 `DEFAULT_RETENTION_MILLIS = 30 * 24 * 60 * 60 * 1000` = 30 days (`artifact.rs:22`). The store owns
@@ -838,6 +910,9 @@ How a caller distinguishes the three cases:
 | Capture stays within `MAX_ARTIFACT_FILES` / `_TOTAL_BYTES` | `artifact.rs:539-541`, `artifact.rs:451-453`, `artifact.rs:352-355` | `artifact.rs:577`; `disappearing_output_and_storage_quota_fail_without_publishing_records` (`artifact.rs:753`) |
 | Expired artifacts are invisible, then deleted | `artifact.rs:132`, `artifact.rs:168`, `artifact.rs:186-223` | `artifact.rs:804`; `lib.rs:3399` |
 | Capture is all-or-nothing w.r.t. records | retain before insert (`artifact.rs:311-322`) | `artifact.rs:753` |
+| A declared output that was not captured is never a success | `decide_artifact_capture` (server crate root) | `a_declared_output_that_was_not_captured_never_reports_success` (`tests/artifact_capture_disposition.rs`); `a_declared_output_that_was_not_captured_never_reports_success` (server unit test) |
+| The declared-artifact capability follows the platform's capture fact | `server_capability_features`; `artifact::capture_capability` | `the_declared_artifact_capability_is_advertised_only_when_the_platform_can_capture` (server unit test) |
+| The capture disposition is on the terminal result, not inferred | `ExecutionResult.artifact_capture` (`eggwork_core`) | `a_snapshot_without_the_capture_disposition_decodes_as_unknown` (core unit test) |
 | Retention cannot stay pinned after a crash | `workspace.rs:667-696`, `workspace.rs:518-533` | `workspace.rs:1430`; `workspace.rs:1497` |
 | The GC preview and the GC apply select the same candidates | `UNREFERENCED_CANDIDATES_SQL` / `WORKSPACE_CANDIDATES_SQL` / `MANIFEST_CANDIDATES_SQL` / `ARTIFACT_CANDIDATES_SQL` in the owner modules; the operator holds no candidate predicate | `gc_preview_uses_the_stores_own_blob_predicate_not_the_reference_count_counter` (`operations.rs`); `gc_preview_candidates_are_a_subset_of_what_the_apply_pass_removes`; `gc_preview_and_apply_agree_when_the_store_has_no_expired_references`; `the_operator_module_contains_no_candidate_predicate_of_its_own` (`tests/gc_preview_parity.rs`) |
 | A candidate is selected on the reference rows, not on the counter | `UNREFERENCED_CANDIDATES_SQL` (`NOT EXISTS (SELECT 1 FROM blob_references ...)`) | `gc_preview_uses_the_stores_own_blob_predicate_not_the_reference_count_counter` (`operations.rs`) |
@@ -943,7 +1018,10 @@ runner's confinement to the materialized root.
 - No test drives a manifest that `RelativePath` accepts but the strict portable validator rejects (a
   Windows-reserved name, a trailing dot, a non-ASCII byte) through the `workspace_create` handler.
 - No test exercises the non-unix branches: `open_file_beneath` returning `ErrorKind::Unsupported`,
-  the `#[cfg(not(unix))]` permission helpers, or the `sync_directory` no-op.
+  the `#[cfg(not(unix))]` permission helpers, or the `sync_directory` no-op. The *decision* that a
+  platform which cannot capture must refuse a declared output is now covered portably
+  (`tests/artifact_capture_disposition.rs`), but the non-unix capture code itself is still
+  unexecuted, and the Windows job's coverage of it is the `windows-runner` CI step, not this host.
 - No test drives `reconcile_manifests`' orphan-reference sweep past the first page *except*
   `manifest_orphan_sweep_reaches_owners_past_the_first_page`, which pins the resume cursor and the
   wrap-back-at-end behaviour. Unbounded `retained_manifests` growth and a hardlink-based quota

@@ -201,6 +201,16 @@ None of these are presented as bugs already judged to be bugs. They are the plac
 | 20 | `decode_json` calls `response.bytes()` with **no size cap**. The node bounds its own request bodies, but the client bounds only the NDJSON line buffer, leaving the JSON paths open to memory exhaustion from a hostile node. | [client-transport.md](client-transport.md) |
 | 21 | Redirect and retry safety is an **accident of the dependency profile**: the workspace's `standard-http1` omits eggfetch's `redirects` and `logical-retry` features, so 3xx is returned unfollowed. Bumping to the `http1` alias would silently enable both and no test would fail. | [client-transport.md](client-transport.md) |
 
+### Platform limitations
+
+This table carries the rows that are about *a platform*, not about a module. It
+is separate so the numbering stays monotonic: rows 1-21 are cited elsewhere by
+number, and a row inserted into an earlier table would renumber them.
+
+| # | Observation | Where |
+|---|---|---|
+| 22 | **Declared artifacts are refused, not captured, on a platform that cannot open a file beneath the workspace root safely.** `open_file_beneath` is a descriptor-relative `NOFOLLOW` chain with no non-Unix implementation, so a non-Unix node cannot capture declared outputs. ~~Before the M005a corrective, the finalization set the finalization-failure marker and left the terminal state `Succeeded`, so a caller that declared outputs saw a successful execution with zero artifacts and no error — the declared outputs were silently dropped — and the node advertised `artifact.declared.v1` on every platform.~~ **Closed by the M005a corrective.** The platform's capture-capability fact now reports the limitation, a node that cannot capture does not advertise `artifact.declared.v1`, and an execution that declares outputs there ends in `Failed` with a `Failed` capture disposition and a diagnostic event. The limitation itself remains: the product's top-level claim of *terminal state plus declared artifacts* holds on a Unix platform only. | [data-plane.md](data-plane.md) · [protocol.md](protocol.md) |
+
 ### Positive notes worth keeping
 
 - Authorization strictly **precedes** resource resolution in `dispatch`, and id parsing touches only the path, so a denied caller cannot distinguish an existing resource from an absent one.

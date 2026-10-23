@@ -591,6 +591,12 @@ impl ExecutionStore {
                     cleanup_warning: None,
                     finalization_failure: None,
                     artifact_count: 0,
+                    // The recovery path does not know what the interrupted
+                    // execution declared, so it reports no capture
+                    // disposition rather than a fabricated one. The
+                    // execution's terminal state is `Interrupted`, so the
+                    // snapshot never reads as a success.
+                    artifact_capture: eggwork_core::ArtifactCaptureDisposition::Unknown,
                     sandbox: None,
                     resources: None,
                 });

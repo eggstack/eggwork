@@ -284,6 +284,28 @@ jobs:
             --test installed_qualification -- --ignored \
             --exact installed_release_admits_execution_and_refuses_unsupported_isolation \
             --nocapture
+      - name: Qualify the truthful declared-artifact disposition
+        # Windows cannot capture declared outputs, and the qualified claim is
+        # the *refusal*: the node must not advertise `artifact.declared.v1`, and
+        # an execution that declares outputs must end in a failed state with a
+        # `failed` capture disposition and a diagnostic event — never a
+        # successful execution whose declared outputs were silently dropped.
+        # Without this step the hosted qualification would never invoke the
+        # suite, because the workflow selects suites by `--exact` name.
+        shell: bash
+        env:
+          RELEASE_QUALIFICATION_TOKEN: ${{ secrets.RELEASE_QUALIFICATION_TOKEN }}
+          EGGWORK_QUALIFY_DAEMON: ${{ runner.temp }}/qualification/bin/eggworkd.exe
+          EGGWORK_QUALIFY_CONFIG: ${{ runner.temp }}/qualification/state/node.json
+          EGGWORK_QUALIFY_TLS_DIR: ${{ runner.temp }}/qualification/state/tls
+          EGGWORK_QUALIFY_RECEIPT: ${{ runner.temp }}/receipts/execution-windows.json
+          EGGWORK_QUALIFY_PLATFORM: windows
+        run: |
+          set -euo pipefail
+          cargo test --locked -p eggwork-server --features qualification \
+            --test installed_qualification -- --ignored \
+            --exact installed_release_reports_a_truthful_declared_artifact_disposition \
+            --nocapture
       - name: Record the service management disposition
         shell: pwsh
         run: |
