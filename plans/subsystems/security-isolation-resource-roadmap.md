@@ -1,6 +1,6 @@
 # Security, Isolation, and Resource Enforcement Roadmap
 
-Status: closed through M004 (remote-admission C001 and Operations M002 included)
+Status: closed through M004 (remote-admission C001 and Operations M002 included); M005a and M005b correctives proposed; M005c blocked on ADR-0007
 
 Canonical authority:
 
@@ -149,6 +149,84 @@ Closed prerequisites include remote-admission corrective C001, Foundation owners
 Objective:
 
 Run hostile input/process/workspace/transport fixtures, audit dependencies and unsafe code, validate privilege/service configurations, and close high/medium findings.
+
+### M005a — Degraded-isolation observability corrective
+
+Class: invariant
+
+Status: proposed
+
+Corrective addendum:
+
+- `plans/subsystems/security-isolation-resource-isolation-truthfulness-corrective-addendum.md`
+
+Implementation plan:
+
+- `plans/implementation/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`
+
+Objective:
+
+Make degradation visible where a caller will actually see it. `SandboxResult::NotApplied` is recorded truthfully in the terminal snapshot, but `ExecutionEventKind::Diagnostic` has no production publisher — it is emitted only from test code — so a caller streaming events sees an ordinary successful execution when best-effort isolation or resource enforcement was not applied. The `Required` path must not change: a required request still fails closed before the target spawns.
+
+Exit conditions:
+
+- a degraded best-effort execution emits a diagnostic into the event stream, with a payload that identifies what degraded and why;
+- the diagnostic is emitted on the same path as the terminal result, so the two cannot disagree;
+- no `Required` execution reaches the target without the requested control;
+- the required-isolation and required-resource fail-closed rules are unchanged.
+
+### M005b — Sandbox-helper environment parity corrective
+
+Class: invariant
+
+Status: proposed
+
+Corrective addendum:
+
+- `plans/subsystems/security-isolation-resource-isolation-truthfulness-corrective-addendum.md`
+
+Implementation plan:
+
+- `plans/implementation/security-isolation-resource/005b-sandbox-helper-environment-parity-corrective.md`
+
+Objective:
+
+Give the sandbox environment deny-list one source of truth. The runner and the standalone sandbox helper maintain the same list independently and apply it with different semantics — the runner silently drops denied keys, the helper rejects the whole launch — and the helper additionally enforces a `PATH` rule the runner does not. The helper's no-workspace-dependency rule makes the duplication architecturally forced, so the fix is a shared artifact plus a pinning test, not a shared crate.
+
+The duplication is live, and this milestone closes it. The runner's launch-specification builder starts from a fixed baseline and then appends every non-denied caller key, and none of the baseline keys except `PATH` is denied. A caller that sets `LANG` therefore produces a launch specification with two `LANG` entries; the helper refuses a specification with duplicate keys; and for a best-effort request the runner answers that pre-target setup failure by re-spawning the target **with no Landlock ruleset at all**. The observable result is a successful, unconfined execution whose only trace of the degradation is a `NotApplied` in the terminal snapshot.
+
+Exit conditions:
+
+- one source of truth exists that the helper binary can consume without gaining a workspace-crate dependency;
+- the drop-versus-reject difference is decided explicitly per side and documented;
+- a caller-supplied key that collides with a node-owned baseline key does not produce a duplicate-key launch specification, and does not cause a best-effort execution to lose its confinement;
+- the direct path and the helper path agree on which value wins for a reserved key;
+- the `PATH` rule is either enforced on both sides or replaced by an explicit statement of the actual child-environment baseline;
+- a test pins the two lists element-wise, so a one-sided edit fails the build.
+
+### M005c — Resource-scoped authorization corrective
+
+Class: invariant
+
+Status: **blocked** — concrete blocker is ADR-0007, `plans/adrs/ADR-0007-resource-scoped-authorization.md` (**proposed, not accepted**)
+
+Corrective addendum:
+
+- `plans/subsystems/security-isolation-resource-isolation-truthfulness-corrective-addendum.md`
+
+Implementation plan:
+
+- `plans/implementation/security-isolation-resource/005c-resource-scoped-authorization-corrective.md`
+
+Objective:
+
+Decide and then close the disposition of the resource-scoped authorization hook. The production authorizer implements only the operation-level check, so the typed `ResourceId` carried by every request is never consulted, and a principal granted blob-read can read any known digest. The gap is already recorded as divergence #4, so this milestone is a decision about a known gap rather than a new defect report. Per `plans/003-planning-process.md` §4 the plan is written early to preserve design intent while the decision is pending.
+
+Exit conditions:
+
+- ADR-0007 is accepted and states whether resource-scoped grants are implemented or the hook and its plumbing are removed;
+- the node does not present a mechanism as available while it is inert;
+- the divergences-table entry is updated to the decided disposition.
 
 ## 4. Capability semantics
 

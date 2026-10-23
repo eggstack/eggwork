@@ -1,6 +1,6 @@
 # Workspace and Artifact Transport Roadmap
 
-Status: active roadmap; M001-M004 closed
+Status: active roadmap; M001-M004 closed; M005a and M005b data-plane correctives proposed
 
 Canonical authority:
 
@@ -131,6 +131,58 @@ Exit conditions:
 - retained manifests pin required blobs only for bounded retention;
 - cross-principal manifest reuse is impossible;
 - no Git semantics or shared writable workspace tree enters Eggwork.
+
+### M005a — Declared-artifact capture fail-closed corrective
+
+Class: invariant
+
+Status: proposed
+
+Corrective addendum:
+
+- `plans/subsystems/workspace-artifact-transport-data-plane-corrective-addendum.md`
+
+Implementation plan:
+
+- `plans/implementation/workspace-artifact-transport/005a-declared-artifact-capture-fail-closed-corrective.md`
+
+Objective:
+
+Stop a shipped target from silently losing declared outputs. On a non-Unix target the safe artifact-capture open is refused, and the execution still reports `Succeeded` with a zero artifact count and a nested finalization-failure marker. An execution whose declared outputs could not be captured must not present as a successful execution with missing artifacts.
+
+Exit conditions:
+
+- a failed capture is visible in the terminal state, the event stream, and to the caller, not only as a nested marker;
+- the caller can distinguish "no declared outputs" from "declared outputs that were not captured";
+- the platform claim in the README and in the divergences table matches the code;
+- the required-isolation and fail-closed rules are unchanged.
+
+### M005b — GC preview and store ownership corrective
+
+Class: invariant
+
+Status: proposed
+
+Corrective addendum:
+
+- `plans/subsystems/workspace-artifact-transport-data-plane-corrective-addendum.md`
+
+Implementation plan:
+
+- `plans/implementation/workspace-artifact-transport/005b-gc-preview-and-store-ownership-corrective.md`
+
+Objective:
+
+Make the operator's GC preview and the apply pass share one implementation, so they cannot disagree, and bring the blob store's path layout and the manifest owner-id format back under the modules that own them. The owner module already states that the dry run and the real run must share the candidate statement; that rule is currently violated in the sibling module, where the preview uses a different predicate from the one the apply pass uses.
+
+Exit conditions:
+
+- the dry-run report and the apply pass select candidates through the same store-owned statement;
+- the operator's blob inspection goes through the store's path and ownership API rather than re-deriving the shard layout;
+- the workspace materializer uses the store's verified-open path;
+- the manifest owner-id composite has exactly one producer, and the two inlined call sites use it;
+- a test proves that the preview and the apply pass agree;
+- no public protocol surface and no stored format changes.
 
 ## 4. Future optimized materializers
 

@@ -1,6 +1,6 @@
 # Foundation and Execution Core Roadmap
 
-Status: M001-M004 closed (M004 conditional on a release containing it); C001 post-closure CI corrective closed
+Status: M001-M004 closed (M004 conditional on a release containing it); C001 post-closure CI corrective closed; M005 request-validation parity corrective proposed
 
 Canonical authority:
 
@@ -150,6 +150,32 @@ Dependencies:
 
 - no hard implementation dependency;
 - Operations M004 remains conditionally closed until a release containing M004 is hosted-qualified.
+
+### M005 — Runner request validation parity corrective
+
+Class: invariant
+
+Status: proposed
+
+Corrective addendum:
+
+- `plans/subsystems/foundation-execution-core-request-validation-corrective-addendum.md`
+
+Implementation plan:
+
+- `plans/implementation/foundation-execution-core/005-runner-request-validation-parity-corrective.md`
+
+Objective:
+
+Make the runner's request validation a projection of the `eggwork-core` domain contract rather than an independent restatement of it. The runner's private validation copy is weaker than core on environment-entry syntax and duplicate names, and the runner's public constructor and public environment setter reach that weaker gate without passing through core validation at all — which contradicts the runner's own documented claim that callers cannot bypass protocol bounds.
+
+Exit conditions:
+
+- every request rule the runner enforces has one owner in `eggwork-core`;
+- the runner is never weaker than core on a shared rule, and any stricter runner-level rule is explicit, documented, and tested;
+- no public runner API can produce a request that violates the core contract, proven by a test;
+- the runner's local `StdinPolicy` duplicate and its hand-written conversion are removed;
+- no numeric bound and no wire representation changes.
 
 ## 4. CodeGG reuse strategy
 
