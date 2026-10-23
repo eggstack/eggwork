@@ -193,6 +193,16 @@ eggworkd gc --config <node.json> --limit 128
 # ... "dry_run": true
 ```
 
+The preview never creates or reconciles a store: against a node whose data
+directories do not exist yet it fails with the generic bounded-GC error rather
+than reporting zero candidates, and it leaves the filesystem untouched.
+
+The preview reports what `--apply` would remove, and the apply pass may remove
+*more*: the apply pass also deletes expired blob references first, so a blob
+that becomes unreferenced as a result is collectable in the same pass. When the
+store holds no expired references, the preview's figures and the applied pass
+agree exactly.
+
 Applying it needs `--apply`, which is bounded by `--limit` and takes an
 **exclusive lock on node state**. It therefore fails while the node process is
 running — deliberately, because a live server is holding references the local

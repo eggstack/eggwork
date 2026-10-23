@@ -402,8 +402,8 @@ walks `blob_root` and `workspace_root` iteratively with no limit, summing file l
 skipping symlinks (it checks `file_type().is_symlink()` and `continue`s, so a symlink is
 neither followed nor counted). Execution and artifact sizes instead use `file_family_bytes`,
 which sums the main file plus `-wal` and `-shm` siblings — so the reported execution
-footprint includes un-checkpointed WAL. The artifact database is
-`database_path.with_extension("artifacts.sqlite")`. `filesystem_free_bytes` is `None` when
+footprint includes un-checkpointed WAL. The artifact database path is
+`artifact::metadata_path(database_path)`. `filesystem_free_bytes` is `None` when
 the measurement fails, and quotas are echoed so the operator computes utilisation — the
 CLI does not.
 
@@ -430,12 +430,16 @@ operator verbs.
 The three `inspect_*` functions each return `ResourceInspection { kind, id, metadata }`
 where `kind` is a `&'static str` and `metadata` is a free-form `serde_json::Value`:
 
-- `inspect_blob` parses a `BlobDigest`, resolves the two-hex-character shard directory,
-  rejects a symlinked shard or a symlinked blob file, reads the blob's `size_bytes` and
-  `reference_count` from the blob store's `metadata.sqlite`, and **cross-checks the
-  recorded size against the file's actual length**, reporting `OperationsError::Data` on
-  mismatch. It is therefore a corruption check, not just a lookup. Reveals size, reference
-  count, and stored-ness. Bounded to one shard entry.
+- `inspect_blob` parses a `BlobDigest`, resolves the shard directory and the object path
+  through the blob store's own path ownership (`blob::shard_path` and `blob::object_path` -
+  pure functions of `(root, digest)`), rejects a symlinked shard or a symlinked blob file,
+  reads the blob's `size_bytes` and `reference_count` from the blob store's metadata
+  database, and **cross-checks the recorded size against the file's actual length**,
+  reporting `OperationsError::Data` on mismatch. It is therefore a corruption check, not
+  just a lookup. Reveals size, reference count, and stored-ness. Bounded to one shard
+  entry. It resolves the object *without opening the store*: `BlobStore::open` would
+  create the root and the metadata database when absent and sweep stale part files, and
+  an inspection verb must not bring a store into being or reconcile one that exists.
 - `inspect_workspace` reads one row: `state`, `logical_bytes`, `manifest_digest`,
   `expires_unix_ms`. Single indexed query.
 - `inspect_artifact` reads `record_json` and deserializes the full
@@ -444,7 +448,9 @@ where `kind` is a `&'static str` and `metadata` is a free-form `serde_json::Valu
 
 All three read only, and all three map a missing or unreadable resource to
 `OperationsError::NotFound`, which the binary flattens to "resource was not found or could
-not be inspected" — indistinguishable from the outside.
+not be inspected" — indistinguishable from the outside. The store metadata file names are
+not spelled here: they are resolved through `blob::metadata_path`,
+`workspace::metadata_path` and `artifact::metadata_path`, which are their owners.
 
 ## Garbage collection
 
@@ -452,16 +458,38 @@ not be inspected" — indistinguishable from the outside.
 `1..=MAX_GC_BATCH` (1024) and then splits.
 
 **The default is a read-only preview.** Without `--apply`, `dry_run` is true and
-`dry_run_gc` runs a fixed set of read-only aggregate queries: expired workspaces with a
-count and summed `logical_bytes`; expired retained manifests; expired artifacts; expired
-blob *references*; and unreferenced blobs (`reference_count = 0`, ordered by
-`last_used_unix_ms`) with a count and summed `size_bytes`. All except the manifest query
-are bounded by `LIMIT ?`; the manifest query is wrapped in `unwrap_or(0)` with an explicit
-comment that older stores predate the retained-manifest cache and the preview should
-report zero rather than fail. All counts are `.max(0) as u64`, and every `*_deleted` field
-is `0`. **What the limit implies:** the preview is a bounded *sample* of the oldest
-eligible entries, not an exhaustive census. A nonzero count proves there is garbage; a
-zero count does not prove there is none when the eligible set exceeds the limit.
+`dry_run_gc` asks each owner module for the candidates the collector would act on:
+expired workspaces with a count and summed `logical_bytes`; expired retained manifests;
+expired artifacts; expired blob *references*; and unreferenced blobs with a count and
+summed `size_bytes`. The operator module holds **no** candidate predicate and **no** SQL of
+its own: it calls `blob::preview_gc`, `workspace::preview_gc` and `artifact::preview_gc`,
+which evaluate the same canonical statements the collectors evaluate. All candidate
+queries are bounded by `LIMIT ?`; the manifest query tolerates a store that predates the
+retained-manifest cache and reports zero manifest candidates for it rather than failing the
+whole preview. Every `*_deleted` field is `0`. **What the limit implies:** the preview is a
+bounded *sample* of the oldest eligible entries, not an exhaustive census. A nonzero count
+proves there is garbage; a zero count does not prove there is none when the eligible set
+exceeds the limit.
+
+**The preview does not open the stores.** `BlobStore::open`, `WorkspaceManager::open` and
+`ArtifactStore::open` all create and reconcile — they create the root and the metadata
+database when absent, and they sweep stale part files and unmatched rows. A preview that
+opened a store would therefore mutate the store it reports on, and against a store that does
+not exist yet it would bring one into being. So the preview reaches the owner modules
+through entry points that open the metadata database `SQLITE_OPEN_READ_ONLY` and evaluate
+the canonical statement directly. The consequence for the operator: **`eggworkd gc` against
+a store that does not exist fails with a typed error rather than reporting zero
+candidates**, and it leaves the filesystem exactly as it found it.
+
+**Preview and apply answer the same question.** The preview evaluates the candidate
+statement *before* the expired blob references are deleted; the apply pass evaluates it
+*after*. The preview's set is therefore a **subset** of what the apply pass removes, and
+the difference is exactly the blobs that became unreferenced because their expired reference
+was swept in the same pass. When the store holds no expired references, the two select at
+the same point and the sets are **equal**. This used not to hold: the preview carried its
+own hand-copied copy of the blob candidate predicate and selected on the `reference_count`
+counter while the collector selected on the reference rows, so the preview could report a
+candidate the apply pass would not remove, and miss one it would.
 
 **Applying takes an exclusive lock, which is why it cannot run against a live node.**
 `acquire_maintenance_lock` opens `database_path.with_extension("lock")` (mode `0o600`)
@@ -474,16 +502,19 @@ generic "bounded garbage collection failed", which is unfortunate but not wrong.
 contrast with the live path matters: `NodeServer::collect_garbage` runs inside the node,
 where the lock is already held and coordination is internal. So there are two GC paths
 with the same report shape and different preconditions — do not conclude from the shared
-`NodeGcReport` that the offline and online paths are interchangeable.
+`NodeGcReport` that the offline and online paths are interchangeable. What they *do* share
+is the candidate predicate: both call the owner collectors, so the in-process path and the
+operator's path cannot disagree about what is collectable.
 
 The applied path is also **not exhaustive**: each of the four stores is asked to collect
 `now, limit, false`, so one invocation removes at most `limit` items per store (up to
 1024) and repeated invocations are how a large backlog is drained.
 
 **Reference and execution protection** is inherited from the stores themselves: blob
-eligibility is `reference_count = 0` (a referenced blob is never a candidate), workspaces
-must be past `expires_unix_ms`, and running executions keep their workspaces and blobs
-referenced. This file does not add its own active-execution filter to GC — that
+eligibility is the *absence of a reference row* (a referenced blob is never a candidate,
+and the trigger-maintained `reference_count` counter is deliberately not consulted),
+workspaces must be past `expires_unix_ms`, and running executions keep their workspaces
+and blobs referenced. This file does not add its own active-execution filter to GC — that
 protection lives in the store implementations ([data-plane.md](data-plane.md),
 [storage-journal.md](storage-journal.md)). Note that `gc` is a *separate* verb from
 `drain`: `eggworkd gc` does not set the drain marker, so the operator must reason about
@@ -598,7 +629,9 @@ be able to tell them apart from the JSON alone, since the exit code is 2 in ever
 | Execution listings are bounded and paginate | `MAX_EXECUTION_PAGE`, `load_snapshots` `LIMIT 2049` + `Bounds` | `execution_listing_is_bounded_and_paginates_over_durable_records` |
 | Symlinks are never followed when measuring a tree | `tree_bytes` `file_type().is_symlink()` check | `tree_size_never_follows_symlinks` |
 | The reported metric set is fixed and bounded | `METRIC_NAMES` overlay filter | `metrics_report_uses_a_fixed_bounded_counter_set` |
-| GC preview is read-only and reports its bound | `dry_run_gc` aggregate queries; no stores opened | `garbage_collection_preview_reads_only_and_reports_bounds` |
+| GC preview is read-only and reports its bound | `dry_run_gc` asks the owner modules for their candidate sets; no store is opened | `garbage_collection_preview_reads_only_and_reports_bounds`; `gc_preview_does_not_create_a_store_that_does_not_exist` |
+| GC preview and GC apply select the same candidates | the owner modules' canonical candidate statements; the operator holds no candidate predicate | `gc_preview_uses_the_stores_own_blob_predicate_not_the_reference_count_counter`; `gc_preview_candidates_are_a_subset_of_what_the_apply_pass_removes`; `gc_preview_and_apply_agree_when_the_store_has_no_expired_references`; `the_operator_module_contains_no_candidate_predicate_of_its_own` (`tests/gc_preview_parity.rs`) |
+| The operator does not spell a store's file name or the blob layout | `blob::metadata_path`, `workspace::metadata_path`, `artifact::metadata_path`, `blob::shard_path`, `blob::object_path` | `the_operator_module_contains_no_candidate_predicate_of_its_own` (`tests/gc_preview_parity.rs`); `inspect_blob_resolves_the_object_through_the_store_path_ownership` |
 | `gc --apply` cannot race a running node | `acquire_maintenance_lock` `try_lock_exclusive` | `applying_gc_refuses_to_race_a_running_node` |
 | The drain marker survives a process restart and `undrain` removes it | `set_persistent_drain` temp+rename+fsync; `NotFound` tolerated on removal | `drain_state_survives_process_restart_and_undrain_removes_marker` |
 | Quiescence fails closed on unreadable state | `active_execution_count` returning `usize::MAX` | No test in this file; exercised by [release-qualification.md](release-qualification.md) |

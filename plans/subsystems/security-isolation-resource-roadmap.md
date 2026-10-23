@@ -1,6 +1,6 @@
 # Security, Isolation, and Resource Enforcement Roadmap
 
-Status: closed through M004 (remote-admission C001 and Operations M002 included); M005a implemented (closure record written, implementation commit pending); M005b corrective proposed; M005c blocked on ADR-0007
+Status: closed through M004 (remote-admission C001 and Operations M002 included); M005a and M005b implemented (closure records written, implementation commits pending); M005c blocked on ADR-0007
 
 Canonical authority:
 
@@ -182,7 +182,10 @@ Exit conditions:
 
 Class: invariant
 
-Status: proposed
+Status: implemented — closure record written, implementation commit pending
+
+Closure evidence: `plans/closure/security-isolation-resource/005b-status.md`
+(implementation `IMPLEMENTATION-COMMIT-PENDING`)
 
 Corrective addendum:
 

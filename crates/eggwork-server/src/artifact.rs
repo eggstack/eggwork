@@ -6,7 +6,7 @@ use eggwork_core::{
     ExecutionId, PrincipalId, RelativePath, WorkspaceEntry, WorkspaceManifest,
 };
 use futures_util::stream;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -54,6 +54,76 @@ pub struct ArtifactStore {
 pub struct ArtifactGcReport {
     pub candidate_artifacts: u64,
     pub deleted_artifacts: u64,
+}
+
+/// The canonical artifact-candidate statement.
+///
+/// One producer for the predicate: the collector and the operator's preview
+/// evaluate this exact statement, so the preview cannot answer a different
+/// question from the pass it previews.
+const ARTIFACT_CANDIDATES_SQL: &str = "SELECT artifact_id FROM artifacts WHERE expires_unix_ms <= ?1 ORDER BY expires_unix_ms LIMIT ?2";
+
+/// The artifact store's metadata database path.
+///
+/// The store owns this file name. The operator resolves it through this
+/// function instead of spelling `artifacts.sqlite` itself, so renaming the
+/// store's database is a one-line change here.
+pub fn metadata_path(database_path: &Path) -> PathBuf {
+    database_path.with_extension("artifacts.sqlite")
+}
+
+/// What the collector would act on, evaluated without opening the store.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcPreview {
+    /// Expired artifacts, oldest expiry first.
+    pub artifacts: Vec<String>,
+}
+
+/// Open the store's metadata database without the ability to change it.
+///
+/// `SQLITE_OPEN_READ_ONLY` never creates the file and never writes to it,
+/// which is what lets the operator's preview read a store that does not
+/// exist (it fails) instead of bringing one into being (it must not).
+fn open_metadata_read_only(path: &Path) -> Result<Connection, ArtifactError> {
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(ArtifactError::from)
+}
+
+/// Expired artifacts, oldest expiry first, bounded by `limit`.
+///
+/// The one implementation of the artifact candidate predicate. The collector
+/// evaluates it against the live store; the operator's preview evaluates the
+/// same statement against a read-only connection.
+fn artifact_candidates(
+    connection: &Connection,
+    now_unix_ms: u64,
+    limit: usize,
+) -> Result<Vec<String>, ArtifactError> {
+    let mut statement = connection.prepare(ARTIFACT_CANDIDATES_SQL)?;
+    let rows = statement.query_map(
+        params![now_unix_ms as i64, limit.min(i64::MAX as usize) as i64],
+        |row| row.get(0),
+    )?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// The artifact candidates the collector would act on, without opening the
+/// store.
+///
+/// `ArtifactStore::open` is not read-only: it creates the parent directory
+/// and the metadata database when they are absent. An operator preview that
+/// opened the store would therefore bring into being the very store it is
+/// reporting on, so it reaches the canonical statement through this entry
+/// point instead: the same database file, opened read-only, and the same
+/// statement.
+pub fn preview_gc(path: &Path, now_unix_ms: u64, limit: usize) -> Result<GcPreview, ArtifactError> {
+    let connection = open_metadata_read_only(path)?;
+    Ok(GcPreview {
+        artifacts: artifact_candidates(&connection, now_unix_ms, limit)?,
+    })
 }
 
 type DiscoveredFiles = Vec<(RelativePath, PathBuf, bool)>;
@@ -190,33 +260,22 @@ impl ArtifactStore {
         dry_run: bool,
     ) -> Result<ArtifactGcReport, ArtifactError> {
         let connection = self.connection.lock().map_err(|_| ArtifactError::Worker)?;
-        let count: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM artifacts WHERE expires_unix_ms <= ?1",
-            [now_unix_ms as i64],
-            |row| row.get(0),
-        )?;
-        let limit = limit.min(i64::MAX as usize) as i64;
-        let candidate_count: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM (SELECT artifact_id FROM artifacts
-             WHERE expires_unix_ms <= ?1 ORDER BY expires_unix_ms LIMIT ?2)",
-            params![now_unix_ms as i64, limit],
-            |row| row.get(0),
-        )?;
+        // One statement, one predicate. The candidate window is the same set
+        // the operator's preview reports, and the delete removes exactly the
+        // rows that window named.
+        let candidates = artifact_candidates(&connection, now_unix_ms, limit)?;
+        let candidate_count = candidates.len() as u64;
         if !dry_run {
-            connection.execute(
-                "DELETE FROM artifacts WHERE artifact_id IN
-                 (SELECT artifact_id FROM artifacts WHERE expires_unix_ms <= ?1
-                  ORDER BY expires_unix_ms LIMIT ?2)",
-                params![now_unix_ms as i64, limit],
-            )?;
+            for artifact_id in &candidates {
+                connection.execute(
+                    "DELETE FROM artifacts WHERE artifact_id = ?1",
+                    [artifact_id],
+                )?;
+            }
         }
         Ok(ArtifactGcReport {
-            candidate_artifacts: candidate_count.max(0).min(count.max(0)) as u64,
-            deleted_artifacts: if dry_run {
-                0
-            } else {
-                candidate_count.max(0).min(count.max(0)) as u64
-            },
+            candidate_artifacts: candidate_count,
+            deleted_artifacts: if dry_run { 0 } else { candidate_count },
         })
     }
 }

@@ -888,7 +888,7 @@ fn file_family_bytes(path: &Path) -> u64 {
 }
 
 pub fn storage_summary(config: &OperatorConfig) -> Result<StorageSummary, OperationsError> {
-    let artifact_db = config.database_path.with_extension("artifacts.sqlite");
+    let artifact_db = crate::artifact::metadata_path(&config.database_path);
     Ok(StorageSummary {
         execution_bytes: file_family_bytes(&config.database_path),
         blob_bytes: tree_bytes(&config.blob_root)?,
@@ -946,7 +946,7 @@ pub async fn collect_garbage(
         .map_err(|_| OperationsError::Data)?;
     let blobs = BlobStore::open(&config.blob_root, config.blob_quota_bytes)
         .map_err(|_| OperationsError::Data)?;
-    let artifacts = ArtifactStore::open(config.database_path.with_extension("artifacts.sqlite"))
+    let artifacts = ArtifactStore::open(crate::artifact::metadata_path(&config.database_path))
         .map_err(|_| OperationsError::Data)?;
     let now = crate::artifact::now_unix_ms();
     let (workspace_candidates, workspace_logical_bytes, workspaces_deleted) = workspaces
@@ -1030,64 +1030,46 @@ fn read_only_database(path: &Path) -> Result<rusqlite::Connection, OperationsErr
 }
 
 fn dry_run_gc(config: &OperatorConfig, limit: usize) -> Result<NodeGcReport, OperationsError> {
-    let now = crate::artifact::now_unix_ms() as i64;
-    let workspace_db = read_only_database(&config.workspace_root.join("metadata.sqlite"))?;
-    let (workspace_candidates, workspace_logical_bytes): (i64, i64) = workspace_db
-        .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(logical_bytes),0) FROM
-             (SELECT logical_bytes FROM workspaces WHERE expires_unix_ms IS NOT NULL
-              AND expires_unix_ms <= ?1 ORDER BY expires_unix_ms LIMIT ?2)",
-            rusqlite::params![now, limit as i64],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|_| OperationsError::Data)?;
-    // Older stores predate the retained-manifest cache; report zero instead
-    // of failing the whole preview.
-    let manifest_candidates: i64 = workspace_db
-        .query_row(
-            "SELECT COUNT(*) FROM (SELECT manifest_digest FROM retained_manifests
-             WHERE expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?1
-             ORDER BY expires_unix_ms LIMIT ?2)",
-            rusqlite::params![now, limit as i64],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let artifact_db = read_only_database(&config.database_path.with_extension("artifacts.sqlite"))?;
-    let artifact_candidates: i64 = artifact_db
-        .query_row(
-            "SELECT COUNT(*) FROM (SELECT artifact_id FROM artifacts
-             WHERE expires_unix_ms <= ?1 ORDER BY expires_unix_ms LIMIT ?2)",
-            rusqlite::params![now, limit as i64],
-            |row| row.get(0),
-        )
-        .map_err(|_| OperationsError::Data)?;
-    let blob_db = read_only_database(&config.blob_root.join("metadata.sqlite"))?;
-    let expired_blob_references: i64 = blob_db
-        .query_row(
-            "SELECT COUNT(*) FROM blob_references WHERE expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?1",
-            [now],
-            |row| row.get(0),
-        )
-        .map_err(|_| OperationsError::Data)?;
-    let (blob_candidates, blob_candidate_bytes): (i64, i64) = blob_db
-        .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM
-             (SELECT size_bytes FROM blobs WHERE reference_count = 0 ORDER BY last_used_unix_ms LIMIT ?1)",
-            [limit as i64],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+    // The preview owns no candidate predicate of its own. It asks each owner
+    // module for the set the collector would act on, and the owner evaluates
+    // the same statement the collector evaluates - so the preview and the
+    // apply pass cannot answer different questions.
+    //
+    // The owner entry points open the store's metadata database read-only.
+    // They do not open the store: `BlobStore::open`, `WorkspaceManager::open`
+    // and `ArtifactStore::open` all create and reconcile, and a preview that
+    // created the store it reports on would not be a preview.
+    let now = crate::artifact::now_unix_ms();
+    let workspaces = crate::workspace::preview_gc(
+        &crate::workspace::metadata_path(&config.workspace_root),
+        now,
+        limit,
+    )
+    .map_err(|_| OperationsError::Data)?;
+    let artifacts = crate::artifact::preview_gc(
+        &crate::artifact::metadata_path(&config.database_path),
+        now,
+        limit,
+    )
+    .map_err(|_| OperationsError::Data)?;
+    let blobs = crate::blob::preview_gc(&crate::blob::metadata_path(&config.blob_root), now, limit)
         .map_err(|_| OperationsError::Data)?;
     Ok(NodeGcReport {
-        workspace_candidates: workspace_candidates.max(0) as u64,
-        workspace_logical_bytes: workspace_logical_bytes.max(0) as u64,
+        workspace_candidates: workspaces.workspaces.len() as u64,
+        workspace_logical_bytes: workspaces.workspaces.iter().fold(0u64, |sum, candidate| {
+            sum.saturating_add(candidate.logical_bytes)
+        }),
         workspaces_deleted: 0,
-        manifest_candidates: manifest_candidates.max(0) as u64,
+        manifest_candidates: workspaces.manifests.len() as u64,
         manifests_deleted: 0,
-        artifact_candidates: artifact_candidates.max(0) as u64,
+        artifact_candidates: artifacts.artifacts.len() as u64,
         artifacts_deleted: 0,
-        expired_blob_references: expired_blob_references.max(0) as u64,
-        blob_candidates: blob_candidates.max(0) as u64,
-        blob_candidate_bytes: blob_candidate_bytes.max(0) as u64,
+        expired_blob_references: blobs.expired_references,
+        blob_candidates: blobs.candidates.len() as u64,
+        blob_candidate_bytes: blobs
+            .candidates
+            .iter()
+            .fold(0u64, |sum, (_, size)| sum.saturating_add(*size)),
         blobs_deleted: 0,
         blob_bytes_deleted: 0,
         dry_run: true,
@@ -1100,17 +1082,21 @@ pub fn inspect_blob(
 ) -> Result<ResourceInspection, OperationsError> {
     let digest = eggwork_core::BlobDigest::parse(digest.to_owned())
         .map_err(|_| OperationsError::NotFound)?;
-    let shard = config.blob_root.join(&digest.as_str()[..2]);
+    // The shard directory and the object path come from the store's own path
+    // ownership. The inspection verb runs against an offline store, so it
+    // must not need a store instance - and a store instance would mean the
+    // creating, reconciling open that `BlobStore::open` performs.
+    let shard = crate::blob::shard_path(&config.blob_root, &digest);
     let shard_meta = fs::symlink_metadata(&shard).map_err(|_| OperationsError::NotFound)?;
     if !shard_meta.is_dir() || shard_meta.file_type().is_symlink() {
         return Err(OperationsError::NotFound);
     }
-    let path = shard.join(digest.as_str());
+    let path = crate::blob::object_path(&config.blob_root, &digest);
     let metadata = fs::symlink_metadata(&path).map_err(|_| OperationsError::NotFound)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(OperationsError::NotFound);
     }
-    let db = read_only_database(&config.blob_root.join("metadata.sqlite"))?;
+    let db = read_only_database(&crate::blob::metadata_path(&config.blob_root))?;
     let size_recorded: Option<(i64, i64)> = db
         .query_row(
             "SELECT size_bytes,reference_count FROM blobs WHERE digest=?1",
@@ -1136,7 +1122,7 @@ pub fn inspect_workspace(
 ) -> Result<ResourceInspection, OperationsError> {
     let id =
         eggwork_core::WorkspaceId::new(id.to_owned()).map_err(|_| OperationsError::NotFound)?;
-    let db = read_only_database(&config.workspace_root.join("metadata.sqlite"))?;
+    let db = read_only_database(&crate::workspace::metadata_path(&config.workspace_root))?;
     let row: Option<(String, i64, String, Option<i64>)> = db.query_row("SELECT state, logical_bytes, manifest_digest, expires_unix_ms FROM workspaces WHERE workspace_id=?1", [id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|_| OperationsError::Data)?;
     let (state, logical, digest, expires) = row.ok_or(OperationsError::NotFound)?;
     Ok(ResourceInspection {
@@ -1151,7 +1137,7 @@ pub fn inspect_artifact(
     id: &str,
 ) -> Result<ResourceInspection, OperationsError> {
     let id = eggwork_core::ArtifactId::new(id.to_owned()).map_err(|_| OperationsError::NotFound)?;
-    let db = read_only_database(&config.database_path.with_extension("artifacts.sqlite"))?;
+    let db = read_only_database(&crate::artifact::metadata_path(&config.database_path))?;
     let row: Option<Vec<u8>> = db
         .query_row(
             "SELECT record_json FROM artifacts WHERE artifact_id=?1",
@@ -1462,51 +1448,453 @@ mod tests {
         assert_eq!(next.next_offset, Some(2));
     }
 
+    /// The three data-plane stores, built through their owner modules.
+    ///
+    /// The fixture this replaces hand-built a `blobs` table whose columns were
+    /// `(reference_count, size_bytes, last_used_unix_ms)`, with no `digest`
+    /// column at all. It was a database shaped to the hand-copied predicate,
+    /// and the canonical statement could not even be evaluated against it.
+    fn real_stores(config: &OperatorConfig) -> (BlobStore, WorkspaceManager, ArtifactStore) {
+        (
+            BlobStore::open(&config.blob_root, config.blob_quota_bytes).unwrap(),
+            WorkspaceManager::open(&config.workspace_root, config.workspace_quota_bytes).unwrap(),
+            ArtifactStore::open(crate::artifact::metadata_path(&config.database_path)).unwrap(),
+        )
+    }
+
+    async fn seed_blob(blobs: &BlobStore, bytes: &'static [u8]) -> eggwork_core::BlobDigest {
+        let digest = eggwork_core::BlobDigest::from_bytes(bytes);
+        blobs
+            .put_stream(
+                digest.clone(),
+                bytes.len() as u64,
+                futures_util::stream::iter([Ok::<_, ()>(bytes::Bytes::from_static(bytes))]),
+            )
+            .await
+            .unwrap();
+        digest
+    }
+
+    /// The blob states the two candidate predicates can disagree about.
+    struct BlobStates {
+        /// A live reference row: never a candidate.
+        live: eggwork_core::BlobDigest,
+        /// Only an expired reference row: a candidate once that row is gone.
+        /// Absent when the fixture seeds no expired reference at all.
+        expired: Option<eggwork_core::BlobDigest>,
+        /// No reference rows at all: always a candidate.
+        unreferenced: Vec<eggwork_core::BlobDigest>,
+        /// A live reference row whose counter says zero.
+        ///
+        /// Two of them, so that the two candidate predicates disagree on the
+        /// *count* and not only on the membership: a counter-based predicate
+        /// would report one blob too many, which a count comparison can see.
+        counter_low: Vec<eggwork_core::BlobDigest>,
+        /// No reference rows whose counter says one.
+        counter_high: eggwork_core::BlobDigest,
+    }
+
+    /// Seed the blob states and drift the trigger-maintained counter against
+    /// the reference rows of two of them.
+    ///
+    /// `blobs.reference_count` is a denormalization written only by the
+    /// `blob_reference_insert` / `blob_reference_delete` triggers. Drifting it
+    /// here does not fabricate a reference row: it reproduces the condition
+    /// under which a counter-based predicate and a reference-row predicate
+    /// answer different questions, which is the whole point of the
+    /// divergence this milestone removes.
+    async fn seed_blob_states(
+        config: &OperatorConfig,
+        blobs: &BlobStore,
+        with_expired_reference: bool,
+    ) -> BlobStates {
+        let states = BlobStates {
+            live: seed_blob(blobs, b"live").await,
+            expired: if with_expired_reference {
+                Some(seed_blob(blobs, b"expired").await)
+            } else {
+                None
+            },
+            unreferenced: vec![
+                seed_blob(blobs, b"unreferenced-a").await,
+                seed_blob(blobs, b"unreferenced-b").await,
+                seed_blob(blobs, b"unreferenced-c").await,
+            ],
+            counter_low: vec![
+                seed_blob(blobs, b"counter-low-a").await,
+                seed_blob(blobs, b"counter-low-b").await,
+            ],
+            counter_high: seed_blob(blobs, b"counter-high").await,
+        };
+        blobs
+            .retain(
+                "workspace",
+                "ws-live",
+                std::slice::from_ref(&states.live),
+                None,
+            )
+            .unwrap();
+        blobs
+            .retain("workspace", "ws-counter", &states.counter_low, None)
+            .unwrap();
+        if let Some(expired) = states.expired.clone() {
+            blobs
+                .retain("workspace", "ws-expired", &[expired], Some(1))
+                .unwrap();
+        }
+        let connection =
+            rusqlite::Connection::open(crate::blob::metadata_path(&config.blob_root)).unwrap();
+        for digest in &states.counter_low {
+            connection
+                .execute(
+                    "UPDATE blobs SET reference_count = 0 WHERE digest = ?1",
+                    [digest.as_str()],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "UPDATE blobs SET reference_count = 1 WHERE digest = ?1",
+                [states.counter_high.as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        states
+    }
+
+    /// Seed expired workspaces and artifacts so the preview's workspace and
+    /// artifact figures are exercised against real tables.
+    ///
+    /// The workspace rows need a storage directory that exists, because the
+    /// manager's reconciliation drops rows whose tree is gone.
+    fn seed_expired_workspaces(config: &OperatorConfig, count: usize) {
+        let connection =
+            rusqlite::Connection::open(crate::workspace::metadata_path(&config.workspace_root))
+                .unwrap();
+        for index in 0..count {
+            let storage_key = format!("workspace-{}", uuid::Uuid::new_v4());
+            fs::create_dir_all(config.workspace_root.join(&storage_key)).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO workspaces(workspace_id, execution_id, generation, principal_id,
+                       manifest_digest, storage_key, logical_bytes, state, created_unix_ms,
+                       expires_unix_ms)
+                     VALUES (?1, 'exec-expired', 1, 'principal-a', 'digest', ?2, 99, 'Ready', 0, 1)",
+                    rusqlite::params![
+                        format!("workspace-expired-{index}"),
+                        storage_key
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+    }
+
+    fn seed_expired_artifacts(config: &OperatorConfig, count: usize) {
+        let connection =
+            rusqlite::Connection::open(crate::artifact::metadata_path(&config.database_path))
+                .unwrap();
+        for index in 0..count {
+            connection
+                .execute(
+                    "INSERT INTO artifacts(artifact_id, execution_id, generation, principal_id,
+                       record_json, created_unix_ms, expires_unix_ms)
+                     VALUES (?1, 'exec-expired', 1, 'principal-a', ?2, 0, 1)",
+                    rusqlite::params![
+                        format!("artifact-expired-{index}"),
+                        format!("{{\"n\":{index}}}").into_bytes()
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+    }
+
+    /// The candidates the store's own canonical statement selects.
+    fn owner_preview(config: &OperatorConfig, now: u64, limit: usize) -> crate::blob::GcPreview {
+        crate::blob::preview_gc(&crate::blob::metadata_path(&config.blob_root), now, limit).unwrap()
+    }
+
+    /// The digests the store's own candidate statement selects.
+    fn owner_candidates(config: &OperatorConfig, now: u64, limit: usize) -> Vec<String> {
+        owner_preview(config, now, limit)
+            .candidates
+            .into_iter()
+            .map(|(digest, _)| digest)
+            .collect()
+    }
+
+    /// Every seeded digest, in a stable order.
+    fn all_seeded(states: &BlobStates) -> Vec<eggwork_core::BlobDigest> {
+        let mut all = vec![states.live.clone(), states.counter_high.clone()];
+        all.extend(states.counter_low.iter().cloned());
+        all.extend(states.expired.clone());
+        all.extend(states.unreferenced.iter().cloned());
+        all
+    }
+
+    /// The digests whose object file the collector removed.
+    fn removed_objects(config: &OperatorConfig, states: &BlobStates) -> Vec<String> {
+        all_seeded(states)
+            .into_iter()
+            .filter(|digest| !crate::blob::object_path(&config.blob_root, digest).exists())
+            .map(|digest| digest.as_str().to_owned())
+            .collect()
+    }
+
     #[tokio::test]
     async fn garbage_collection_preview_reads_only_and_reports_bounds() {
         let temp = TempDir::new().unwrap();
         let config = config(temp.path());
-        fs::create_dir_all(&config.workspace_root).unwrap();
-        fs::create_dir_all(&config.blob_root).unwrap();
         fs::create_dir_all(config.database_path.parent().unwrap()).unwrap();
-        let workspace_db =
-            rusqlite::Connection::open(config.workspace_root.join("metadata.sqlite")).unwrap();
-        workspace_db.execute_batch("CREATE TABLE workspaces(workspace_id TEXT,logical_bytes INTEGER,expires_unix_ms INTEGER);").unwrap();
-        workspace_db
-            .execute("INSERT INTO workspaces VALUES ('workspace-1',99,0)", [])
-            .unwrap();
-        drop(workspace_db);
-        let artifact_db =
-            rusqlite::Connection::open(config.database_path.with_extension("artifacts.sqlite"))
-                .unwrap();
-        artifact_db
-            .execute_batch("CREATE TABLE artifacts(artifact_id TEXT,expires_unix_ms INTEGER);")
-            .unwrap();
-        artifact_db
-            .execute("INSERT INTO artifacts VALUES ('artifact-1',0)", [])
-            .unwrap();
-        drop(artifact_db);
-        let blob_db = rusqlite::Connection::open(config.blob_root.join("metadata.sqlite")).unwrap();
-        blob_db.execute_batch("CREATE TABLE blob_references(expires_unix_ms INTEGER); CREATE TABLE blobs(reference_count INTEGER,size_bytes INTEGER,last_used_unix_ms INTEGER);").unwrap();
-        blob_db
-            .execute("INSERT INTO blob_references VALUES (0)", [])
-            .unwrap();
-        blob_db
-            .execute("INSERT INTO blobs VALUES (0,123,0)", [])
-            .unwrap();
-        drop(blob_db);
+        let (blobs, workspaces, artifacts) = real_stores(&config);
+        seed_blob_states(&config, &blobs, true).await;
+        seed_expired_workspaces(&config, 2);
+        seed_expired_artifacts(&config, 2);
+        // Close the stores so the preview reads a cleanly checkpointed
+        // database rather than a live write-ahead log.
+        drop(artifacts);
+        drop(workspaces);
+        drop(blobs);
         let in_flight_upload = config.blob_root.join(".part-live-upload");
         fs::write(&in_flight_upload, b"partial upload").unwrap();
 
-        let report = collect_garbage(&config, true, 1).await.unwrap();
-        assert_eq!(report.workspace_candidates, 1);
-        assert_eq!(report.workspace_logical_bytes, 99);
-        assert_eq!(report.artifact_candidates, 1);
-        assert_eq!(report.expired_blob_references, 1);
-        assert_eq!(report.blob_candidates, 1);
-        assert!(report.dry_run);
+        // The bound is honoured: the preview reports a bounded sample of the
+        // eligible entries, not a census.
+        let bounded = collect_garbage(&config, true, 1).await.unwrap();
+        assert_eq!(bounded.workspace_candidates, 1);
+        assert_eq!(bounded.artifact_candidates, 1);
+        assert_eq!(bounded.blob_candidates, 1);
+        assert!(bounded.dry_run);
+        assert_eq!(bounded.workspaces_deleted, 0);
+        assert_eq!(bounded.artifacts_deleted, 0);
+        assert_eq!(bounded.blobs_deleted, 0);
+        // A preview reads; it does not sweep. The in-flight upload survives.
         assert!(in_flight_upload.exists());
         assert_eq!(fs::read(&in_flight_upload).unwrap(), b"partial upload");
+
+        // The unbounded figures of the same store.
+        let full = collect_garbage(&config, true, 8).await.unwrap();
+        assert_eq!(full.workspace_candidates, 2);
+        assert_eq!(full.workspace_logical_bytes, 198);
+        assert_eq!(full.artifact_candidates, 2);
+        assert_eq!(full.expired_blob_references, 1);
+        assert_eq!(full.blob_candidates, 4);
+        assert!(full.dry_run);
+        assert!(in_flight_upload.exists());
+        assert_eq!(fs::read(&in_flight_upload).unwrap(), b"partial upload");
+    }
+
+    #[tokio::test]
+    async fn gc_preview_uses_the_stores_own_blob_predicate_not_the_reference_count_counter() {
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        fs::create_dir_all(config.database_path.parent().unwrap()).unwrap();
+        let (blobs, workspaces, artifacts) = real_stores(&config);
+        let states = seed_blob_states(&config, &blobs, true).await;
+        drop(artifacts);
+        drop(workspaces);
+        drop(blobs);
+
+        let report = collect_garbage(&config, true, 8).await.unwrap();
+        let owner = owner_preview(&config, crate::artifact::now_unix_ms(), 8);
+        let candidates: Vec<String> = owner
+            .candidates
+            .iter()
+            .map(|(digest, _)| digest.clone())
+            .collect();
+
+        // The operator's preview reports exactly the owner's candidate set -
+        // the same count and the same bytes. A counter-based predicate would
+        // report two blobs too many here, because it counts the drifted
+        // blobs whose counter says zero and misses the one whose counter
+        // says one.
+        assert_eq!(report.blob_candidates as usize, owner.candidates.len());
+        assert_eq!(report.blob_candidates, 4);
+        assert_eq!(
+            report.blob_candidate_bytes,
+            owner
+                .candidates
+                .iter()
+                .fold(0u64, |sum, (_, size)| sum.saturating_add(*size))
+        );
+
+        // The reference-row predicate, not the counter: a blob whose counter
+        // says zero but which still has a live reference row is not a
+        // candidate, and a blob whose counter says one but which has no
+        // reference rows is. A counter-based predicate answers exactly the
+        // opposite for both, which is the divergence this test rules out.
+        for digest in &states.counter_low {
+            assert!(
+                !candidates.contains(&digest.as_str().to_owned()),
+                "a blob with a live reference row is never a candidate"
+            );
+        }
+        assert!(
+            candidates.contains(&states.counter_high.as_str().to_owned()),
+            "a blob with no reference rows is a candidate whatever the counter says"
+        );
+        assert!(!candidates.contains(&states.live.as_str().to_owned()));
+        assert!(!candidates.contains(&states.expired.as_ref().unwrap().as_str().to_owned()));
+        for digest in &states.unreferenced {
+            assert!(candidates.contains(&digest.as_str().to_owned()));
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_preview_candidates_are_a_subset_of_what_the_apply_pass_removes() {
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        fs::create_dir_all(config.database_path.parent().unwrap()).unwrap();
+        let (blobs, workspaces, artifacts) = real_stores(&config);
+        let states = seed_blob_states(&config, &blobs, true).await;
+        drop(artifacts);
+        drop(workspaces);
+        drop(blobs);
+
+        let preview = owner_candidates(&config, crate::artifact::now_unix_ms(), 8);
+        assert_eq!(preview.len(), 4);
+
+        let applied = collect_garbage(&config, false, 8).await.unwrap();
+        assert!(!applied.dry_run);
+        let removed = removed_objects(&config, &states);
+
+        // The preview's set is a subset of what the apply pass removes.
+        for digest in &preview {
+            assert!(
+                removed.contains(digest),
+                "the preview reported {digest}, which the apply pass did not remove"
+            );
+        }
+        // The apply pass removes strictly more here, and only for the
+        // documented reason: it selects after the expired reference rows are
+        // deleted, so a blob that has just become unreferenced is collectable
+        // in the same pass.
+        assert_eq!(removed.len(), 5);
+        assert!(removed.contains(&states.expired.as_ref().unwrap().as_str().to_owned()));
+        assert!(!removed.contains(&states.live.as_str().to_owned()));
+        for digest in &states.counter_low {
+            assert!(!removed.contains(&digest.as_str().to_owned()));
+        }
+        assert!(!removed.contains(&states.live.as_str().to_owned()));
+    }
+
+    #[tokio::test]
+    async fn gc_preview_and_apply_agree_when_the_store_has_no_expired_references() {
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        fs::create_dir_all(config.database_path.parent().unwrap()).unwrap();
+        let (blobs, workspaces, artifacts) = real_stores(&config);
+        let states = seed_blob_states(&config, &blobs, false).await;
+        drop(artifacts);
+        drop(workspaces);
+        drop(blobs);
+
+        let preview = owner_candidates(&config, crate::artifact::now_unix_ms(), 8);
+        assert_eq!(preview.len(), 4);
+
+        let applied = collect_garbage(&config, false, 8).await.unwrap();
+        assert_eq!(applied.blob_candidates, 4);
+
+        let removed = removed_objects(&config, &states);
+
+        // With no expired references the two passes select at the same point
+        // in the transaction, so the sets are equal.
+        let mut preview_sorted = preview.clone();
+        preview_sorted.sort();
+        let mut removed_sorted = removed.clone();
+        removed_sorted.sort();
+        assert_eq!(preview_sorted, removed_sorted);
+    }
+
+    #[tokio::test]
+    async fn gc_preview_does_not_create_a_store_that_does_not_exist() {
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        assert!(!config.blob_root.exists());
+        assert!(!config.workspace_root.exists());
+        assert!(!config.database_path.exists());
+        assert!(!config.database_path.parent().unwrap().exists());
+
+        // The preview cannot evaluate a store that is not there, so it fails
+        // with a typed error rather than reporting zero candidates - and it
+        // fails without bringing the store into being.
+        assert!(collect_garbage(&config, true, 1).await.is_err());
+        assert!(!config.blob_root.exists());
+        assert!(!config.workspace_root.exists());
+        assert!(!config.database_path.exists());
+        assert!(!config.database_path.parent().unwrap().exists());
+
+        // The assertion has teeth: the creating, reconciling open the
+        // preview must not use does bring the store into being.
+        BlobStore::open(&config.blob_root, config.blob_quota_bytes).unwrap();
+        assert!(config.blob_root.exists());
+        assert!(crate::blob::metadata_path(&config.blob_root).exists());
+    }
+
+    #[tokio::test]
+    async fn inspect_blob_resolves_the_object_through_the_store_path_ownership() {
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        let blobs = BlobStore::open(&config.blob_root, config.blob_quota_bytes).unwrap();
+        let digest = seed_blob(&blobs, b"inspectable").await;
+
+        let inspection = inspect_blob(&config, digest.as_str()).unwrap();
+        assert_eq!(inspection.kind, "blob");
+        assert_eq!(inspection.id, digest.as_str());
+        assert_eq!(inspection.metadata["size_bytes"], 11u64);
+
+        // A recorded size that disagrees with the file's actual length is a
+        // data error, not a successful inspection.
+        let connection =
+            rusqlite::Connection::open(crate::blob::metadata_path(&config.blob_root)).unwrap();
+        connection
+            .execute(
+                "UPDATE blobs SET size_bytes = 3 WHERE digest = ?1",
+                [digest.as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            inspect_blob(&config, digest.as_str()),
+            Err(OperationsError::Data)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inspect_blob_refuses_a_symlinked_shard_or_object() {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        let blobs = BlobStore::open(&config.blob_root, config.blob_quota_bytes).unwrap();
+        let digest = seed_blob(&blobs, b"inspectable").await;
+        let shard = crate::blob::shard_path(&config.blob_root, &digest);
+        let object = crate::blob::object_path(&config.blob_root, &digest);
+
+        // A symlinked object file is refused.
+        let bytes = fs::read(&object).unwrap();
+        let outside = temp.path().join("outside-object");
+        fs::write(&outside, &bytes).unwrap();
+        fs::remove_file(&object).unwrap();
+        symlink(&outside, &object).unwrap();
+        assert!(matches!(
+            inspect_blob(&config, digest.as_str()),
+            Err(OperationsError::NotFound)
+        ));
+
+        // A symlinked shard directory is refused.
+        fs::remove_file(&object).unwrap();
+        fs::write(&object, &bytes).unwrap();
+        let outside_shard = temp.path().join("outside-shard");
+        fs::create_dir_all(&outside_shard).unwrap();
+        fs::write(outside_shard.join(digest.as_str()), &bytes).unwrap();
+        fs::remove_dir_all(&shard).unwrap();
+        symlink(&outside_shard, &shard).unwrap();
+        assert!(matches!(
+            inspect_blob(&config, digest.as_str()),
+            Err(OperationsError::NotFound)
+        ));
     }
 
     #[tokio::test]

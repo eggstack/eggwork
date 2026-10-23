@@ -39,6 +39,20 @@ use tokio_util::sync::CancellationToken;
 
 mod process_tree;
 
+/// The node's environment policy.
+///
+/// The policy — the denied-key list and its matching rule, the node-owned
+/// (reserved) keys, the node-owned baseline, and the `PATH` value contract —
+/// has exactly one owner: `crates/eggwork-runner/policy/environment-policy.toml`.
+/// This module is the runner's generated copy of it.
+///
+/// The standalone sandbox helper enforces the same policy and may not depend
+/// on any workspace crate, so it compiles its own generated copy of the same
+/// source. The two copies are pinned together by a parity test, which is what
+/// makes a one-sided edit fail the build instead of silently changing what is
+/// enforced.
+pub mod environment_policy;
+
 use process_tree::{ProcessTree, TreeConvergence};
 
 const READ_BUFFER: usize = 8192;
@@ -1877,33 +1891,92 @@ impl LocalProcessRunner {
     }
 }
 
-fn denied_environment_key(key: &str) -> bool {
-    let upper = key.to_ascii_uppercase();
-    [
-        "LD_",
-        "DYLD_",
-        "PATH",
-        "IFS",
-        "SHELLOPTS",
-        "CDPATH",
-        "BASH_ENV",
-        "ENV",
-        "PYTHONPATH",
-        "PYTHONHOME",
-        "NODE_OPTIONS",
-        "RUBYOPT",
-        "PERL5OPT",
-        "GIT_ASKPASS",
-        "SSH_ASKPASS",
-        "GIT_CONFIG",
-        "GIT_CONFIG_",
-        "AWS_",
-        "AZURE_",
-        "GOOGLE_",
-        "SSH_AUTH_SOCK",
-    ]
-    .iter()
-    .any(|denied| upper == *denied || upper.starts_with(denied))
+/// True when the node owns `key` on this platform.
+///
+/// The node-owned class is the node's own baseline: the node owns exactly the
+/// keys its baseline sets. On the Unix baseline that is
+/// `environment_policy::RESERVED_KEYS`, which is the shared policy's class.
+/// The Windows baseline is runner-local — its values are read from the parent
+/// process at spawn time, and the sandbox helper is Linux-only so it never
+/// sees a Windows launch — so it is derived from the baseline the runner
+/// actually installs rather than from the shared list.
+///
+/// The rule is deliberately *not* "is this key on the deny-list". A deny-list
+/// entry is a key the caller may not set at all; a node-owned key is one the
+/// node sets itself, and the caller's value for it is discarded in favour of
+/// the node's.
+fn node_owned_key(key: &str, baseline: &[(&'static str, String)]) -> bool {
+    baseline
+        .iter()
+        .any(|(owned, _)| owned.eq_ignore_ascii_case(key))
+}
+
+/// The environment a child process receives, built from the shared policy.
+///
+/// This is the single place the runner builds an environment, and both of the
+/// runner's launch paths use it, so the direct path and the sandbox-helper
+/// path cannot disagree about what a child sees.
+///
+/// Three rules, in the order they are applied:
+///
+/// 1. **The node's baseline wins.** The baseline is installed first and a
+///    caller-supplied value for a node-owned key is discarded. Before this
+///    rule, a caller that set `LANG` produced a launch specification with two
+///    `LANG` entries; the helper refuses a specification with duplicate keys,
+///    and a best-effort request answered that pre-target refusal by
+///    re-spawning the target with no Landlock ruleset at all. The
+///    observable result was a successful, entirely unconfined execution.
+/// 2. **A denied key is dropped.** Silently, and only here: the runner is the
+///    request-normalisation boundary, and a hardened environment has to be a
+///    property of the node rather than something the caller has to get right.
+///    The helper refuses a launch that contains one; the difference is a
+///    deliberate two-layer contract, and only the list is shared.
+/// 3. **Everything else is the caller's**, with a repeated key resolved to
+///    its last value. Collapsing the repeat is what keeps the launch
+///    specification free of duplicate keys, which the helper refuses.
+///
+/// The provenance entries are appended last and are node-owned too: they are
+/// neutral attribution, and a caller cannot forge them.
+fn build_child_environment(request: &RunnerRequest) -> Vec<(String, String)> {
+    let baseline = baseline_child_environment();
+    let mut environment: Vec<(String, String)> = baseline
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), value.clone()))
+        .collect();
+    for (key, value) in &request.environment {
+        if environment_policy::denied_environment_key(key) {
+            continue;
+        }
+        if node_owned_key(key, &baseline) {
+            continue;
+        }
+        match environment.iter_mut().find(|(existing, _)| existing == key) {
+            Some(slot) => slot.1 = value.clone(),
+            None => environment.push((key.clone(), value.clone())),
+        }
+    }
+    if let Some(id) = &request.provenance.execution_id {
+        environment.push(("EGGWORK_EXECUTION_ID".into(), id.as_str().into()));
+    }
+    if let Some(generation) = request.provenance.generation {
+        environment.push((
+            "EGGWORK_EXECUTION_GENERATION".into(),
+            generation.get().to_string(),
+        ));
+    }
+    environment
+}
+
+/// The keys the node's own baseline installs for an execution child.
+///
+/// The list is derived from the baseline the runner actually uses, so it
+/// cannot drift from it: it is the shared policy's Unix class on Unix, and the
+/// runner-local Windows class on Windows.
+pub fn baseline_environment_keys() -> Vec<&'static str> {
+    baseline_child_environment()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect()
 }
 
 fn direct_command(request: &RunnerRequest, cwd: PathBuf) -> Command {
@@ -1916,39 +1989,12 @@ fn direct_command(request: &RunnerRequest, cwd: PathBuf) -> Command {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     command.env_clear();
-    for (key, value) in baseline_child_environment() {
+    for (key, value) in build_child_environment(request) {
         command.env(key, value);
-    }
-    for (key, value) in &request.environment {
-        if !denied_environment_key(key) {
-            command.env(key, value);
-        }
-    }
-    if let Some(id) = &request.provenance.execution_id {
-        command.env("EGGWORK_EXECUTION_ID", id.as_str());
-    }
-    if let Some(generation) = request.provenance.generation {
-        command.env("EGGWORK_EXECUTION_GENERATION", generation.get().to_string());
     }
     command
 }
 
-/// The platform-appropriate minimum environment for an execution child.
-///
-/// This baseline is deliberately platform-shaped. It used to declare a
-/// Unix-only environment unconditionally, including `PATH=/usr/bin:/bin`, so a
-/// Windows child would have been handed a `PATH` that does not exist on
-/// Windows and no `SystemRoot`. That shaping was written against the M004
-/// qualification symptom of `state: Failed`, `failure: Internal`,
-/// `exit_code: null` -- and it could not have fixed Windows qualification,
-/// because at that time no Windows child existed at all: `run` refused with
-/// `UnsupportedPlatform` before spawn and the server mapped that refusal to
-/// `Internal`. Foundation M004 removed the refusal, which makes this shaping
-/// load-bearing instead of merely aspirational.
-///
-/// Unix keeps the narrow, deterministic baseline the existing Linux and macOS
-/// evidence was gathered with. Windows gets the system directories its loader
-/// and `cmd.exe` require, without inheriting the caller's full environment.
 /// What a settled output monitor means for the running child.
 ///
 /// `Some` is a termination reason and ends the wait. `None` means the monitor
@@ -1975,27 +2021,56 @@ fn monitor_termination(overflowed: bool) -> Option<TerminationReason> {
     overflowed.then_some(TerminationReason::OutputLimit)
 }
 
+/// The platform-appropriate minimum environment for an execution child.
+///
+/// The baseline is the node's own: it is installed before any caller-supplied
+/// entry, and a caller-supplied value for a baseline key is discarded in
+/// favour of the node's. See `build_child_environment` for the rules.
+///
+/// The Unix baseline is the shared policy's, and it is read from the generated
+/// policy module rather than written out here, so the runner and the sandbox
+/// helper cannot disagree about it.
+///
+/// The Windows baseline is deliberately runner-local and platform-shaped. It
+/// used to declare a Unix-only environment unconditionally, including
+/// `PATH=/usr/bin:/bin`, so a Windows child would have been handed a `PATH`
+/// that does not exist on Windows and no `SystemRoot`. That shaping was
+/// written against the M004 qualification symptom of `state: Failed`,
+/// `failure: Internal`, `exit_code: null` -- and it could not have fixed
+/// Windows qualification, because at that time no Windows child existed at
+/// all: `run` refused with `UnsupportedPlatform` before spawn and the server
+/// mapped that refusal to `Internal`. Foundation M004 removed the refusal,
+/// which makes this shaping load-bearing instead of merely aspirational.
+///
+/// Windows gets the system directories its loader and `cmd.exe` require,
+/// without inheriting the caller's full environment. The Windows `PATH` is
+/// deliberately *not* the shared policy's `PATH` value: the `PATH` contract is
+/// a Linux/Unix contract, and the sandbox helper never sees a Windows launch.
 fn baseline_child_environment() -> Vec<(&'static str, String)> {
-    let mut baseline: Vec<(&'static str, String)> = vec![
-        ("CI", "1".to_owned()),
-        ("NO_COLOR", "1".to_owned()),
-        ("TERM", "dumb".to_owned()),
-        ("GIT_TERMINAL_PROMPT", "0".to_owned()),
-        ("PAGER", "cat".to_owned()),
-    ];
-    #[cfg(not(windows))]
-    baseline.extend([
-        ("PATH", "/usr/bin:/bin".to_owned()),
-        ("LANG", "C.UTF-8".to_owned()),
-        ("LC_ALL", "C.UTF-8".to_owned()),
-    ]);
-    #[cfg(windows)]
-    {
-        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
-        baseline.push(("SystemRoot", system_root.clone()));
-        baseline.push(("windir", system_root.clone()));
-        baseline.push(("PATH", format!(r"{system_root}\System32;{system_root}")));
-    }
+    platform_baseline()
+}
+
+/// The Unix baseline: the shared policy's, in the policy's order.
+#[cfg(not(windows))]
+fn platform_baseline() -> Vec<(&'static str, String)> {
+    environment_policy::BASELINE
+        .iter()
+        .map(|(key, value)| (*key, (*value).to_owned()))
+        .collect()
+}
+
+/// The Windows baseline: the shared policy's platform-independent part, plus
+/// the system directories the loader and `cmd.exe` need.
+#[cfg(windows)]
+fn platform_baseline() -> Vec<(&'static str, String)> {
+    let mut baseline: Vec<(&'static str, String)> = environment_policy::BASELINE_COMMON
+        .iter()
+        .map(|(key, value)| (*key, (*value).to_owned()))
+        .collect();
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+    baseline.push(("SystemRoot", system_root.clone()));
+    baseline.push(("windir", system_root.clone()));
+    baseline.push(("PATH", format!(r"{system_root}\System32;{system_root}")));
     baseline
 }
 
@@ -2085,6 +2160,7 @@ impl SandboxSession {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
 enum SandboxWaitError {
     BeforeTarget(RunnerError),
     AfterTarget(RunnerError),
@@ -2096,6 +2172,34 @@ impl SandboxWaitError {
         match self {
             Self::BeforeTarget(error) | Self::AfterTarget(error) => error,
         }
+    }
+}
+
+/// The runner's reading of the helper's first status byte.
+///
+/// `Ok(false)` means the helper will not report resource counters and the run
+/// continues. `Ok(true)` means the helper applied its mechanics and the second
+/// byte says whether the target started. `Err` is a refusal that happened
+/// before the target existed, and the byte is carried in the message so an
+/// operator can tell an environment-policy refusal (13) apart from the general
+/// specification-validation refusal (12) — the two are different failures and
+/// a single "the helper refused" line cannot distinguish them.
+///
+/// Every refusal, whatever the byte, is a *pre-target* failure: the target did
+/// not exist yet, so nothing ran unconfined by accident. What a caller does
+/// with that refusal is the caller's decision, and the required path fails
+/// closed on it.
+#[cfg(target_os = "linux")]
+fn classify_helper_status(status: u8) -> Result<bool, SandboxWaitError> {
+    match status {
+        0 | 2 | 3 | 30 | 31 => Ok(false),
+        1 => Ok(true),
+        code if code >= 4 => Err(SandboxWaitError::BeforeTarget(RunnerError::Setup(format!(
+            "sandbox helper rejected its launch specification (status {code})"
+        )))),
+        _ => Err(SandboxWaitError::BeforeTarget(RunnerError::Setup(
+            "sandbox status was invalid".into(),
+        ))),
     }
 }
 
@@ -2130,30 +2234,13 @@ impl SandboxChannel {
         let status_path = directory.path().join("status.sock");
         let listener = UnixListener::bind(&status_path)
             .map_err(|_| RunnerError::Setup("sandbox status channel unavailable".into()))?;
-        let mut environment = vec![
-            ("PATH".into(), "/usr/bin:/bin".into()),
-            ("LANG".into(), "C.UTF-8".into()),
-            ("LC_ALL".into(), "C.UTF-8".into()),
-            ("CI".into(), "1".into()),
-            ("NO_COLOR".into(), "1".into()),
-            ("TERM".into(), "dumb".into()),
-            ("GIT_TERMINAL_PROMPT".into(), "0".into()),
-            ("PAGER".into(), "cat".into()),
-        ];
-        for (key, value) in &request.environment {
-            if !denied_environment_key(key) {
-                environment.push((key.clone(), value.clone()));
-            }
-        }
-        if let Some(id) = &request.provenance.execution_id {
-            environment.push(("EGGWORK_EXECUTION_ID".into(), id.as_str().into()));
-        }
-        if let Some(generation) = request.provenance.generation {
-            environment.push((
-                "EGGWORK_EXECUTION_GENERATION".into(),
-                generation.get().to_string(),
-            ));
-        }
+        // The launch specification's environment is built by the same function
+        // that builds the direct child's environment, so the two paths cannot
+        // disagree about a node-owned key's value. Before that was true, the
+        // direct path applied the caller's `LANG` *after* the node's baseline
+        // while the specification carried both, and the helper refused the
+        // resulting duplicate-key specification.
+        let environment = build_child_environment(request);
         let spec = SandboxLaunchSpec {
             schema_version: 1,
             profile,
@@ -2223,10 +2310,15 @@ impl SandboxChannel {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("LANG", "C.UTF-8")
-            .env("LC_ALL", "C.UTF-8");
+            .env_clear();
+        // The helper's own environment is the node's baseline, from the same
+        // shared policy the target's environment is built from. `env_clear()`
+        // matters here: the helper must not inherit the daemon's `LD_*`,
+        // `GIT_*`, or cloud variables while it is parsing a specification that
+        // a deny-list was supposed to keep clean.
+        for (key, value) in environment_policy::BASELINE {
+            command.env(key, value);
+        }
         command
     }
 
@@ -2250,10 +2342,9 @@ impl SandboxChannel {
                 result
                     .map_err(|_| SandboxWaitError::BeforeTarget(RunnerError::Setup("sandbox status timed out".into())))?
                     .map_err(|_| SandboxWaitError::BeforeTarget(RunnerError::Setup("sandbox status channel failed".into())))?;
-                match status[0] {
-                    0 | 2 | 3 | 30 | 31 => Ok(None),
-                    code if code >= 4 => Err(SandboxWaitError::BeforeTarget(RunnerError::Setup(format!("sandbox helper rejected its launch specification (status {code})")))),
-                    1 => {
+                match classify_helper_status(status[0]) {
+                    Ok(false) => Ok(None),
+                    Ok(true) => {
                         let mut target_spawned = [0u8; 1];
                         tokio::select! {
                             _ = cancellation.cancelled() => return Err(SandboxWaitError::AfterTarget(RunnerError::CancelledBeforeSpawn)),
@@ -2269,7 +2360,7 @@ impl SandboxChannel {
                             _ => Err(SandboxWaitError::AfterTarget(RunnerError::Setup("sandbox status was invalid".into()))),
                         }
                     }
-                    _ => Err(SandboxWaitError::BeforeTarget(RunnerError::Setup("sandbox status was invalid".into()))),
+                    Err(error) => Err(error),
                 }
             }
         }
@@ -2794,5 +2885,267 @@ mod tests {
         let setup = NoExecutionSetup;
         let runtime = setup.execution_capabilities().await;
         assert!(runtime.is_empty());
+    }
+
+    /// The node-owned class is the node's own baseline.
+    ///
+    /// If the two could drift, the runner would discard a caller's value for a
+    /// key the helper still expects to carry the node's value, and the helper
+    /// would refuse the launch — the same collision that used to cost a
+    /// best-effort execution its confinement.
+    #[test]
+    fn the_node_owned_class_is_the_node_owned_baseline() {
+        let baseline_keys: Vec<&str> = environment_policy::BASELINE
+            .iter()
+            .map(|(key, _)| *key)
+            .collect();
+        assert_eq!(
+            environment_policy::RESERVED_KEYS,
+            baseline_keys.as_slice(),
+            "the node-owned class and the node-owned baseline must be the same set"
+        );
+        for (key, value) in environment_policy::BASELINE {
+            assert_eq!(
+                environment_policy::baseline_value(key),
+                Some(*value),
+                "the baseline value of {key} must be the policy's value"
+            );
+            assert!(
+                environment_policy::is_reserved_key(key),
+                "{key} is in the baseline and must be node-owned"
+            );
+        }
+    }
+
+    /// A caller's value for a node-owned key never reaches the child.
+    ///
+    /// The live defect was that the caller's `LANG` was *appended* to the
+    /// node's baseline, so the child saw the caller's locale and the launch
+    /// specification carried two `LANG` entries.
+    #[test]
+    fn a_caller_supplied_node_owned_key_does_not_replace_the_node_value() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let mut req = request(root.path(), &["/bin/sh", "-c", "true"]);
+        req.environment = vec![
+            ("LANG".into(), "en_US.UTF-8".into()),
+            ("LC_ALL".into(), "en_US.UTF-8".into()),
+            ("CI".into(), "false".into()),
+            ("lang".into(), "de_DE.UTF-8".into()),
+        ];
+        let environment = build_child_environment(&req);
+        for key in ["LANG", "LC_ALL", "CI"] {
+            let matching: Vec<&String> = environment
+                .iter()
+                .filter(|(name, _)| name == key)
+                .map(|(_, value)| value)
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "{key} must appear exactly once in the child environment"
+            );
+            assert_eq!(
+                matching[0],
+                environment_policy::baseline_value(key).expect("baseline value"),
+                "{key} must carry the node's value"
+            );
+        }
+        assert!(
+            !environment.iter().any(|(name, _)| name == "lang"),
+            "a differently-cased spelling of a node-owned key is the same key"
+        );
+    }
+
+    /// A denied key is dropped, and only dropped.
+    ///
+    /// The runner is the request-normalisation boundary: it drops the key
+    /// silently and says nothing, because a hardened environment has to be a
+    /// property of the node rather than something the caller has to get right.
+    /// The helper's refusal is a different layer and a different behaviour.
+    #[test]
+    fn a_caller_supplied_denied_key_does_not_reach_the_child() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let mut req = request(root.path(), &["/bin/sh", "-c", "true"]);
+        req.environment = vec![
+            ("LD_PRELOAD".into(), "/tmp/evil.so".into()),
+            ("AWS_SECRET_ACCESS_KEY".into(), "secret".into()),
+            ("PYTHONPATH".into(), "/tmp".into()),
+            ("KEEP_ME".into(), "kept".into()),
+        ];
+        let environment = build_child_environment(&req);
+        for denied in ["LD_PRELOAD", "AWS_SECRET_ACCESS_KEY", "PYTHONPATH"] {
+            assert!(
+                !environment.iter().any(|(name, _)| name == denied),
+                "{denied} must not reach the child"
+            );
+        }
+        assert!(
+            environment
+                .iter()
+                .any(|(name, value)| name == "KEEP_ME" && value == "kept"),
+            "a caller-controlled key must reach the child"
+        );
+    }
+
+    /// A repeated caller key is resolved to its last value.
+    ///
+    /// The launch specification must not carry a duplicate key: the helper
+    /// refuses a specification that does, and a best-effort request answers
+    /// that refusal by re-spawning the target with no Landlock ruleset.
+    #[test]
+    fn a_repeated_caller_key_is_resolved_to_one_entry() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let mut req = request(root.path(), &["/bin/sh", "-c", "true"]);
+        req.environment = vec![
+            ("REPEATED".into(), "first".into()),
+            ("REPEATED".into(), "second".into()),
+        ];
+        let environment = build_child_environment(&req);
+        let matching: Vec<&String> = environment
+            .iter()
+            .filter(|(name, _)| name == "REPEATED")
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(matching, vec!["second"]);
+    }
+
+    /// The launch specification carries exactly one entry per node-owned key,
+    /// with the node's value.
+    ///
+    /// This is the regression for the live defect. The helper refuses a
+    /// specification with duplicate keys, so a specification that carried the
+    /// caller's `LANG` *and* the node's `LANG` was refused with status 12,
+    /// and a best-effort request then ran the target with no Landlock ruleset
+    /// at all.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_launch_specification_carries_one_entry_per_node_owned_key() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let mut req = request(root.path(), &["/bin/sh", "-c", "true"]);
+        req.sandbox = SandboxRequest::BestEffort {
+            profile: "workspace_rw".into(),
+        };
+        req.environment = vec![("LANG".into(), "en_US.UTF-8".into())];
+        let channel = SandboxChannel::new(
+            Path::new("/nonexistent/eggwork-sandbox-helper"),
+            &req,
+            root.path().to_path_buf(),
+            false,
+        )
+        .expect("sandbox channel");
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(channel.spec_path).expect("spec"))
+                .expect("spec json");
+        let environment = spec["environment"]
+            .as_array()
+            .expect("environment array")
+            .iter()
+            .map(|entry| {
+                (
+                    entry[0].as_str().expect("key").to_owned(),
+                    entry[1].as_str().expect("value").to_owned(),
+                )
+            })
+            .collect::<Vec<(String, String)>>();
+        for key in environment_policy::RESERVED_KEYS {
+            let matching: Vec<&String> = environment
+                .iter()
+                .filter(|(name, _)| name == *key)
+                .map(|(_, value)| value)
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "the specification must carry exactly one {key}"
+            );
+            assert_eq!(
+                matching[0],
+                environment_policy::baseline_value(key).expect("baseline value"),
+                "the specification's {key} must carry the node's value"
+            );
+        }
+        assert_eq!(
+            environment_policy::PATH_VALUE,
+            "/usr/bin:/bin",
+            "the `PATH` contract is a Linux/Unix contract"
+        );
+        assert!(
+            environment
+                .iter()
+                .any(|(name, value)| name == "PATH" && value == environment_policy::PATH_VALUE),
+            "the specification's PATH must carry the contract value"
+        );
+    }
+
+    /// The direct path and the launch specification agree.
+    ///
+    /// They used to disagree: the direct path applied the caller's `LANG`
+    /// after the node's baseline, so the child saw the caller's locale, while
+    /// the specification carried both entries and was refused.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_direct_path_and_the_launch_specification_agree() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let mut req = request(root.path(), &["/bin/sh", "-c", "true"]);
+        req.sandbox = SandboxRequest::BestEffort {
+            profile: "workspace_rw".into(),
+        };
+        req.environment = vec![
+            ("LANG".into(), "en_US.UTF-8".into()),
+            ("CI".into(), "false".into()),
+            ("CALLER_KEY".into(), "caller".into()),
+        ];
+        let direct = build_child_environment(&req);
+        let channel = SandboxChannel::new(
+            Path::new("/nonexistent/eggwork-sandbox-helper"),
+            &req,
+            root.path().to_path_buf(),
+            false,
+        )
+        .expect("sandbox channel");
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(channel.spec_path).expect("spec"))
+                .expect("spec json");
+        let specified = spec["environment"]
+            .as_array()
+            .expect("environment array")
+            .iter()
+            .map(|entry| {
+                (
+                    entry[0].as_str().expect("key").to_owned(),
+                    entry[1].as_str().expect("value").to_owned(),
+                )
+            })
+            .collect::<Vec<(String, String)>>();
+        assert_eq!(direct, specified);
+    }
+
+    /// The environment-policy refusal is its own status, and the runner
+    /// treats it as a failure that happened before the target existed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_helper_status_bytes_classify_a_refusal_before_the_target() {
+        for (byte, expected) in [
+            (0u8, false),
+            (2, false),
+            (3, false),
+            (30, false),
+            (31, false),
+        ] {
+            assert!(
+                matches!(classify_helper_status(byte), Ok(value) if value == expected),
+                "status {byte} must not be a refusal"
+            );
+        }
+        assert!(matches!(classify_helper_status(1), Ok(true)));
+        for code in [12u8, 13] {
+            match classify_helper_status(code) {
+                Err(SandboxWaitError::BeforeTarget(RunnerError::Setup(message))) => assert!(
+                    message.contains(&format!("status {code}")),
+                    "the refusal must name its status byte: {message}"
+                ),
+                _ => panic!("status {code} must be a pre-target refusal"),
+            }
+        }
     }
 }

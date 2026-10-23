@@ -1,12 +1,12 @@
 //! Validated, execution-owned workspace materialization.
 
-use crate::blob::{BlobStore, MAX_BLOB_BYTES};
+use crate::blob::{BlobError, BlobStore, MAX_BLOB_BYTES};
 use eggwork_core::{
     BlobDigest, ExecutionGeneration, ExecutionHandle, ExecutionId, PrincipalId, WorkspaceEntry,
     WorkspaceId, WorkspaceManifest, WorkspaceManifestPatch,
 };
 use rusqlite::TransactionBehavior;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
@@ -70,6 +70,144 @@ pub struct ReadyWorkspace {
     pub manifest_digest: String,
 }
 
+/// The canonical workspace-candidate statement.
+///
+/// One producer for the predicate: the collector and the operator's preview
+/// evaluate this exact statement, so the preview cannot answer a different
+/// question from the pass it previews.
+const WORKSPACE_CANDIDATES_SQL: &str =
+    "SELECT workspace_id, storage_key, logical_bytes FROM workspaces
+     WHERE expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?1
+     ORDER BY expires_unix_ms ASC LIMIT ?2";
+
+/// The canonical retained-manifest-candidate statement.
+///
+/// One producer for the predicate, for the same reason as
+/// `WORKSPACE_CANDIDATES_SQL`.
+const MANIFEST_CANDIDATES_SQL: &str = "SELECT principal_id, manifest_digest FROM retained_manifests
+     WHERE expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?1
+     ORDER BY expires_unix_ms ASC LIMIT ?2";
+
+/// The workspace manager's metadata database path.
+///
+/// The manager owns this file name. The operator resolves it through this
+/// function instead of spelling `metadata.sqlite` itself, so renaming the
+/// store's database is a one-line change here.
+pub fn metadata_path(root: &Path) -> PathBuf {
+    root.join("metadata.sqlite")
+}
+
+/// An expired workspace the collector would reclaim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCandidate {
+    pub workspace_id: String,
+    pub storage_key: String,
+    pub logical_bytes: u64,
+}
+
+/// What the collector would act on, evaluated without opening the store.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcPreview {
+    /// Expired workspaces, oldest expiry first.
+    pub workspaces: Vec<WorkspaceCandidate>,
+    /// Expired retained manifests, oldest expiry first: `(principal_id,
+    /// manifest_digest)`.
+    pub manifests: Vec<(String, String)>,
+}
+
+/// Open the manager's metadata database without the ability to change it.
+///
+/// `SQLITE_OPEN_READ_ONLY` never creates the file and never writes to it,
+/// which is what lets the operator's preview read a store that does not
+/// exist (it fails) instead of bringing one into being (it must not).
+fn open_metadata_read_only(path: &Path) -> Result<Connection, WorkspaceError> {
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(WorkspaceError::from)
+}
+
+/// Whether the store has a table with this name.
+fn table_exists(connection: &Connection, name: &str) -> Result<bool, WorkspaceError> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Expired workspaces, oldest expiry first, bounded by `limit`.
+///
+/// The one implementation of the workspace candidate predicate. The
+/// collector evaluates it inside its write transaction; the operator's
+/// preview evaluates the same statement against a read-only connection.
+fn workspace_candidates(
+    connection: &Connection,
+    now_unix_ms: u64,
+    limit: usize,
+) -> Result<Vec<WorkspaceCandidate>, WorkspaceError> {
+    let mut statement = connection.prepare(WORKSPACE_CANDIDATES_SQL)?;
+    let rows = statement.query_map(
+        params![now_unix_ms as i64, limit.min(i64::MAX as usize) as i64],
+        |row| {
+            Ok(WorkspaceCandidate {
+                workspace_id: row.get(0)?,
+                storage_key: row.get(1)?,
+                logical_bytes: row.get::<_, i64>(2)?.max(0) as u64,
+            })
+        },
+    )?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Expired retained manifests, oldest expiry first, bounded by `limit`.
+///
+/// The one implementation of the retained-manifest candidate predicate.
+fn manifest_candidates(
+    connection: &Connection,
+    now_unix_ms: u64,
+    limit: usize,
+) -> Result<Vec<(String, String)>, WorkspaceError> {
+    let mut statement = connection.prepare(MANIFEST_CANDIDATES_SQL)?;
+    let rows = statement.query_map(
+        params![now_unix_ms as i64, limit.min(i64::MAX as usize) as i64],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// The workspace candidates the collector would act on, without opening the
+/// store.
+///
+/// `WorkspaceManager::open` is not read-only: it creates the root and the
+/// metadata database when they are absent and it calls `reconcile`, which
+/// deletes rows and directories that do not match the store. An operator
+/// preview that opened the manager would therefore mutate the store it is
+/// reporting on, so it reaches the canonical statements through this entry
+/// point instead: the same database file, opened read-only, and the same
+/// statements.
+pub fn preview_gc(
+    path: &Path,
+    now_unix_ms: u64,
+    limit: usize,
+) -> Result<GcPreview, WorkspaceError> {
+    let connection = open_metadata_read_only(path)?;
+    let workspaces = workspace_candidates(&connection, now_unix_ms, limit)?;
+    // Older stores predate the retained-manifest cache; report zero instead
+    // of failing the whole preview.
+    let manifests = if table_exists(&connection, "retained_manifests")? {
+        manifest_candidates(&connection, now_unix_ms, limit)?
+    } else {
+        Vec::new()
+    };
+    Ok(GcPreview {
+        workspaces,
+        manifests,
+    })
+}
+
 impl WorkspaceManager {
     pub fn open(root: impl AsRef<Path>, quota_bytes: u64) -> Result<Self, WorkspaceError> {
         let root = root.as_ref().to_path_buf();
@@ -79,7 +217,7 @@ impl WorkspaceManager {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
         }
-        let metadata = Connection::open(root.join("metadata.sqlite"))?;
+        let metadata = Connection::open(metadata_path(&root))?;
         metadata.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
@@ -487,19 +625,7 @@ impl WorkspaceManager {
             .metadata
             .lock()
             .map_err(|_| WorkspaceError::Worker)?;
-        let expired: Vec<(String, String)> = {
-            let mut statement = connection.prepare(
-                "SELECT principal_id, manifest_digest FROM retained_manifests
-                 WHERE expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?1
-                 ORDER BY expires_unix_ms ASC LIMIT ?2",
-            )?;
-            statement
-                .query_map(
-                    params![now_unix_ms as i64, limit.min(i64::MAX as usize) as i64],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )?
-                .collect::<Result<_, _>>()?
-        };
+        let expired = manifest_candidates(&connection, now_unix_ms, limit)?;
         let candidates = expired.len() as u64;
         if dry_run {
             return Ok((candidates, 0));
@@ -522,8 +648,15 @@ impl WorkspaceManager {
             if removed == 0 {
                 continue;
             }
-            let _ =
-                blobs.release_references("manifest", &format!("{principal_id}:{manifest_digest}"));
+            // Validate the row's principal where validation is possible and
+            // fall back to the raw key otherwise. Both entry points produce the
+            // same composite, and refusing to release the reference for an
+            // unparseable principal would leak the pin.
+            let owner = match PrincipalId::new(principal_id.clone()) {
+                Ok(principal) => manifest_owner_id(&principal, manifest_digest),
+                Err(_) => manifest_owner_id_for_key(principal_id, manifest_digest),
+            };
+            let _ = blobs.release_references("manifest", &owner);
             deleted += 1;
         }
         Ok((candidates, deleted))
@@ -588,7 +721,7 @@ impl WorkspaceManager {
                     );
                     let _ = blobs.release_references(
                         "manifest",
-                        &format!("{principal_id}:{manifest_digest}"),
+                        &manifest_owner_id_for_key(principal_id, manifest_digest),
                     );
                 }
             }
@@ -780,35 +913,17 @@ impl WorkspaceManager {
             .lock()
             .map_err(|_| WorkspaceError::Worker)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let candidates: Vec<(String, String, u64)> = {
-            let mut statement = transaction.prepare(
-                "SELECT workspace_id, storage_key, logical_bytes FROM workspaces
-                 WHERE expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?1
-                 ORDER BY expires_unix_ms ASC LIMIT ?2",
-            )?;
-            statement
-                .query_map(
-                    params![now_unix_ms as i64, limit.min(i64::MAX as usize) as i64],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get::<_, i64>(2)?.max(0) as u64,
-                        ))
-                    },
-                )?
-                .collect::<Result<_, _>>()?
-        };
-        let bytes = candidates
-            .iter()
-            .fold(0u64, |sum, (_, _, size)| sum.saturating_add(*size));
+        let candidates = workspace_candidates(&transaction, now_unix_ms, limit)?;
+        let bytes = candidates.iter().fold(0u64, |sum, candidate| {
+            sum.saturating_add(candidate.logical_bytes)
+        });
         let mut deleted = 0u64;
         if !dry_run {
-            for (workspace_id, key, _) in &candidates {
-                if !valid_storage_key(key) {
+            for candidate in &candidates {
+                if !valid_storage_key(&candidate.storage_key) {
                     continue;
                 }
-                match fs::remove_dir_all(self.inner.root.join(key)) {
+                match fs::remove_dir_all(self.inner.root.join(&candidate.storage_key)) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(WorkspaceError::Io(error)),
@@ -816,7 +931,7 @@ impl WorkspaceManager {
                 transaction.execute(
                     "DELETE FROM workspaces WHERE workspace_id = ?1
                          AND expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?2",
-                    params![workspace_id, now_unix_ms as i64],
+                    params![candidate.workspace_id, now_unix_ms as i64],
                 )?;
                 deleted += 1;
             }
@@ -953,8 +1068,28 @@ fn valid_storage_key(key: &str) -> bool {
         .is_some()
 }
 
+/// The blob-reference owner id for a retained manifest.
+///
+/// One format, one producer. The composite is `"{principal}:{manifest_digest}"`
+/// and it exists here, once. A manifest digest is hex and contains no colon,
+/// so the pair is recovered by splitting at the *last* colon even when the
+/// principal itself contains one; an owner id with no colon in it cannot
+/// match any cache row and is therefore treated as an orphan.
+///
+/// The raw-key entry point exists because two call sites read the principal
+/// out of a SQL row, where it may not parse as a `PrincipalId` - a corrupt
+/// row is exactly the case the reconciliation sweep exists to clean up.
+/// Refusing to release the reference in that case would leak the pin, so the
+/// raw form is the fallback and the validated form delegates to it. Both
+/// produce the same bytes for the same principal, so the choice of entry
+/// point never changes which owner id is used.
+fn manifest_owner_id_for_key(principal_key: &str, manifest_digest: &str) -> String {
+    format!("{principal_key}:{manifest_digest}")
+}
+
+/// The owner id for a manifest held by a validated principal.
 fn manifest_owner_id(principal_id: &PrincipalId, manifest_digest: &str) -> String {
-    format!("{}:{manifest_digest}", principal_id.as_str())
+    manifest_owner_id_for_key(principal_id.as_str(), manifest_digest)
 }
 
 fn materialize_tree(
@@ -979,8 +1114,6 @@ fn materialize_tree(
                 executable,
                 ..
             } => {
-                let source = blobs.path_for(digest);
-                let mut source_file = File::open(source)?;
                 let mut options = OpenOptions::new();
                 options.write(true).create_new(true);
                 #[cfg(unix)]
@@ -988,13 +1121,32 @@ fn materialize_tree(
                     use std::os::unix::fs::OpenOptionsExt;
                     options.mode(if *executable { 0o700 } else { 0o600 });
                 }
-                let mut destination = options.open(&path)?;
-                let copied = io::copy(&mut source_file, &mut destination)?;
-                if copied != *size_bytes {
-                    return Err(WorkspaceError::BlobSizeMismatch);
+                // The bytes that reach the tree are verified against the
+                // manifest digest *as they are copied*, by the store's own
+                // routine. A size-only check would accept any file of the
+                // right length, and a separate pre-flight hash would still
+                // leave a window in which the object changes between the
+                // check and the copy.
+                let copied = {
+                    let mut destination = options.open(&path)?;
+                    match blobs.copy_verified(digest, &mut destination) {
+                        Ok(copied) if copied == *size_bytes => {
+                            destination.sync_all()?;
+                            set_file_permissions(&path, *executable)?;
+                            Ok(copied)
+                        }
+                        Ok(_) => Err(WorkspaceError::BlobSizeMismatch),
+                        Err(BlobError::DigestMismatch) => Err(WorkspaceError::InvalidBlob),
+                        Err(error) => Err(WorkspaceError::Blob(error)),
+                    }
+                };
+                if copied.is_err() {
+                    // The staged file holds bytes that failed verification; it
+                    // must not survive into the tree, and the staging
+                    // directory is removed by the caller on any failure.
+                    let _ = fs::remove_file(&path);
                 }
-                destination.sync_all()?;
-                set_file_permissions(&path, *executable)?;
+                copied?;
             }
             WorkspaceEntry::Symlink { .. } => return Err(WorkspaceError::InvalidManifest),
         }
@@ -1708,6 +1860,133 @@ mod tests {
                     .is_some()
             );
         }
+    }
+
+    /// The materializer must verify the bytes it writes, not their length.
+    ///
+    /// The stored object's length matches the manifest's, but its content no
+    /// longer matches its digest. Only an out-of-band write can produce that
+    /// state - the store is content addressed - and it is exactly the state a
+    /// size-only check copies into the tree.
+    #[tokio::test]
+    async fn materialize_tree_refuses_blob_bytes_that_do_not_match_the_manifest_digest() {
+        let temp = TempDir::new().unwrap();
+        let blobs = BlobStore::open(temp.path().join("blobs"), 1024).unwrap();
+        let digest = upload_blob(&blobs, b"authentic").await;
+        let object = blobs.path_for(&digest);
+        fs::write(&object, b"tampered!").unwrap();
+        assert_eq!(
+            fs::read(&object).unwrap().len(),
+            9,
+            "the corrupted object must keep the manifest's length, or the case is not the size-only one"
+        );
+        let manifest = WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![WorkspaceEntry::File {
+                path: eggwork_core::RelativePath::new("input").unwrap(),
+                digest: digest.clone(),
+                size_bytes: 9,
+                executable: false,
+            }],
+        };
+        let stage = temp.path().join("stage");
+        assert!(matches!(
+            materialize_tree(&stage, &manifest, &blobs),
+            Err(WorkspaceError::InvalidBlob)
+        ));
+        assert!(
+            !stage.join("input").exists(),
+            "unverified bytes must not survive into the tree"
+        );
+
+        // Correct bytes still materialize.
+        let good = upload_blob(&blobs, b"genuine").await;
+        let good_manifest = WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![WorkspaceEntry::File {
+                path: eggwork_core::RelativePath::new("input").unwrap(),
+                digest: good,
+                size_bytes: 7,
+                executable: false,
+            }],
+        };
+        let good_stage = temp.path().join("stage-good");
+        materialize_tree(&good_stage, &good_manifest, &blobs).unwrap();
+        assert_eq!(fs::read(good_stage.join("input")).unwrap(), b"genuine");
+    }
+
+    /// One producer for the manifest owner id, reachable from both a
+    /// validated principal and a string key.
+    #[tokio::test]
+    async fn manifest_owner_id_has_one_producer_for_validated_and_string_principals() {
+        let principal = PrincipalId::new("principal-a").unwrap();
+        assert_eq!(
+            manifest_owner_id(&principal, "digest"),
+            manifest_owner_id_for_key("principal-a", "digest")
+        );
+        // A principal may itself contain a colon, so the composite is only
+        // recoverable by splitting at the last colon.
+        let colon_principal = PrincipalId::new("tenant:agent").unwrap();
+        assert_eq!(
+            manifest_owner_id(&colon_principal, "digest"),
+            manifest_owner_id_for_key("tenant:agent", "digest")
+        );
+        assert_eq!(
+            manifest_owner_id(&colon_principal, "digest"),
+            "tenant:agent:digest"
+        );
+    }
+
+    /// A retained manifest whose stored principal cannot be parsed still has
+    /// its blob reference released.
+    ///
+    /// Refusing to release the reference would leak the pin: the blob would
+    /// stay unreclaimable for ever, and the owner id the row would have
+    /// carried is not recoverable from an unparseable principal by any other
+    /// route.
+    #[tokio::test]
+    async fn manifest_gc_releases_the_reference_for_an_unparseable_stored_principal() {
+        let temp = TempDir::new().unwrap();
+        let blobs = BlobStore::open(temp.path().join("blobs"), 1024).unwrap();
+        let manager = WorkspaceManager::open(temp.path().join("workspaces"), 1024).unwrap();
+        let digest = upload_blob(&blobs, b"pinned").await;
+        let corrupt_principal = "not a principal";
+        assert!(
+            PrincipalId::new(corrupt_principal.to_owned()).is_err(),
+            "the fixture's principal must be unparseable"
+        );
+        let manifest_digest = "digest-under-a-corrupt-principal";
+        blobs
+            .retain(
+                "manifest",
+                &manifest_owner_id_for_key(corrupt_principal, manifest_digest),
+                std::slice::from_ref(&digest),
+                None,
+            )
+            .unwrap();
+        {
+            let connection = self::Connection::open(metadata_path(&manager.inner.root)).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO retained_manifests(principal_id, manifest_digest, manifest_json,
+                       logical_bytes, created_unix_ms, expires_unix_ms)
+                     VALUES (?1, ?2, X'7B7D', 0, 0, 1)",
+                    rusqlite::params![corrupt_principal, manifest_digest],
+                )
+                .unwrap();
+        }
+        let (candidates, deleted) = manager
+            .manifest_garbage_collect(1, 10, false, &blobs)
+            .unwrap();
+        assert_eq!(candidates, 1);
+        assert_eq!(deleted, 1);
+        assert!(
+            blobs
+                .reference_owners("manifest", None, 10)
+                .unwrap()
+                .is_empty(),
+            "the manifest's blob pin must be released even for an unparseable principal"
+        );
     }
 
     #[tokio::test]

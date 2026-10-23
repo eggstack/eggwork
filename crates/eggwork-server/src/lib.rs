@@ -340,7 +340,7 @@ impl NodeServer {
         let workspaces =
             workspace::WorkspaceManager::open(&config.workspace_root, config.workspace_quota_bytes)
                 .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
-        let artifact_path = config.database_path.with_extension("artifacts.sqlite");
+        let artifact_path = artifact::metadata_path(&config.database_path);
         let artifacts = artifact::ArtifactStore::open(&artifact_path)
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
         let recovered = store

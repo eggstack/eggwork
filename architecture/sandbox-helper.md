@@ -16,8 +16,8 @@ Crate facts: one `[[bin]]` (`path = "src/main.rs"`), `version.workspace = true`,
 
 **Does not own**
 
-- **No execution admission.** It never decides whether a workload may run. The profile name, the resource values, the argv, the root, and the cwd were all chosen by `eggwork-runner` before the helper was spawned; `TrustedLandlockSetup::prepare` (`crates/eggwork-runner/src/lib.rs:425`) has already refused to hand over a `Required` request whose profile is not `workspace_rw` or whose helper fails `verify_trusted_helper`.
-- **No lifecycle.** It does not time out, cancel, reap, or signal anything. Timeout/cancellation/termination of the *target* is the runner's, via the process group and `kill_on_drop` (`SandboxChannel::command`, `lib.rs:1779`). The helper only `wait()`s.
+- **No execution admission.** It never decides whether a workload may run. The profile name, the resource values, the argv, the root, and the cwd were all chosen by `eggwork-runner` before the helper was spawned; `TrustedLandlockSetup::prepare` has already refused to hand over a `Required` request whose profile is not `workspace_rw` or whose helper fails `verify_trusted_helper`.
+- **No lifecycle.** It does not time out, cancel, reap, or signal anything. Timeout/cancellation/termination of the *target* is the runner's, via the process group and `kill_on_drop` (`SandboxChannel::command`). The helper only `wait()`s.
 - **No policy decision about whether execution is allowed.** It applies mechanics that were already decided. Every branch that ends in `Err` is an abort, never a downgrade: nothing here can turn "required" into "best effort".
 - **No trust self-assertion.** The helper never states that it is trusted; the runner verifies the file and the runner alone interprets the status bytes.
 
@@ -33,7 +33,7 @@ Crate facts: one `[[bin]]` (`path = "src/main.rs"`), `version.workspace = true`,
 
 ## Trust boundary and installation
 
-The helper is treated as an installation-owned, trusted root (or effective-user) artifact. Trust is verified by the **runner**, in one function, `eggwork_runner::verify_trusted_helper` (`lib.rs:596`, Linux) — deliberately public so operator diagnostics report the same answer the enforcement path will give rather than a second, independently drifting copy of the policy (the doc comment says so explicitly). The Linux checks, in order:
+The helper is treated as an installation-owned, trusted root (or effective-user) artifact. Trust is verified by the **runner**, in one function, `eggwork_runner::verify_trusted_helper` (the Linux variant) — deliberately public so operator diagnostics report the same answer the enforcement path will give rather than a second, independently drifting copy of the policy (the doc comment says so explicitly). The Linux checks, in order:
 
 | Check | Detail |
 | --- | --- |
@@ -44,15 +44,15 @@ The helper is treated as an installation-owned, trusted root (or effective-user)
 | Parent dir | `path.parent().canonicalize()`; must be a directory, `uid ∈ {0, geteuid()}`, `mode & 0o022 == 0` |
 | Every ancestor | must be a directory; `uid ∈ {0, geteuid()}` **or** a root-owned sticky directory (`uid == 0 && mode & 0o1000 != 0`); `mode & 0o022 == 0` unless it is that sticky root directory |
 
-Any failure returns `Err(String)` and the caller reacts by request severity: `Required` → `RunnerError::Setup(reason)` (execution refused), `BestEffort` → `SandboxOutcome::NotApplied { reason }` (surfaced, never described as enforced). The non-Linux variant (`lib.rs:641`) is unconditional: `Err("trusted Landlock is unsupported on this platform")`. So required isolation fails closed rather than degrading.
+Any failure returns `Err(String)` and the caller reacts by request severity: `Required` → `RunnerError::Setup(reason)` (execution refused), `BestEffort` → `SandboxOutcome::NotApplied { reason }` (surfaced, never described as enforced). The non-Linux variant is unconditional: `Err("trusted Landlock is unsupported on this platform")`. So required isolation fails closed rather than degrading.
 
 `TrustedLandlockSetup::prepare` calls `verify_trusted_helper` **twice** in principle: once when resource setup was applied by `SystemdCgroupBackend` (a required-resource request refuses to continue with an untrusted helper; a best-effort one downgrades to `NotApplied`), and once for the sandbox profile. It never executes the helper during `prepare` — execution happens later, in `SandboxChannel::wait`.
 
-The second, independent gate is the version-coherence probe, and it is not in the runner. `eggworkd deployment status` calls `check_helper_compatibility(helper_path, env!("CARGO_PKG_VERSION"))` (`crates/eggwork-server/src/deployment.rs:330` onward): a lighter duplicate of the ownership/mode/executable checks, then `eggup_core::CommandSpec::new(path).arg("--version").timeout(timeout)` run through `eggup_core::run_bounded` (cleared environment, null stdin, bounded output, timeout, kill/reap). The printed version must be non-empty, ≤ 64 bytes, free of control characters, and an **exact** match for the daemon's own crate version, otherwise `HelperCompatibility::VersionSkew { expected, found }`. `helper_satisfies_required_isolation(compatibility)` (`deployment.rs:300`) is what gates the advertised requirement. This probe is the documented ownership exception in [execution-ownership.md](execution-ownership.md): it "performs no execution admission, owns no lifecycle, and exists only so required-isolation admission can fail closed on version skew."
+The second, independent gate is the version-coherence probe, and it is not in the runner. `eggworkd deployment status` calls `check_helper_compatibility(helper_path, env!("CARGO_PKG_VERSION"))` (in `crates/eggwork-server/src/deployment.rs`): a lighter duplicate of the ownership/mode/executable checks, then `eggup_core::CommandSpec::new(path).arg("--version").timeout(timeout)` run through `eggup_core::run_bounded` (cleared environment, null stdin, bounded output, timeout, kill/reap). The printed version must be non-empty, ≤ 64 bytes, free of control characters, and an **exact** match for the daemon's own crate version, otherwise `HelperCompatibility::VersionSkew { expected, found }`. `helper_satisfies_required_isolation(compatibility)` is what gates the advertised requirement. This probe is the documented ownership exception in [execution-ownership.md](execution-ownership.md): it "performs no execution admission, owns no lifecycle, and exists only so required-isolation admission can fail closed on version skew."
 
-**Where the path comes from.** `TrustedLandlockSetup::discover_sibling()` (`lib.rs:412`) canonicalizes `std::env::current_exe()`, takes its parent, and appends `eggwork-sandbox-helper`, falling back to the bare relative name `eggwork-sandbox-helper`. The production daemon does not use that convenience: `start_server` (`operations.rs:1029`) constructs `TrustedLandlockSetup::new(helper)` from `config.sandbox_helper`, the operator-configured absolute path. Both funnel into the same `verify_trusted_helper`.
+**Where the path comes from.** `TrustedLandlockSetup::discover_sibling()` canonicalizes `std::env::current_exe()`, takes its parent, and appends `eggwork-sandbox-helper`, falling back to the bare relative name `eggwork-sandbox-helper`. The production daemon does not use that convenience: `start_server` (in `crates/eggwork-server/src/operations.rs`) constructs `TrustedLandlockSetup::new(helper)` from `config.sandbox_helper`, the operator-configured absolute path. Both funnel into the same `verify_trusted_helper`.
 
-**Release-unit consequence.** `README.md`: "Linux releases ship the daemon and its Landlock sandbox helper as one bundle from one source revision, so the pair can never drift. macOS and Windows ship the daemon only." `install_unit_matrix(helper_required)` (`deployment.rs:119`) is the machine-readable form: `MEMBER_DAEMON` → `DEST_DAEMON` is always `required: true`; `MEMBER_HELPER` → `DEST_HELPER` (`bin/eggwork-sandbox-helper`) takes `required: helper_required`, and `eggworkd` sets that to `config.sandbox_helper.is_some()` (`src/bin/eggworkd.rs:193`) — i.e. a node configured with a helper path on Linux. `crates/eggwork-server/tests/release_contract.rs::the_helper_ships_exactly_on_linux_release_targets` pins the helper to the Linux triples only and asserts `install_unit_matrix(false)` marks it not required, which is the macOS/Windows shape. `operations.rs:449` (`doctor`) and `operations.rs:1029` (`start_server`) are the two operational consumers: `doctor` reports `trusted_helper(helper)` then, only if trusted, builds a `TrustedLandlockSetup` and asks for `execution_capabilities()`; `start_server` selects `TrustedLandlockSetup` when `config.sandbox_helper` is set and `NoExecutionSetup` otherwise.
+**Release-unit consequence.** `README.md`: "Linux releases ship the daemon and its Landlock sandbox helper as one bundle from one source revision, so the pair can never drift. macOS and Windows ship the daemon only." `install_unit_matrix(helper_required)` (in `crates/eggwork-server/src/deployment.rs`) is the machine-readable form: `MEMBER_DAEMON` → `DEST_DAEMON` is always `required: true`; `MEMBER_HELPER` → `DEST_HELPER` (`bin/eggwork-sandbox-helper`) takes `required: helper_required`, and `eggworkd` sets that to `config.sandbox_helper.is_some()` (in `crates/eggwork-server/src/bin/eggworkd.rs`) — i.e. a node configured with a helper path on Linux. `crates/eggwork-server/tests/release_contract.rs::the_helper_ships_exactly_on_linux_release_targets` pins the helper to the Linux triples only and asserts `install_unit_matrix(false)` marks it not required, which is the macOS/Windows shape. `doctor` and `start_server` (both in `crates/eggwork-server/src/operations.rs`) are the two operational consumers: `doctor` reports `trusted_helper(helper)` then, only if trusted, builds a `TrustedLandlockSetup` and asks for `execution_capabilities()`; `start_server` selects `TrustedLandlockSetup` when `config.sandbox_helper` is set and `NoExecutionSetup` otherwise.
 
 ## Command-line contract
 
@@ -63,7 +63,7 @@ Two accepted argv shapes, parsed strictly. Anything else is `Err(())` → exit *
 | `eggwork-sandbox-helper --version` (and *no* further argument) | prints `env!("CARGO_PKG_VERSION")` to stdout, one line, exit 0. `--version` with a trailing argument is an error, not a version print. |
 | `eggwork-sandbox-helper --spec SPEC --status SOCK` (in that order, nothing else) | full launch path. Order is fixed: the second token must be `--status`, a fourth token must not exist. |
 
-The runner therefore builds exactly (`SandboxChannel::command`, `lib.rs:1779`):
+The runner therefore builds exactly (`SandboxChannel::command`):
 
 ```
 Command::new(<helper_path>)
@@ -78,9 +78,9 @@ Command::new(<helper_path>)
 
 `current_dir` is the `0700` temp directory, so the helper starts with the same working directory the spec file lives in and never depends on the daemon's cwd. `env_clear()` on the helper itself matters: the helper must not inherit the daemon's `LD_*`, `GIT_*`, or cloud variables while it is parsing a spec that a deny-list was supposed to keep clean.
 
-The `--spec` path writes **nothing** to stdout or stderr. All structured output is one-byte codes on the connected `UnixStream`; the helper never logs. The runner gives the helper piped stdio (`SandboxChannel::command`, `lib.rs:1779`) and drains it with the ordinary capture machinery, so the only output an untrusted-looking helper could produce is bounded like any child's.
+The `--spec` path writes **nothing** to stdout or stderr. All structured output is one-byte codes on the connected `UnixStream`; the helper never logs. The runner gives the helper piped stdio (`SandboxChannel::command`) and drains it with the ordinary capture machinery, so the only output an untrusted-looking helper could produce is bounded like any child's.
 
-Order of operations inside `run()` (`main.rs:48`):
+Order of operations inside `run()` (`linux::run`):
 
 1. `UnixStream::connect(&status_path)` — **before** the spec is read. A missing or unconnectable socket aborts immediately, leaving the spec file untouched and no target started.
 2. `read_spec(&spec_path)`; on failure write the numeric code and abort.
@@ -93,15 +93,15 @@ Order of operations inside `run()` (`main.rs:48`):
 9. Write `1` again (phase marker: target started), flush.
 10. `child.wait()`, then write the resource bit-flags byte, then `exit_code(result)`.
 
-**Bounded output and time.** The status protocol is a fixed one-byte-per-phase exchange; the runner wraps each phase read in `tokio::time::timeout(Duration::from_secs(5))` — `accept`, the first status byte, the second status byte — and the final resource byte in a 2 s timeout inside `SandboxSession::resource_limits_exceeded` (`lib.rs:1633`). `--version` is bounded by the deployment layer's `eggup_core::run_bounded` plus the ≤ 64-byte/no-control-character validation. Helper-side size bounds are the `MAX_*` constants in `read_spec`.
+**Bounded output and time.** The status protocol is a fixed one-byte-per-phase exchange; the runner wraps each phase read in `tokio::time::timeout(Duration::from_secs(5))` — `accept`, the first status byte, the second status byte — and the final resource byte in a 2 s timeout inside `SandboxSession::resource_limits_exceeded`. `--version` is bounded by the deployment layer's `eggup_core::run_bounded` plus the ≤ 64-byte/no-control-character validation. Helper-side size bounds are the generated `MAX_*` constants; the five protocol limits come from `eggwork-core` via the generator, and `MAX_SPEC_BYTES` is helper-only.
 
 **Exit codes.** `entry()` is `std::process::exit(run().unwrap_or(125))`, so 125 means "the helper refused or could not proceed" for every cause, and is intentionally *not* a fine-grained channel: the reason is delivered on the status socket, and 125 is what remains when the socket could not even be connected. A successful run exits with the target's code: `exit_code(status) = status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0))` — the conventional 128 + signal form for a signalled child.
 
-**Non-Linux entry point** (`main.rs:393`): accepts `--version` alone (print version, exit 0) and otherwise exits 125. It does not link Landlock or nix and never starts anything.
+**Non-Linux entry point** (the `#[cfg(not(target_os = "linux"))]` `main`): accepts `--version` alone (print version, exit 0) and otherwise exits 125. It does not link Landlock or nix and never starts anything.
 
 ## LaunchSpec
 
-Read by `read_spec` (`main.rs:123`) from the path given by `--spec`. The runner writes it as `SandboxLaunchSpec` (`lib.rs:1605`) via `serde_json::to_vec` into `spec.json` inside a `0700` temp dir (`tempfile::Builder::new().prefix("eggwork-sandbox-")`), opened with `create_new(true)` and `mode(0o600)`; the encoded length is rejected above 1 MiB before the file is even created.
+Read by `read_spec` (`linux::read_spec`) from the path given by `--spec`. The runner writes it as `SandboxLaunchSpec` via `serde_json::to_vec` into `spec.json` inside a `0700` temp dir (`tempfile::Builder::new().prefix("eggwork-sandbox-")`), opened with `create_new(true)` and `mode(0o600)`; the encoded length is rejected above 1 MiB before the file is even created.
 
 | Field | Type | Validation |
 | --- | --- | --- |
@@ -133,7 +133,7 @@ As the runner writes it, a fully-populated spec is:
 }
 ```
 
-`root` is canonicalized by the runner before serialization (`lib.rs:1725`) and a failure there is `RunnerError::InvalidRoot`, so the helper's `root != spec.root` equality check (`code 15`) is a re-assertion, not the first line of defense. `resource_*` are populated only when the runner's cgroup backend actually applied them (`resources_applied.then_some(...)`, `lib.rs:1732-1749`): when the backend did not apply them, the fields serialize as `null` and the helper's verification short-circuits, so a `BestEffort` resource request that was not installed cannot make the helper refuse.
+`root` is canonicalized by the runner before serialization (`SandboxChannel::new`) and a failure there is `RunnerError::InvalidRoot`, so the helper's `root != spec.root` equality check (`code 15`) is a re-assertion, not the first line of defense. `resource_*` are populated only when the runner's cgroup backend actually applied them (`resources_applied.then_some(...)`, in `SandboxChannel::new`): when the backend did not apply them, the fields serialize as `null` and the helper's verification short-circuits, so a `BestEffort` resource request that was not installed cannot make the helper refuse.
 
 **The hand-off, end to end.**
 
@@ -147,7 +147,7 @@ As the runner writes it, a fully-populated spec is:
 
 ## Filesystem isolation (Landlock)
 
-`restrict(&spec)` (`main.rs:186`), called only when `spec.profile.is_some()`:
+`restrict(&spec)` (`linux::restrict`), called only when `spec.profile.is_some()`:
 
 ```rust
 let abi = ABI::V4;
@@ -161,7 +161,7 @@ let mut ruleset = Ruleset::default()
 - **ABI**: hard-coded `ABI::V4`. There is no fallback and no downgrade: `handle_access`, `create`, every `add_rule`, every `PathFd::new`, and `restrict_self` all map to status code `2` on failure. On a kernel that does not implement V4 the helper refuses to start the target.
 - **Handled rights**: `AccessFs::from_all(ABI::V4)` — the full handled set for that ABI, which is what makes the model "deny by default": anything not covered by a rule is denied.
 - **Workspace rule is pinned to a descriptor, not a name.** `read_spec` opens `root` once, immediately after the containment checks, with `O_PATH | O_CLOEXEC` (mirroring what `PathFd::new` would have used) and hands the `File` to `restrict`, which passes it straight to `PathBeneath::new`. The object that was validated is therefore the object that is enforced. This used to re-resolve `spec.root` *by name* inside `restrict`, which left a window in which any process able to write the parent of the workspace root could replace it with a symlink; the ruleset would then grant all rights beneath the link target while still reporting `FullyEnforced`. Exploiting that needs a second process at the node's uid — the confined target cannot do it, because `workspace_rw` grants rights only *beneath* root — but it is exactly the adversary the spec file is already hardened against (reject symlink, then compare `dev`/`ino` on the descriptor actually read), and `root` was getting none of that discipline. `spec.cwd` is still resolved by name at spawn, but that is bounded: the pinned root rule denies everything outside the workspace regardless of where `chdir` lands.
-- **Workspace rule**: the single `PathBeneath` rule on that pinned root descriptor with **all** handled rights, i.e. read *and* write *and* create *and* remove. This is the `workspace_rw` profile. The mapping from the public capability name to these concrete rights is: `LANDLOCK_WORKSPACE_RW_CAPABILITY` = `"isolation.landlock.workspace-rw.v1"` (`lib.rs:528`), advertised only when `verify_trusted_helper` succeeds **and** `probe_landlock_ruleset()` is true; the probe builds the identical `ABI::V4` ruleset with the identical four runtime paths and identical rights in-process but never calls `restrict_self` (`lib.rs:538` onward, including the comment that the devnull rule "must mirror the helper's null-device rule exactly").
+- **Workspace rule**: the single `PathBeneath` rule on that pinned root descriptor with **all** handled rights, i.e. read *and* write *and* create *and* remove. This is the `workspace_rw` profile. The mapping from the public capability name to these concrete rights is: `LANDLOCK_WORKSPACE_RW_CAPABILITY` = `"isolation.landlock.workspace-rw.v1"`, advertised only when `verify_trusted_helper` succeeds **and** `probe_landlock_ruleset()` is true; the probe builds the identical `ABI::V4` ruleset with the identical four runtime paths and identical rights in-process but never calls `restrict_self` (in `probe_landlock_ruleset`, including the comment that the devnull rule "must mirror the helper's null-device rule exactly").
 - **Runtime read allowlist**: `for path in ["/usr", "/etc/ld.so.cache", "/etc/ssl/certs", "/dev/null"]`, each `canonicalize()`d, and a path that fails to canonicalize is **skipped silently** (no rule, so it stays denied):
 
   | Path | Rights granted |
@@ -172,7 +172,7 @@ let mut ruleset = Ruleset::default()
   | `/dev/null` | `ReadFile | WriteFile` |
   | anything else | denied |
 
-  **`/dev/null` handling** (`main.rs:208-214`): granting write is deliberate and the in-source rationale is that the null device "discards all writes and yields EOF on reads: granting write is information-neutral, while denying it breaks ordinary `>/dev/null` redirection and makes escape-trap fixtures vacuous (redirection setup fails before the escape attempt runs). No other `/dev` path is allowed." That is exactly why the test fixture's `cat "$1" >/dev/null 2>&1` escape trap measures a real denial rather than a failed redirection.
+  **`/dev/null` handling** (the `/dev/null` rule in `linux::restrict`): granting write is deliberate and the in-source rationale is that the null device "discards all writes and yields EOF on reads: granting write is information-neutral, while denying it breaks ordinary `>/dev/null` redirection and makes escape-trap fixtures vacuous (redirection setup fails before the escape attempt runs). No other `/dev` path is allowed." That is exactly why the test fixture's `cat "$1" >/dev/null 2>&1` escape trap measures a real denial rather than a failed redirection.
 
 - **Denied paths**: any path outside the ruleset — including the workspace root's parents, the target's own scratch space, `/tmp`, other `/dev` entries, `/proc` beyond the fds already open — is denied by the handled set, and `no_new_privs` blocks the target from acquiring privilege to escape.
 - **`RestrictionStatus` outcomes**: `ruleset.restrict_self()` returns a `RestrictionStatus`; the helper requires `status.ruleset == RulesetStatus::FullyEnforced`, else status byte `30`, and requires `status.no_new_privs`, else status byte `31`. Both are aborts before the target exists — i.e. a partially enforced ruleset (a ruleset whose enforcement was degraded for a sub-layer) is treated as a refusal, not as best effort. The `RestrictionStatus` is otherwise discarded; it is not forwarded to the runner.
@@ -184,7 +184,7 @@ let mut ruleset = Ruleset::default()
 
 **No rlimits are set anywhere in this crate.** There is no `setrlimit`/`rlimit` call. The helper's role is verification and observation; the limits themselves are applied by the runner's `SystemdCgroupBackend` (which wraps the helper command in a cgroup, and reports `ResourceSetupOutcome::Applied { backend: "systemd-cgroup-v2" }`), and this test asserts that backend string.
 
-`verify_resource_limits(&spec)` (`main.rs:335`) is a pre-flight check that the cgroup the helper is *already inside* actually enforces the declared values, so the target is never started into a cgroup that silently does not bound what the request asked for. It returns `true` immediately when all three spec fields are `None`. Otherwise it reads `/proc/self/cgroup`, finds the `0::` unified-hierarchy line, and joins the remainder under `/sys/fs/cgroup` (an unreadable cgroup file, a missing `0::` line, or an unparseable value is a **failure**, via `is_none_or` / `return false` — fail closed):
+`verify_resource_limits(&spec)` (`linux::verify_resource_limits`) is a pre-flight check that the cgroup the helper is *already inside* actually enforces the declared values, so the target is never started into a cgroup that silently does not bound what the request asked for. It returns `true` immediately when all three spec fields are `None`. Otherwise it reads `/proc/self/cgroup`, finds the `0::` unified-hierarchy line, and joins the remainder under `/sys/fs/cgroup` (an unreadable cgroup file, a missing `0::` line, or an unparseable value is a **failure**, via `is_none_or` / `return false` — fail closed):
 
 | Declared | Files read | Acceptance rule |
 | --- | --- | --- |
@@ -192,7 +192,7 @@ let mut ruleset = Ruleset::default()
 | `resource_pids` | `pids.max` | must parse as `u32` and be **≤** the declared value |
 | `resource_cpu_millis` | `cpu.max` | both whitespace-separated fields must parse as `u64`; `period != 0`; and `quota.saturating_mul(1000) / period <= cpu_millis` — i.e. the effective millicores-per-second must not exceed what was requested |
 
-**The counter-file mechanism.** `ResourceEvents` (`main.rs:271`) holds up to two `EventCounter`s, one for memory and one for pids, each an open `fs::File` plus a key plus a baseline read at construction. `EventCounter::for_events` resolves `/proc/self/cgroup` → `<cgroup>/memory.events` (key `oom_kill`) or `<cgroup>/pids.events` (key `max`), and `self` is constructed with `track_memory.then(EventCounter::memory).flatten()` — so an unavailable cgroup file or an unparseable baseline simply means no tracking for that dimension, not a failure. `read_counter(&mut file, key)` (`main.rs:325`) seeks to 0, reads the whole file as a string, and returns the first line whose first space-separated token equals `key`, parsed as `u64`. `exceeded()` is `read_counter(...) > baseline` — a strictly-greater comparison, so a target that merely ran near the limit is not reported.
+**The counter-file mechanism.** `ResourceEvents` holds up to two `EventCounter`s, one for memory and one for pids, each an open `fs::File` plus a key plus a baseline read at construction. `EventCounter::for_events` resolves `/proc/self/cgroup` → `<cgroup>/memory.events` (key `oom_kill`) or `<cgroup>/pids.events` (key `max`), and `self` is constructed with `track_memory.then(EventCounter::memory).flatten()` — so an unavailable cgroup file or an unparseable baseline simply means no tracking for that dimension, not a failure. `read_counter(&mut file, key)` seeks to 0, reads the whole file as a string, and returns the first line whose first space-separated token equals `key`, parsed as `u64`. `exceeded()` is `read_counter(...) > baseline` — a strictly-greater comparison, so a target that merely ran near the limit is not reported.
 
 After the target exits, `ResourceEvents::status_code()` packs the result into one byte: bit 0 = `oom_kill` exceeded, bit 1 = `pids.events: max` exceeded. The runner decodes exactly these two bits in `SandboxSession::resource_limits_exceeded` into `eggwork_core::ResourceDimension::{Memory, Pids}` under a 2 s timeout, and a timeout or short read yields no exceeded dimensions rather than an error.
 
@@ -208,9 +208,29 @@ Note the different units on the two mechanisms: the pre-flight check compares *c
 
 ## Environment handling
 
-`denied_environment_key` (`main.rs:242`) uppercases the key and matches it against a fixed list by exact equality **or** prefix: `LD_`, `DYLD_`, `PATH`, `IFS`, `SHELLOPTS`, `CDPATH`, `BASH_ENV`, `ENV`, `PYTHONPATH`, `PYTHONHOME`, `NODE_OPTIONS`, `RUBYOPT`, `PERL5OPT`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_CONFIG`, `GIT_CONFIG_`, `AWS_`, `AZURE_`, `GOOGLE_`, `SSH_AUTH_SOCK`. The intent is to strip every knob that would re-inject code or redirect the loader/interpreter inside a confined target: dynamic-linker search paths, shell startup files, interpreter startup options, and credential/config discovery for the major cloud and Git/SSH clients.
+### One owner, two generated copies
 
-It is enforced twice, as two independent layers. The runner filters with its own copy of the same predicate before building the spec (`lib.rs:1465`, used at `lib.rs:1709`) so denied keys are not even written. The helper *validates* the spec: in `read_spec`, `denied_environment_key(key) && key != "PATH"` is a rejection (code `12`), and `PATH` is the single exception, permitted only with the exact value `"/usr/bin:/bin"`. Duplicate keys are also rejected.
+The environment policy has exactly one owner: `crates/eggwork-runner/policy/environment-policy.toml`. It holds the denied-key list and its matching rule, the node-owned (reserved) keys, the node-owned baseline, and the `PATH` value contract. Nothing else in the tree states any of them.
+
+The helper is a standalone binary that may not depend on any workspace crate, so it cannot share the policy as a library. It compiles a *generated copy* instead: `scripts/generate_environment_policy.py` writes `crates/eggwork-runner/src/environment_policy.rs` and `crates/eggwork-sandbox-helper/src/environment_policy.rs` from that one source. Both copies are checked in, so no build needs the generator, no crate reads a file outside its own directory, no `build.rs` is added, and no dependency edge is created. A hand edit of a generated copy is a contract change, not a local fix: change the source of truth and re-run the generator.
+
+The generated module exposes the same API in both crates — `DENIED_KEYS`, `MATCH_RULE`, `RESERVED_KEYS`, `BASELINE_COMMON`, `BASELINE`, `PATH_VALUE`, and the predicates `denied_environment_key`, `is_reserved_key`, `baseline_entry`, `baseline_value`. The helper's copy additionally carries the five protocol limit constants, because `eggwork-core` owns the wire limits and the helper cannot import them; the generator reads those five values out of `eggwork-core/src/lib.rs` and emits them, so the helper's copy is generated rather than hand-maintained.
+
+Two copies of one contract is a hole unless something pins them together. What pins them is `crates/eggwork-sandbox-helper/tests/environment_policy_parity.rs`, which compares the two copies element by element *and* drives the real helper binary against every probe key to compare its accept/refuse decision with what the runner's copy of the policy says. A one-sided edit to either copy fails that suite.
+
+### The drop-versus-reject contract
+
+The policy has three key classes, and the two layers treat them differently on purpose:
+
+| Class | Meaning | The runner | The helper |
+| --- | --- | --- | --- |
+| Denied | the caller may not set this key at all | **drops** it, silently | **refuses the launch** |
+| Node-owned (reserved) | the node sets this key itself | **replaces** the caller's value with the node's | **refuses** a spec that carries a different value |
+| Caller-controlled | everything else | passes it through | accepts it |
+
+The difference between dropping and refusing is deliberate and is not a contradiction. The runner is the *request-normalisation boundary*: a hardened environment has to be a property of the node rather than something the caller has to get right, so a denied key never reaches the specification and the caller is not told. The helper is the *enforcement point*: a denied key arriving there means the node's own filtering did not happen, which is a defect in the node rather than a caller error, so the whole launch is refused. Only the **list** is shared between them; the **behaviour** is deliberately not.
+
+`environment_policy::denied_environment_key` uppercases the key and matches it against the fixed list by exact equality **or** prefix: `LD_`, `DYLD_`, `PATH`, `IFS`, `SHELLOPTS`, `CDPATH`, `BASH_ENV`, `ENV`, `PYTHONPATH`, `PYTHONHOME`, `NODE_OPTIONS`, `RUBYOPT`, `PERL5OPT`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_CONFIG`, `GIT_CONFIG_`, `AWS_`, `AZURE_`, `GOOGLE_`, `SSH_AUTH_SOCK`. The intent is to strip every knob that would re-inject code or redirect the loader/interpreter inside a confined target: dynamic-linker search paths, shell startup files, interpreter startup options, and credential/config discovery for the major cloud and Git/SSH clients. `GIT_CONFIG_` is redundant, because the `GIT_CONFIG` prefix already covers `GIT_CONFIG_GLOBAL` and its relatives; it is carried over unchanged from the reviewed baseline.
 
 | Group | Denied keys | Why |
 | --- | --- | --- |
@@ -220,9 +240,27 @@ It is enforced twice, as two independent layers. The runner filters with its own
 | Interpreter options | `PYTHONPATH`, `PYTHONHOME`, `NODE_OPTIONS`, `RUBYOPT`, `PERL5OPT` | the same class of injection, per runtime; `NODE_OPTIONS` alone is a code-execution vector |
 | VCS / credential discovery | `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_CONFIG`, `GIT_CONFIG_`, `SSH_AUTH_SOCK` | these point an otherwise-sandboxed process at an agent or a config file outside the workspace |
 | Cloud credentials | `AWS_`, `AZURE_`, `GOOGLE_` (prefixes) | a confined process must not inherit cloud credential endpoints or tokens from the daemon's environment |
-| Path | `PATH` | permitted only as the single hard-coded value `"/usr/bin:/bin"`; see below |
+| Path | `PATH` | permitted only as the single contract value `"/usr/bin:/bin"`; see below |
 
-**The surviving environment** is therefore a closed set that the helper reconstructs from scratch: `Command::env_clear()`, then `.env("PATH", "/usr/bin:/bin")`, then `.envs(...)` over the spec's environment with `key != "PATH"` filtered out — the `PATH` filter is redundant with the spec validation and exists so a pinned `PATH` cannot be overridden by a later entry. Nothing is inherited: the runner also launches the helper itself with `env_clear()` plus `PATH`/`LANG`/`LC_ALL` (`lib.rs:1791`). The spec the runner builds starts from the baseline `PATH`, `LANG=C.UTF-8`, `LC_ALL=C.UTF-8`, `CI=1`, `NO_COLOR=1`, `TERM=dumb`, `GIT_TERMINAL_PROMPT=0`, `PAGER=cat`, then appends non-denied request environment, then `EGGWORK_EXECUTION_ID` and `EGGWORK_EXECUTION_GENERATION` from `ExecutionProvenance` when present (`lib.rs:1698-1721`).
+### The node-owned baseline
+
+The node-owned baseline is the environment the node installs for a child before any caller-supplied entry: `PATH=/usr/bin:/bin`, `LANG=C.UTF-8`, `LC_ALL=C.UTF-8`, `CI=1`, `NO_COLOR=1`, `TERM=dumb`, `GIT_TERMINAL_PROMPT=0`, `PAGER=cat`. A caller-supplied value for one of those keys is **discarded in favour of the node's**, on both of the runner's launch paths.
+
+That rule is what closes the collision hole. Before it, the runner's launch-specification builder started from the fixed baseline and then *appended* every non-denied caller key, and none of the baseline keys except `PATH` was denied. A caller that set `LANG` therefore produced a specification with **two** `LANG` entries; the helper refuses a specification with duplicate keys; the runner read that refusal as a pre-target setup failure and — for a **best-effort** request only — rewrote the sandbox outcome to `NotApplied` and re-spawned the target directly with no Landlock ruleset at all. The observable result was a successful, entirely unconfined execution whose only record of the degradation was a `NotApplied` in the terminal snapshot. The `Required` path was unaffected and still failed closed.
+
+The baseline is the node's, so the helper refuses a specification in which a node-owned key carries anything other than the node's value, or carries it under a different spelling: such a specification is one the runner did not build.
+
+### The `PATH` contract
+
+`PATH == /usr/bin:/bin` is an enforced contract on **both** sides. The helper keeps the check, and takes the expected value from the shared policy (`environment_policy::PATH_VALUE`); the runner guarantees the value in the child environment and in the launch specification.
+
+The contract is a **Linux/Unix** contract. The Windows baseline is explicitly outside it: the Windows `PATH` is `%SystemRoot%\System32;%SystemRoot%`, built from the parent process at spawn time, and a future reader must not "fix" it to the Unix value. The shared policy says so in the same terms, so the Windows branch stays runner-local and the statement cannot drift from it.
+
+### The surviving environment
+
+The environment the target receives is a closed set that the helper reconstructs from scratch: `Command::env_clear()`, then `.env("PATH", environment_policy::PATH_VALUE)`, then `.envs(...)` over the spec's environment with `key != "PATH"` filtered out — the `PATH` filter is redundant with the spec validation and exists so a pinned `PATH` cannot be overridden by a later entry. Nothing is inherited: the runner also launches the helper itself with `env_clear()` plus the node's own baseline (`SandboxChannel::command`).
+
+The specification the runner builds is the node's baseline, then the caller's environment with the denied keys dropped and the node-owned keys replaced by the node's values, then `EGGWORK_EXECUTION_ID` and `EGGWORK_EXECUTION_GENERATION` from `ExecutionProvenance` when present. A repeated caller key is resolved to its last value, so the specification can never carry a duplicate key.
 
 ## Hand-off to the target
 
@@ -230,7 +268,7 @@ It is enforced twice, as two independent layers. The runner filters with its own
 let (program, argv) = spec.argv.split_first().ok_or(())?;
 let mut command = Command::new(program);
 command.args(argv).current_dir(&spec.cwd).env_clear()
-    .env("PATH", "/usr/bin:/bin")
+    .env("PATH", environment_policy::PATH_VALUE)
     .envs(spec.environment.iter().filter_map(|(k, v)| (k != "PATH").then_some((k, v))));
 let mut child = match command.spawn() { Ok(child) => child, Err(_) => { let _ = status.write_all(&[0]); return Err(()); } };
 ```
@@ -244,7 +282,9 @@ The step is `std::process::Command::spawn`, not a self-`execve`. That is a delib
 | Failure | Status byte | Target started? |
 | --- | --- | --- |
 | status socket unconnectable | none written | no (spec not even read) |
-| `read_spec` rejection | 4–15 | no |
+| `read_spec` rejection — specification shape | 4–12 | no |
+| `read_spec` rejection — **environment policy** | **13** | no |
+| `read_spec` rejection — root canonicalization | 17 | no |
 | `verify_resource_limits` false | 2 | no |
 | `restrict` failure | 2 | no |
 | ruleset not `FullyEnforced` | 30 | no |
@@ -252,7 +292,34 @@ The step is `std::process::Command::spawn`, not a self-`execve`. That is a delib
 | `argv` empty after validation | none | no |
 | `spawn` itself fails (e.g. ENOENT on a denied or missing program) | 0 | no — this is the one code the runner treats as `AfterTarget(Spawn)` |
 
-The runner's reading of those bytes (`SandboxChannel::wait`, `lib.rs:1798`): the first byte `0 | 2 | 3 | 30 | 31` → `Ok(None)` (no resource-reporting session; the run continues), `>= 4` → `Err(SandboxWaitError::BeforeTarget(RunnerError::Setup("sandbox helper rejected its launch specification (status {code})")))`, `1` → read the second byte: `1` → `Ok(Some(SandboxSession))`, `0` → `AfterTarget(Spawn("sandbox target could not start"))`, anything else → `"sandbox status was invalid"`. Every arm is a single byte read, never a length-prefixed or textual protocol.
+### The status-byte table
+
+| Byte | Meaning | Written by |
+| --- | --- | --- |
+| `0` | the target could not be spawned | `run`, after `Command::spawn` fails |
+| `1` | mechanics applied; the second byte says whether the target started | `run`, twice — once for "mechanics applied", once for "the target started" |
+| `2` | resource verification or Landlock setup failed | `verify_resource_limits`, `restrict` |
+| `3` | reserved | — |
+| `4` | the spec file could not be `stat`ed | `read_spec` |
+| `5` | the spec is not a regular file, is a symlink, is owned by another user, is group/world-accessible, or is too large | `read_spec` |
+| `6` | the spec could not be opened | `read_spec` |
+| `7` | the opened spec could not be `fstat`ed | `read_spec` |
+| `8` | the opened spec is a different inode than the stat'ed one | `read_spec` |
+| `9` | the spec could not be read | `read_spec` |
+| `10` | the spec is larger than `MAX_SPEC_BYTES` | `read_spec` |
+| `11` | the spec is not valid JSON, or does not match `LaunchSpec` | `read_spec` |
+| `12` | the specification is invalid: wrong schema version, unsupported profile, empty or oversized argv, or an environment entry that is empty, oversized, or malformed | `read_spec` |
+| `13` | **the environment does not satisfy the shared environment policy**: a denied key is present, `PATH` is not the contract value, a node-owned key carries a value or a spelling other than the node's, or an environment key is duplicated | `read_spec` |
+| `14` | the working directory could not be canonicalized | `read_spec` |
+| `15` | the root is not canonical, is not a directory, or does not contain the working directory | `read_spec` |
+| `16` | the validated root could not be pinned open | `read_spec` |
+| `17` | the root could not be canonicalized | `read_spec` |
+| `30` | the ruleset was not `FullyEnforced` | `restrict` |
+| `31` | `no_new_privs` was not set | `restrict` |
+
+Bytes `13` and `17` are new relative to the pre-corrective table. `13` was the root-canonicalization failure and is now the environment-policy refusal, because an operator reading "status 12" cannot tell which of several specification problems happened — and the environment-policy refusal is the one whose cause is a *contract* rather than a malformed file. The root-canonicalization failure moved to `17`, which was unused. The runner's reading of the bytes is unchanged: every byte `>= 4` is a pre-target refusal, so both `13` and `17` fail closed before the target exists.
+
+The runner's reading of those bytes (`SandboxChannel::wait`, via `classify_helper_status`): the first byte `0 | 2 | 3 | 30 | 31` → `Ok(None)` (no resource-reporting session; the run continues), `>= 4` → `Err(SandboxWaitError::BeforeTarget(RunnerError::Setup("sandbox helper rejected its launch specification (status {code})")))`, `1` → read the second byte: `1` → `Ok(Some(SandboxSession))`, `0` → `AfterTarget(Spawn("sandbox target could not start"))`, anything else → `"sandbox status was invalid"`. Every arm is a single byte read, never a length-prefixed or textual protocol.
 
 **The handshake recovery path and what the caller is told.** When the helper cannot confirm confinement — status byte `0`, `2`, `3`, `30` or `31`, or a spec rejection the runner treats as recoverable — the runner kills the helper tree, rewrites `setup.sandbox` and `setup.resources` to `NotApplied { reason }`, and re-spawns the target **directly**, with no Landlock ruleset and no cgroup verification. The target therefore runs unconfined, and the runner reports that as a degradation diagnostic on its output channel (`OutputChunk::Diagnostic` → `ExecutionEventKind::Diagnostic`) before the re-spawn, so the caller learns the execution ran unconfined while it is still running rather than only from the terminal result. The diagnostic's class is `isolation.degraded` for the sandbox and `resources.degraded` for the resource dimension; the grammar and bound are in [protocol.md](protocol.md#the-execution-diagnostic-payload-schema-version-1). The runner's own rules for when this happens live in [runner-execution.md](runner-execution.md#reporting-a-degradation); from the helper's side the only requirement is the one below.
 
@@ -263,7 +330,7 @@ The wire sequence, as a fixed four-message exchange with no framing beyond "one 
 | # | Direction | Byte | Meaning |
 | --- | --- | --- | --- |
 | 1 | helper → runner | accept | the helper reached `connect` and passed argv parsing |
-| 2 | helper → runner | `4`–`15` | spec rejected; runner errors before spawn |
+| 2 | helper → runner | `4`–`12`, `13`, `14`–`17` | spec rejected; runner errors before spawn |
 | 3 | helper → runner | `2` / `30` / `31` | mechanics failed; run continues without a resource session |
 | 4 | helper → runner | `1` | resources verified and Landlock applied (or not requested) |
 | 5 | helper → runner | `1` | the target `execve` succeeded |
@@ -274,7 +341,7 @@ Steps 4 and 5 deliberately reuse the value `1`: the runner distinguishes them by
 
 ## Platform support
 
-Linux is the only functional path, and the gate is on the module, not the dependency list: `#[cfg(target_os = "linux")] mod linux` holds `run`, `read_spec`, `restrict`, `exit_code`, `denied_environment_key`, `read_counter`, `verify_resource_limits`, plus `ResourceEvents`/`EventCounter`. Two `main` functions are `#[cfg]`-selected: the Linux one calls `linux::entry()`; the `#[cfg(not(target_os = "linux"))]` one (a) prints the version and exits 0 for a bare `--version`, and (b) exits 125 for everything else.
+Linux is the only functional path, and the gate is on the module, not the dependency list: `#[cfg(target_os = "linux")] mod linux` holds `run`, `read_spec`, `restrict`, `exit_code`, `environment_policy_refuses`, `read_counter`, `verify_resource_limits`, plus `ResourceEvents`/`EventCounter`. The generated `environment_policy` module is *not* inside that gate: it is a pure data-and-predicate module with no platform dependency, it is compiled on every host so that the two copies are always compiled, and its items the non-Linux entry point does not use are explicitly allowed to be dead. Two `main` functions are `#[cfg]`-selected: the Linux one calls `linux::entry()`; the `#[cfg(not(target_os = "linux"))]` one (a) prints the version and exits 0 for a bare `--version`, and (b) exits 125 for everything else.
 
 The crate still compiles on every other host because the machinery's dependencies are target-scoped (`landlock` under `cfg(target_os = "linux")`, `nix` under `cfg(unix)`), so a macOS or Windows build of the workspace pulls neither into the graph and the non-Linux entry point needs neither. What a non-Linux host actually gets is a binary that answers `--version` and refuses every launch with 125; the `[[bin]]` is unconditional in the manifest, so a host build of the workspace does produce that binary — it simply never becomes part of a release (the release file set for macOS and Windows is the daemon alone; `README.md` "Published targets" and `release_contract.rs` agree on the same split).
 
@@ -296,11 +363,13 @@ The crate still compiles on every other host because the machinery's dependencie
 
 The `Cargo.toml` states the intent in a comment: "The helper's Linux-only sandbox machinery (`mod linux`) is the sole user of these crates. Both are Unix/Linux-only and must not enter the build graph on other hosts; the non-Linux entry point uses neither."
 
-Dev-dependencies are `eggwork-runner`, `eggwork-core`, `tempfile`, `tokio` (`features = ["net"]`), and `tokio-util` — used only by `tests/landlock_runner.rs`, which drives the *real* binary (`env!("CARGO_BIN_EXE_eggwork-sandbox-helper")`) through the real `LocalProcessRunner`. None of them enter the shipped binary's graph, which is what keeps the trusted artifact's dependency surface to serde/serde_json plus one sandbox crate. Combined with `#![forbid(unsafe_code)]`, the shipped helper contains no `unsafe` of its own.
+Dev-dependencies are `eggwork-runner`, `eggwork-core`, `tempfile`, `tokio` (`features = ["net"]`), and `tokio-util` — used by `tests/landlock_runner.rs` and `tests/environment_policy_parity.rs`, both of which drive the *real* binary (`env!("CARGO_BIN_EXE_eggwork-sandbox-helper")`), the first through the real `LocalProcessRunner` and the second also directly. None of them enter the shipped binary's graph, which is what keeps the trusted artifact's dependency surface to serde/serde_json plus one sandbox crate. Combined with `#![forbid(unsafe_code)]`, the shipped helper contains no `unsafe` of its own.
 
 ## Test coverage
 
-`tests/landlock_runner.rs` is 534 lines, 10 tests, **all `#[cfg(target_os = "linux")]`** (9 `#[tokio::test]`, 1 `#[test]`); on any other host the file compiles and runs zero tests. Every test copies `CARGO_BIN_EXE_eggwork-sandbox-helper` into a `0700` temp dir as `0755` so `verify_trusted_helper` accepts it — the trust rules are satisfied by construction, which is itself part of the contract being tested. The suite is an integration suite: it never imports the helper, it drives the real binary either through the real `LocalProcessRunner` or, once, through a raw `Command`.
+`tests/landlock_runner.rs` is 534 lines, 10 tests, **all `#[cfg(target_os = "linux")]`** (9 `#[tokio::test]`, 1 `#[test]`); on any other host the file compiles and runs zero tests.
+
+`tests/environment_policy_parity.rs` is the environment-policy gate: 12 tests, of which the element-wise parity ones and the limit-constant ones run on every host and the behavioural ones are Linux-gated. It is the only suite that compares the two generated copies of the policy with each other and the only one that drives the real helper binary with a hand-written specification carrying a single probe key. Every test copies `CARGO_BIN_EXE_eggwork-sandbox-helper` into a `0700` temp dir as `0755` so `verify_trusted_helper` accepts it — the trust rules are satisfied by construction, which is itself part of the contract being tested. The suite is an integration suite: it never imports the helper, it drives the real binary either through the real `LocalProcessRunner` or, once, through a raw `Command`.
 
 | Test | What it pins down |
 | --- | --- |
@@ -328,27 +397,32 @@ In detail:
 9. `concurrent_resource_scopes_keep_pid_limits_isolated` — two overlapping runs on the same `LocalProcessRunner`, one with `pids: Required(6)` and one with `Required(32)`, each forking 8 children: the low scope reports `LimitExceeded` while the high scope reports `Applied`. This is the test that keeps the shared-cgroup hazard in `read_counter` honest.
 10. `malformed_private_spec_and_unavailable_status_channel_do_not_launch_target` — the only **direct** invocation of the binary. A `0700` dir, a `0600` `spec.json` with `profile: "unsupported-profile"` and `argv: ["/usr/bin/touch", marker]`, a bound `status.sock`: the first status byte is exactly `12`, the child exits non-zero, and the marker is absent. Second case: a valid `workspace_rw` spec but a missing status socket — non-zero exit, marker absent, proving the connect happens before the spec is read.
 
-**Thin areas, honestly.** The `restrict` failure codes `30` and `31` have no test, and neither does `2` (resource verification refused) — so the "Landlock not fully enforced" and "`no_new_privs` unset" branches are unexercised. `read_spec` codes `4`, `5` (e.g. a `0644` or euid-mismatched spec), `6`–`11`, `13`–`15` are untested; only `12` is. There is no test for oversized argv/environment or a > 1 MiB spec, none for `denied_environment_key` at the helper level (test 1's `PATH` is neutralized by the runner, not refused by the helper), none for `exit_code`'s 128 + signal mapping, and none that invokes the helper's `--version` path directly. All 9 tests are Linux-gated, so the non-Linux 125 path has no coverage. The memory/PID tests assume `python3` at `/usr/bin/python3` and a cgroup v2 hierarchy the test host can write.
+**Thin areas, honestly.** The `restrict` failure codes `30` and `31` have no test, and neither does `2` (resource verification refused) — so the "Landlock not fully enforced" and "`no_new_privs` unset" branches are unexercised. `read_spec` codes `4`, `5` (e.g. a `0644` or euid-mismatched spec), `6`–`11`, `14`–`17` are untested; `12` and `13` are covered — `12` by `malformed_private_spec_and_unavailable_status_channel_do_not_launch_target` and `13` by the parity suite. There is no test for oversized argv/environment or a > 1 MiB spec, none for `exit_code`'s 128 + signal mapping, and none that invokes the helper's `--version` path directly. The helper-level `denied_environment_key` refusal that test 1 did not reach is now covered by `the_helper_refuses_exactly_what_the_runner_drops` in the parity suite. All 9 tests are Linux-gated, so the non-Linux 125 path has no coverage. The memory/PID tests assume `python3` at `/usr/bin/python3` and a cgroup v2 hierarchy the test host can write.
 
 ## Invariants and enforcement
 
 | Invariant | Enforcement site | Test |
 | --- | --- | --- |
-| A required sandbox profile is never served by an untrusted helper | `verify_trusted_helper` → `RunnerError::Setup` (`lib.rs:465-473`) | `helper_trust_checks_reject_missing_wrong_and_symlinked_helpers` |
-| Best-effort sandbox is reported as `NotApplied`, never as enforced | `SandboxOutcome::NotApplied { reason }` (`lib.rs:469`) | same test |
-| Workspace is read-write, everything else outside the runtime allowlist is denied | `restrict`, `ABI::V4`, `from_all` handled set, root rule at full rights (`main.rs:186`) | `required_landlock_allows_workspace_and_denies_outside_reads_and_writes`, `workspace_symlink_cannot_read_outside_workspace` |
-| `/dev/null` stays writable; no other `/dev` path is allowed | explicit `/dev/null` rule + comment (`main.rs:208`) | exercised implicitly by the escape trap's `>/dev/null 2>&1` |
-| A partially enforced ruleset is a refusal, not a downgrade | `status.ruleset != FullyEnforced → 30` (`main.rs:227`) | none (uncovered) |
-| `no_new_privs` is set | `!status.no_new_privs → 31` (`main.rs:230`) | none (uncovered) |
+| A required sandbox profile is never served by an untrusted helper | `verify_trusted_helper` → `RunnerError::Setup` | `helper_trust_checks_reject_missing_wrong_and_symlinked_helpers` |
+| Best-effort sandbox is reported as `NotApplied`, never as enforced | `SandboxOutcome::NotApplied { reason }` | same test |
+| Workspace is read-write, everything else outside the runtime allowlist is denied | `restrict`, `ABI::V4`, `from_all` handled set, root rule at full rights (`linux::restrict`) | `required_landlock_allows_workspace_and_denies_outside_reads_and_writes`, `workspace_symlink_cannot_read_outside_workspace` |
+| `/dev/null` stays writable; no other `/dev` path is allowed | explicit `/dev/null` rule + comment (`linux::restrict`) | exercised implicitly by the escape trap's `>/dev/null 2>&1` |
+| A partially enforced ruleset is a refusal, not a downgrade | `status.ruleset != FullyEnforced → 30` (`linux::restrict`) | none (uncovered) |
+| `no_new_privs` is set | `!status.no_new_privs → 31` (`linux::restrict`) | none (uncovered) |
 | No ABI downgrade to an older Landlock version | hard-coded `ABI::V4`, every failure → 2 | indirect: runner's `probe_landlock_ruleset` gates the capability |
-| The target never starts with the declared limits unenforced | `verify_resource_limits` (`main.rs:335`), fail-closed on unreadable/unparseable | `required_cpu_quota_is_verified_before_target_start`; memory/pids classification tests |
+| The target never starts with the declared limits unenforced | `verify_resource_limits` (`linux::verify_resource_limits`), fail-closed on unreadable/unparseable | `required_cpu_quota_is_verified_before_target_start`; memory/pids classification tests |
 | Limit breaches are attributed per dimension, not guessed | `ResourceEvents` bit flags → `ResourceDimension::{Memory, Pids}` | `required_memory_limit_is_enforced_and_classified`, `required_pid_limit_is_enforced_and_classified` |
 | Per-run cgroup isolation is real, not shared state | runner-side scope creation; helper only reads its own `/proc/self/cgroup` | `concurrent_resource_scopes_keep_pid_limits_isolated` |
 | A malformed spec aborts before the target runs | `read_spec` → code 12 + `Err` | `malformed_private_spec_and_unavailable_status_channel_do_not_launch_target` |
 | A runtime enforcement failure is reported to the caller, not only to the snapshot | the runner's handshake recovery path emits a diagnostic before it re-spawns the target directly | runner-side `crates/eggwork-runner/tests/diagnostic_degradation.rs`; server-side `a_degraded_best_effort_execution_publishes_its_diagnostic_before_output_and_terminal` |
-| An unavailable status channel aborts before the spec is read | `UnixStream::connect` first (`main.rs:69`) | same test |
-| The environment is rebuilt, never inherited | `env_clear()` + pinned `PATH` + validated spec env (`main.rs:100`) | `required_landlock_allows_workspace_and_denies_outside_reads_and_writes` (`PATH=/malicious/path`) |
-| Loader/interpreter/credential knobs never reach the target | `denied_environment_key` in both crates | none directly (runner-side filter is what test 1 observes) |
+| An unavailable status channel aborts before the spec is read | `UnixStream::connect` first (`linux::run`) | same test |
+| The environment is rebuilt, never inherited | `env_clear()` + the contract `PATH` + validated spec env (`linux::run`) | `required_landlock_allows_workspace_and_denies_outside_reads_and_writes` (`PATH=/malicious/path`) |
+| Loader/interpreter/credential knobs never reach the target | the shared policy's deny-list; the runner drops, the helper refuses | `the_helper_refuses_exactly_what_the_runner_drops` (helper side); runner-side `a_caller_supplied_denied_key_does_not_reach_the_child` |
+| The environment policy has exactly one owner | `crates/eggwork-runner/policy/environment-policy.toml`, generated into each crate by `scripts/generate_environment_policy.py` | `test_the_checked_in_copies_are_what_the_generator_produces`; `the_denied_key_list_is_the_same_list_in_the_same_order` |
+| The two generated copies cannot drift apart | `crates/eggwork-sandbox-helper/tests/environment_policy_parity.rs`, element-wise and behavioural | same suite; a one-sided edit to either copy fails it |
+| A node-owned key carries the node's value, in the child and in the specification | the runner's `build_child_environment`; the helper's `linux::environment_policy_refuses` | `a_caller_supplied_node_owned_key_keeps_the_execution_confined`; `the_direct_path_and_the_helper_path_agree_about_the_environment` |
+| The `PATH` contract is enforced on both sides and is Linux/Unix-scoped | `environment_policy::PATH_VALUE`; the runner installs it, the helper refuses anything else | `the_matching_rule_and_the_path_contract_are_the_same_in_both_copies`; `the_path_contract_states_that_windows_is_outside_it` |
+| The helper's limit constants are the owner's, not a copy | generated into the helper's copy from `eggwork-core/src/lib.rs` | `the_helper_limit_constants_match_eggwork_core` |
 | Timeout and cancellation reap the whole tree | runner process-group signaling; helper only `wait()`s | `sandbox_timeout_and_cancellation_reap_the_helper_process_group` |
 | Helper and daemon cannot be version-skewed | exact `--version` match in `check_helper_compatibility` | `crates/eggwork-server`: `helper_version_skew_is_detected`; `release_contract::the_helper_ships_exactly_on_linux_release_targets` |
 
@@ -363,7 +437,7 @@ In detail:
 - **Spec TOCTOU surface.** `read_spec` uses `symlink_metadata`, then `open`, then compares `dev`/`ino` — but it does not use `O_NOFOLLOW`, so the *opened* file is not proven to be the stat'ed non-symlink. The euid + `mode & 0o077 == 0` + `0700` parent requirements are what actually make the substitution uninteresting; confirm that is the intended layering rather than an oversight.
 - **Could an untrusted caller invoke the binary directly?** Yes — argv is unvalidated input to any process, so `verify_trusted_helper` protects the *runner*, not the binary. What stops a malicious direct caller is narrow: the spec must be owned by the caller's euid and `0600`, the caller must be able to bind the status socket (self-reporting only, so it can fabricate any code), and the target will be confined to the caller's own `root` with the caller's own environment. A direct caller therefore gets a *correctly confined process with attacker-chosen rules*, i.e. no privilege gain — but it is worth confirming there is no path where a caller-supplied `root` escapes containment, since `read_spec`'s `root != spec.root` equality after canonicalization plus `cwd.starts_with(root)` is the only thing standing between the two.
 - **Uncleared fd surface.** The helper holds the spec `File`, the `status` `UnixStream`, and up to two cgroup event `File`s across the target's lifetime, plus the `Child`'s inherited pipes. None are `CLOEXEC`-hardened in this crate, and the target inherits whatever the runner's `Command` set. Confirm the runner's stdio wiring is the intended boundary and that the cgroup event fds are harmless to leak (they are pre-restriction opens, which is also exactly why they keep working).
-- **The environment denylist is prefix-matched and duplicated.** `denied_environment_key` lives in both crates and is a closed list; a new interpreter or loader knob (e.g. `PERL5LIB`, `RUBYLIB`, `NODE_PATH`, `GLIBC_TUNABLES`, `PROMPT_COMMAND`) is not covered. The duplication is deliberate (runner filters, helper validates) but is two copies to keep in sync, and only the runner's copy has any test coverage.
+- **The environment denylist is prefix-matched and closed.** The list is now written once — `crates/eggwork-runner/policy/environment-policy.toml` — and generated into both crates, so the two copies cannot drift. What remains closed is the *coverage*: a new interpreter or loader knob (e.g. `PERL5LIB`, `RUBYLIB`, `NODE_PATH`, `GLIBC_TUNABLES`, `PROMPT_COMMAND`) is not in the list at all. Adding one is a policy decision with its own security review; it is not a mechanical consequence of the duplication being gone. The prefix match also means `PATH` denies *any* key beginning with `PATH`, not only `PATH` itself, which is deliberate but worth remembering when reading the list.
 - **Exit code fidelity.** `exit_code` maps a signalled target to `128 + signal`, which is conventional but indistinguishable from a target that legitimately exited with that number. Worth confirming the runner's classification does not treat large exit codes as failures by accident.
 
 ## Related

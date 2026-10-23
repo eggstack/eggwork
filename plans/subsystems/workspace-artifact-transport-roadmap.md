@@ -1,6 +1,6 @@
 # Workspace and Artifact Transport Roadmap
 
-Status: active roadmap; M001-M004 closed; M005a and M005b data-plane correctives proposed
+Status: active roadmap; M001-M004 closed; M005a data-plane corrective proposed; M005b data-plane corrective implemented
 
 Canonical authority:
 
@@ -161,7 +161,7 @@ Exit conditions:
 
 Class: invariant
 
-Status: proposed
+Status: implemented
 
 Corrective addendum:
 
@@ -170,6 +170,10 @@ Corrective addendum:
 Implementation plan:
 
 - `plans/implementation/workspace-artifact-transport/005b-gc-preview-and-store-ownership-corrective.md`
+
+Closure record:
+
+- `plans/closure/workspace-artifact-transport/005b-status.md`
 
 Objective:
 
@@ -183,6 +187,14 @@ Exit conditions:
 - the manifest owner-id composite has exactly one producer, and the two inlined call sites use it;
 - a test proves that the preview and the apply pass agree;
 - no public protocol surface and no stored format changes.
+
+Implemented:
+
+- the candidate predicate for blobs, workspaces, retained manifests, and artifacts is written once, in the owner module, and the operator's preview obtains its candidate sets through that owner code and holds no SQL of its own;
+- the preview reaches the owner through a non-mutating seam - `blob::preview_gc`, `workspace::preview_gc`, and `artifact::preview_gc` open the metadata database read-only, because every owner `open` creates and reconciles;
+- the blob path layout has one owner: `blob::object_path` and `blob::shard_path`, which `BlobStore::path_for` delegates to;
+- the materializer verifies the bytes it writes while copying them, through the store's `copy_verified`, so the verification is bound to the bytes actually copied rather than to a separate earlier read;
+- the manifest owner id has one producer, `manifest_owner_id_for_key`, with `manifest_owner_id` as the validated-principal entry point and the two inlined call sites routed through it.
 
 ## 4. Future optimized materializers
 

@@ -93,11 +93,23 @@ whole capture instead of producing a partial record set.
   <d2d3>/...                               one shard directory per first-hex-byte pair
 ```
 
-`path_for` is `root.join(&digest.as_str()[..2]).join(digest.as_str())` (`blob.rs:123-128`): a
-single level of sharding on the first two hex characters - 256 shard directories, no deeper
-nesting, no extension, full digest as the file name. Two-digit sharding keeps any one directory
-from accumulating the whole store while leaving `read_dir` cheap at open time (`remove_stale_parts`
-walks exactly the shards).
+`path_for` delegates to the store-owned pure function `blob::object_path(root, digest)`:
+`root.join(&digest.as_str()[..2]).join(digest.as_str())` - a single level of sharding on the first
+two hex characters - 256 shard directories, no deeper nesting, no extension, full digest as the file
+name. Two-digit sharding keeps any one directory from accumulating the whole store while leaving
+`read_dir` cheap at open time (`remove_stale_parts` walks exactly the shards). `blob::shard_path`
+resolves the shard directory alone, and `blob::object_path` resolves the object. Both are pure
+functions of `(root, digest)`, so a caller that only needs to resolve a path does not need a store
+instance - and therefore does not need `BlobStore::open`, which creates the root, creates the
+metadata database when absent, and calls `remove_stale_parts` (which deletes stale part files and
+reconciles index rows). The operator's `inspect blob` verb resolves the object through
+`blob::object_path` and never opens the store.
+
+**One owner for the store's metadata file name.** `blob::metadata_path(root)`,
+`workspace::metadata_path(root)` and `artifact::metadata_path(database_path)` are the only places
+the three metadata file names (`metadata.sqlite`, `metadata.sqlite`, `artifacts.sqlite`) are
+written. The operator module resolves them through those functions instead of spelling them, so
+renaming a store's database is a one-line change in its owner.
 
 The metadata database, not the filesystem, is the authority for existence. `blobs` is
 `(digest TEXT PRIMARY KEY, size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
@@ -106,12 +118,19 @@ reference_count INTEGER NOT NULL DEFAULT 0, last_used_unix_ms INTEGER NOT NULL)`
 `(owner_kind, owner_id, digest)` with `FOREIGN KEY(digest) REFERENCES blobs(digest) ON DELETE
 CASCADE`. `reference_count` is never written by Rust - two triggers (`blob_reference_insert` /
 `blob_reference_delete`, `blob.rs:101-110`) maintain it. Reclamation queries deliberately use
-`NOT EXISTS (SELECT 1 FROM blob_references ...)` rather than the counter.
+`NOT EXISTS (SELECT 1 FROM blob_references ...)` rather than the counter: the counter is a
+denormalization maintained only by those triggers, so it can drift from the rows that actually pin
+bytes, and the rows are the truth.
 
 `blob_references.owner_kind` is a small closed set in practice: `"workspace"`, `"manifest"`,
 `"artifact"`, and `"reader"` (in-flight download, `lib.rs:1413`). `owner_id` is the `WorkspaceId`,
-the `"{principal}:{manifest_digest}"` composite (`workspace.rs:883`), the `ArtifactId`, or a fresh
-UUID.
+the `"{principal}:{manifest_digest}"` composite, the `ArtifactId`, or a fresh UUID. The composite
+has one producer: `manifest_owner_id_for_key(principal_key, manifest_digest)` in `workspace.rs`,
+with `manifest_owner_id(principal_id, manifest_digest)` as the validated-principal entry point
+that delegates to it. The two retained-manifest call sites - the GC pass and the orphan sweep -
+both go through it, so the format is written in exactly one place. A manifest digest is hex and
+contains no colon, so the pair is recovered by splitting at the *last* colon even when the
+principal itself contains one.
 
 ### Public surface
 
@@ -123,9 +142,21 @@ UUID.
 - `BlobError` (`blob.rs:33-55`), walked in [Error model](#error-model).
 - `BlobStore::{open, path_for, find_missing, prepare_upload, stored_size, retain,
   set_reference_expiry, clear_reference_expiry, release_references, reference_owners,
-  garbage_collect, put_stream, verify_existing, open_verified}`. `BlobStore` is `Clone` and
-  internally `Arc`-shared, so one instance is reachable from every handler and from the workspace
-  and artifact modules.
+  garbage_collect, put_stream, verify_existing, open_verified, copy_verified}`. `BlobStore` is
+  `Clone` and internally `Arc`-shared, so one instance is reachable from every handler and from the
+  workspace and artifact modules.
+- **Owner-module free functions.** These are the seams the operator uses, and they are deliberately
+  *not* methods on an open store, because every `open` in this subsystem creates and reconciles:
+  - `blob::metadata_path(root) -> PathBuf`, `blob::shard_path(root, digest) -> PathBuf`,
+    `blob::object_path(root, digest) -> PathBuf` - the store's file names and layout, pure.
+  - `blob::preview_gc(metadata_path, now_unix_ms, limit) -> Result<blob::GcPreview, BlobError>` -
+    the blob candidates the collector would act on, evaluated against a read-only connection.
+  - `workspace::metadata_path(root) -> PathBuf`,
+    `workspace::preview_gc(metadata_path, now_unix_ms, limit) -> Result<workspace::GcPreview,
+    WorkspaceError>` - the same for workspaces and retained manifests.
+  - `artifact::metadata_path(database_path) -> PathBuf`,
+    `artifact::preview_gc(metadata_path, now_unix_ms, limit) -> Result<artifact::GcPreview,
+    ArtifactError>` - the same for artifacts.
 
 ### Ingest
 
@@ -209,9 +240,45 @@ Two phases. First, an unbounded `COUNT(*)` of expired references
 (`expires_unix_ms IS NOT NULL AND expires_unix_ms <= now`) - the number a dry run reports. Then,
 when not a dry run, delete up to `limit` of them, **re-select** blob candidates, and delete them.
 Selection is `WHERE NOT EXISTS (SELECT 1 FROM blob_references r WHERE r.digest = blobs.digest)
-ORDER BY last_used_unix_ms ASC LIMIT ?1` (`blob.rs:318-324`): unreferenced-only, cold
-(least-recently-verified) first. Selection is repeated after the expired references are dropped so
-a blob that just became unreferenced is eligible in the same pass.
+ORDER BY last_used_unix_ms ASC LIMIT ?1` - unreferenced-only, cold (least-recently-verified) first.
+Selection is repeated after the expired references are dropped so a blob that just became
+unreferenced is eligible in the same pass.
+
+**One predicate, three readers.** The candidate statement is the module constant
+`UNREFERENCED_CANDIDATES_SQL` in `blob.rs`, and it is the only place the blob candidate predicate
+is written. It has three readers: the collector's dry run, the collector's real pass, and the
+operator's preview. The first two are the same function - `BlobStore::garbage_collect` selects
+through `BlobStore::unreferenced_candidates` - evaluated at two different points in the
+transaction. The third is `blob::preview_gc`, which evaluates the *same* statement against a
+read-only connection to the same database file.
+
+This matters because the operator's preview used to carry its own hand-copied copy of the
+predicate, and the copy had drifted: it selected on `blobs.reference_count = 0` while the collector
+selected on the reference rows. The counter is a denormalization maintained only by the
+`blob_reference_insert` / `blob_reference_delete` triggers, so it can drift from the rows that
+actually pin bytes. The preview therefore reported a *different* set from the pass it was
+previewing - both in membership and, once the drift was asymmetric, in count.
+
+**The preview seam is non-mutating by construction.** `BlobStore::open`, `WorkspaceManager::open`
+and `ArtifactStore::open` all create and reconcile: they create the root and the metadata database
+when absent, and `BlobStore::open` calls `remove_stale_parts` (deleting stale part files and
+reconciling index rows) while `WorkspaceManager::open` calls `reconcile` (deleting rows and
+directories that do not match the store). A preview that opened a store would therefore mutate the
+store it reports on - and, against a store that does not exist yet, would bring it into being. So
+the preview does not open the store: `blob::preview_gc`, `workspace::preview_gc` and
+`artifact::preview_gc` open the metadata database with `SQLITE_OPEN_READ_ONLY` and evaluate the
+owner's canonical statement. A preview that cannot evaluate the canonical statement fails with a
+typed error; it never degrades to zero candidates. The one exception is deliberate and historical:
+a store that predates the retained-manifest cache has no `retained_manifests` table, and
+`workspace::preview_gc` reports zero manifest candidates for it instead of failing the whole
+preview.
+
+**Preview versus apply.** The preview evaluates the candidate statement *before* the expired
+reference rows are deleted; the apply pass evaluates it *after*. The preview's set is therefore a
+**subset** of what the apply pass removes, and the difference is exactly the blobs that became
+unreferenced because their expired reference was swept in the same pass. When the store holds no
+expired references, the two select at the same point and the sets are **equal**. That relation is
+enforced by tests, not by a comment.
 
 Per candidate: `fs::remove_file`, then
 `DELETE FROM blobs WHERE digest = ?1 AND NOT EXISTS (SELECT 1 FROM blob_references WHERE digest =
@@ -351,11 +418,38 @@ loop fails without touching the filesystem at all.
 before creation, so parents precede children with no dependency analysis, and parent existence is
 already guaranteed by the second pass of `manifest.validate()`. `Directory` -> `create_dir` + 0700.
 `File` -> `OpenOptions::new().write(true).create_new(true)` with `mode(0o700)` when `executable` else
-`0o600`, copying from `blobs.path_for(digest)` opened with `File::open`; `io::copy` must yield
-exactly `size_bytes` else `BlobSizeMismatch` (`workspace.rs:919-921`), then `sync_all()` and
-`set_file_permissions`. `Symlink` -> `InvalidManifest` (`workspace.rs:926`) - defense in depth,
-since core already rejected it. Afterwards every created directory is `sync_all`ed deepest-first
-(reverse component count).
+`0o600`, copying from `blobs.path_for(digest)` through `BlobStore::copy_verified`; the copy must
+yield exactly `size_bytes` else `BlobSizeMismatch`, then `sync_all()` and `set_file_permissions`.
+`Symlink` -> `InvalidManifest` (`workspace.rs:926`) - defense in depth, since core already rejected
+it. Afterwards every created directory is `sync_all`ed deepest-first (reverse component count).
+
+**The materializer verifies the bytes it writes.** `BlobStore::copy_verified` hashes the byte
+stream it forwards into the staging file and compares the result with the manifest's digest; a
+mismatch is `InvalidBlob`, and the staged file is removed so unverified bytes never survive into
+the tree. The hash is computed **over the bytes that are actually copied**, not over a separate
+read of the same path. A pre-flight check and a later copy are two reads of a mutable file, and
+only hashing the bytes that reach the destination proves the destination holds the manifest's
+content: an object that changes between the two reads cannot be smuggled past a check that
+happened before it. A size-only check accepted any file of the right length, which is not a
+weaker version of the same guarantee - it is a different and weaker one.
+
+The choice was **verify-while-copying**, not verify-then-copy. The performance consequence is
+worth stating precisely, because this path already pays a full re-hash of every input:
+
+- Before: the pre-flight `blobs.verify_existing(digest)` re-hashes every referenced blob (one
+  read, one SHA-256 pass), and `materialize_tree` then re-reads the object to copy it (one read, no
+  hash).
+- After: the pre-flight is unchanged, and the copy computes a SHA-256 pass over the bytes it
+  forwards. The number of reads of the object file and the bytes moved are **unchanged**; what is
+  added is one SHA-256 computation over the copied bytes.
+- A verify-then-copy implementation would have added a *third* read of every object file: hash the
+  file, close it, open it again, copy it.
+
+So the recorded property - "blob download and workspace materialization both pay a full re-hash of
+every input" - remains true, and is now bound to the bytes actually written rather than to a
+separate earlier read. The cost is CPU, not I/O. The bounds are unchanged: no quota, size, or entry
+count moved, and the staging/rename protocol, the `0600`/`0700` permissions, the symlink refusal
+and the staging cleanup behaviour are all as they were.
 
 **Symlink policy: materialization never creates a symlink.** No code path in `materialize_tree`
 calls `symlink`, and a symlinked *parent* cannot exist because the staging root is fresh, 0700, and
@@ -535,9 +629,12 @@ startup, so a crash mid-execution cannot leave a permanently live reference.
 
 ### Bounded cleanup
 
-`ArtifactStore::garbage_collect(now_unix_ms, limit, dry_run)` (`artifact.rs:186-223`) runs three
-bounded statements: count all expired, count the bounded candidate window (`ORDER BY
-expires_unix_ms LIMIT limit`), and - when not a dry run - delete that window.
+`ArtifactStore::garbage_collect(now_unix_ms, limit, dry_run)` (`artifact.rs:186-223`) selects the
+bounded candidate window through the module constant `ARTIFACT_CANDIDATES_SQL`
+(`SELECT artifact_id FROM artifacts WHERE expires_unix_ms <= ?1 ORDER BY expires_unix_ms LIMIT ?2`)
+and - when not a dry run - deletes exactly the rows that window named. The constant is the only
+place the artifact candidate predicate is written; `artifact::preview_gc` evaluates the same
+statement against a read-only connection.
 `ArtifactGcReport { candidate_artifacts, deleted_artifacts }` (`artifact.rs:54-57`), where
 `deleted_artifacts` is the bounded candidate count, not a measured row count.
 
@@ -565,6 +662,21 @@ which is what makes those blobs unreferenced; artifact GC deletes rows next, whi
 reference rows expirable; blob GC runs last and picks up everything that became collectable. The
 blob pass is the only one that takes `BlobStore::write_lock`, so it is the one that can block behind
 an in-flight upload.
+
+**The operator's path and the in-process path.** `eggworkd gc` runs outside the node: it takes the
+exclusive maintenance lock (so it refuses to race a running node), opens the three stores, and
+either previews or applies. `NodeServer::collect_garbage` runs *inside* the node against the
+already-open store instances. They are separate entry points and are **not** unified, for a reason
+that is not about the predicate: the operator path's defining property is that it takes an
+exclusive lock and therefore refuses to run against a live node, while the in-process path's
+defining property is that it runs against the live store. Merging them would give up one of those
+two properties.
+
+What *is* unified is the candidate predicate. Both paths call the owner collectors, and the owner
+collectors and the operator's preview all evaluate the same module constants
+(`UNREFERENCED_CANDIDATES_SQL`, `WORKSPACE_CANDIDATES_SQL`, `MANIFEST_CANDIDATES_SQL`,
+`ARTIFACT_CANDIDATES_SQL`), so there is no second place where the answer could differ. The
+in-process path is not exposed as a remote route.
 
 ## Bounds and quotas
 
@@ -727,6 +839,12 @@ How a caller distinguishes the three cases:
 | Expired artifacts are invisible, then deleted | `artifact.rs:132`, `artifact.rs:168`, `artifact.rs:186-223` | `artifact.rs:804`; `lib.rs:3399` |
 | Capture is all-or-nothing w.r.t. records | retain before insert (`artifact.rs:311-322`) | `artifact.rs:753` |
 | Retention cannot stay pinned after a crash | `workspace.rs:667-696`, `workspace.rs:518-533` | `workspace.rs:1430`; `workspace.rs:1497` |
+| The GC preview and the GC apply select the same candidates | `UNREFERENCED_CANDIDATES_SQL` / `WORKSPACE_CANDIDATES_SQL` / `MANIFEST_CANDIDATES_SQL` / `ARTIFACT_CANDIDATES_SQL` in the owner modules; the operator holds no candidate predicate | `gc_preview_uses_the_stores_own_blob_predicate_not_the_reference_count_counter` (`operations.rs`); `gc_preview_candidates_are_a_subset_of_what_the_apply_pass_removes`; `gc_preview_and_apply_agree_when_the_store_has_no_expired_references`; `the_operator_module_contains_no_candidate_predicate_of_its_own` (`tests/gc_preview_parity.rs`) |
+| A candidate is selected on the reference rows, not on the counter | `UNREFERENCED_CANDIDATES_SQL` (`NOT EXISTS (SELECT 1 FROM blob_references ...)`) | `gc_preview_uses_the_stores_own_blob_predicate_not_the_reference_count_counter` (`operations.rs`) |
+| The GC preview does not create or reconcile a store | `blob::preview_gc` / `workspace::preview_gc` / `artifact::preview_gc` open the metadata database `SQLITE_OPEN_READ_ONLY`; the owner `open` functions create and reconcile | `gc_preview_does_not_create_a_store_that_does_not_exist` (`operations.rs`) |
+| The store's metadata file name and the blob layout are written once | `blob::metadata_path`, `workspace::metadata_path`, `artifact::metadata_path`, `blob::shard_path`, `blob::object_path` | `the_operator_module_contains_no_candidate_predicate_of_its_own` (`tests/gc_preview_parity.rs`); `inspect_blob_resolves_the_object_through_the_store_path_ownership` (`operations.rs`) |
+| The manifest owner id has one producer | `manifest_owner_id_for_key` / `manifest_owner_id` (`workspace.rs`) | `manifest_owner_id_has_one_producer_for_validated_and_string_principals` (`workspace.rs`); `manifest_gc_releases_the_reference_for_an_unparseable_stored_principal` (`workspace.rs`) |
+| Materialized bytes match the manifest digest, not just its length | `BlobStore::copy_verified` (hash over the copied stream) | `materialize_tree_refuses_blob_bytes_that_do_not_match_the_manifest_digest` (`workspace.rs`) |
 
 ## Test coverage
 
@@ -742,7 +860,7 @@ and its row deleted, `.part-` files swept at reopen, and `find_missing` reportin
 as missing afterwards. That one test covers digest mismatch, quota exhaustion, corruption/quarantine,
 and startup cleanup.
 
-**`workspace.rs` (10 tests).** Exact tree materialization with 0600/0700 permissions and fenced
+**`workspace.rs` (13 tests).** Exact tree materialization with 0600/0700 permissions and fenced
 resolution (1002); missing blobs and symlink manifests never producing a ready workspace (1088);
 concurrent same-identity materialization plus recovery of unready state (1145); quota checked
 *before* materialization (1194); retention GC preserving a live workspace and later reclaiming its
@@ -751,6 +869,50 @@ manifest digest (1310); cross-principal lookup behaving as missing with no side 
 expired base behaving as missing and GC releasing the blobs it pinned (1430); a manifest whose blob
 is missing being reaped with crash/reopen reconciliation (1497); and 12-way concurrent derived
 materialization with conflict fencing and invalid patches (1543).
+
+Three more cover the store-ownership and byte-verification properties:
+`materialize_tree_refuses_blob_bytes_that_do_not_match_the_manifest_digest` corrupts a stored
+object **in place, keeping its length**, and asserts the materializer refuses it (`InvalidBlob`)
+and that the unverified bytes do not survive into the tree - a size-only check would have copied
+them; the same test also asserts that correct bytes still materialize.
+`manifest_owner_id_has_one_producer_for_validated_and_string_principals` asserts that the
+validated-principal and string-keyed entry points produce the same composite, including for a
+principal that itself contains a colon. `manifest_gc_releases_the_reference_for_an_unparseable_stored_principal`
+seeds a retained-manifest row whose stored principal cannot be parsed and asserts the GC still
+deletes the row and releases the blob pin.
+
+**`operations.rs` (GC preview).** The preview fixture builds the three stores through their owner
+modules, so it is a real store and not a hand-built database shaped to a predicate.
+`garbage_collection_preview_reads_only_and_reports_bounds` asserts the preview honours its bound
+(one candidate at `limit = 1`, the full census at `limit = 8`), reports nothing as deleted, and
+leaves an in-flight `.part-` upload untouched.
+`gc_preview_uses_the_stores_own_blob_predicate_not_the_reference_count_counter` seeds a store
+whose `reference_count` counter has drifted from its reference rows - two blobs with a live
+reference row and a counter of zero, one blob with no reference rows and a counter of one - and
+asserts the operator's preview reports exactly the owner's canonical candidate set. The fixture is
+asymmetric on purpose: the two predicates would otherwise produce the same *count* and differ only
+in membership.
+`gc_preview_candidates_are_a_subset_of_what_the_apply_pass_removes` asserts the preview's set is
+a subset of what the apply pass removes, and that the difference is exactly the blob that became
+unreferenced because its expired reference was swept in the same pass.
+`gc_preview_and_apply_agree_when_the_store_has_no_expired_references` asserts the two sets are
+*equal* when the store holds no expired references.
+`gc_preview_does_not_create_a_store_that_does_not_exist` points the preview at a store that does
+not exist, asserts it fails with a typed error, and asserts that the blob root, the workspace root
+and the database - and the database's parent directory - are still absent afterwards; the same
+test then performs the creating open the preview must not use, to show the assertion has teeth.
+`inspect_blob_resolves_the_object_through_the_store_path_ownership` resolves an object in a real
+store and asserts a recorded size that disagrees with the file's actual length is a data error;
+`inspect_blob_refuses_a_symlinked_shard_or_object` (unix) asserts a symlinked shard directory and a
+symlinked object file are both refused.
+
+**`tests/gc_preview_parity.rs` (3 tests).** A structural guard that keeps the two paths from
+drifting apart again: the operator module's production code must not spell a reclamation predicate,
+the candidate ordering, a store metadata file name or the shard layout, and the operator's preview
+function must contain no SQL and open no store. The guard is precise - it does not forbid SQL in
+general, because the inspection verbs legitimately read a single record by id - and it does not
+scan the test module, because a fixture has to reach the store's tables to seed the drifted states
+the behavioural tests need.
 
 **`artifact.rs` (6 tests).** Only declared files captured with content streaming back verified (577);
 missing required and symlinked outputs failing with no records published (663); a disappearing
@@ -786,8 +948,15 @@ runner's confinement to the materialized root.
   `manifest_orphan_sweep_reaches_owners_past_the_first_page`, which pins the resume cursor and the
   wrap-back-at-end behaviour. Unbounded `retained_manifests` growth and a hardlink-based quota
   bypass remain uncovered.
-- Nothing in `crates/eggwork-server/tests/` touches the data plane: `installed_qualification.rs` and
-  `release_contract.rs` are the only integration files.
+- Nothing in `crates/eggwork-server/tests/` touches the data plane *behaviourally*: the only
+  integration file that reaches into it is `gc_preview_parity.rs`, and it is a structural guard
+  over the operator module's source rather than a behavioural test.
+- The materializer's byte verification adds one SHA-256 computation over the copied bytes on top
+  of the pre-flight re-hash. The number of reads and the bytes moved are unchanged - a
+  verify-then-copy implementation would have added a third read of every object file - but the
+  hashing CPU for the materialization step roughly doubles. The recorded property "blob download
+  and workspace materialization both pay a full re-hash of every input" is unchanged and is now
+  bound to the bytes actually written.
 - Recorded evidence: [001](../plans/closure/workspace-artifact-transport/001-status.md) through
   [004](../plans/closure/workspace-artifact-transport/004-status.md); 004 records
   `cargo test --workspace --all-targets` as 108 passed, 1 ignored, 8 suites, and enumerates the
