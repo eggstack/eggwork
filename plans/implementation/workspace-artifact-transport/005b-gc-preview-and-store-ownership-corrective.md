@@ -543,8 +543,12 @@ The record must distinguish code inspection from executed evidence and must incl
   reported, the set the apply pass removed, and the relation observed between them, with the
   subset relation stated explicitly and the equality case demonstrated separately;
 - the non-vacuity evidence for each new test, including how the digest-mismatch materializer case
-  was shown to fail before the fix and the corrupt-principal owner-id case was shown to fail
-  before the fix;
+  was shown to fail before the fix. For the corrupt-principal owner-id case, the pre-fix behaviour
+  must be established empirically rather than assumed: if the pre-fix inline format produced the
+  identical composite (the defect being duplication rather than a wrong released value), then the
+  closure record states that plainly and cites the structural guard that enforces the single
+  producer, instead of claiming a pre-fix failure that did not occur. A closure record must not
+  assert a failing-before-the-fix result it did not observe;
 - the **compatibility review**: an explicit statement that no wire shape and no stored format
   changed, with the performance consequence of the materializer change recorded;
 - the documentation status for `architecture/data-plane.md` and `architecture/operations-cli.md`,

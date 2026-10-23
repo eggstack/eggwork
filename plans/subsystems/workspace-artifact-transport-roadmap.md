@@ -183,7 +183,7 @@ Exit conditions:
 
 - the dry-run report and the apply pass select candidates through the same store-owned statement;
 - the operator's blob inspection goes through the store's path and ownership API rather than re-deriving the shard layout;
-- the workspace materializer uses the store's verified-open path;
+- the workspace materializer uses the store's verified-copy path, so the verification is bound to the bytes actually copied;
 - the manifest owner-id composite has exactly one producer, and the two inlined call sites use it;
 - a test proves that the preview and the apply pass agree;
 - no public protocol surface and no stored format changes.
