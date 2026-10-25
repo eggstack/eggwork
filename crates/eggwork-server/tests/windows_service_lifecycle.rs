@@ -557,6 +557,11 @@ async fn the_windows_service_lifecycle_is_owned_and_reachable() -> Result<(), St
         observed.state, "Running",
         "a service whose configuration cannot be loaded must never report Running"
     );
+    println!(
+        "RECEIPT: a node whose configuration cannot be loaded never reported Running; \
+         ownership={} state={}",
+        observed.ownership, observed.state
+    );
     let _ = service_verb_with_config(&subject, "uninstall", &unavailable);
     delete_registration();
 

@@ -126,7 +126,44 @@ Windows jobs.
 | Fixture | the repository's own rcgen-based qualification fixture, materialised by `qualification_fixture` under the `qualification` feature |
 | Bind | a loopback port reserved by the job and released, so the service-hosted node binds an address the test can reach |
 
-__LIFECYCLE_EVIDENCE__
+The suite prints a receipt for every phase, and the hosted log is the
+evidence:
+
+```
+RECEIPT: daemon D:\a\_temp/service-host/bin/eggworkd.exe
+RECEIPT: config D:\a\_temp/service-host\state/node.json
+RECEIPT: install completed; ownership=Owned state=Stopped
+RECEIPT: start completed; ownership=Owned state=Running
+RECEIPT: the service-hosted node answered an authenticated capabilities and status request at https://localhost:50245
+RECEIPT: stop completed; ownership=Owned state=Stopped
+RECEIPT: the active execution converged to Cancelled before the process exited
+RECEIPT: the second start begins
+RECEIPT: the restart begins
+RECEIPT: uninstall completed; ownership=Absent state=Stopped
+RECEIPT: a same-name registration Eggwork does not own was not mutated
+RECEIPT: a node whose configuration cannot be loaded never reported Running; ownership=Unknown state=Stopped
+```
+
+| Phase | What the receipt proves |
+| --- | --- |
+| install | the registration exists and Eggwork owns it: `ownership=Owned` |
+| start | the manager reports `Running`, and the node answers an **authenticated** capabilities and status request while it does. The manager's state alone would not prove the node is serving. |
+| stop | the manager reports `Stopped`, and the execution that was active when the stop arrived had already converged — `Cancelled`, read from the journal **after** the service stopped. The node waits for its executions before it reports `STOPPED`, so a terminal record at that point is the convergence evidence. |
+| start again | the service starts a second time from the same registration |
+| restart | the service restarts and reaches `Running` again |
+| uninstall | the registration is gone: `ownership=Absent` |
+| foreign registration | a same-name registration with a different executable is neither claimed nor mutated, and `stop`, `uninstall`, and `start` all refuse it |
+| unusable configuration | the node whose configuration cannot be loaded never reports `Running`; the service reaches `Stopped` with a service-specific failure disposition |
+
+A belt-and-braces step after the suite fails the job if a registration
+survived the run, so a failed assertion cannot leave one behind.
+
+**What the hosted run does not prove.** A stop that arrives *during* startup
+is a race with two acceptable outcomes, and asserting one of them would make
+the gate flaky rather than strict. That half of acceptance criterion 6 is
+proven by the deterministic state-machine tests instead — `ready()` refuses
+the running claim when the latch is set, and the state never becomes
+`Running`. The hosted run proves the startup-failure half end to end.
 
 ## 7. Acceptance criteria
 
@@ -163,7 +200,7 @@ depend on the marker are untouched.
 | --- | --- |
 | `cargo fmt --all -- --check` | clean |
 | `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` | clean |
-| `cargo test --locked --workspace --all-targets` | __TEST_RESULT__ |
+| `cargo test --locked --workspace --all-targets` | 463 passed, 0 failed, 1 ignored — the ignored one is the hosted Windows lifecycle suite, which is `#[ignore]`d because it mutates a real service control manager |
 | `cargo check --workspace` | clean |
 | `python3 scripts/check_execution_ownership.py` | passed; the approved process owners are unchanged (`eggwork-runner`, `eggwork-sandbox-helper`) |
 | `python3 scripts/check_execution_ownership.py --prove-negative-exit` | passed |
