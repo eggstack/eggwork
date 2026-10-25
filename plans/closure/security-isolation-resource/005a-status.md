@@ -321,8 +321,8 @@ was published. Both pass (§5).
 | Platform | Evidence | Claim |
 | --- | --- | --- |
 | Linux x86_64 (`6.8.0-147-generic`, rustc 1.89.0) | The suites in §5 were executed on this host. The degradation paths exercised are the *setup* paths (`NoExecutionSetup`: no sandbox backend, no resource backend) and the server's refusal path. | The diagnostic mechanism, its ordering, its bound and its durability are qualified on this host class. The **Landlock and cgroup enforcement paths themselves were not exercised here** — no trusted helper was installed in this environment, so the *handshake-recovery* emission point and the *post-mortem unobservable-counter* emission point are **code-inspected only**. |
-| macOS arm64 (`macos-14`) and macOS x64 (`macos-15-intel`) | The hosted `macos-runner` and `macos-x64-runner` jobs execute the runner's whole test suite on both macOS targets the release matrix builds — `cargo test --locked -p eggwork-runner --all-targets`, which includes the `OutputChunk` shape change and the platform tree backend. Both are green on run `RUN_ID`. The two jobs also had to fix two pre-existing macOS-shaped defects to get there: `/bin/true` does not exist on macOS, and the runner's confined working-directory expectation ignored the `/var` to `/private/var` symlink. | **Exercised, not qualified.** The `OutputChunk` shape change and the degradation paths that the runner's own suite covers now run on both macOS targets. The Landlock and cgroup *enforcement* paths still do not: no trusted helper is installed on a hosted runner, so the handshake-recovery and post-mortem emission points remain code-inspected only. |
-| Windows x64 (`windows-latest`, `x86_64-pc-windows-msvc`) | The hosted `windows-runner` job compiles and lints the runner for the Windows target with `-D warnings` and executes the runner's whole test suite — `cargo test --locked -p eggwork-runner --all-targets`, which is where the `OutputChunk` shape change is exercised — green on run `RUN_ID`. The job had to fix one pre-existing Windows-shaped defect to get there: an unused `std::fs::File` import in `crates/eggwork-server/src/workspace.rs`. | **Exercised, not qualified.** The `OutputChunk` shape change and the degradation paths the runner's own suite covers now run on the Windows target. The Landlock and cgroup *enforcement* paths still do not: no trusted helper is installed on a hosted runner, so the handshake-recovery and post-mortem emission points remain code-inspected only. |
+| macOS arm64 (`macos-14`) and macOS x64 (`macos-15-intel`) | The hosted `macos-runner` and `macos-x64-runner` jobs execute the runner's whole test suite on both macOS targets the release matrix builds — `cargo test --locked -p eggwork-runner --all-targets`, which includes the `OutputChunk` shape change and the platform tree backend. Both are green on run `40217353896`. The two jobs also had to fix two pre-existing macOS-shaped defects to get there: `/bin/true` does not exist on macOS, and the runner's confined working-directory expectation ignored the `/var` to `/private/var` symlink. | **Exercised, not qualified.** The `OutputChunk` shape change and the degradation paths that the runner's own suite covers now run on both macOS targets. The Landlock and cgroup *enforcement* paths still do not: no trusted helper is installed on a hosted runner, so the handshake-recovery and post-mortem emission points remain code-inspected only. |
+| Windows x64 (`windows-latest`, `x86_64-pc-windows-msvc`) | The hosted `windows-runner` job compiles and lints the runner for the Windows target with `-D warnings` and executes the runner's whole test suite — `cargo test --locked -p eggwork-runner --all-targets`, which is where the `OutputChunk` shape change is exercised — green on run `40217353896`. The job had to fix one pre-existing Windows-shaped defect to get there: an unused `std::fs::File` import in `crates/eggwork-server/src/workspace.rs`. | **Exercised, not qualified.** The `OutputChunk` shape change and the degradation paths the runner's own suite covers now run on the Windows target. The Landlock and cgroup *enforcement* paths still do not: no trusted helper is installed on a hosted runner, so the handshake-recovery and post-mortem emission points remain code-inspected only. |
 
 Only the Linux toolchain is installed here, so no cross-compilation was
 attempted. **No platform is claimed as qualified merely because its code
@@ -358,7 +358,7 @@ so it does not add to the repository's stale-line-number defect.
   targets the release matrix builds". The hosted `windows-runner`,
   `macos-runner`, and `macos-x64-runner` jobs now execute the runner's whole
   test suite on all three of those targets, and all three are green on run
-  `RUN_ID`. The suite in `crates/eggwork-runner/tests/diagnostic_degradation.rs`
+  `40217353896`. The suite in `crates/eggwork-runner/tests/diagnostic_degradation.rs`
   was written Unix-shaped and is joined by the platform-aware Windows tree
   suite; the §7 rows now say "exercised" rather than "not qualified",
   because the enforcement paths these rows still cannot reach are named
@@ -473,14 +473,18 @@ variant), so that requirement applied. The release matrix builds three
 Windows and macOS targets — `windows-x64`, `macos-arm64`, and `macos-x64` —
 and the hosted `windows-runner`, `macos-runner`, and `macos-x64-runner` jobs
 now execute the runner's whole test suite on each of them. All three are
-green on run `RUN_ID`, and the `OutputChunk` shape change is exercised on
+green on run `40217353896`, and the `OutputChunk` shape change is exercised on
 every one of them.
 
 Getting there needed two hosted jobs that did not exist when this record was
-written, and three pre-existing platform defects fixed so that the jobs could
-run: an unused `std::fs::File` import on Windows, `/bin/true` not existing on
-macOS, and the runner's confined working-directory expectation ignoring the
-`/var` to `/private/var` symlink.
+written — `macos-runner` and `macos-x64-runner`, so that both macOS targets
+the matrix builds are exercised rather than only the one the hosted image
+happens to be — and several pre-existing platform defects fixed so that the
+jobs could run at all: an unused `std::fs::File` import and two
+platform-gated dead-code sites on Windows, a needless `return` and a
+node-owned-key expectation that only clippy on macOS rejected, `/bin/true`
+not existing on macOS, and the runner's confined working-directory expectation
+ignoring the `/var` to `/private/var` symlink.
 
 The claim that is *not* made is that any platform has been **qualified**. The
 Landlock and cgroup enforcement paths still have no hosted evidence, because a
