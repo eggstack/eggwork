@@ -257,6 +257,32 @@ jobs:
       # The same portable server integration target the Windows job runs.
       - name: declared-artifact capture disposition suite
         run: cargo test --locked -p eggwork-server --test artifact_capture_disposition
+  macos-x64-runner:
+    # The release matrix builds macos-x64 and macos-arm64. `macos-runner`
+    # covers the arm64 target; this job covers the x64 one, so both macOS
+    # targets the matrix builds are exercised rather than only the one the
+    # hosted image happens to be.
+    #
+    # The scope mirrors `macos-runner` exactly. A target that is only
+    # compiled is not exercised, and an exercised target is not a qualified
+    # one: this job is the native evidence that the shipped surface compiles
+    # and its platform-neutral tests pass on macos-x64.
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-x64
+      - run: cargo clippy --locked --workspace --lib --bins --all-features -- -D warnings
+      - name: eggwork-runner test targets
+        run: cargo clippy --locked -p eggwork-runner --all-targets --all-features -- -D warnings
+      - name: eggwork-runner test suite
+        run: cargo test --locked -p eggwork-runner --all-targets -- --nocapture
+      - name: declared-artifact capture disposition suite
+        run: cargo test --locked -p eggwork-server --test artifact_capture_disposition
   quickstart:
     # The quickstart is a *procedure*, and `docs/quickstart.md` is the
     # user-facing instruction while `scripts/quickstart.sh` is its executed

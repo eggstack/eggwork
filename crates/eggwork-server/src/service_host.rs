@@ -35,8 +35,14 @@ use tokio::sync::watch;
 
 use crate::{NodeServer, operations::OperatorConfig};
 
+/// The Windows service control manager adapter.
+///
+/// The module is public because the daemon's entry point reaches it: the
+/// binary selects the service-host mode and hands over to
+/// `windows::entry`, and the adapter owns everything that touches the
+/// manager.
 #[cfg(windows)]
-mod windows;
+pub mod windows;
 
 /// The state a service-hosted node reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
