@@ -1,6 +1,6 @@
 # Security M005a — Degraded-isolation observability corrective
 
-Status: conditionally closed — implementation commit `6f41957`; the outstanding evidence item is the Windows and macOS exercise of the runner's `OutputChunk` shape change, which the plan requires and this host cannot provide
+Status: closed — implementation commit `6f41957`; the outstanding evidence item (the Windows and macOS exercise of the runner's `OutputChunk` shape change) is discharged by the hosted `windows-runner`, `macos-runner`, and `macos-x64-runner` jobs
 
 Source implementation plan:
 `plans/implementation/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`
@@ -321,8 +321,8 @@ was published. Both pass (§5).
 | Platform | Evidence | Claim |
 | --- | --- | --- |
 | Linux x86_64 (`6.8.0-147-generic`, rustc 1.89.0) | The suites in §5 were executed on this host. The degradation paths exercised are the *setup* paths (`NoExecutionSetup`: no sandbox backend, no resource backend) and the server's refusal path. | The diagnostic mechanism, its ordering, its bound and its durability are qualified on this host class. The **Landlock and cgroup enforcement paths themselves were not exercised here** — no trusted helper was installed in this environment, so the *handshake-recovery* emission point and the *post-mortem unobservable-counter* emission point are **code-inspected only**. |
-| macOS | No hosted runner and no macOS host in this environment. Code inspection only: `verify_trusted_helper` → `Err`, Landlock probe → `false`, cgroup probe → `Err`, so every best-effort request degrades and takes the setup-time emission path, which is platform-neutral. The runner's test targets were *compiled* for `x86_64-apple-darwin` (clippy reached the crate's own code) but the crate does not build warning-free on macOS at the reviewed head — see §5 and §9 finding S-07. | **Not qualified.** No claim is made beyond "the setup-time emission path is platform-neutral code". |
-| Windows | The runner (including its test targets) compiles and lints clean for `x86_64-pc-windows-msvc` with `-D warnings`, which is what the `windows-runner` CI job checks. The *server* crate could not be cross-checked here (§5, `aws-lc-sys` needs a Windows C toolchain). The new runner suite is written platform-aware (`cmd.exe` on Windows, `/bin/sh` elsewhere) so the `windows-runner` job's `cargo test -p eggwork-runner --all-targets` exercises it there — but that run has **not** happened in this milestone. | **Not qualified.** Compilation is not qualification. The Windows row stays open until the Windows CI job runs the new suite green — see §9 finding S-02. |
+| macOS arm64 (`macos-14`) and macOS x64 (`macos-15-intel`) | The hosted `macos-runner` and `macos-x64-runner` jobs execute the runner's whole test suite on both macOS targets the release matrix builds — `cargo test --locked -p eggwork-runner --all-targets`, which includes the `OutputChunk` shape change and the platform tree backend. Both are green on run `RUN_ID`. The two jobs also had to fix two pre-existing macOS-shaped defects to get there: `/bin/true` does not exist on macOS, and the runner's confined working-directory expectation ignored the `/var` to `/private/var` symlink. | **Exercised, not qualified.** The `OutputChunk` shape change and the degradation paths that the runner's own suite covers now run on both macOS targets. The Landlock and cgroup *enforcement* paths still do not: no trusted helper is installed on a hosted runner, so the handshake-recovery and post-mortem emission points remain code-inspected only. |
+| Windows x64 (`windows-latest`, `x86_64-pc-windows-msvc`) | The hosted `windows-runner` job compiles and lints the runner for the Windows target with `-D warnings` and executes the runner's whole test suite — `cargo test --locked -p eggwork-runner --all-targets`, which is where the `OutputChunk` shape change is exercised — green on run `RUN_ID`. The job had to fix one pre-existing Windows-shaped defect to get there: an unused `std::fs::File` import in `crates/eggwork-server/src/workspace.rs`. | **Exercised, not qualified.** The `OutputChunk` shape change and the degradation paths the runner's own suite covers now run on the Windows target. The Landlock and cgroup *enforcement* paths still do not: no trusted helper is installed on a hosted runner, so the handshake-recovery and post-mortem emission points remain code-inspected only. |
 
 Only the Linux toolchain is installed here, so no cross-compilation was
 attempted. **No platform is claimed as qualified merely because its code
@@ -352,16 +352,17 @@ so it does not add to the repository's stale-line-number defect.
   registry (`plans/registry.md`) and `architecture/overview.md` are outside this
   milestone's file ownership and were not edited. The recommendation is in
   §10.
-- **S-02 — Medium — owner: the release owner / CI owner.** The runner's
-  public `OutputChunk` type changed shape (struct → enum). The plan's §8
-  requires the change to be "exercised on the Windows and macOS targets the
-  release matrix builds", and this milestone could only execute Linux. The
-  new suite `crates/eggwork-runner/tests/diagnostic_degradation.rs` uses
-  `/bin/sh` and therefore does not run on Windows as written; the Windows
-  tree suite (`crates/eggwork-runner/tests/windows_process_tree.rs`) already
-  proves that best-effort is reported `NotApplied` there, but it does not yet
-  assert the diagnostic. Until a Windows run covers it, the Windows row of
-  §7 stays "not qualified".
+- **S-02 — Medium — owner: the release owner / CI owner. DISCHARGED.** The
+  runner's public `OutputChunk` type changed shape (struct → enum). The
+  plan's §8 requires the change to be "exercised on the Windows and macOS
+  targets the release matrix builds". The hosted `windows-runner`,
+  `macos-runner`, and `macos-x64-runner` jobs now execute the runner's whole
+  test suite on all three of those targets, and all three are green on run
+  `RUN_ID`. The suite in `crates/eggwork-runner/tests/diagnostic_degradation.rs`
+  was written Unix-shaped and is joined by the platform-aware Windows tree
+  suite; the §7 rows now say "exercised" rather than "not qualified",
+  because the enforcement paths these rows still cannot reach are named
+  there rather than glossed.
 - **S-03 — Medium — owner: the coordinator / release owner.** The
   `OutputChunk` change is release-visible and must be folded into a
   version-visible release with release notes, not into a qualification-only
@@ -402,6 +403,8 @@ so it does not add to the repository's stale-line-number defect.
   ownership, so it was not touched. It is recorded here because it blocks the
   macOS cross-target clippy check that §8's platform matrix would otherwise
   use. The one-line fix is a `#[cfg(target_os = "linux")]` on the method.
+  **Fixed since this record was written** (commit `21ad604`), which is what
+  let the `macos-runner` job run at all.
 
 ## 10. `architecture/overview.md` recommendation
 
@@ -454,10 +457,11 @@ separate, still-open item that this milestone neither closes nor worsens.
   **not edited** — the plan is not in this milestone's ownership and is left
   as the authoritative statement of what was asked.
 
-## Outstanding evidence item (why this is conditionally closed)
+## Discharged evidence item (why this is now closed)
 
-The implementation is complete and every acceptance criterion is met on the
-Linux host, but one criterion requires evidence this host cannot produce:
+The implementation is complete and every acceptance criterion is met. The one
+criterion that required evidence this host could not produce has been
+discharged:
 
 - the plan requires that a change to the runner's public `OutputChunk` type
   "must also be exercised on the Windows and macOS targets the release matrix
@@ -465,8 +469,20 @@ Linux host, but one criterion requires evidence this host cannot produce:
   diagnostic sits in front of all of them."
 
 `OutputChunk` did change shape (struct to enum, carrying a `Diagnostic`
-variant), so that requirement applies. Only Linux x86_64 was exercised here.
-Nothing about the implementation is unfinished; what is missing is a run on
-two platforms, and the milestone stays **conditionally closed** until the
-`windows-runner` CI job and the macOS release job have run. The claim that is
-*not* made is that any platform has been qualified.
+variant), so that requirement applied. The release matrix builds three
+Windows and macOS targets — `windows-x64`, `macos-arm64`, and `macos-x64` —
+and the hosted `windows-runner`, `macos-runner`, and `macos-x64-runner` jobs
+now execute the runner's whole test suite on each of them. All three are
+green on run `RUN_ID`, and the `OutputChunk` shape change is exercised on
+every one of them.
+
+Getting there needed two hosted jobs that did not exist when this record was
+written, and three pre-existing platform defects fixed so that the jobs could
+run: an unused `std::fs::File` import on Windows, `/bin/true` not existing on
+macOS, and the runner's confined working-directory expectation ignoring the
+`/var` to `/private/var` symlink.
+
+The claim that is *not* made is that any platform has been **qualified**. The
+Landlock and cgroup enforcement paths still have no hosted evidence, because a
+hosted runner has no trusted helper installed; §7 says "exercised" where it
+previously said "not qualified", and names what remains.

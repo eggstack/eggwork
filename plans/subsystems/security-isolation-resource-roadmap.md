@@ -1,6 +1,6 @@
 # Security, Isolation, and Resource Enforcement Roadmap
 
-Status: closed through M004 (remote-admission C001 and Operations M002 included); M005a conditionally closed, M005b closed, M005c closed
+Status: closed through M004 (remote-admission C001 and Operations M002 included); M005a closed, M005b closed, M005c closed
 
 Canonical authority:
 
@@ -154,7 +154,7 @@ Run hostile input/process/workspace/transport fixtures, audit dependencies and u
 
 Class: invariant
 
-Status: conditionally closed — implementation commit `6f41957`; the outstanding evidence item is the Windows and macOS exercise of the runner's `OutputChunk` shape change
+Status: closed — implementation commit `6f41957`; the outstanding evidence item (the Windows and macOS exercise of the runner's `OutputChunk` shape change) is discharged by the hosted `windows-runner`, `macos-runner`, and `macos-x64-runner` jobs
 
 Closure evidence: `plans/closure/security-isolation-resource/005a-status.md`
 (implementation `6f41957`)

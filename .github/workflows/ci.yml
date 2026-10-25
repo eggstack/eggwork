@@ -218,6 +218,13 @@ jobs:
         # The lifecycle removes its own registration, and a failed assertion
         # must not leave one behind. This step is the belt to the test's
         # braces: it fails the job if a registration survives the run.
+        #
+        # The step ends with an explicit `exit 0`, because `sc.exe query`
+        # exits non-zero when the service does not exist — which is the
+        # outcome this step wants. Without the explicit exit, the step
+        # inherits that non-zero code and turns a passed check into a failed
+        # job. This is the same trap M004 recorded for the Windows
+        # disposition step.
         shell: pwsh
         run: |
           $existing = sc.exe query eggwork-node 2>&1 | Out-String
@@ -226,6 +233,7 @@ jobs:
             exit 1
           }
           Write-Output "no service registration survived the lifecycle job"
+          exit 0
   macos-runner:
     # The release matrix builds macos-x64 and macos-arm64, and nothing in this
     # workflow exercised a macOS target, so a macOS-only regression could reach

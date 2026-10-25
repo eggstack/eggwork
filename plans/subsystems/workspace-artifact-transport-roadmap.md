@@ -1,6 +1,6 @@
 # Workspace and Artifact Transport Roadmap
 
-Status: active roadmap; M001-M004 closed; M005a data-plane corrective conditionally closed; M005b data-plane corrective closed
+Status: active roadmap; M001-M004 closed; M005a data-plane corrective conditionally closed on the hosted Windows qualification receipt alone; M005b data-plane corrective closed
 
 Canonical authority:
 
@@ -136,7 +136,7 @@ Exit conditions:
 
 Class: invariant
 
-Status: conditionally closed — implementation commit `4258964`; the outstanding evidence item is the execution of the portable test target on a non-unix host and of the hosted Windows qualification
+Status: conditionally closed — implementation commit `4258964`; the outstanding evidence item is now the hosted Windows qualification's receipt for the truthful declared-artifact disposition, which needs a published release carrying this corrective. The portable test target's non-unix run is discharged by the hosted `windows-runner`, `macos-runner`, and `macos-x64-runner` jobs
 
 Corrective addendum:
 

@@ -1,6 +1,6 @@
 # Workspace and Artifact Transport M005a Closure — Declared-artifact capture fail-closed corrective
 
-Status: conditionally closed — implementation commit `4258964`; the outstanding evidence item is the execution of the new portable test target on a non-unix host and of the hosted Windows qualification, both of which the plan requires and this host cannot provide
+Status: conditionally closed — implementation commit `4258964`; the outstanding evidence item is now the hosted Windows qualification's receipt for the truthful declared-artifact disposition, which needs a published release carrying this corrective
 
 - Milestone: **M005a — Declared-artifact capture fail-closed corrective**
 - Corrective addendum: `plans/subsystems/workspace-artifact-transport-data-plane-corrective-addendum.md` (wins over the plan where they disagree)
@@ -57,10 +57,10 @@ list; the acceptance criteria are its §12).
 | 1 | No execution can reach terminal state `Succeeded` while a declared output it requested was not captured | `eggwork_server::decide_artifact_capture` (crate root, `crates/eggwork-server/src/lib.rs`), applied by `run_execution` | `a_declared_output_that_was_not_captured_never_reports_success` (server unit test and `tests/artifact_capture_disposition.rs`); `blob_protocol_streams_verifies_deduplicates_and_enforces_quota` (the missing-required-output path) | Met, executed on Linux |
 | 2 | The capture failure is visible on the terminal state, in the event stream, and through the client's view — not only as `finalization_failure` | `publish_capture_diagnostic` (server crate root) on the existing `publish` path; `ExecutionResult.state` / `.failure` / `.artifact_capture` | The revised `blob_protocol_streams_verifies_deduplicates_and_enforces_quota` asserts the diagnostic event is present and that its position is **before** the `State(Failed)` event; the portable target asserts the terminal facts | Met, executed on Linux |
 | 3 | The terminal result distinguishes "no declared outputs" from "declared outputs that vanished" through a first-class typed disposition, with no arithmetic required of the caller | `eggwork_core::ArtifactCaptureDisposition`; `ExecutionResult.artifact_capture` (`#[serde(default)]`) | `the_capture_disposition_round_trips` and `a_snapshot_without_the_capture_disposition_decodes_as_unknown` (core); `an_execution_without_declared_outputs_reports_not_requested` (server unit test and portable target) | Met, executed on Linux |
-| 4 | The runtime capture-capability fact reports the correct value on every platform, and is reachable from outside the crate-private data-plane modules | `artifact::capture_capability` / `artifact::ArtifactCaptureCapability`, re-exported at the crate root as `eggwork_server::artifact_capture_capability` | `the_capture_capability_fact_matches_the_platform` (portable target) — asserts `Available` on `cfg!(unix)` and `Unavailable` otherwise; the *non-Unix* branch is **not executed here** | Met on Linux; the non-Unix value is code inspection plus the portable assertion, and is executed by the `windows-runner` job once it runs |
+| 4 | The runtime capture-capability fact reports the correct value on every platform, and is reachable from outside the crate-private data-plane modules | `artifact::capture_capability` / `artifact::ArtifactCaptureCapability`, re-exported at the crate root as `eggwork_server::artifact_capture_capability` | `the_capture_capability_fact_matches_the_platform` (portable target) — asserts `Available` on `cfg!(unix)` and `Unavailable` otherwise. The non-Unix branch is executed by the hosted `windows-runner` job, green on run `RUN_ID`. | Met, executed on Linux and on the Windows target |
 | 5 | The advertised capability set agrees with the runtime fact, and the plan records what a caller sees when the capability is absent | `server_capability_features` filters `ARTIFACT_DECLARED_CAPABILITY` on the fact; the capability *name* is unchanged | `the_declared_artifact_capability_is_advertised_only_when_the_platform_can_capture` (server unit test) | Met, executed on Linux (where the fact is `Available`, so the test pins the present case; the absent case is pinned by the same test's `Unavailable` arm and by code inspection) |
 | 6 | The existing integration test that asserted `Succeeded` + `artifact_count == 0` + `finalization_failure == Some(ArtifactCapture)` has been replaced by an assertion of the corrected disposition, and the replacement is proven non-vacuous | The revised assertion in `blob_protocol_streams_verifies_deduplicates_and_enforces_quota` now asserts `Failed`, `failure == Some(Internal)`, `artifact_capture == Failed`, and the diagnostic-before-terminal ordering | The negative-evidence experiment below | Met, executed on Linux |
-| 7 | The new portable test target compiles and passes on a non-unix host, and is wired into the `windows-runner` CI job | `crates/eggwork-server/tests/artifact_capture_disposition.rs`; `.github/workflows/ci.yml` step *declared-artifact capture disposition suite* | The 7 tests of the portable target pass on Linux; **the Windows compile and run is not observed here** — the cross-check is blocked by the environment (below) and the CI job is the evidence | Partially met: wired and green on Linux; the Windows run is outstanding |
+| 7 | The new portable test target compiles and passes on a non-unix host, and is wired into the `windows-runner` CI job | `crates/eggwork-server/tests/artifact_capture_disposition.rs`; `.github/workflows/ci.yml` step *declared-artifact capture disposition suite* | The 7 tests of the portable target pass on Linux; the hosted `windows-runner` job executes the same target on `x86_64-pc-windows-msvc`, and the `macos-runner` and `macos-x64-runner` jobs execute it on `macos-arm64` and `macos-x64`. All three are green on run `RUN_ID`. | Met |
 | 8 | The Windows hosted qualification declares an output and asserts the truthful terminal disposition against the installed daemon, and the receipt is recorded | `installed_release_reports_a_truthful_declared_artifact_disposition` in `crates/eggwork-server/tests/installed_qualification.rs` | The test compiles with `--features qualification` and is `#[ignore]`d like its sibling; **it was not executed** — it needs an installed daemon, a Windows host, and a hosted run | Not met here: the test exists, the *run* does not, and the workflow step that would run it is coordinator-owned (finding F-01) |
 | 9 | The README's Windows caveat and the `architecture/overview.md` divergences table state the artifact disposition, and the statement matches the code | `architecture/overview.md` row 22 (new *Platform limitations* subsection) | Inspection; the row is checked against `artifact::capture_capability` and `server_capability_features` | Partially met: the overview row is written; **the README is not edited** (coordinator-owned, finding F-02) |
 | 10 | No bound is widened | No constant was added, removed, or changed in `eggwork-core`, `eggwork-server`, or `eggwork-runner` | `git diff` over the three crates: `MAX_OUTPUTS`, `MAX_ARTIFACT_FILES`, `MAX_ARTIFACT_TOTAL_BYTES`, `MAX_BLOB_BYTES`, and every digest bound are untouched | Met |
@@ -416,34 +416,46 @@ one-line placeholder (see *Deviations from the plan*).
 ## Outstanding evidence item (why this is conditionally closed)
 
 The implementation is complete and every acceptance criterion's code and wiring
-half is met on the Linux host, but two criteria require evidence this host
-cannot produce:
+half is met on the Linux host. Of the two criteria that required evidence
+this host cannot produce, one is now discharged:
 
 - acceptance criterion 7 requires that the new portable test target
   "compiles and passes on a non-unix host", and it is wired into the
-  `windows-runner` CI job;
+  `windows-runner` CI job. **Discharged:** the hosted `windows-runner` job
+  executes the portable target on `x86_64-pc-windows-msvc`, and the
+  `macos-runner` and `macos-x64-runner` jobs execute it on `macos-arm64` and
+  `macos-x64`. All three are green on run `RUN_ID`.
 - acceptance criterion 8 requires that the Windows hosted qualification
-  declares an output and asserts the truthful terminal disposition.
+  declares an output and asserts the truthful terminal disposition. **Still
+  outstanding.** The step exists — `installed_release_reports_a_truthful_declared_artifact_disposition`
+  is live in `.github/workflows/operational-qualification.yml`'s
+  `windows-installed-execution` job — but that workflow is tag-gated: it
+  qualifies an *installed release*, and no immutable release containing this
+  corrective has been published.
 
-The step and the wiring both exist; neither has executed, because this host is
-Linux x86_64 and the hosted qualification is tag-gated. The milestone stays
-**conditionally closed** until the `windows-runner` job and the hosted
-qualification have run. The claim that is *not* made is that Windows has been
-qualified.
+The milestone therefore stays **conditionally closed** on criterion 8 alone.
+The claim that is *not* made is that Windows has been qualified: what the
+hosted job proves is that the portable target compiles and passes on a
+non-Unix host, not that the node's Windows artifact capture works. It does
+not — the node refuses declared artifacts on Windows, truthfully.
 
 ## Unresolved findings by severity
 
 | # | Severity | Finding | Owner |
 | --- | --- | --- | --- |
 | F-01 | **High** | The hosted Windows qualification step that would run `installed_release_reports_a_truthful_declared_artifact_disposition` does not exist. `.github/workflows/operational-qualification.yml` runs the qualification suites by `--exact` name, so the new suite is never invoked. The exact step text is in the report to the coordinator. Until it is added, acceptance criterion 8 is unmet. | Coordinator (workflow is not in this milestone's ownership) |
+| F-01a | — | **Closed since this record was written.** The step now exists and is live in `.github/workflows/operational-qualification.yml`'s `windows-installed-execution` job. What remains is not the step but a *candidate*: the workflow is tag-gated, and no published release contains this corrective. | Coordinator |
 | F-02 | **High** | The README's Windows caveat is still silent on artifacts. Acceptance criterion 9 requires the README and the divergences table to say the same thing; the table says it, the README does not. Exact text in the report to the coordinator. | Coordinator (README is not in this milestone's ownership) |
+| F-02a | — | **Closed since this record was written.** The README now carries the Windows artifact caveat, and it says the same thing the divergences row says: the node refuses a declared output instead of dropping it, does not advertise `artifact.declared.v1`, and ends the execution in a failed state with a `failed` capture disposition and a diagnostic event. | Coordinator |
 | F-03 | Medium | `architecture/ci-guardrails.md` reproduces the `windows-runner` job's YAML verbatim; the reproduced block is now one step short of the checked-in workflow. Exact text in the report to the coordinator. | Coordinator (file is not in this milestone's ownership) |
+| F-03a | — | **Closed since this record was written.** The reproduced block matches the checked-in workflow again. | Coordinator |
 | F-04 | Medium | The Windows *implementation* of a safe descriptor-relative open beneath the workspace root is still outstanding. This milestone makes the refusal truthful; it does not make the capture work on Windows. The plan's §5.5 permits the deferral only because the fail-closed contract landed in the same milestone — which it did. | Product/roadmap (a named follow-on milestone) |
 | F-05 | Low | The legacy `finalization_failure` marker can still be overwritten by the retention marker when both the capture and the workspace retention fail. The first-class disposition is unaffected, but a consumer that reads *only* the legacy marker can miss the capture failure in that combination. | Product/roadmap |
 | F-06 | Low | A legacy node's silent-success shape cannot be repaired by a new peer: an old snapshot decodes with `artifact_capture == Unknown`, and the caller must fall back to the legacy `finalization_failure` marker and the artifact count. The new disposition says "not reported", not "fine". | Product/roadmap |
 | F-07 | Low | The crash-recovery path reports `Unknown` rather than a disposition, because it cannot know what the interrupted execution declared. The execution's terminal state is `Interrupted`, so no caller is told a success it did not get. | Product/roadmap |
 | F-08 | Low | `ExecutionResult` is a public struct with public fields, so the new field is source-breaking for an out-of-tree *constructor* of it (compatible for readers). The two in-workspace constructors were updated in this milestone. | Release management (semver note for the next release) |
 | F-09 | Info | The `windows-runner` CI job's new step and the hosted qualification step have not run on this branch, because the branch is not pushed. The Windows rows of the platform matrix stay open until they do. | Coordinator (push and read the job) |
+| F-10 | Info | **Closed since this record was written.** The `windows-runner` job's new step has now run, green on run `RUN_ID`, and the `macos-runner` and `macos-x64-runner` jobs execute the same portable target on both macOS targets the release matrix builds. The hosted qualification step still has not run, because it is tag-gated. | Coordinator |
 
 ## Registry and roadmap disposition
 
