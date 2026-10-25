@@ -211,6 +211,18 @@ number, and a row inserted into an earlier table would renumber them.
 |---|---|---|
 | 22 | **Declared artifacts are refused, not captured, on a platform that cannot open a file beneath the workspace root safely.** `open_file_beneath` is a descriptor-relative `NOFOLLOW` chain with no non-Unix implementation, so a non-Unix node cannot capture declared outputs. ~~Before the M005a corrective, the finalization set the finalization-failure marker and left the terminal state `Succeeded`, so a caller that declared outputs saw a successful execution with zero artifacts and no error — the declared outputs were silently dropped — and the node advertised `artifact.declared.v1` on every platform.~~ **Closed by the M005a corrective.** The platform's capture-capability fact now reports the limitation, a node that cannot capture does not advertise `artifact.declared.v1`, and an execution that declares outputs there ends in `Failed` with a `Failed` capture disposition and a diagnostic event. The limitation itself remains: the product's top-level claim of *terminal state plus declared artifacts* holds on a Unix platform only. | [data-plane.md](data-plane.md) · [protocol.md](protocol.md) |
 
+### Operator-surface corrections
+
+This table carries the rows the M008a corrective closed. It is separate for
+the same reason the platform table is: the rows are numbered monotonically
+across the document, rows 1-22 are cited elsewhere by number, and a row
+inserted into an earlier table would renumber them.
+
+| # | Observation | Where |
+|---|---|---|
+| 23 | ~~The operator surface's metric vocabulary had no owner that was the producer.~~ **Closed by the M008a corrective.** `operations.rs` declared a hand-maintained `METRIC_NAMES` and the report copied a stored value *only* when the name was already in its map, so a counter the server incremented but the list did not name was dropped by the report — five of them, all workspace counters. The vocabulary is now a typed `Metric` enumeration declared with the producers in `crates/eggwork-server/src/lib.rs`; the report reads that declaration, and a row whose name the vocabulary does not know is reported under its own name rather than dropped. | [operations-cli.md](operations-cli.md) · [storage-journal.md](storage-journal.md) |
+| 24 | ~~One field name, `active_executions`, carried two facts.~~ **Closed by the M008a corrective.** On the wire it is the number of execution permits the node holds; in the operator's own listing it was the number of durable execution rows in a non-terminal state, and nothing in the output said which was which. The wire field keeps its published name and its published meaning — renaming it would break every deployed client that deserializes `NodeStatus` — and the operator surface now names the two facts apart: `execution_permits_held` for the permit count, `non_terminal_executions` for the row count. The old operator-side `active_executions` key is removed rather than aliased, because an alias would keep the ambiguity alive and a silently changed meaning is worse than a missing key. | [operations-cli.md](operations-cli.md) · [server-node.md](server-node.md) |
+
 ### Positive notes worth keeping
 
 - Authorization strictly **precedes** resource resolution in `dispatch`, and id parsing touches only the path, so a denied caller cannot distinguish an existing resource from an absent one.

@@ -1543,6 +1543,21 @@ impl NodeCapabilities {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The node's status as published on the control plane.
+///
+/// `active_executions` is the number of execution permits the node currently
+/// holds — how many executions it is running right now. It is **not** the
+/// number of durable execution rows in a non-terminal state: an execution
+/// whose process died keeps its row until the node recovers it, and an
+/// idempotent re-request releases its permit while the original execution
+/// still holds one, so the two counts legitimately disagree. Only the running
+/// node knows the permit count, which is why the operator surface reports it
+/// under its own name (`execution_permits_held`) and reports the row count
+/// separately (`non_terminal_executions`).
+///
+/// The field name, the field set, and this meaning are published: a deployed
+/// client deserializes this type, so renaming the field would break every
+/// client that reads node status, and adding one would change the wire shape.
 pub struct NodeStatus {
     pub node_id: NodeId,
     pub draining: bool,

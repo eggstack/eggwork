@@ -272,6 +272,8 @@ Two things a reviewer should hold onto. The chunk bound is **per event**; the cu
 
 `NodeStatus { node_id, draining: bool, active_executions: u32, capabilities: NodeCapabilities }` (`lib.rs:1089-1095`) is the dynamic counterpart per §17, and it has **no `validate()` at all**. It embeds a full `NodeCapabilities` rather than referencing it, so a status read is self-contained for placement decisions — but nothing in core compares `active_executions` against `capabilities.max_active_executions`, and nothing in core decides anything on the basis of `draining`. Per §16-18, capability is not capacity and status is not a scheduling decision; placement belongs to the controller.
 
+`NodeStatus::active_executions` is the number of execution **permits the node currently holds** — how many executions it is running right now. It is not the number of durable execution rows in a non-terminal state. Those two counts legitimately disagree: an execution whose process died keeps its row until the node recovers it, and an idempotent re-request releases its permit while the original execution still holds one. Only the running node knows the permit count, so the operator surface reports it under its own name (`execution_permits_held`) and reports the row count separately (`non_terminal_executions`). The field name, the field set, and this meaning are published — a deployed client deserializes `NodeStatus`, so renaming the field would break every client that reads node status, and adding one would change the wire shape.
+
 The relationship to the request model is the three-state correspondence, and core only supplies the vocabulary for it:
 
 | Request asks | Requires a node capability | Outcome reported as |

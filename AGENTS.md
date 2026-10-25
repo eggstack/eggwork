@@ -59,12 +59,16 @@ reasoning and boundary evidence goes in `architecture/`.
 | [docs/deployment.md](docs/deployment.md) | Install/update a node as service software via Eggup |
 | [docs/releases.md](docs/releases.md) | Consume a published release; release identity, Windows reproducibility |
 
-Quickstart commands in `docs/` are **executed and verified**, not illustrative.
-The config loader's strictness (owner-only state directories `0700`, private key
-`0600`, nothing group/world writable, and a sandbox helper outside world-writable
-ancestors) is undocumented anywhere else and produces a single unhelpful
-`configuration is invalid or unreadable` — if that message ever appears, check
-permissions first.
+Quickstart commands in `docs/` are **executed and verified**, not illustrative:
+`scripts/quickstart.sh` runs the whole flow end to end and
+`scripts/check_quickstart_sync.py` keeps the document and that script in
+agreement. The config loader's strictness (owner-only state directories `0700`,
+private key `0600`, nothing group/world writable, and a sandbox helper outside
+world-writable ancestors) is undocumented anywhere else — since the M008a
+corrective it produces a **named, greppable rule id** and the offending item
+rather than a single unhelpful string, so a configuration fault now says which
+rule was violated and what to do. If a configuration fault still surfaces
+without a rule id, check permissions first.
 
 ## Architecture index
 
