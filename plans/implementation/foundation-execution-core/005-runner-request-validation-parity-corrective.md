@@ -1,6 +1,6 @@
 # Foundation M005 — Runner request validation parity corrective
 
-Status: proposed
+Status: active
 
 Closure record: `plans/closure/foundation-execution-core/005-status.md`
 

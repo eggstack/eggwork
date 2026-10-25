@@ -4,17 +4,28 @@
 //!
 //! Embedding API: construct a validated [`RunnerRequest`] from an
 //! [`eggwork_core::ExecutionSpec`] with [`RunnerRequest::from_spec`], then run
-//! it through [`LocalProcessRunner`]. Request fields remain private so callers
-//! cannot bypass protocol bounds. Platform setup is supplied through
+//! it through [`LocalProcessRunner`]. Request fields remain private, and every
+//! public construction path is covered by the `eggwork_core` domain contract:
+//! [`RunnerRequest::contract_error`] reports a violation without running
+//! anything, and [`LocalProcessRunner::run`] refuses one before setup and
+//! before any child exists. Platform setup is supplied through
 //! [`ExecutionSetup`]; neither this API nor its result types carry scheduler
 //! placement, priority, or project fairness policy.
 
 use eggwork_core::{
-    CommandSpec, ExecutionFailure, ExecutionGeneration, ExecutionId, ExecutionResult,
-    ExecutionSpec, ExecutionState, MAX_CAPTURE_BYTES, MAX_ENV_COUNT, MAX_ENV_NAME_BYTES,
-    MAX_ENV_VALUE_BYTES, MAX_EVENT_CHUNK_BYTES, OverflowPolicy as CoreOverflowPolicy, RelativePath,
-    Requirement, StdinPolicy as CoreStdinPolicy,
+    CommandSpec, EnvironmentEntry, ExecutionFailure, ExecutionGeneration, ExecutionId,
+    ExecutionResult, ExecutionSpec, ExecutionState, MAX_CAPTURE_BYTES, MAX_EVENT_CHUNK_BYTES,
+    OutputPolicy, OverflowPolicy as CoreOverflowPolicy, RelativePath, Requirement,
+    ResourceRequirements, ValidationError, validate_argv, validate_environment_entries,
+    validate_timeout,
 };
+// The runner consumes the core domain type rather than keeping a local copy of
+// it. The public path `eggwork_runner::StdinPolicy` is retained as a re-export
+// so that embedders and the in-tree suites keep compiling against the path they
+// already use; the type that path names is `eggwork_core::StdinPolicy`, and the
+// runner's former local duplicate -- with its own `Debug` and its own copy of
+// the stdin bound -- is gone.
+pub use eggwork_core::StdinPolicy;
 #[cfg(target_os = "linux")]
 use serde::Serialize;
 #[cfg(target_os = "linux")]
@@ -1104,8 +1115,12 @@ impl std::fmt::Debug for RunnerRequest {
 }
 
 impl RunnerRequest {
-    /// Create an embedding request with conservative defaults. [`run`](LocalProcessRunner::run)
-    /// validates every field before setup or child creation.
+    /// Create an embedding request with conservative defaults.
+    ///
+    /// The request is covered by the `eggwork_core` domain contract like every
+    /// other construction path: [`RunnerRequest::contract_error`] reports a
+    /// violation without running anything, and [`run`](LocalProcessRunner::run)
+    /// refuses one before setup and before any child creation.
     pub fn new(argv: Vec<String>, root: impl Into<PathBuf>) -> Self {
         Self {
             argv,
@@ -1135,6 +1150,12 @@ impl RunnerRequest {
         self.cwd = cwd;
     }
 
+    /// Replace the request's environment.
+    ///
+    /// The entries are the caller's raw name/value pairs; the environment-entry
+    /// rules themselves are owned by `eggwork_core` and are applied by
+    /// [`RunnerRequest::contract_error`] and by
+    /// [`run`](LocalProcessRunner::run), not restated here.
     pub fn set_environment(&mut self, environment: Vec<(String, String)>) {
         self.environment = environment;
     }
@@ -1190,8 +1211,7 @@ impl RunnerRequest {
         root: impl Into<PathBuf>,
         provenance: ExecutionProvenance,
     ) -> Result<Self, RunnerError> {
-        spec.validate()
-            .map_err(|e| RunnerError::InvalidRequest(e.to_string()))?;
+        spec.validate().map_err(RunnerError::InvalidRequest)?;
         let CommandSpec {
             argv,
             cwd,
@@ -1217,10 +1237,7 @@ impl RunnerRequest {
             root: root.into(),
             cwd,
             environment: environment.into_iter().map(|e| (e.name, e.value)).collect(),
-            stdin: match stdin {
-                CoreStdinPolicy::Null => StdinPolicy::Null,
-                CoreStdinPolicy::Bytes(bytes) => StdinPolicy::Bytes(bytes),
-            },
+            stdin,
             timeout: Duration::from_millis(timeout_millis),
             capture_limit: output.capture_limit_bytes,
             event_chunk_bytes: output.event_chunk_bytes,
@@ -1235,48 +1252,106 @@ impl RunnerRequest {
         })
     }
 
-    fn validate(&self) -> Result<PathBuf, RunnerError> {
-        if self.argv.is_empty()
-            || self.argv.len() > eggwork_core::MAX_ARG_COUNT
-            || self
-                .argv
-                .iter()
-                .any(|a| a.is_empty() || a.len() > eggwork_core::MAX_ARG_BYTES || a.contains('\0'))
-        {
-            return Err(RunnerError::InvalidRequest(
-                "argv is empty or contains an empty/NUL entry".into(),
-            ));
-        }
-        if self.environment.len() > MAX_ENV_COUNT
-            || self.environment.iter().any(|(k, v)| {
-                k.is_empty()
-                    || k.len() > MAX_ENV_NAME_BYTES
-                    || v.len() > MAX_ENV_VALUE_BYTES
-                    || k.contains('\0')
-                    || k.contains('=')
-                    || v.contains('\0')
+    /// The first violation of the request contract, if this request has one.
+    ///
+    /// The request contract is the `eggwork_core` domain contract -- the argv,
+    /// environment-entry, output-policy, timeout, stdin and resource rules --
+    /// plus the runner's own stricter argv-entry rule. It is checked here
+    /// without touching the filesystem, so an embedder can ask whether what it
+    /// built is acceptable before it runs anything.
+    ///
+    /// [`LocalProcessRunner::run`] refuses a request that has a violation,
+    /// before setup and before any child exists, with the same error. The
+    /// root-directory and working-directory rules are deliberately not part of
+    /// this answer: they are the runner's own, they need filesystem access, and
+    /// they are enforced at the same point.
+    pub fn contract_error(&self) -> Option<ValidationError> {
+        self.contract_violation()
+    }
+
+    /// The request's environment as core environment entries.
+    ///
+    /// The runner stores raw name/value pairs because that is what the child's
+    /// environment is built from, but the *rules* that govern an entry are
+    /// owned by `eggwork_core`. The entries are handed over as plain values so
+    /// that `eggwork_core` re-validates them rather than trusting them.
+    fn environment_entries(&self) -> Vec<EnvironmentEntry> {
+        self.environment
+            .iter()
+            .map(|(name, value)| EnvironmentEntry {
+                name: name.clone(),
+                value: value.clone(),
             })
-        {
-            return Err(RunnerError::InvalidRequest(
-                "environment violates bounds or syntax".into(),
-            ));
+            .collect()
+    }
+
+    /// The request's output policy as the core output policy.
+    fn output_policy(&self) -> OutputPolicy {
+        OutputPolicy {
+            capture_limit_bytes: self.capture_limit,
+            event_chunk_bytes: self.event_chunk_bytes,
+            overflow: self.overflow.clone(),
         }
-        if self.capture_limit > MAX_CAPTURE_BYTES
-            || self.event_chunk_bytes == 0
-            || self.event_chunk_bytes > MAX_EVENT_CHUNK_BYTES
-        {
-            return Err(RunnerError::InvalidRequest(
-                "output limits are outside supported bounds".into(),
-            ));
+    }
+
+    /// The request's resource requirements as the core resource requirements.
+    fn resource_requirements(&self) -> ResourceRequirements {
+        ResourceRequirements {
+            memory_bytes: self.resources.memory_bytes,
+            cpu_millis: self.resources.cpu_millis,
+            pids: self.resources.pids,
         }
-        if self.timeout.is_zero() || self.timeout > eggwork_core::MAX_TIMEOUT {
-            return Err(RunnerError::InvalidRequest(
-                "timeout must be positive".into(),
-            ));
+    }
+
+    /// The first contract violation in the request, in the canonical order.
+    ///
+    /// The order is the one `eggwork_core::CommandSpec::validate` uses -- argv,
+    /// environment, timeout, stdin, output, resources -- with the runner's own
+    /// argv-entry rule immediately after the argv bounds, so that a request
+    /// built through the builder path and the same request built through
+    /// `from_spec` report the *same* rule for the same input.
+    ///
+    /// Every rule below is owned by `eggwork_core` except the argv-entry rule,
+    /// which is the runner's own and is stricter than the core contract.
+    fn contract_violation(&self) -> Option<ValidationError> {
+        validate_argv(&self.argv)
+            .err()
+            .or_else(|| self.argv_entry_violation())
+            .or_else(|| validate_environment_entries(&self.environment_entries()).err())
+            .or_else(|| validate_timeout(self.timeout).err())
+            .or_else(|| self.stdin.validate().err())
+            .or_else(|| self.output_policy().validate().err())
+            .or_else(|| self.resource_requirements().validate().err())
+    }
+
+    /// The runner's own argv-entry rule.
+    ///
+    /// `eggwork_core` permits an empty argv entry; the runner does not. An
+    /// empty argument is not a protocol problem -- it is a child-process
+    /// construction hazard: the runner hands the argv to the operating system
+    /// as an argument vector, where an empty element is either a silent no-op
+    /// argument or an ambiguity the caller cannot see. The runner is therefore
+    /// deliberately *stricter* than its owner here, and this is the only rule
+    /// it adds on top of the core contract.
+    fn argv_entry_violation(&self) -> Option<ValidationError> {
+        self.argv
+            .iter()
+            .any(|argument| argument.is_empty())
+            .then_some(ValidationError::InvalidSyntax {
+                field: "argv entry",
+            })
+    }
+
+    fn validate(&self) -> Result<PathBuf, RunnerError> {
+        // Every core-owned rule is consumed from `eggwork_core` rather than
+        // restated here, so the runner cannot drift from the contract it
+        // claims to enforce.
+        if let Some(violation) = self.contract_violation() {
+            return Err(RunnerError::InvalidRequest(violation));
         }
-        self.stdin
-            .validate()
-            .map_err(|e| RunnerError::InvalidRequest(e.to_string()))?;
+        // The runner's own contract rules: the root-directory and
+        // working-directory resolution. `eggwork_core` does not own them,
+        // because they are about a filesystem the domain layer never sees.
         let root = self
             .root
             .canonicalize()
@@ -1301,32 +1376,6 @@ impl RunnerRequest {
             root.clone()
         };
         Ok(cwd)
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub enum StdinPolicy {
-    Null,
-    Bytes(Vec<u8>),
-}
-impl std::fmt::Debug for StdinPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Null => f.write_str("Null"),
-            Self::Bytes(bytes) => f
-                .debug_struct("Bytes")
-                .field("length", &bytes.len())
-                .field("value", &"[REDACTED]")
-                .finish(),
-        }
-    }
-}
-impl StdinPolicy {
-    fn validate(&self) -> Result<(), RunnerError> {
-        if matches!(self, Self::Bytes(v) if v.len() > eggwork_core::MAX_STDIN_BYTES) {
-            return Err(RunnerError::InvalidRequest("stdin exceeds limit".into()));
-        }
-        Ok(())
     }
 }
 
@@ -1475,8 +1524,14 @@ fn resource_result(
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
+    /// The request violates the `eggwork_core` domain contract.
+    ///
+    /// The payload is the core [`ValidationError`], so the failure stays
+    /// attributable to the rule that produced it: an environment name with
+    /// invalid syntax and a duplicate environment name are two different
+    /// rules, and a caller can tell them apart without parsing a message.
     #[error("invalid execution request: {0}")]
-    InvalidRequest(String),
+    InvalidRequest(ValidationError),
     #[error("execution root is invalid: {0}")]
     InvalidRoot(String),
     #[error("working directory is invalid: {0}")]

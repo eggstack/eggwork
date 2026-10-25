@@ -43,7 +43,7 @@ All twenty constants live in one block at `lib.rs:10-29` and are the only number
 | Constant | Value | What it bounds |
 |---|---|---|
 | `MAX_ARG_COUNT` | `256` | Number of entries in `CommandSpec.argv`. |
-| `MAX_ARG_BYTES` | `32768` (32 KiB) | Byte length of a single argv entry. Checked per entry at `lib.rs:498-506`; there is no bound on the *total* argv byte size. |
+| `MAX_ARG_BYTES` | `32768` (32 KiB) | Byte length of a single argv entry. Checked per entry by `eggwork_core::validate_argv`; there is no bound on the *total* argv byte size. |
 | `MAX_ENV_COUNT` | `256` | Number of `EnvironmentEntry` values. |
 | `MAX_ENV_NAME_BYTES` | `256` | Byte length of one environment variable name. |
 | `MAX_ENV_VALUE_BYTES` | `16384` (16 KiB) | Byte length of one environment variable value. |
@@ -113,7 +113,7 @@ The lowercase-only rule is the load-bearing part: it gives a content address **e
 
 `ProtocolVersion { major: u16, minor: u16 }` is a `Copy` data pair with derived ordering, major first; `ProtocolVersionRange { min, max }` is a plain pair with no validation of its own and no `Copy`. The only check that `min <= max` lives in `NodeCapabilities::validate` (`lib.rs:1068-1072`), not on the range.
 
-`Versioned<T> { schema_version: u16, value: T }` (`lib.rs:1097-1101`) is a generic versioned envelope. It is **declared and never used** — no type in the crate has a `Versioned` field, and no code in the crate constructs one. The crate's actual convention is a duplicated explicit field: `ExecuteRequest`, `ExecutionAccepted`, `ExecutionSnapshot`, and `ApiError` each carry `schema_version: u16` directly, and `ExecutionSpec` carries a *second*, independent one. A reviewer should decide whether `Versioned<T>` is a reserved generic form or dead surface.
+`Versioned<T> { schema_version: u16, value: T }` (`struct Versioned<T>`) is a generic versioned envelope. It is **declared and never used** — no type in the crate has a `Versioned` field, and no code in the crate constructs one. The crate's actual convention is a duplicated explicit field: `ExecuteRequest`, `ExecutionAccepted`, `ExecutionSnapshot`, and `ApiError` each carry `schema_version: u16` directly, and `ExecutionSpec` carries a *second*, independent one. A reviewer should decide whether `Versioned<T>` is a reserved generic form or dead surface.
 
 Three different version axes coexist here, with three different openness rules — this is a real source of confusion:
 
@@ -129,26 +129,28 @@ The model is a four-step nest, then three response shapes.
 
 ### `CommandSpec` — what to run
 
-`lib.rs:458-541`. Ten public fields: `argv`, `cwd: Option<RelativePath>`, `environment: Vec<EnvironmentEntry>`, `stdin: StdinPolicy`, `timeout_millis: u64`, `output: OutputPolicy`, `declared_outputs: Vec<DeclaredOutput>`, `resources: ResourceRequirements`, `isolation: IsolationRequirement`, `network: NetworkRequirement`.
+`struct CommandSpec`. Ten public fields: `argv`, `cwd: Option<RelativePath>`, `environment: Vec<EnvironmentEntry>`, `stdin: StdinPolicy`, `timeout_millis: u64`, `output: OutputPolicy`, `declared_outputs: Vec<DeclaredOutput>`, `resources: ResourceRequirements`, `isolation: IsolationRequirement`, `network: NetworkRequirement`.
 
 There is no shell string. `argv` is the executable plus arguments, matching `plans/001-terminology-and-domain-model.md` §9 (an explicit shell mode would be a separate requested capability, and no such field exists). `cwd` is an *optional relative path within the workspace* — a node-local locator, not workspace identity, which is why it is a `RelativePath` and not a `WorkspaceId`.
 
-`CommandSpec::validate` (`lib.rs:488-540`) runs in a fixed order and delegates outward:
+`CommandSpec::validate` runs in a fixed order and delegates outward:
 
-1. `argv` non-empty, at most `MAX_ARG_COUNT`, each entry at most `MAX_ARG_BYTES` and free of NUL.
-2. `environment` at most `MAX_ENV_COUNT`; **every** entry is re-validated by calling `EnvironmentEntry::new(&e.name, &e.value)` (`lib.rs:513-515`) — re-validation, not a trust of already-constructed entries.
-3. `environment` names are unique, via a `HashSet<&str>` (`lib.rs:516-526`).
+1. `argv` non-empty, at most `MAX_ARG_COUNT`, each entry at most `MAX_ARG_BYTES` and free of NUL — `eggwork_core::validate_argv`.
+2. `environment` at most `MAX_ENV_COUNT`; **every** entry is re-validated by calling `EnvironmentEntry::new(&e.name, &e.value)` — re-validation, not a trust of already-constructed entries. The list rules live in `eggwork_core::validate_environment_entries`, which is the single owner of the count bound, the per-entry rule and the duplicate-name rule.
+3. `environment` names are unique, via a `HashSet<&str>`.
 4. `declared_outputs` at most `MAX_OUTPUTS`.
 5. `timeout_millis` in `1..=MAX_TIMEOUT`.
 6. `self.stdin.validate()`, `self.output.validate()`, `self.resources.validate()`.
 
+The argv, environment-entry and timeout rules are not written inside `CommandSpec::validate`; they are three public functions — `eggwork_core::validate_argv`, `eggwork_core::validate_environment_entries` and `eggwork_core::validate_timeout` — and `validate` calls them. That is deliberate: these are the rules the runner consumes, and a rule the runner has to re-state is a rule that can drift. The runner now calls the same three functions rather than keeping a private copy (see [runner-execution.md](runner-execution.md)). Core is therefore the *single* owner of the environment-entry rules — name syntax, value bounds, the list count bound, and the duplicate-name rule — and a second copy of any of them anywhere else is a defect.
+
 What `validate` does **not** do is as important: it does not check `argv[0]` is non-empty or path-like, does not bound total argv bytes, does not check `declared_outputs` paths for duplicates, and never validates `IsolationRequirement` or `NetworkRequirement` — neither type has a `validate` method at all.
 
-`Debug` for `CommandSpec` is hand-written (`lib.rs:471-486`): `argv` is replaced with `"[REDACTED]"` outright (not just a length), while every other field is printed normally, delegating to the redacting `Debug` impls of `EnvironmentEntry`, `StdinPolicy`, and `ExecutionSpec`'s metadata. The test at `lib.rs:1264` pins this for argv, env, stdin, and metadata secrets.
+`Debug` for `CommandSpec` is hand-written (`impl fmt::Debug for CommandSpec`): `argv` is replaced with `"[REDACTED]"` outright (not just a length), while every other field is printed normally, delegating to the redacting `Debug` impls of `EnvironmentEntry`, `StdinPolicy`, and `ExecutionSpec`'s metadata. The test `execution_spec_debug_redacts_credentials_and_command_arguments` pins this for argv, env, stdin, and metadata secrets.
 
 ### `ExecutionSpec` — the execution-defining description
 
-`lib.rs:543-585`. Three fields: `schema_version: u16`, `command: CommandSpec`, `metadata: Vec<(String, String)>`. `validate` runs `command.validate()` first, then requires `schema_version != 0`, then bounds metadata: at most `MAX_METADATA_COUNT` pairs, each key non-empty and at most `MAX_METADATA_KEY_BYTES`, each value at most `MAX_METADATA_VALUE_BYTES`, no NUL in either. Metadata keys have no charset restriction beyond that (unlike environment names), and **duplicate metadata keys are not rejected** — unlike duplicate environment names, which are.
+`struct ExecutionSpec`. Three fields: `schema_version: u16`, `command: CommandSpec`, `metadata: Vec<(String, String)>`. `validate` runs `command.validate()` first, then requires `schema_version != 0`, then bounds metadata: at most `MAX_METADATA_COUNT` pairs, each key non-empty and at most `MAX_METADATA_KEY_BYTES`, each value at most `MAX_METADATA_VALUE_BYTES`, no NUL in either. Metadata keys have no charset restriction beyond that (unlike environment names), and **duplicate metadata keys are not rejected** — unlike duplicate environment names, which are.
 
 `Debug` prints `metadata_count` and the redacted `command`, never metadata values (`lib.rs:549-557`).
 
@@ -175,9 +177,9 @@ The custom serde encoding is deliberately backward-compatible with a legacy shap
 - `StdinPolicy { Null, Bytes(Vec<u8>) }` (`lib.rs:270-299`). `Null` and a bounded byte payload. `validate` checks only the length bound. `Debug` prints `Bytes { length, value: "[REDACTED]" }`.
 - `OverflowPolicy { Truncate, Terminate }` (`lib.rs:301-305`) — the declared behavior when output exceeds the capture budget. Two variants, no data, no validation, no rename attribute.
 - `OutputPolicy { capture_limit_bytes, event_chunk_bytes, overflow }` (`lib.rs:307-334`) with `Default` = `1 MiB` / `16 KiB` / `Truncate` — note these defaults are *not* expressions of `MAX_CAPTURE_BYTES` / `MAX_EVENT_CHUNK_BYTES`; they are independent literals that happen to be 1/16 and 1/4 of the maxima. `validate` requires `capture_limit_bytes <= MAX_CAPTURE_BYTES`, `event_chunk_bytes` in `1..=MAX_EVENT_CHUNK_BYTES`. It does **not** require `event_chunk_bytes <= capture_limit_bytes`, and it accepts `capture_limit_bytes == 0`.
-- `DeclaredOutput { path: RelativePath, required: bool }` (`lib.rs:336-340`) — a declared capture target and whether its absence is a failure. This is the declaration mechanism from ADR-0004 decision 10: Eggwork captures only declared paths, and `ArtifactType` has exactly one variant (`File`) because nothing else is in scope.
-- `EnvironmentEntry { name, value }` (`lib.rs:229-268`). `new` requires a name that is non-empty, at most `MAX_ENV_NAME_BYTES`, ASCII alphanumeric or `_` only, **not** starting with an ASCII digit (`is_some_and(u8::is_ascii_digit)` at `lib.rs:248`), and NUL-free; and a value at most `MAX_ENV_VALUE_BYTES` and NUL-free, with a NUL value reported as `Forbidden { field: "environment value NUL" }`. A leading underscore is allowed; a hyphen in a name is not. `Debug` prints the name and `"[REDACTED]"` for the value.
-- `RelativePath` (`lib.rs:187-227`) is the single path type and its safety rules are: non-empty, at most `MAX_PATH_BYTES`, not starting with `/`, no `\`, no NUL, and no `/`-delimited component that is empty, `.`, or `..`. The empty-component rule subsumes trailing slashes and doubled slashes. It is **not** ASCII-restricted, has no trailing-dot or trailing-space rule, and no Windows reserved-name rule — those stricter rules exist only in `validate_portable_workspace_path` for workspace trees. The inner `String` is private, so every `RelativePath` in the system has passed these checks; `"C:/secret"` and `"café.txt"` are legal `RelativePath` values that the workspace validator rejects separately (asserted at `lib.rs:1431-1433`).
+- `DeclaredOutput { path: RelativePath, required: bool }` (`struct DeclaredOutput`) — a declared capture target and whether its absence is a failure. This is the declaration mechanism from ADR-0004 decision 10: Eggwork captures only declared paths, and `ArtifactType` has exactly one variant (`File`) because nothing else is in scope.
+- `EnvironmentEntry { name, value }` (`struct EnvironmentEntry`). `new` requires a name that is non-empty, at most `MAX_ENV_NAME_BYTES`, ASCII alphanumeric or `_` only, **not** starting with an ASCII digit (`is_some_and(u8::is_ascii_digit)` at `lib.rs:248`), and NUL-free; and a value at most `MAX_ENV_VALUE_BYTES` and NUL-free, with a NUL value reported as `Forbidden { field: "environment value NUL" }`. A leading underscore is allowed; a hyphen in a name is not. `Debug` prints the name and `"[REDACTED]"` for the value.
+- `RelativePath` (`struct RelativePath`) is the single path type and its safety rules are: non-empty, at most `MAX_PATH_BYTES`, not starting with `/`, no `\`, no NUL, and no `/`-delimited component that is empty, `.`, or `..`. The empty-component rule subsumes trailing slashes and doubled slashes. It is **not** ASCII-restricted, has no trailing-dot or trailing-space rule, and no Windows reserved-name rule — those stricter rules exist only in `validate_portable_workspace_path` for workspace trees. The inner `String` is private, so every `RelativePath` in the system has passed these checks; `"C:/secret"` and `"café.txt"` are legal `RelativePath` values that the workspace validator rejects separately (asserted at `lib.rs:1431-1433`).
 
 ## Workspace model
 
@@ -293,7 +295,7 @@ Three digests, three domain-separation prefixes, three version axes.
 
 `lib.rs:1155-1161`, paired with `CANONICAL_REQUEST_VERSION: u16 = 2` at `lib.rs:1150-1151` ("Version of the execution request canonicalization algorithm").
 
-1. `normalize_execution_spec(spec)` (`lib.rs:1187-1203`) clones the spec and sorts the three semantically unordered collections: `command.environment` by `name`; `metadata` by `(key, value)`; `command.declared_outputs` by `(path, required)`. `argv` is deliberately left in order, because argv order is semantic. All three sorts use `sort_by`, which is stable.
+1. `normalize_execution_spec(spec)` clones the spec and sorts the three semantically unordered collections: `command.environment` by `name`; `metadata` by `(key, value)`; `command.declared_outputs` by `(path, required)`. `argv` is deliberately left in order, because argv order is semantic. All three sorts use `sort_by`, which is stable.
 2. Bytes are built as `b"eggwork-execution-spec\0canonical-json-v2\0"` followed by `serde_json::to_vec(&normalized)`.
 3. `BlobDigest::from_bytes` SHA-256s the whole thing into lowercase hex.
 
@@ -375,9 +377,9 @@ Where it is produced: the five constructors (`id_type!::new`, `ExecutionGenerati
 | `EventSequence` — no invariant | none; `const fn new` accepts any `u64` | none (no test constructs one outside the event test) |
 | `BlobDigest` is 64 lowercase hex | `BlobDigest::parse` / `TryFrom<String>`; `from_bytes` cannot violate | `typed_ids_and_digest_validate`: known SHA-256 vector for `b"abc"`, and `parse("ABC").is_err()` |
 | `RelativePath` relative, confined, no empty/`.`/`..` component, no `\`, no NUL, ≤`MAX_PATH_BYTES` | `RelativePath::new`; private inner field means no other construction route | `paths_env_metadata_outputs_and_roundtrip`: `/tmp` and `a/../b` rejected. No depth, NUL, or length case. |
-| Env name charset, non-digit first byte, no NUL; value length and NUL | `EnvironmentEntry::new`; re-checked for every entry by `CommandSpec::validate` (`lib.rs:513-515`) | `paths_env_metadata_outputs_and_roundtrip`: `1BAD` and `a\0b` rejected |
-| Environment names unique | `CommandSpec::validate` (`lib.rs:516-526`) | `duplicate_environment_names_are_rejected` |
-| `argv` non-empty, ≤`MAX_ARG_COUNT`, each ≤`MAX_ARG_BYTES`, no NUL | `CommandSpec::validate` (`lib.rs:489-506`) | `spec_and_bounds_validate`: cleared argv, oversized `argv[0]`. Count bound untested. |
+| Env name charset, non-digit first byte, no NUL; value length and NUL | `EnvironmentEntry::new`; re-checked for every entry by `eggwork_core::validate_environment_entries` | `paths_env_metadata_outputs_and_roundtrip`: `1BAD` and `a\0b` rejected; `environment_rule_partition` proves the accepted and rejected sets partition the candidate space |
+| Environment names unique | `eggwork_core::validate_environment_entries` | `duplicate_environment_names_are_rejected`; `environment_rule_partition` |
+| `argv` non-empty, ≤`MAX_ARG_COUNT`, each ≤`MAX_ARG_BYTES`, no NUL | `eggwork_core::validate_argv` | `spec_and_bounds_validate`: cleared argv, oversized `argv[0]`. Count bound untested at the core level; the runner's parity suite covers it. |
 | `timeout_millis` in `1..=MAX_TIMEOUT` | `CommandSpec::validate` (`lib.rs:533-535`) | none |
 | `stdin` ≤ `MAX_STDIN_BYTES` | `StdinPolicy::validate` | none |
 | `capture_limit_bytes` ≤ `MAX_CAPTURE_BYTES`; `event_chunk_bytes` in `1..=MAX_EVENT_CHUNK_BYTES` | `OutputPolicy::validate` | none (the default policy is only ever used valid) |

@@ -763,55 +763,93 @@ impl fmt::Debug for CommandSpec {
             .finish()
     }
 }
+/// Validate an argv vector against the core contract.
+///
+/// This is the single owner of the argv rules: the vector is non-empty, its
+/// length is bounded by [`MAX_ARG_COUNT`], and every entry is bounded by
+/// [`MAX_ARG_BYTES`] and free of NUL. [`CommandSpec::validate`] and the
+/// runner both consume this function, so the two cannot drift apart.
+///
+/// The runner is permitted to be *stricter* than this — it rejects an empty
+/// argv entry, which this contract permits, because an empty entry is a
+/// child-process construction hazard rather than a protocol concern. That
+/// addition is the runner's own rule and it is documented and tested there.
+pub fn validate_argv(argv: &[String]) -> Result<(), ValidationError> {
+    if argv.is_empty() {
+        return Err(ValidationError::Empty { field: "argv" });
+    }
+    if argv.len() > MAX_ARG_COUNT {
+        return Err(ValidationError::TooMany {
+            field: "argv",
+            max: MAX_ARG_COUNT,
+        });
+    }
+    if argv
+        .iter()
+        .any(|a| a.len() > MAX_ARG_BYTES || a.as_bytes().contains(&0))
+    {
+        return Err(ValidationError::OutOfRange {
+            field: "argv entry",
+        });
+    }
+    Ok(())
+}
+
+/// Validate a complete environment list against the core contract.
+///
+/// This is the single owner of the environment-entry rules: the list length is
+/// bounded by [`MAX_ENV_COUNT`], every entry's name and value satisfy
+/// [`EnvironmentEntry::new`], and no two entries share a name.
+///
+/// The entries are re-validated rather than trusted, because
+/// [`EnvironmentEntry`] has public fields: a caller can build one that
+/// [`EnvironmentEntry::new`] would have refused. [`CommandSpec::validate`] and
+/// the runner both consume this function.
+pub fn validate_environment_entries(entries: &[EnvironmentEntry]) -> Result<(), ValidationError> {
+    if entries.len() > MAX_ENV_COUNT {
+        return Err(ValidationError::TooMany {
+            field: "environment",
+            max: MAX_ENV_COUNT,
+        });
+    }
+    for entry in entries {
+        EnvironmentEntry::new(&entry.name, &entry.value)?;
+    }
+    let mut environment_names = std::collections::HashSet::with_capacity(entries.len());
+    if entries
+        .iter()
+        .any(|entry| !environment_names.insert(entry.name.as_str()))
+    {
+        return Err(ValidationError::InvalidSyntax {
+            field: "duplicate environment name",
+        });
+    }
+    Ok(())
+}
+
+/// Validate an execution timeout against the core contract.
+///
+/// This is the single owner of the timeout rule: the timeout is non-zero and
+/// no longer than [`MAX_TIMEOUT`]. [`CommandSpec::validate`] and the runner
+/// both consume this function.
+pub fn validate_timeout(timeout: Duration) -> Result<(), ValidationError> {
+    if timeout.is_zero() || timeout > MAX_TIMEOUT {
+        return Err(ValidationError::OutOfRange { field: "timeout" });
+    }
+    Ok(())
+}
+
 impl CommandSpec {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.argv.is_empty() {
-            return Err(ValidationError::Empty { field: "argv" });
-        }
-        if self.argv.len() > MAX_ARG_COUNT {
-            return Err(ValidationError::TooMany {
-                field: "argv",
-                max: MAX_ARG_COUNT,
-            });
-        }
-        if self
-            .argv
-            .iter()
-            .any(|a| a.len() > MAX_ARG_BYTES || a.as_bytes().contains(&0))
-        {
-            return Err(ValidationError::OutOfRange {
-                field: "argv entry",
-            });
-        }
-        if self.environment.len() > MAX_ENV_COUNT {
-            return Err(ValidationError::TooMany {
-                field: "environment",
-                max: MAX_ENV_COUNT,
-            });
-        }
-        for e in &self.environment {
-            EnvironmentEntry::new(&e.name, &e.value)?;
-        }
-        let mut environment_names =
-            std::collections::HashSet::with_capacity(self.environment.len());
-        if self
-            .environment
-            .iter()
-            .any(|entry| !environment_names.insert(entry.name.as_str()))
-        {
-            return Err(ValidationError::InvalidSyntax {
-                field: "duplicate environment name",
-            });
-        }
+        validate_argv(&self.argv)?;
+        validate_environment_entries(&self.environment)?;
         if self.declared_outputs.len() > MAX_OUTPUTS {
             return Err(ValidationError::TooMany {
                 field: "declared outputs",
                 max: MAX_OUTPUTS,
             });
         }
-        if self.timeout_millis == 0 || self.timeout_millis > MAX_TIMEOUT.as_millis() as u64 {
-            return Err(ValidationError::OutOfRange { field: "timeout" });
-        }
+        validate_timeout(Duration::from_millis(self.timeout_millis))?;
         self.stdin.validate()?;
         self.output.validate()?;
         self.resources.validate()?;

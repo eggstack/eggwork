@@ -1,6 +1,6 @@
 # Foundation and Execution Core Roadmap
 
-Status: M001-M004 closed (M004 conditional on a release containing it); C001 post-closure CI corrective closed; M005 request-validation parity corrective proposed
+Status: M001-M004 closed (M004 conditional on a release containing it); C001 post-closure CI corrective closed; M005 request-validation parity corrective active
 
 Canonical authority:
 
@@ -155,7 +155,7 @@ Dependencies:
 
 Class: invariant
 
-Status: proposed
+Status: active
 
 Corrective addendum:
 
@@ -176,6 +176,12 @@ Exit conditions:
 - no public runner API can produce a request that violates the core contract, proven by a test;
 - the runner's local `StdinPolicy` duplicate and its hand-written conversion are removed;
 - no numeric bound and no wire representation changes.
+
+Implementation record:
+
+- `plans/closure/foundation-execution-core/005-status.md`
+
+Owner disposition for the public API: the runner's public `RunnerRequest::new` and `RunnerRequest::set_environment` are **kept**, not removed. Both have in-tree callers in five test files across two crates — two of them in `crates/eggwork-sandbox-helper/tests/`, which is outside this milestone's file ownership and outside the plan's stated scope — so removing them would have broken the build rather than hardened it. They are instead covered by the core contract at the single enforcement point, with `RunnerRequest::contract_error()` reporting a violation without running anything. The runner's local `StdinPolicy` duplicate is deleted; the public path `eggwork_runner::StdinPolicy` survives as a re-export of `eggwork_core::StdinPolicy`.
 
 ## 4. CodeGG reuse strategy
 
