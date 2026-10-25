@@ -71,9 +71,10 @@ load error rather than a silently ignored setting.
 field, are resolved relative to the config file's own directory when they are relative —
 so a config can be moved as a unit.
 
-The shape in `examples/eggworkd.example.json` matches this table exactly, with one
-`clients` entry granting all eleven operation names and absolute paths under
-`/var/lib/eggwork` and `/etc/eggwork`.
+The shape in `examples/eggworkd.example.json` matches this table exactly, with
+absolute paths under `/var/lib/eggwork` and `/etc/eggwork` and two `clients`
+entries: one granting all twelve operation names, and one carrying a
+`resource_scopes` list that narrows three of them.
 
 **Load-time checks (`OperatorConfig::load`).** Before any parsing, `fs::symlink_metadata`
 must show a regular file that is not a symlink, is at most `MAX_CONFIG_BYTES` (1 MiB), and
@@ -86,6 +87,27 @@ across the grant set (compared lowercased), every named operation must resolve, 
 `tls_config()` must build successfully — which reads the chain and the client CA through
 `read_certificates` (regular file, not a symlink, not writable by others, non-empty) and
 the private key through `trusted_private_key`.
+
+**Resource scopes (`ClientGrant.resource_scopes`).** A grant may carry an optional list of
+resource scopes. Each scope names an operation, a resource kind (`execution`, `blob`,
+`workspace`, `artifact`), and a resource identifier — the string form of the identifier,
+parsed back into the typed form. A scope may only narrow an operation the same grant
+already holds. Every one of these is a configuration error, and the node refuses to start
+rather than degrade to a decision that ignores the scope:
+
+| Error class | Refused because |
+| --- | --- |
+| Unknown operation name | The scope does not name a known operation. |
+| Unknown resource kind | The scope does not name a known resource kind. |
+| Malformed identifier | The identifier is not the string form of the kind's typed identifier. |
+| Scope for an unheld operation | The scope would grant an operation the grant does not hold. |
+| Scope for a kind the operation never names | The scope could never be consulted, so it would narrow nothing. |
+| Duplicate scope | The same `(operation, kind, identifier)` appears twice in one grant. |
+| Over-cap grant count | More than `MAX_RESOURCE_SCOPES_PER_GRANT` (64) scopes in one grant, or more than `MAX_RESOURCE_SCOPES_TOTAL` (4096) across the node's grant set. |
+
+The caps are the same kind of bound the other configuration caps are, and they are checked
+in `validate` alongside them. `principals()` parses the same shapes strictly, so a node
+that could not build its grant table refuses to start even if `validate` was bypassed.
 
 The directory and file trust predicates, on Unix:
 
@@ -108,35 +130,44 @@ On non-Unix targets these predicates are the trivial `true`/`false` stubs; the U
 ownership and mode checks do not exist there.
 
 **Redaction.** `OperatorConfig::redacted_json` serializes the whole config and then
-replaces exactly two things: `tls.private_key` and every `clients[].certificate_sha256`,
-each with the literal string `[REDACTED]`. Only `config print` uses this. Why it is a
-security property and not cosmetics: `config print` output is the artifact an operator
-pastes into a ticket, a chat channel, or a support bundle. The private key *path* names
-where the key lives, and the client fingerprints bind a principal to a leaf certificate —
-together they are the two fields an attacker needs to start targeting key custody or to
-fingerprint a specific client. Everything else printed (chain path, client CA path,
-principal ids, quotas) is an identifier the operator already needs. Note precisely what is
-redacted: the *strings* are replaced, and no key material is ever loaded into the redacted
-document to begin with.
+replaces exactly three things: `tls.private_key`, every `clients[].certificate_sha256`, and
+every `clients[].resource_scopes[].resource_id`, each with the literal string
+`[REDACTED]`. Only `config print` uses this. Why it is a security property and not
+cosmetics: `config print` output is the artifact an operator pastes into a ticket, a chat
+channel, or a support bundle. The private key *path* names where the key lives, and the
+client fingerprints bind a principal to a leaf certificate — together they are the two
+fields an attacker needs to start targeting key custody or to fingerprint a specific
+client. A scope's identifier is the third: it names the exact resource the operator
+confined the grant to, and for a blob it is a content address whose disclosure says what
+the principal is allowed to see. The scope's `operation` and `resource_kind` stay visible,
+because the *shape* of the narrowing is what an operator reads; the identifier does not.
+Everything else printed (chain path, client CA path, principal ids, quotas) is an identifier
+the operator already needs. Note precisely what is redacted: the *strings* are replaced,
+and no key material is ever loaded into the redacted document to begin with.
 
 ## Authorization model
 
-A `ClientGrant` is a principal plus an explicit set of operation names:
+A `ClientGrant` is a principal plus an explicit set of operation names, and optionally
+plus a set of resource scopes that narrow those names:
 `principal_id`, `certificate_sha256` (documented in source as the lowercase hex SHA-256
-digest of the verified leaf certificate DER), and `operations: Vec<String>`.
+digest of the verified leaf certificate DER), `operations: Vec<String>`, and
+`resource_scopes: Vec<ResourceScope>`.
 
 `OperatorConfig::principals()` builds a pair. Every grant contributes
 `(certificate_sha256.to_ascii_lowercase(), PrincipalId)` to a
-`FingerprintPrincipalResolver`, and a `HashSet<Operation>` to a `GrantAuthorizer`. The
+`FingerprintPrincipalResolver`, and a `PrincipalGrant` to a `GrantAuthorizer`. The
 lowercasing on both sides is what makes config-time and handshake-time fingerprints
 comparable.
 
-`GrantAuthorizer` is a newtype over `HashMap<PrincipalId, HashSet<Operation>>` and
-implements the server's `Authorizer` trait with a single method:
+A `PrincipalGrant` is the set of `Operation`s the principal holds plus a scope table keyed
+by `(Operation, ResourceKind)` holding typed resource identifiers. `GrantAuthorizer`
+implements the server's `Authorizer` trait:
 
 ```rust
 fn authorize(&self, principal: &NodePrincipal, operation: Operation) -> bool {
-    self.0.get(&principal.id).is_some_and(|allowed| allowed.contains(&operation))
+    self.grants
+        .get(&principal.id)
+        .is_some_and(|grant| grant.operations.contains(&operation))
 }
 ```
 
@@ -144,21 +175,38 @@ The default is fail-closed by construction: an unknown principal produces `None`
 map lookup, an ungranted operation is absent from the set, and both collapse to `false`
 through `is_some_and`. There is no allow-by-default branch anywhere in the file.
 
-The name → enum mapping is a closed 11-name table in `fn operation`: `capabilities`,
-`status`, `execute`, `observe`, `cancel`, `renew`, `events`, `blob-read`, `blob-write`,
-`workspace-create`, `artifact-read`. Anything else returns `None`, which `validate` treats
-as a config error, so a typo in a grant is a startup refusal rather than a silently
-missing permission.
+The name → enum mapping is a closed 12-name table in `fn operation`: `capabilities`,
+`status`, `telemetry`, `execute`, `observe`, `cancel`, `renew`, `events`, `blob-read`,
+`blob-write`, `workspace-create`, `artifact-read`. Anything else returns `None`, which
+`validate` treats as a config error, so a typo in a grant is a startup refusal rather than
+a silently missing permission.
 
-**Scope of the policy, stated conservatively.** In `operations.rs` the authorizer
-overrides *only* `authorize`. This file does not implement, and does not reference, any
-resource-aware `authorize_request` hook. I could not verify from the two files owned by
-this deep dive whether the `Authorizer` trait in `lib.rs` declares such a hook and what
-its default body does; the resolution is recorded in [server-node.md](server-node.md). The
-operationally important consequence is the part that *is* visible here: the policy
-expressed in this file is a principal × operation product with no resource dimension at
-all. Any per-resource narrowing a deployment needs is therefore not produced by
-`GrantAuthorizer` and must be enforced by the request path.
+**Scope of the policy.** The policy expressed in this file is a principal × operation
+product, optionally narrowed per resource. `GrantAuthorizer` overrides both `authorize` and
+the trait's resource-aware `authorize_request` hook; the hook's decision is:
+
+1. the operation grant must be present — a scope never grants an operation the principal
+   does not hold;
+2. a request that carries no resource falls back to the operation-level grant;
+3. when a scope is configured for that operation **and** that resource kind, the resource
+   must be inside it;
+4. otherwise the operation-level grant stands.
+
+Rule 3 is per `(operation, kind)`: a scope for `execute`/`execution` does not narrow
+`execute`/`workspace`. The decision consults a configuration-derived set only — it never
+asks the store who owns a resource — so it adds no lock and no ordering dependency to the
+request path. Ownership stays where it already was: the store's `principal_id` fences,
+which the authorizer can only narrow in front of, never widen around. A scope that names
+another principal's resource lets the request reach the store, and the store refuses it
+there. The exception is `blob`: blob storage is content-addressed and shared, so a blob has
+no owner to fence it, and a blob scope is an explicit digest list rather than an ownership
+comparison. The full decision record is in [server-node.md](server-node.md).
+
+**Compatibility.** `ClientGrant` keeps `#[serde(deny_unknown_fields)]` and the new field is
+`#[serde(default)]`, so a configuration written before scopes existed still loads, and an
+*older node* reading a newer configuration that carries a scope refuses to start rather
+than silently ignoring the narrowing the operator wrote. That refusal is correct behaviour:
+a node whose boundary is wider than its configuration states is the defect.
 
 ## Command surface
 
@@ -622,9 +670,12 @@ be able to tell them apart from the JSON alone, since the exit code is 2 in ever
 | --- | --- | --- |
 | A group/other-writable or symlinked config is refused | `OperatorConfig::load` metadata gate | `invalid_configuration_is_rejected_without_exposing_secret_material` |
 | A private key readable by group/other is refused | `trusted_private_key` | `valid_operator_config_builds_required_mtls_server_identity` |
-| `config print` never emits the key path or client fingerprints | `OperatorConfig::redacted_json` | `redacted_config_print_hides_private_key_path_and_client_fingerprints` |
+| `config print` never emits the key path, client fingerprints, or scope identifiers | `OperatorConfig::redacted_json` | `redacted_config_print_hides_private_key_path_and_client_fingerprints`, `the_printed_configuration_redacts_resource_scope_identifiers` |
 | An unknown operation name is a config error, not a missing permission | `validate` → `operation()` returning `None` | `valid_operator_config_builds_required_mtls_server_identity` |
-| An unknown principal or ungranted operation is denied | `GrantAuthorizer::authorize` via `is_some_and` | No unit test in this file; see [server-node.md](server-node.md) |
+| An unknown principal or ungranted operation is denied | `GrantAuthorizer::authorize` via `is_some_and` | `a_scope_never_grants_an_operation_the_principal_does_not_hold` (`tests/resource_scoped_authorization.rs`); see [server-node.md](server-node.md) |
+| A resource scope narrows an operation the grant holds and never widens it | `GrantAuthorizer::authorize_request` | `a_resource_scope_narrows_the_operation_grant_it_names` (`tests/resource_scoped_authorization.rs`) |
+| A malformed scope is a config error, not an ignored entry | `validate` + `principals()` | `a_malformed_resource_scope_is_refused_by_the_configuration`, `a_duplicate_resource_scope_is_refused_by_the_configuration`, `too_many_resource_scopes_in_one_grant_are_refused`, `too_many_resource_scopes_across_the_node_are_refused` |
+| An older node refuses a configuration that carries a scope | `deny_unknown_fields` on `ClientGrant` | `an_older_node_refuses_a_configuration_that_carries_a_resource_scope` (`tests/resource_scoped_authorization.rs`) |
 | `doctor` agrees with the enforcement path on helper trust | `trusted_helper` → `verify_trusted_helper`, shared with the runner | `valid_operator_config_builds_required_mtls_server_identity` (adjacent); see [sandbox-helper.md](sandbox-helper.md) |
 | Execution listings are bounded and paginate | `MAX_EXECUTION_PAGE`, `load_snapshots` `LIMIT 2049` + `Bounds` | `execution_listing_is_bounded_and_paginates_over_durable_records` |
 | Symlinks are never followed when measuring a tree | `tree_bytes` `file_type().is_symlink()` check | `tree_size_never_follows_symlinks` |
@@ -640,8 +691,16 @@ be able to tell them apart from the JSON alone, since the exit code is 2 in ever
 
 ## Test coverage
 
-`operations.rs` has exactly 9 tests in its in-file `mod tests`, all library-level:
+`operations.rs` has exactly 17 tests in its in-file `mod tests`, all library-level:
 `redacted_config_print_hides_private_key_path_and_client_fingerprints`,
+`the_printed_configuration_redacts_resource_scope_identifiers`,
+`a_resource_scope_that_narrows_a_held_operation_is_accepted`,
+`a_malformed_resource_scope_is_refused_by_the_configuration`,
+`a_duplicate_resource_scope_is_refused_by_the_configuration`,
+`too_many_resource_scopes_in_one_grant_are_refused`,
+`too_many_resource_scopes_across_the_node_are_refused`,
+`a_configuration_written_before_resource_scopes_still_validates`,
+`the_grant_table_refuses_a_scope_it_cannot_parse`,
 `drain_state_survives_process_restart_and_undrain_removes_marker`,
 `tree_size_never_follows_symlinks`,
 `execution_listing_is_bounded_and_paginates_over_durable_records`,
@@ -650,9 +709,17 @@ be able to tell them apart from the JSON alone, since the exit code is 2 in ever
 `metrics_report_uses_a_fixed_bounded_counter_set`,
 `invalid_configuration_is_rejected_without_exposing_secret_material`, and
 `valid_operator_config_builds_required_mtls_server_identity`. They cover config
-load/validate, redaction, drain, sizing, pagination, both GC modes, and metrics. They
-build their fixture config inline, which is why the field set is duplicated in the test
-helper and why a new `OperatorConfig` field is a compile-time reminder there.
+load/validate, redaction, drain, sizing, pagination, both GC modes, metrics, and the
+resource-scope configuration surface. They build their fixture config inline, which is why
+the field set is duplicated in the test helper and why a new `OperatorConfig` field is a
+compile-time reminder there.
+
+`tests/resource_scoped_authorization.rs` is a separate, portable target: it drives the
+grant table through the public API only, so it needs no filesystem, no process, no TLS
+handshake, and no host platform. It holds the decision rule and the configuration shape —
+that a scope narrows, that it never grants, that it is per `(operation, kind)`, that a
+request without a resource falls back to the operation grant, and that an older node
+refuses a configuration carrying a scope.
 
 **`bin/eggworkd.rs` has no `#[cfg(test)]` module at all.** Every CLI concern is therefore
 untested at the unit level: argv parsing and the `--config` splice, `parse_option`
@@ -674,7 +741,9 @@ both a nonzero return code and that `draining` is present in the output. I read 
 harness only by targeted grep, so the list above is grep-verified but not
 exhaustively so.
 
-**Honest gaps.** No unit test for `GrantAuthorizer` itself; no test for
+**Honest gaps.** The `GrantAuthorizer` decision is covered by
+`tests/resource_scoped_authorization.rs` and by the server's own end-to-end test, but the
+*in-file* `operations.rs` module has no test that calls the authorizer directly; no test for
 `active_execution_count`'s fail-closed branches; no test for `storage_summary`'s WAL/shm
 accounting; no test for the three `inspect_*` functions or the blob size cross-check; no
 test for `start_server`; and no test at all in the binary. The macOS launchd flag matrix

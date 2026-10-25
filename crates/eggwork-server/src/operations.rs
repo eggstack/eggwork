@@ -2,11 +2,13 @@
 
 use crate::{
     Authorizer, FingerprintPrincipalResolver, NodeConfig, NodeGcReport, NodePrincipal, NodeServer,
-    Operation, artifact::ArtifactStore, blob::BlobStore, telemetry::HostTelemetryConfig,
-    workspace::WorkspaceManager,
+    Operation, OperationRequest, ResourceId, ResourceKind, artifact::ArtifactStore,
+    blob::BlobStore, telemetry::HostTelemetryConfig, workspace::WorkspaceManager,
 };
 use eggserve_core::tls::TlsServerConfig;
-use eggwork_core::{ExecutionGeneration, ExecutionId, NodeId, PrincipalId};
+use eggwork_core::{
+    ArtifactId, BlobDigest, ExecutionGeneration, ExecutionId, NodeId, PrincipalId, WorkspaceId,
+};
 use rusqlite::OptionalExtension;
 use rustls::pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
@@ -24,6 +26,14 @@ use thiserror::Error;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_GC_BATCH: usize = 1024;
 const MAX_EXECUTION_PAGE: usize = 200;
+/// The maximum number of resource scopes one grant may carry.
+///
+/// A scope is a small, hand-written narrowing of an operation the principal
+/// already holds, not a policy language. The cap bounds the configuration's
+/// size and the work the authorizer does per request.
+const MAX_RESOURCE_SCOPES_PER_GRANT: usize = 64;
+/// The maximum number of resource scopes one node's grant set may carry.
+const MAX_RESOURCE_SCOPES_TOTAL: usize = 4096;
 const METRIC_NAMES: &[&str] = &[
     "executions_accepted",
     "rejected_route",
@@ -121,6 +131,26 @@ pub struct TlsFiles {
     pub client_ca: PathBuf,
 }
 
+/// A resource-scoped narrowing of one operation a principal already holds.
+///
+/// A scope is a name, a kind, and an identifier — nothing more. It cannot
+/// grant an operation the grant does not hold, and it cannot widen a grant:
+/// the store's `principal_id` fences stay authoritative for ownership, so a
+/// scope only ever removes access.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceScope {
+    /// The operation this scope narrows. Must be an operation the same grant
+    /// already holds.
+    pub operation: String,
+    /// The resource kind this scope names: `execution`, `blob`, `workspace`,
+    /// or `artifact`.
+    pub resource_kind: String,
+    /// The string form of the resource identifier, parsed back into the typed
+    /// variant its kind names.
+    pub resource_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientGrant {
@@ -128,6 +158,18 @@ pub struct ClientGrant {
     /// Lowercase hex SHA-256 digest of the verified leaf certificate DER.
     pub certificate_sha256: String,
     pub operations: Vec<String>,
+    /// Optional resource-scoped narrowing of the operations above.
+    ///
+    /// Absent or empty means the grant is exactly as broad as its operation
+    /// list, which is the meaning every configuration written before
+    /// resource scopes existed has. A scope narrows one operation and one
+    /// resource kind; it never grants an operation the grant does not hold.
+    ///
+    /// `deny_unknown_fields` on this struct is deliberate: an older node
+    /// reading a configuration that carries a scope refuses to start rather
+    /// than silently ignoring the narrowing the operator wrote.
+    #[serde(default)]
+    pub resource_scopes: Vec<ResourceScope>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -253,6 +295,7 @@ impl OperatorConfig {
             return Err(OperationsError::Config);
         }
         let mut fingerprints = HashSet::new();
+        let mut total_scopes = 0usize;
         for grant in &self.clients {
             if PrincipalId::new(grant.principal_id.clone()).is_err()
                 || grant.certificate_sha256.len() != 64
@@ -268,6 +311,43 @@ impl OperatorConfig {
                     .any(|name| operation(name).is_none())
             {
                 return Err(OperationsError::Config);
+            }
+            total_scopes += grant.resource_scopes.len();
+            if total_scopes > MAX_RESOURCE_SCOPES_TOTAL
+                || grant.resource_scopes.len() > MAX_RESOURCE_SCOPES_PER_GRANT
+            {
+                return Err(OperationsError::Config);
+            }
+            // A scope narrows an operation the grant already holds, so the
+            // grant's own operation list is the reference a scope is checked
+            // against. Every name in that list already resolved above.
+            let held: HashSet<Operation> = grant
+                .operations
+                .iter()
+                .filter_map(|name| operation(name))
+                .collect();
+            let mut seen: HashSet<(Operation, ResourceKind, ResourceId)> = HashSet::new();
+            for scope in &grant.resource_scopes {
+                let Some(narrowed) = operation(&scope.operation) else {
+                    return Err(OperationsError::Config);
+                };
+                let Some(kind) = resource_kind(&scope.resource_kind) else {
+                    return Err(OperationsError::Config);
+                };
+                // A scope for an operation the grant does not hold would be a
+                // grant written in the wrong place; a scope for a kind that
+                // operation never names could never be consulted and would
+                // narrow nothing while the operator believed it did. Both are
+                // configuration errors, not silently ignored entries.
+                if !held.contains(&narrowed) || !narrowed.resource_kinds().contains(&kind) {
+                    return Err(OperationsError::Config);
+                }
+                let Some(identifier) = parse_resource_id(kind, &scope.resource_id) else {
+                    return Err(OperationsError::Config);
+                };
+                if !seen.insert((narrowed, kind, identifier)) {
+                    return Err(OperationsError::Config);
+                }
             }
         }
         let _ = self.tls_config()?;
@@ -350,6 +430,21 @@ impl OperatorConfig {
             for client in clients {
                 if let Some(object) = client.as_object_mut() {
                     object.insert("certificate_sha256".into(), "[REDACTED]".into());
+                    // The scope's identifier names the exact resource the
+                    // operator confined the grant to — the same class of
+                    // value as the certificate fingerprint. The operation and
+                    // kind stay visible, because the shape of the narrowing
+                    // is what an operator reads; the identifier does not.
+                    if let Some(scopes) = object
+                        .get_mut("resource_scopes")
+                        .and_then(serde_json::Value::as_array_mut)
+                    {
+                        for scope in scopes {
+                            if let Some(scope_object) = scope.as_object_mut() {
+                                scope_object.insert("resource_id".into(), "[REDACTED]".into());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -381,7 +476,7 @@ impl OperatorConfig {
         &self,
     ) -> Result<(FingerprintPrincipalResolver, GrantAuthorizer), OperationsError> {
         let mut identities = Vec::with_capacity(self.clients.len());
-        let mut grants = HashMap::new();
+        let mut grants: HashMap<PrincipalId, PrincipalGrant> = HashMap::new();
         for client in &self.clients {
             let id = PrincipalId::new(client.principal_id.clone())
                 .map_err(|_| OperationsError::Config)?;
@@ -391,11 +486,33 @@ impl OperatorConfig {
                 .iter()
                 .filter_map(|name| operation(name))
                 .collect();
-            grants.insert(id, allowed);
+            let mut scopes: HashMap<(Operation, ResourceKind), HashSet<ResourceId>> =
+                HashMap::new();
+            for scope in &client.resource_scopes {
+                // Parsing is strict here even though `validate` already
+                // refused the same shapes: `principals` is what the daemon
+                // calls, and a node that could not build its grant table must
+                // refuse to start rather than start with a permissive one.
+                let narrowed = operation(&scope.operation).ok_or(OperationsError::Config)?;
+                let kind = resource_kind(&scope.resource_kind).ok_or(OperationsError::Config)?;
+                let identifier =
+                    parse_resource_id(kind, &scope.resource_id).ok_or(OperationsError::Config)?;
+                scopes
+                    .entry((narrowed, kind))
+                    .or_default()
+                    .insert(identifier);
+            }
+            grants.insert(
+                id,
+                PrincipalGrant {
+                    operations: allowed,
+                    scopes,
+                },
+            );
         }
         Ok((
             FingerprintPrincipalResolver::new(identities),
-            GrantAuthorizer(grants),
+            GrantAuthorizer { grants },
         ))
     }
 
@@ -404,14 +521,95 @@ impl OperatorConfig {
     }
 }
 
-pub struct GrantAuthorizer(HashMap<PrincipalId, HashSet<Operation>>);
+/// One principal's grant: the operations it holds, and the resource scopes
+/// that narrow them.
+///
+/// The scope table is keyed by `(operation, resource kind)` and holds typed
+/// identifiers, so a scope for `Blob` can never be compared against an
+/// `Execution` even if the configuration tried.
+struct PrincipalGrant {
+    operations: HashSet<Operation>,
+    scopes: HashMap<(Operation, ResourceKind), HashSet<ResourceId>>,
+}
+
+/// The per-principal grant table the node authorizes against.
+///
+/// The grant table is derived entirely from the operator configuration: the
+/// decision it makes is a lookup, never a store round trip, so authorization
+/// keeps the in-memory shape it has always had and never acquires a lock or
+/// an ordering dependency it did not have before.
+pub struct GrantAuthorizer {
+    grants: HashMap<PrincipalId, PrincipalGrant>,
+}
 
 impl Authorizer for GrantAuthorizer {
     fn authorize(&self, principal: &NodePrincipal, operation: Operation) -> bool {
-        self.0
+        self.grants
             .get(&principal.id)
-            .is_some_and(|allowed| allowed.contains(&operation))
+            .is_some_and(|grant| grant.operations.contains(&operation))
     }
+
+    /// The resource-scoped decision.
+    ///
+    /// The rule, in order:
+    ///
+    /// 1. the operation grant must be present — a scope never grants an
+    ///    operation the principal does not hold;
+    /// 2. a request that carries no resource falls back to the operation-level
+    ///    grant, exactly as before resource scopes existed;
+    /// 3. when a scope is configured for that operation *and* that resource
+    ///    kind, the resource must be inside it;
+    /// 4. otherwise the operation-level grant stands.
+    ///
+    /// Rule 3 is per `(operation, kind)`: scoping `Execute` against
+    /// `Execution` does not scope `Execute` against `Workspace`. An operator
+    /// who wants both constrained writes a scope for each.
+    ///
+    /// This decision can only narrow. It never asks who owns the resource, so
+    /// the store's `principal_id` fences remain the authority on ownership: a
+    /// scope that names another principal's resource lets the request reach
+    /// the store, and the store refuses it there.
+    fn authorize_request(&self, principal: &NodePrincipal, request: &OperationRequest) -> bool {
+        if !self.authorize(principal, request.operation) {
+            return false;
+        }
+        let Some(resource) = request.resource.as_ref() else {
+            return true;
+        };
+        let Some(grant) = self.grants.get(&principal.id) else {
+            return false;
+        };
+        match grant.scopes.get(&(request.operation, resource.kind())) {
+            Some(allowed) => allowed.contains(resource),
+            None => true,
+        }
+    }
+}
+
+/// The resource kinds a scope may name.
+fn resource_kind(name: &str) -> Option<ResourceKind> {
+    Some(match name {
+        "execution" => ResourceKind::Execution,
+        "blob" => ResourceKind::Blob,
+        "workspace" => ResourceKind::Workspace,
+        "artifact" => ResourceKind::Artifact,
+        _ => return None,
+    })
+}
+
+/// Parse a scope's identifier into the typed variant its kind names.
+///
+/// The identifier is the string form of the corresponding `ResourceId`
+/// variant, and it is parsed back through the same constructors the request
+/// path uses, so a configuration cannot name a resource the request path
+/// would refuse to resolve.
+fn parse_resource_id(kind: ResourceKind, value: &str) -> Option<ResourceId> {
+    Some(match kind {
+        ResourceKind::Execution => ResourceId::Execution(ExecutionId::new(value.to_owned()).ok()?),
+        ResourceKind::Blob => ResourceId::Blob(BlobDigest::parse(value.to_owned()).ok()?),
+        ResourceKind::Workspace => ResourceId::Workspace(WorkspaceId::new(value.to_owned()).ok()?),
+        ResourceKind::Artifact => ResourceId::Artifact(ArtifactId::new(value.to_owned()).ok()?),
+    })
 }
 
 fn operation(name: &str) -> Option<Operation> {
@@ -1213,6 +1411,7 @@ mod tests {
                 principal_id: "controller".into(),
                 certificate_sha256: "ab".repeat(32),
                 operations: vec!["status".into()],
+                resource_scopes: Vec::new(),
             }],
             host_telemetry: None,
         }
@@ -1225,6 +1424,192 @@ mod tests {
         assert!(!encoded.contains("super-secret-key.pem"));
         assert!(!encoded.contains(&"ab".repeat(32)));
         assert!(encoded.contains("[REDACTED]"));
+    }
+
+    /// The printed configuration must not carry the resource a scope names,
+    /// the same way it does not carry the private key path or the certificate
+    /// fingerprint. The shape of the narrowing stays readable: the operator
+    /// reads which operation and which kind were confined.
+    #[test]
+    fn the_printed_configuration_redacts_resource_scope_identifiers() {
+        let temp = TempDir::new().unwrap();
+        let mut config = config(temp.path());
+        config.clients[0].operations = vec!["blob-read".into()];
+        config.clients[0].resource_scopes = vec![ResourceScope {
+            operation: "blob-read".into(),
+            resource_kind: "blob".into(),
+            resource_id: "cd".repeat(32),
+        }];
+        let encoded = config.redacted_json().unwrap();
+        assert!(!encoded.contains(&"cd".repeat(32)));
+        assert!(!encoded.contains("super-secret-key.pem"));
+        assert!(!encoded.contains(&"ab".repeat(32)));
+        assert!(encoded.contains("[REDACTED]"));
+        assert!(encoded.contains("blob-read"));
+        assert!(encoded.contains("blob"));
+    }
+
+    /// A scope that narrows an operation the grant already holds is accepted.
+    #[test]
+    fn a_resource_scope_that_narrows_a_held_operation_is_accepted() {
+        let temp = TempDir::new().unwrap();
+        let mut config = installed_config(temp.path());
+        config.clients[0].operations = vec!["blob-read".into()];
+        config.clients[0].resource_scopes = vec![ResourceScope {
+            operation: "blob-read".into(),
+            resource_kind: "blob".into(),
+            resource_id: "a".repeat(64),
+        }];
+        assert!(config.validate().is_ok());
+    }
+
+    /// Every malformed scope is a configuration error. The node refuses to
+    /// start rather than degrade to a decision that ignores the scope.
+    #[test]
+    fn a_malformed_resource_scope_is_refused_by_the_configuration() {
+        let cases: Vec<(&str, ResourceScope)> = vec![
+            (
+                "an unknown operation name",
+                ResourceScope {
+                    operation: "blob-readd".into(),
+                    resource_kind: "blob".into(),
+                    resource_id: "a".repeat(64),
+                },
+            ),
+            (
+                "an unknown resource kind",
+                ResourceScope {
+                    operation: "blob-read".into(),
+                    resource_kind: "blobs".into(),
+                    resource_id: "a".repeat(64),
+                },
+            ),
+            (
+                "a malformed identifier",
+                ResourceScope {
+                    operation: "blob-read".into(),
+                    resource_kind: "blob".into(),
+                    resource_id: "not-a-digest".into(),
+                },
+            ),
+            (
+                "a scope for an operation the grant does not hold",
+                ResourceScope {
+                    operation: "blob-write".into(),
+                    resource_kind: "blob".into(),
+                    resource_id: "a".repeat(64),
+                },
+            ),
+            (
+                "a scope for a kind the operation never names",
+                ResourceScope {
+                    operation: "blob-read".into(),
+                    resource_kind: "execution".into(),
+                    resource_id: "exec-1".into(),
+                },
+            ),
+            (
+                "a scope for an operation that names no resource at all",
+                ResourceScope {
+                    operation: "status".into(),
+                    resource_kind: "execution".into(),
+                    resource_id: "exec-1".into(),
+                },
+            ),
+        ];
+        for (label, scope) in cases {
+            let temp = TempDir::new().unwrap();
+            let mut config = installed_config(temp.path());
+            config.clients[0].operations = vec!["blob-read".into(), "status".into()];
+            config.clients[0].resource_scopes = vec![scope];
+            assert!(config.validate().is_err(), "{label} must be refused");
+        }
+    }
+
+    /// The same scope twice is a duplicate, not a redundancy to be tolerated.
+    #[test]
+    fn a_duplicate_resource_scope_is_refused_by_the_configuration() {
+        let temp = TempDir::new().unwrap();
+        let mut config = installed_config(temp.path());
+        config.clients[0].operations = vec!["blob-read".into()];
+        config.clients[0].resource_scopes = vec![
+            ResourceScope {
+                operation: "blob-read".into(),
+                resource_kind: "blob".into(),
+                resource_id: "a".repeat(64),
+            },
+            ResourceScope {
+                operation: "blob-read".into(),
+                resource_kind: "blob".into(),
+                resource_id: "a".repeat(64),
+            },
+        ];
+        assert!(config.validate().is_err());
+    }
+
+    /// One grant cannot carry more scopes than the per-grant cap.
+    #[test]
+    fn too_many_resource_scopes_in_one_grant_are_refused() {
+        let temp = TempDir::new().unwrap();
+        let mut config = installed_config(temp.path());
+        config.clients[0].operations = vec!["blob-read".into()];
+        config.clients[0].resource_scopes = (0..=MAX_RESOURCE_SCOPES_PER_GRANT)
+            .map(|index| ResourceScope {
+                operation: "blob-read".into(),
+                resource_kind: "blob".into(),
+                resource_id: format!("{index:064x}"),
+            })
+            .collect();
+        assert!(config.validate().is_err());
+    }
+
+    /// The node's grant set cannot carry more scopes than the per-node cap,
+    /// even when every individual grant is within its own cap.
+    #[test]
+    fn too_many_resource_scopes_across_the_node_are_refused() {
+        let temp = TempDir::new().unwrap();
+        let mut config = installed_config(temp.path());
+        let base = config.clients.remove(0);
+        let grants = MAX_RESOURCE_SCOPES_TOTAL / MAX_RESOURCE_SCOPES_PER_GRANT + 1;
+        for grant in 0..grants {
+            let mut client = base.clone();
+            client.principal_id = format!("controller-{grant:02}");
+            client.certificate_sha256 = format!("{grant:064x}");
+            client.operations = vec!["blob-read".into()];
+            client.resource_scopes = (0..MAX_RESOURCE_SCOPES_PER_GRANT)
+                .map(|index| ResourceScope {
+                    operation: "blob-read".into(),
+                    resource_kind: "blob".into(),
+                    resource_id: format!("{:064x}", (grant as u64) * 1_000 + index as u64),
+                })
+                .collect();
+            config.clients.push(client);
+        }
+        assert!(config.validate().is_err());
+    }
+
+    /// A configuration written before resource scopes existed still validates.
+    #[test]
+    fn a_configuration_written_before_resource_scopes_still_validates() {
+        let temp = TempDir::new().unwrap();
+        let config = installed_config(temp.path());
+        assert!(config.clients[0].resource_scopes.is_empty());
+        assert!(config.validate().is_ok());
+    }
+
+    /// The grant table the daemon builds refuses a scope it cannot parse,
+    /// even if `validate` was never called on the way to it.
+    #[test]
+    fn the_grant_table_refuses_a_scope_it_cannot_parse() {
+        let temp = TempDir::new().unwrap();
+        let mut config = installed_config(temp.path());
+        config.clients[0].operations = vec!["blob-read".into()];
+        config.clients[0].resource_scopes = vec![ResourceScope {
+            operation: "blob-read".into(),
+            resource_kind: "blob".into(),
+            resource_id: "not-a-digest".into(),
+        }];
+        assert!(config.principals().is_err());
     }
 
     /// A configuration document in the shape the loader accepts.

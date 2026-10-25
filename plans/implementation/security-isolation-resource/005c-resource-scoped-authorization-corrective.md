@@ -1,8 +1,8 @@
 # Security M005c — Resource-scoped authorization disposition corrective
 
-Status: blocked
+Status: active
 
-Concrete blocker: `plans/adrs/ADR-0007-resource-scoped-authorization.md` — **proposed, not yet accepted**. The ADR must decide whether resource-scoped grants are implemented or the inert hook and its `ResourceId` plumbing are removed. Per `plans/003-planning-process.md` §4, this plan MUST NOT be handed off as ready until that ADR is accepted, and it MUST NOT be handed off as ready merely because adjacent implementation exists.
+Decision: `plans/adrs/ADR-0007-resource-scoped-authorization.md` is **accepted** — Option A, implement resource-scoped grants. The blocker that held this plan is discharged; §5 (Branch A) is the work in flight, and §4, §7, §8, §9, §11, §12, and §14 hold as written.
 
 Closure record: `plans/closure/security-isolation-resource/005c-status.md`
 
@@ -315,7 +315,7 @@ Do not claim tests were run when they were only inspected. Do not claim a platfo
 
 ## 15. Handoff notes
 
-- **This plan is blocked and must not be handed off as ready.** The blocker is concrete and named: `plans/adrs/ADR-0007-resource-scoped-authorization.md`, which is **proposed, not accepted**. It is written now, per `plans/003-planning-process.md` §4, to preserve the design intent so that the implementation is mechanical once the decision is made.
+- **The blocking decision is made.** `plans/adrs/ADR-0007-resource-scoped-authorization.md` is **accepted** — Option A, implement resource-scoped grants. The plan was written while the decision was pending, per `plans/003-planning-process.md` §4, so that the implementation would be mechanical once the decision was made; §5 (Branch A) is that implementation. The status line above is `active` until the coordinator sets the final status after the pre-submit gate.
 - The plan is written so that **either** ADR outcome is executable without re-deriving the design. §5 is Branch A's work; §6 is Branch B's work; §4, §7, §8, §9, §10, §11, §12, and §14 hold in both.
 - The decision is durable and needs a human's judgement, not an implementer's. The two branches differ enormously in cost and in what they promise a caller: one adds a real per-resource boundary, the other removes a false promise.
 - The defect is **already recorded**. This milestone must not be reported as a newly discovered defect, and the closure record must say that the gap was known and is now decided.

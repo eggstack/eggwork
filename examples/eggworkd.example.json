@@ -34,6 +34,34 @@
         "workspace-create",
         "artifact-read"
       ]
+    },
+    {
+      "principal_id": "controller-02",
+      "certificate_sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "operations": [
+        "capabilities",
+        "status",
+        "execute",
+        "observe",
+        "blob-read"
+      ],
+      "resource_scopes": [
+        {
+          "operation": "execute",
+          "resource_kind": "execution",
+          "resource_id": "batch-2026-10-25-001"
+        },
+        {
+          "operation": "observe",
+          "resource_kind": "execution",
+          "resource_id": "batch-2026-10-25-001"
+        },
+        {
+          "operation": "blob-read",
+          "resource_kind": "blob",
+          "resource_id": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        }
+      ]
     }
   ]
 }

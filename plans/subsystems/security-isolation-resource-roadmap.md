@@ -1,6 +1,6 @@
 # Security, Isolation, and Resource Enforcement Roadmap
 
-Status: closed through M004 (remote-admission C001 and Operations M002 included); M005a conditionally closed, M005b closed, M005c blocked on ADR-0007
+Status: closed through M004 (remote-admission C001 and Operations M002 included); M005a conditionally closed, M005b closed, M005c implemented against accepted ADR-0007
 
 Canonical authority:
 
@@ -214,7 +214,13 @@ Exit conditions:
 
 Class: invariant
 
-Status: **blocked** — concrete blocker is ADR-0007, `plans/adrs/ADR-0007-resource-scoped-authorization.md` (**proposed, not accepted**)
+Status: **implemented** — ADR-0007 is **accepted** (`plans/adrs/ADR-0007-resource-scoped-authorization.md`, Option A: implement resource-scoped grants) and Branch A of the implementation plan is in the tree.
+
+Closure evidence: `plans/closure/security-isolation-resource/005c-status.md`
+
+Deciding ADR:
+
+- `plans/adrs/ADR-0007-resource-scoped-authorization.md`
 
 Corrective addendum:
 
@@ -233,6 +239,10 @@ Exit conditions:
 - ADR-0007 is accepted and states whether resource-scoped grants are implemented or the hook and its plumbing are removed;
 - the node does not present a mechanism as available while it is inert;
 - the divergences-table entry is updated to the decided disposition.
+
+Decided disposition (ADR-0007, Option A):
+
+The hook stays and becomes real. `GrantAuthorizer` implements `authorize_request`; `ClientGrant` gains an optional, additive, bounded `resource_scopes` list whose entries name an operation, a resource kind, and a typed resource identifier; the decision consults a configuration-derived set only, so it adds no lock and no ordering dependency to the request path; the store's `principal_id` fences stay authoritative for ownership, so a scope can only narrow and never widen; and a blob scope is an explicit digest list, because content-addressed blob storage has no owner. Configuration fails closed at load time on every malformed scope. No wire value, wire field, capability byte, or `API_SCHEMA_VERSION` changes.
 
 ## 4. Capability semantics
 

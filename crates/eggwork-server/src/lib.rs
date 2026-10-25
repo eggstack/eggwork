@@ -180,12 +180,60 @@ pub enum Operation {
     ArtifactRead,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Operation {
+    /// The resource kinds this operation's requests can name.
+    ///
+    /// A resource scope is refused when its `(operation, kind)` pair is not
+    /// in this table: a scope that could never be consulted would narrow
+    /// nothing while the operator believed it did. The table is exactly the
+    /// set the request path resolves — `resource_for_path` for the
+    /// path-derived operations, and the handler-level `authorize_resource`
+    /// calls for the body-derived ones — so a scope can never be written
+    /// for a resource the node does not resolve.
+    pub fn resource_kinds(&self) -> &'static [ResourceKind] {
+        match self {
+            Self::Execute => &[ResourceKind::Execution, ResourceKind::Workspace],
+            Self::Observe | Self::Cancel | Self::Renew | Self::Events => &[ResourceKind::Execution],
+            Self::BlobRead | Self::BlobWrite => &[ResourceKind::Blob],
+            Self::WorkspaceCreate => &[ResourceKind::Workspace],
+            Self::ArtifactRead => &[ResourceKind::Artifact, ResourceKind::Execution],
+            Self::Capabilities | Self::Status | Self::Telemetry => &[],
+        }
+    }
+}
+
+/// The kind of resource a request names.
+///
+/// A resource scope names a kind and an identifier, and the two must agree:
+/// a scope for `Blob` is compared against blob identifiers only. The kind is
+/// derived from the typed [`ResourceId`] variant so the configuration and
+/// the request path cannot disagree about what an identifier is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResourceKind {
+    Execution,
+    Blob,
+    Workspace,
+    Artifact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ResourceId {
     Execution(ExecutionId),
     Blob(eggwork_core::BlobDigest),
     Workspace(eggwork_core::WorkspaceId),
     Artifact(eggwork_core::ArtifactId),
+}
+
+impl ResourceId {
+    /// The kind of resource this identifier names.
+    pub fn kind(&self) -> ResourceKind {
+        match self {
+            Self::Execution(_) => ResourceKind::Execution,
+            Self::Blob(_) => ResourceKind::Blob,
+            Self::Workspace(_) => ResourceKind::Workspace,
+            Self::Artifact(_) => ResourceKind::Artifact,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +283,13 @@ pub trait Authorizer: Send + Sync + 'static {
 
     /// Resource-aware hook. Existing operation-wide policies remain valid;
     /// scoped policies can override this method to inspect authenticated IDs.
+    ///
+    /// The default body is exactly the operation-level decision, which is the
+    /// behaviour a deployment that configures no resource scope keeps. An
+    /// override may only *narrow* that decision: the store's `principal_id`
+    /// fences remain authoritative for ownership, so an authorizer that
+    /// permits a resource the principal does not own still gets refused by
+    /// the store.
     fn authorize_request(&self, principal: &NodePrincipal, request: &OperationRequest) -> bool {
         self.authorize(principal, request.operation)
     }
@@ -3708,6 +3763,466 @@ mod tests {
         )
         .unwrap();
         assert!(rogue_client.status().await.is_err());
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// Build the node's grant table from client grants.
+    ///
+    /// `OperatorConfig::principals` reads only the client grants, so the
+    /// paths and the TLS material below are never touched: this is the same
+    /// table the daemon builds, reached without a configuration file.
+    fn scoped_grant_table(
+        clients: Vec<crate::operations::ClientGrant>,
+    ) -> crate::operations::GrantAuthorizer {
+        crate::operations::OperatorConfig {
+            schema_version: 1,
+            node_id: "node-scoped".into(),
+            bind: "127.0.0.1:0".into(),
+            execution_root: PathBuf::from("unused"),
+            database_path: PathBuf::from("unused"),
+            blob_root: PathBuf::from("unused"),
+            blob_quota_bytes: 1,
+            workspace_root: PathBuf::from("unused"),
+            workspace_quota_bytes: 1,
+            max_active_executions: 1,
+            lease_ttl_seconds: 1,
+            sandbox_helper: None,
+            tls: crate::operations::TlsFiles {
+                certificate_chain: PathBuf::from("unused"),
+                private_key: PathBuf::from("unused"),
+                client_ca: PathBuf::from("unused"),
+            },
+            clients,
+            host_telemetry: None,
+        }
+        .principals()
+        .expect("the grant table builds")
+        .1
+    }
+
+    fn scoped_grant(
+        principal: &str,
+        fingerprint: u64,
+        operations: &[&str],
+        resource_scopes: Vec<crate::operations::ResourceScope>,
+    ) -> crate::operations::ClientGrant {
+        crate::operations::ClientGrant {
+            principal_id: principal.into(),
+            certificate_sha256: format!("{fingerprint:064x}"),
+            operations: operations.iter().map(|name| (*name).to_string()).collect(),
+            resource_scopes,
+        }
+    }
+
+    fn scoped_scope(
+        operation: &str,
+        resource_kind: &str,
+        resource_id: &str,
+    ) -> crate::operations::ResourceScope {
+        crate::operations::ResourceScope {
+            operation: operation.into(),
+            resource_kind: resource_kind.into(),
+            resource_id: resource_id.into(),
+        }
+    }
+
+    /// A resource scope is a narrowing, never a grant.
+    ///
+    /// The second principal's scopes name the *first* principal's resources.
+    /// The authorizer lets those requests through the scope — it consults a
+    /// configuration-derived set and cannot know who owns a resource — and the
+    /// store's `principal_id` fence refuses them. That is the whole claim:
+    /// a resource-scoped grant naming another principal's resource does not
+    /// reach it, for an execution, a workspace, and an artifact.
+    #[tokio::test]
+    async fn a_resource_scope_cannot_reach_a_foreign_principal_resource() {
+        init_tls();
+        let (root, server_identity, owner_identity, intruder_identity) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let owner = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let intruder = eggwork_core::PrincipalId::new("controller-b").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([
+            (
+                FingerprintPrincipalResolver::fingerprint(owner_identity.cert.as_ref()),
+                owner.clone(),
+            ),
+            (
+                FingerprintPrincipalResolver::fingerprint(intruder_identity.cert.as_ref()),
+                intruder.clone(),
+            ),
+        ]));
+        // Both principals hold the same operations. The second one's scopes
+        // name the first one's resources.
+        let authorizer = Arc::new(scoped_grant_table(vec![
+            scoped_grant(
+                "controller-a",
+                1,
+                &[
+                    "capabilities",
+                    "status",
+                    "execute",
+                    "observe",
+                    "workspace-create",
+                    "artifact-read",
+                    "blob-write",
+                ],
+                vec![],
+            ),
+            scoped_grant(
+                "controller-b",
+                2,
+                &[
+                    "capabilities",
+                    "status",
+                    "execute",
+                    "observe",
+                    "workspace-create",
+                    "artifact-read",
+                    "blob-write",
+                ],
+                vec![
+                    scoped_scope("execute", "execution", "exec-owned-by-a"),
+                    scoped_scope("observe", "execution", "exec-owned-by-a"),
+                    scoped_scope("workspace-create", "workspace", "ws-owned-by-a"),
+                    scoped_scope("artifact-read", "execution", "exec-owned-by-a"),
+                    scoped_scope("artifact-read", "artifact", "art-owned-by-a"),
+                ],
+            ),
+        ]));
+        let server = NodeServer::start(
+            NodeConfig {
+                host_telemetry: None,
+                node_id: NodeId::new("node-scoped").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 2,
+                lease_ttl: std::time::Duration::from_secs(30),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            authorizer.clone(),
+        )
+        .await
+        .unwrap();
+        let owner_temp = TempDir::new().unwrap();
+        let owner_client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&owner_temp, root.as_ref(), &owner_identity),
+        )
+        .unwrap();
+        let intruder_temp = TempDir::new().unwrap();
+        let intruder_client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&intruder_temp, root.as_ref(), &intruder_identity),
+        )
+        .unwrap();
+
+        // The owner creates the execution the intruder's scopes name.
+        let owner_handle = execution_handle("exec-owned-by-a");
+        let accepted = owner_client
+            .execute(
+                &execution_spec(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]),
+                &owner_handle,
+            )
+            .await;
+        let detail = match &accepted {
+            Ok(_) => "accepted".to_string(),
+            Err(eggwork_client::ClientError::Api {
+                status,
+                code,
+                message,
+            }) => format!("{status} {code} {message}"),
+            Err(other) => format!("{other:?}"),
+        };
+        assert!(
+            accepted.is_ok(),
+            "the owner must be able to execute: {detail}"
+        );
+        let execution_id = ExecutionId::new("exec-owned-by-a").unwrap();
+        // The owner reads its own execution.
+        assert!(owner_client.observe(&execution_id).await.is_ok());
+        // The scope lets the intruder through the authorizer: the scope names
+        // the execution, so the authorizer has no reason to refuse it.
+        assert!(authorizer.authorize_request(
+            &NodePrincipal {
+                id: intruder.clone(),
+            },
+            &OperationRequest {
+                operation: Operation::Observe,
+                resource: Some(ResourceId::Execution(execution_id.clone())),
+            },
+        ));
+        // The store's owner fence refuses it anyway.
+        assert!(matches!(
+            intruder_client.observe(&execution_id).await,
+            Err(eggwork_client::ClientError::Api { status: 404, .. })
+        ));
+
+        // The owner creates the workspace the intruder's scope names.
+        let workspace_id = eggwork_core::WorkspaceId::new("ws-owned-by-a").unwrap();
+        let manifest = eggwork_core::WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![],
+        };
+        assert!(
+            owner_client
+                .create_workspace(
+                    &workspace_id,
+                    &execution_handle("ws-owned-by-a-execution"),
+                    &manifest,
+                )
+                .await
+                .is_ok(),
+            "the owner must be able to create the workspace"
+        );
+        assert!(authorizer.authorize_request(
+            &NodePrincipal {
+                id: intruder.clone(),
+            },
+            &OperationRequest {
+                operation: Operation::WorkspaceCreate,
+                resource: Some(ResourceId::Workspace(workspace_id.clone())),
+            },
+        ));
+        // The workspace belongs to the owner; the intruder's create conflicts
+        // with it rather than taking it over.
+        assert!(matches!(
+            intruder_client
+                .create_workspace(
+                    &workspace_id,
+                    &execution_handle("ws-owned-by-a-intruder-execution"),
+                    &manifest,
+                )
+                .await,
+            Err(eggwork_client::ClientError::Api { status: 409, .. })
+        ));
+
+        // The owner publishes an artifact the intruder's scope names.
+        let payload = b"artifact-owned-by-a";
+        let digest = eggwork_core::BlobDigest::from_bytes(payload);
+        let chunks = payload
+            .chunks(32 * 1024)
+            .map(|chunk| Ok::<_, eggfetch_core::Error>(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        owner_client
+            .upload_blob(
+                &digest,
+                payload.len() as u64,
+                Box::pin(stream::iter(chunks)),
+            )
+            .await
+            .unwrap();
+        let record = eggwork_core::ArtifactRecord {
+            artifact_id: eggwork_core::ArtifactId::new("art-owned-by-a").unwrap(),
+            execution_id: execution_id.clone(),
+            generation: ExecutionGeneration::new(1).unwrap(),
+            path: eggwork_core::RelativePath::new("out.txt").unwrap(),
+            kind: eggwork_core::ArtifactType::File,
+            digest: digest.clone(),
+            size_bytes: payload.len() as u64,
+            executable: false,
+            created_unix_ms: artifact::now_unix_ms(),
+            expires_unix_ms: artifact::now_unix_ms() + 3_600_000,
+        };
+        let artifact_store = artifact::ArtifactStore::open(artifact::metadata_path(
+            &temp.path().join("node.sqlite"),
+        ))
+        .unwrap();
+        artifact_store
+            .insert_many(std::slice::from_ref(&record), &owner)
+            .unwrap();
+        // The owner sees its own artifact and can read it.
+        assert_eq!(
+            owner_client
+                .artifacts(&execution_id, 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(owner_client.download_artifact(&record).await.is_ok());
+        // The scope lets the intruder through the authorizer for both kinds
+        // the artifact read names.
+        assert!(authorizer.authorize_request(
+            &NodePrincipal {
+                id: intruder.clone(),
+            },
+            &OperationRequest {
+                operation: Operation::ArtifactRead,
+                resource: Some(ResourceId::Artifact(record.artifact_id.clone())),
+            },
+        ));
+        assert!(authorizer.authorize_request(
+            &NodePrincipal {
+                id: intruder.clone(),
+            },
+            &OperationRequest {
+                operation: Operation::ArtifactRead,
+                resource: Some(ResourceId::Execution(execution_id.clone())),
+            },
+        ));
+        // The store's owner fence refuses both: the intruder's list is empty
+        // and the artifact itself is not found.
+        assert!(
+            intruder_client
+                .artifacts(&execution_id, 1)
+                .await
+                .unwrap()
+                .is_empty(),
+            "another principal's artifacts must stay invisible"
+        );
+        assert!(matches!(
+            intruder_client.download_artifact(&record).await,
+            Err(eggwork_client::ClientError::Api { status: 404, .. })
+        ));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// The status code, error code, and message a denied caller sees.
+    fn denial_shape(error: &eggwork_client::ClientError) -> (u16, String, String) {
+        match error {
+            eggwork_client::ClientError::Api {
+                status,
+                code,
+                message,
+            } => (*status, code.clone(), message.clone()),
+            other => panic!("expected an API error, got {other:?}"),
+        }
+    }
+
+    /// A resource-scoped denial is indistinguishable from an operation-level
+    /// denial, and from the denial of a resource that does not exist.
+    ///
+    /// A scoped principal must not be able to tell "that resource exists but is
+    /// outside my scope" from "that resource does not exist" from "you may not
+    /// read blobs at all": the same status code, the same error code, and the
+    /// same message in all three cases.
+    #[tokio::test]
+    async fn a_resource_scoped_denial_is_indistinguishable_from_an_operation_level_denial() {
+        init_tls();
+        let (root, server_identity, scoped_identity, ungranted_identity) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let scoped_principal = eggwork_core::PrincipalId::new("scoped-controller").unwrap();
+        let ungranted_principal = eggwork_core::PrincipalId::new("ungranted-controller").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([
+            (
+                FingerprintPrincipalResolver::fingerprint(scoped_identity.cert.as_ref()),
+                scoped_principal.clone(),
+            ),
+            (
+                FingerprintPrincipalResolver::fingerprint(ungranted_identity.cert.as_ref()),
+                ungranted_principal.clone(),
+            ),
+        ]));
+        let in_scope = eggwork_core::BlobDigest::from_bytes(b"blob-inside-the-scope");
+        let out_of_scope = eggwork_core::BlobDigest::from_bytes(b"blob-outside-the-scope");
+        let absent = eggwork_core::BlobDigest::from_bytes(b"blob-never-published");
+        let authorizer = Arc::new(scoped_grant_table(vec![
+            scoped_grant(
+                "scoped-controller",
+                1,
+                &["capabilities", "status", "blob-read", "blob-write"],
+                vec![scoped_scope("blob-read", "blob", in_scope.as_str())],
+            ),
+            scoped_grant(
+                "ungranted-controller",
+                2,
+                &["capabilities", "status"],
+                vec![],
+            ),
+        ]));
+        let server = NodeServer::start(
+            NodeConfig {
+                host_telemetry: None,
+                node_id: NodeId::new("node-scoped").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 2,
+                lease_ttl: std::time::Duration::from_secs(30),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            authorizer.clone(),
+        )
+        .await
+        .unwrap();
+        let scoped_temp = TempDir::new().unwrap();
+        let scoped_client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&scoped_temp, root.as_ref(), &scoped_identity),
+        )
+        .unwrap();
+        let ungranted_temp = TempDir::new().unwrap();
+        let ungranted_client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&ungranted_temp, root.as_ref(), &ungranted_identity),
+        )
+        .unwrap();
+        // The scoped principal publishes two blobs: one inside its scope and
+        // one outside it.
+        for payload in [
+            b"blob-inside-the-scope".as_slice(),
+            b"blob-outside-the-scope".as_slice(),
+        ] {
+            let digest = eggwork_core::BlobDigest::from_bytes(payload);
+            let chunks = payload
+                .chunks(32 * 1024)
+                .map(|chunk| Ok::<_, eggfetch_core::Error>(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>();
+            scoped_client
+                .upload_blob(
+                    &digest,
+                    payload.len() as u64,
+                    Box::pin(stream::iter(chunks)),
+                )
+                .await
+                .unwrap();
+        }
+        let scoped_digest = in_scope;
+        let out_of_scope_digest = out_of_scope;
+        let absent_digest = absent;
+        // The digest inside the scope is readable: the scope is consulted and
+        // it let this one through.
+        assert!(scoped_client.download_blob(&scoped_digest).await.is_ok());
+        // A digest outside the scope is refused, whether or not it exists.
+        let scoped_denial = scoped_client
+            .download_blob(&out_of_scope_digest)
+            .await
+            .map(|_| ())
+            .expect_err("an out-of-scope digest must be refused");
+        let absent_denial = scoped_client
+            .download_blob(&absent_digest)
+            .await
+            .map(|_| ())
+            .expect_err("an absent digest must be refused the same way");
+        // A principal with no blob grant at all is refused the same way.
+        let operation_denial = ungranted_client
+            .download_blob(&scoped_digest)
+            .await
+            .map(|_| ())
+            .expect_err("an ungranted operation must be refused");
+        let scoped_shape = denial_shape(&scoped_denial);
+        assert_eq!(scoped_shape.0, 403);
+        assert_eq!(scoped_shape, denial_shape(&absent_denial));
+        assert_eq!(scoped_shape, denial_shape(&operation_denial));
         server.shutdown().await;
         server.wait().await.unwrap();
     }

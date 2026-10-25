@@ -191,18 +191,59 @@ only ever see the operation — never the resource. Resource scoping requires a 
 `derived_workspace_denied_and_oversized_bodies_are_typed` (`lib.rs:4499`) and
 `resource_aware_authorizer_can_scope_blob_capability` (`lib.rs:3039`).
 
-**How `GrantAuthorizer` realizes per-principal grants.** `GrantAuthorizer(HashMap<PrincipalId,
-HashSet<Operation>>)` (`operations.rs:332-340`) implements only `authorize`:
-`self.0.get(&principal.id).is_some_and(|allowed| allowed.contains(&operation))`. It is built by
-`principals()` (`operations.rs:305-325`), which walks the configured clients, lowercases each
-`certificate_sha256` into the `FingerprintPrincipalResolver` table, and maps each configured
-operation *name* to an `Operation` through `operation(name)` (`operations.rs:342-357`) — note
-`filter_map`, so an unrecognized operation name in configuration is **silently dropped** rather
-than rejected, shrinking that client's grant set. Absent principal ⇒ `None` ⇒ `false` (deny by
-default). Because it does not override `authorize_request`, grant-based deployments are strictly
-operation-wide; the `resource_for_path` enrichment in `dispatch` has no effect for them. The
-`GrantAuthorizer` has no cross-principal or cross-execution scoping: per-execution ownership is
-enforced later, in the store, by comparing `existing.principal_id` (`lib.rs:1677`, `2044`, `2267`).
+**How `GrantAuthorizer` realizes per-principal grants.** `GrantAuthorizer` (`operations.rs:535-581`) holds a
+`HashMap<PrincipalId, PrincipalGrant>`; a `PrincipalGrant` (`operations.rs:524-527`) is the set of
+`Operation`s the principal holds plus an optional resource-scope table keyed by
+`(Operation, ResourceKind)` and holding typed `ResourceId`s. It is built by `principals()`
+(`operations.rs:472-511`), which walks the configured clients, lowercases each `certificate_sha256` into the
+`FingerprintPrincipalResolver` table, and maps each configured operation *name* to an `Operation` through
+`operation(name)` (`operations.rs:615-631`) — note `filter_map`, so an unrecognized operation name in
+configuration is **silently dropped** rather than rejected, shrinking that client's grant set. Absent
+principal ⇒ `None` ⇒ `false` (deny by default).
+
+**Resource-scoped grants.** `ClientGrant` (`operations.rs:156-175`) carries an optional `resource_scopes`
+list. Each `ResourceScope` (`operations.rs:142-153`) names an **operation**, a **resource kind**
+(`execution`, `blob`, `workspace`, `artifact`), and a **resource identifier** — the string form of the
+`ResourceId` variant, parsed back into the typed variant by `parse_resource_id`
+(`operations.rs:600-613`) through the same constructors the request path uses, so configuration and the
+request path cannot disagree about what an identifier is. A grant with no scopes keeps exactly its
+operation-level meaning, which is what every configuration written before scopes existed means.
+
+The decision rule (`GrantAuthorizer::authorize_request`, `operations.rs:566-580`) is, in order:
+
+1. the operation grant must be present — a scope never grants an operation the principal does not hold;
+2. a request that carries no resource falls back to the operation-level grant;
+3. when a scope is configured for that operation **and** that resource kind, the resource must be inside it;
+4. otherwise the operation-level grant stands.
+
+Rule 3 is per `(operation, kind)`: a scope for `Execute`/`Execution` does not narrow `Execute`/`Workspace`,
+and a scope for `BlobRead`/`Blob` does not narrow `BlobWrite`/`Blob`. An operator who wants both kinds
+constrained writes a scope for each. The decision consults a **configuration-derived set only** — it never
+asks the store who owns a resource — so authorization keeps the in-memory, lock-free shape it has always
+had and acquires no ordering dependency it did not have before.
+
+**The store stays authoritative for ownership.** The authorizer's resource decision can only *narrow*: it
+never grants an operation, and it never widens a grant. For `Execution`, `Workspace`, and `Artifact` the
+existing `principal_id` fences remain the authority, so a scope that names another principal's resource lets
+the request reach the store and the store refuses it there (`store.load_snapshot_for_principal`, the owner
+comparison in `workspaces.materialize`, `artifacts.get`/`artifacts.list`). `Blob` is different and
+deliberately so: blob storage is content-addressed and shared, so a blob has no owner to fence it — a blob
+scope is an **explicit digest list**, never an ownership comparison.
+
+**Configuration fails closed at load time.** Every error class is a configuration error and the node
+refuses to start rather than degrade to a permissive decision: an unknown operation name, an unknown resource
+kind, a malformed identifier, a scope for an operation the grant does not hold, a scope for a kind that
+operation never names, a duplicate scope, and an over-cap grant count. `OperatorConfig::validate` enforces
+the per-grant cap (`MAX_RESOURCE_SCOPES_PER_GRANT = 64`) and the per-node cap
+(`MAX_RESOURCE_SCOPES_TOTAL = 4096`) alongside the existing caps; `principals()` parses the same shapes
+strictly, so a node that could not build its grant table refuses to start even if `validate` was bypassed.
+
+**`deny_unknown_fields` is deliberate.** `ClientGrant` keeps `#[serde(deny_unknown_fields)]` and the new
+field is `#[serde(default)]`, so an older configuration file still loads — and an *older node* reading a
+newer configuration that carries a scope refuses to start rather than silently ignoring the narrowing the
+operator wrote. That refusal is correct behaviour, not a defect: a node whose boundary is wider than its
+configuration states is the defect.
+
 
 **Authorization runs BEFORE resource resolution.** In `dispatch` the order is: route lookup (728) →
 authentication (732) → `authorize_request` (744) → handler (755). `resource_for_path` (`lib.rs:783-806`)
@@ -212,9 +253,13 @@ store. Handlers then resolve existence — `store.load_snapshot_for_principal` i
 deliberate: a client that is not authorized for an operation learns nothing about whether the target
 execution, blob, or artifact exists, because it is rejected with a uniform `403` before any lookup
 happens. Where a handler must do a *second* resource check (body-derived ids), an unauthorized
-result is still a bare `403` and never leaks existence. The residual disclosure to note: the
-operation-wide gate is uniform across resources, so a principal granted `BlobRead` can use
-`POST /v1/blobs/missing` to probe digest presence — presence is data the grant explicitly confers.
+result is still a bare `403` and never leaks existence. A **resource-scoped** denial is the same bare
+`403 forbidden` / "operation is not authorized" as an operation-level denial, and is identical for a
+resource that exists and for one that does not — the caller learns nothing about which. The residual
+disclosure to note: the operation-wide gate is uniform across resources, so a principal granted `BlobRead`
+with **no** blob scope can use `POST /v1/blobs/missing` to probe digest presence — presence is data the
+grant explicitly confers, and a blob scope is the only boundary available for a resource that has no
+owner.
 `Route::BlobInvalidDigest` (`lib.rs:767-771`) is reached only *after* authorization, and returns a
 distinct `400 invalid_digest`, so an unauthorized caller cannot use it to distinguish "malformed"
 from "well-formed but denied".
@@ -901,6 +946,9 @@ echoes its address: a node whose provider happens to be down is still a healthy 
 | The feature list is single-canonical and deduped | `static_capability_features` + sort/dedup | `static_capability_features_are_a_single_canonical_list`, `server_capability_features_do_not_duplicate_static_dynamic_overlap`, `the_advertised_argv_feature_is_the_one_the_owner_declares` |
 | Only the fixed, versioned route set exists | `operation_for` (`lib.rs:640-700`) | `route_contract_is_fixed_target_and_versioned` (2934) |
 | An authorized op on a different resource is still denied | `authorize_resource` re-checks (`lib.rs:808`, `928`, `983`, `1038`, `1159`, `1518`) | `resource_aware_authorizer_can_scope_blob_capability` (3039), `derived_workspace_denied_and_oversized_bodies_are_typed` (4499) |
+| A resource scope narrows the operation grant and never widens it | `GrantAuthorizer::authorize_request` (`operations.rs:566-580`) | `a_resource_scope_narrows_the_operation_grant_it_names`, `a_scope_never_grants_an_operation_the_principal_does_not_hold` (`tests/resource_scoped_authorization.rs`) |
+| A scope never reaches another principal's resource | the store's `principal_id` fences, unchanged | `a_resource_scope_cannot_reach_a_foreign_principal_resource` (`lib.rs`) |
+| A malformed scope is a configuration error, not an ignored entry | `OperatorConfig::validate` (`operations.rs`) + `principals()` | `a_malformed_resource_scope_is_refused_by_the_configuration`, `a_duplicate_resource_scope_is_refused_by_the_configuration` (`operations.rs`) |
 | A repeat submit never starts a second execution | `store.lookup` pre-check + `ReserveResult::Existing` (`lib.rs:1664`, `1793`) | `blob_protocol_streams_verifies_deduplicates_and_enforces_quota` (3399) |
 | Identity conflicts are refused, not merged | `lib.rs:1670-1690`, `1808-1835` | `mtls_authorization_and_fixed_target_execution` (3137) |
 | Stale generations cannot mutate state | generation preconditions in `control` (`lib.rs:2072`) and `events_route` | `cross_principal_execution_fencing_without_lease_oracle` (5766) |
@@ -942,6 +990,13 @@ file). Fixtures first: `init_tls`, `issue_identity`, `tls_material`, `untrusted_
 - 3039 `resource_aware_authorizer_can_scope_blob_capability` — an authorizer overriding **only**
   `authorize_request` denies one digest, exercising the resource-scoped path independently of
   `GrantAuthorizer`.
+- `a_resource_scope_cannot_reach_a_foreign_principal_resource` — a second principal whose scopes
+  name the first principal's execution, workspace, and artifact: the authorizer lets the requests
+  through the scope and the store's owner fence refuses them.
+- `tests/resource_scoped_authorization.rs` — the decision rule and the configuration shape, portable
+  across hosts: the scope narrows, the scope never grants, the scope is per `(operation, kind)`, a
+  request without a resource falls back to the operation grant, an older node refuses a configuration
+  that carries a scope.
 - 3090 `lease_expiry_takes_precedence_over_cancel_before_spawn` — the match order in
   `failure_for_runner_error` (`Spawn` > expired > `CancelledBeforeSpawn`) is load-bearing.
 - 3137 `mtls_authorization_and_fixed_target_execution`, with 3326 `routed_mtls_execution` and the
@@ -1004,9 +1059,14 @@ file). Fixtures first: `init_tls`, `issue_identity`, `tls_material`, `untrusted_
 - **Digest reuse across callers.** `store.lookup` compares `principal_id` *before* the digest
   (`1677` vs `1684`), so a foreign principal learns an execution id exists from the 403 while a
   matching principal learns identity conflicts. Intended?
-- **`GrantAuthorizer` ignores resources.** It implements only `authorize`, so `resource` in
-  `OperationRequest` is inert for the real deployment path. Is store-level per-execution ownership
-  genuinely sufficient, or are resource-scoped grants required?
+- **Resource scopes are per `(operation, kind)`.** A scope for `Execute`/`Execution` does not
+  narrow `Execute`/`Workspace`, and a scope for `BlobRead`/`Blob` does not narrow `BlobWrite`/`Blob`.
+  Is that granularity what an operator expects, or should a scope on an operation narrow every kind
+  that operation names?
+- **Blob scope identifiers must be known in advance.** Blob digests are content addresses, so a
+  blob scope can only name digests the operator already knows. Is there an operation that would let
+  an operator learn a digest and then scope it, or is "learn the digest, then edit the config"
+  the intended workflow?
 - **Silent config-drop in `operation(name)`** (`operations.rs:342-357`): `filter_map` means a typo in
   a configured operation name quietly narrows a client's grants with no startup error. Should it be
   `OperationsError::Config`?

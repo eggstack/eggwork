@@ -1,7 +1,8 @@
 # Eggwork Node Threat Model
 
 Status: current implementation baseline after Security M004 (includes
-Operations M002 deployment/service surfaces)
+Operations M002 deployment/service surfaces) and Security M005c
+(resource-scoped authorization grants)
 
 Scope: the authenticated fixed-target node API, local execution admission,
 workspace and artifact storage, event/result exposure, secret-bearing
@@ -39,9 +40,12 @@ recorded in the Security M004 closure.
    routes enforce their stored principal owner.
 5. Blob digests are content identifiers, not credentials. Access to the raw
    Blob API is controlled by its `BlobRead`/`BlobWrite` authorization
-   capabilities. Deployments that require per-digest policy should implement
-   the resource-aware authorizer hook; principals granted broad BlobRead can
-   read any known digest.
+   capabilities. A grant may narrow those capabilities with a resource scope,
+   which for a blob is an explicit digest list: blob storage is
+   content-addressed and shared, so a blob has no owner to fence it. A
+   principal granted broad BlobRead with no blob scope can still read any
+   known digest; the scope is the only per-digest boundary available for it,
+   and it is opt-in.
 6. Environment values, stdin bytes, argv, execution metadata values, client
    transport internals, and API error messages are redacted from ordinary
    `Debug` output. The API returns stable generic errors for malformed or
@@ -58,7 +62,7 @@ recorded in the Security M004 closure.
 | Actor | Relevant attack | Mitigation in current baseline | Remaining boundary |
 |---|---|---|---|
 | Unauthenticated peer | Invoke API or enumerate execution state | Required mTLS; absent/unmapped verified identity rejected before route body handling | Certificate issuance and revocation are deployment responsibilities |
-| Authenticated unauthorized principal | Execute, cancel, read, or mutate another principal's resources | Per-operation authorizer; principal fences on execution controls/events, workspace, artifact; observe returns not found for foreign ownership | Broad BlobRead capability permits any known digest unless resource-scoped policy is configured |
+| Authenticated unauthorized principal | Execute, cancel, read, or mutate another principal's resources | Per-operation authorizer, optionally narrowed by a configured resource scope; principal fences on execution controls/events, workspace, artifact; observe returns not found for foreign ownership. A scope only narrows: the store's fences stay authoritative, so a scope naming another principal's resource is still refused there | A grant with no resource scope is still operation-wide, so a broad BlobRead capability permits any known digest; a blob scope is an explicit digest list, and blob storage has no owner to fence it |
 | Malicious/compromised controller | Forge principal fields, reuse identity, submit oversized or malformed values | Identity derives from certificate; wire DTOs reject unknown fields; bounded bodies, core validation, generation/lease/digest fencing | A controller authorized for Execute can request arbitrary commands within currently available host isolation |
 | Malicious executed process | Exfiltrate inherited secrets, flood output, leave descendants | Environment is cleared and rebuilt from a narrow baseline; sensitive runtime variables are denied; output and process-tree controls are bounded; user output is not logged by node; required Landlock `workspace_rw` confinement is enforced on qualified Linux and fails closed elsewhere; systemd/cgroup-v2 memory/CPU/PID controls are enforced where probed and fail closed when required | Network restriction (`Disabled`/`AllowListed`) remains intentionally unsupported and is rejected as `capability_mismatch`; macOS/Windows hard-enforcement backends do not exist and required requests fail closed there |
 | Foreign or tampered local service registration | Stop, replace, or uninstall another deployment's node service | Service ownership is proven by exact installed executable plus critical argv/config (`eggwork-node` spec); `Foreign`/`Unknown` registrations deny all destructive transitions before any mutation; destructive lifecycle flows only through Eggup adapters, never direct manager invocation | The operator must supply the exact registered executable/config paths; guessed paths fail closed by design |
@@ -76,15 +80,15 @@ recorded in the Security M004 closure.
 |---|---|---|
 | `GET /v1/capabilities` | Capabilities | None |
 | `GET /v1/status` | Status | None |
-| `POST /v1/executions` | Execute | Execution ID and optional workspace ID are passed to resource-aware policy; execution ID is reserved to the verified principal |
+| `POST /v1/executions` | Execute | Execution ID and optional workspace ID are passed to the resource-scoped policy; execution ID is reserved to the verified principal |
 | `GET /v1/executions/{id}` | Observe | Snapshot lookup is fenced by principal and optional generation |
 | `POST /v1/executions/{id}/cancel` | Cancel | Principal, generation, and lease token |
 | `POST /v1/executions/{id}/renew` | Renew | Principal, generation, lease token, and renewal idempotency key |
 | `GET /v1/executions/{id}/events` | Events | Principal, generation, and lease token |
-| `POST /v1/blobs/missing`, `GET /v1/blobs/{digest}` | BlobRead | Operation/resource authorization; raw digest access is capability-based |
+| `POST /v1/blobs/missing`, `GET /v1/blobs/{digest}` | BlobRead | Operation authorization, narrowed by any configured blob digest scope; raw digest access is capability-based |
 | `POST /v1/blobs/prepare`, `PUT /v1/blobs/{digest}` | BlobWrite | Operation/resource authorization; digest and content integrity checked |
-| `POST /v1/workspaces` | WorkspaceCreate | Workspace ID resource policy, then principal-bound workspace identity |
-| `GET /v1/executions/{id}/artifacts`, `GET /v1/artifacts/{id}` | ArtifactRead | Execution/artifact resource policy and stored principal ownership |
+| `POST /v1/workspaces` | WorkspaceCreate | Workspace ID resource scope, then principal-bound workspace identity |
+| `GET /v1/executions/{id}/artifacts`, `GET /v1/artifacts/{id}` | ArtifactRead | Execution/artifact resource scope and stored principal ownership |
 
 Unknown routes are not dispatched. There are no network routes for drain,
 workspace deletion, artifact deletion, relay, or PTY in this API version.
@@ -108,6 +112,9 @@ The implementation tests cover mapped and unmapped mTLS identities, operation
 denials before process spawn and storage mutation, unknown payload principal
 fields, principal-fenced observe behavior (foreign reads behave as missing),
 cross-principal cancel/renew/events fencing without a lease oracle,
+resource-scope narrowing (a scope refuses a resource outside the scope, and a
+scope naming another principal's execution, workspace, or artifact is still
+refused by the store's owner fence),
 wrong-lease `invalid_lease` evidence, URL userinfo rejection, resource
 descriptors, hostile workspace manifests over the wire (traversal, absolute,
 backslash, dot-segment, empty, NUL, oversized paths rejected at
