@@ -267,7 +267,11 @@ jobs:
     # compiled is not exercised, and an exercised target is not a qualified
     # one: this job is the native evidence that the shipped surface compiles
     # and its platform-neutral tests pass on macos-x64.
-    runs-on: macos-13
+    #
+    # `macos-15-intel` is the x64 image. The one before it, `macos-13`, is
+    # retired, and a job pinned to a retired image queues forever instead of
+    # failing, which is the worst possible failure for a gate.
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
