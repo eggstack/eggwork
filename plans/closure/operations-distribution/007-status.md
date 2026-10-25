@@ -121,7 +121,7 @@ Windows jobs.
 | Item | Value |
 | --- | --- |
 | Job | `windows-service-host` in `.github/workflows/ci.yml` |
-| Hosted run id | `__RUN_ID__` |
+| Hosted run id | `40217353896` |
 | Daemon | built from source by the job (`cargo build --locked -p eggwork-server --bin eggworkd`), not an installed release |
 | Fixture | the repository's own rcgen-based qualification fixture, materialised by `qualification_fixture` under the `qualification` feature |
 | Bind | a loopback port reserved by the job and released, so the service-hosted node binds an address the test can reach |
@@ -134,14 +134,14 @@ RECEIPT: daemon D:\a\_temp/service-host/bin/eggworkd.exe
 RECEIPT: config D:\a\_temp/service-host\state/node.json
 RECEIPT: install completed; ownership=Owned state=Stopped
 RECEIPT: start completed; ownership=Owned state=Running
-RECEIPT: the service-hosted node answered an authenticated capabilities and status request at https://localhost:50245
+RECEIPT: the service-hosted node answered an authenticated capabilities and status request at https://localhost:59885
 RECEIPT: stop completed; ownership=Owned state=Stopped
 RECEIPT: the active execution converged to Cancelled before the process exited
 RECEIPT: the second start begins
 RECEIPT: the restart begins
 RECEIPT: uninstall completed; ownership=Absent state=Stopped
 RECEIPT: a same-name registration Eggwork does not own was not mutated
-RECEIPT: a node whose configuration cannot be loaded never reported Running; ownership=Unknown state=Stopped
+RECEIPT: a node whose configuration cannot be loaded never reported Running; ownership=Foreign state=Stopped
 ```
 
 | Phase | What the receipt proves |
@@ -153,7 +153,7 @@ RECEIPT: a node whose configuration cannot be loaded never reported Running; own
 | restart | the service restarts and reaches `Running` again |
 | uninstall | the registration is gone: `ownership=Absent` |
 | foreign registration | a same-name registration with a different executable is neither claimed nor mutated, and `stop`, `uninstall`, and `start` all refuse it |
-| unusable configuration | the node whose configuration cannot be loaded never reports `Running`; the service reaches `Stopped` with a service-specific failure disposition |
+| unusable configuration | the node whose configuration cannot be loaded never reports `Running`; the service reaches `Stopped` with a service-specific failure disposition. Its ownership reads `Foreign` because the observation is made against the *operator's* configuration while the registration carries the unusable one — a registration with a different config is not Eggwork's to mutate, which is the same rule the foreign-ownership phase exercises |
 
 A belt-and-braces step after the suite fails the job if a registration
 survived the run, so a failed assertion cannot leave one behind.
@@ -278,7 +278,7 @@ Everything else in this record is discharged by the evidence named above.
 
 ```bash
 # The native source-built Windows service lifecycle.
-gh run view __RUN_ID__ --job <windows-service-host job>
+gh run view 40217353896 --job <windows-service-host job>
 
 # The local pre-submit gate.
 python3 scripts/check_execution_ownership.py

@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M001-M003, M002a, M004a and M004b closed, M004 conditionally closed; M007 ready; M008a and M008b operator-truthfulness correctives closed
+Status: active roadmap; M001-M003, M002a, M004a and M004b closed, M004 conditionally closed; M007 conditionally closed; M008a and M008b operator-truthfulness correctives closed
 
 Canonical authority:
 
@@ -320,7 +320,13 @@ Closure summary:
 
 Class: corrective capability
 
-Status: **ready**
+Status: **conditionally closed** — implementation commits `22f5337` and
+`e72cd22`; the outstanding condition is the *installed-release* Windows service
+receipt, which is Operations M004's item 2
+
+Closure record:
+
+- `plans/closure/operations-distribution/007-status.md`
 
 Implementation plan:
 
@@ -335,6 +341,8 @@ The registered service invokes an explicit `service-host --config ...` entry. It
 A routine service STOP must not create a new persistent drain marker; persistent drain remains explicit operator/update policy and an existing marker is preserved across service restart.
 
 Verification is deliberately split: state/contract tests plus source-built hosted SCM lifecycle evidence close the implementation side; immutable installed-release evidence remains Operations M004 authority. Foundation M004 is already conditionally closed and is not an implementation dependency. No additional M007 prerequisite plan is required.
+
+Both halves are now in place on the implementation side: the state and contract tests run on any host and on the hosted Windows runner, and the source-built hosted SCM lifecycle passes end to end — install, start, an authenticated request while the manager reports `Running`, a stop that converges an active execution, a second start, a restart, a removal, a same-name registration Eggwork does not touch, and a node whose configuration cannot be loaded never reporting `Running`. What remains is the installed-release receipt, which needs an immutable release carrying both Foundation M004 and this milestone.
 
 ### M008a — Operator surface truthfulness corrective
 
