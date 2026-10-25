@@ -3074,6 +3074,14 @@ mod tests {
     /// The live defect was that the caller's `LANG` was *appended* to the
     /// node's baseline, so the child saw the caller's locale and the launch
     /// specification carried two `LANG` entries.
+    ///
+    /// The node-owned class is the **platform** baseline: the node owns a key
+    /// only where it installs that key. The Unix baseline pins the locale, so
+    /// `LANG` and `LC_ALL` are the node's there; the Windows baseline
+    /// deliberately installs no locale keys, so on Windows they are the
+    /// caller's. The rule under test therefore holds on every platform: for
+    /// every key the node installs *here*, the node's value wins and the key
+    /// appears exactly once.
     #[test]
     fn a_caller_supplied_node_owned_key_does_not_replace_the_node_value() {
         let root = tempfile::tempdir().expect("temp dir");
@@ -3085,7 +3093,8 @@ mod tests {
             ("lang".into(), "de_DE.UTF-8".into()),
         ];
         let environment = build_child_environment(&req);
-        for key in ["LANG", "LC_ALL", "CI"] {
+        let node_owned = baseline_child_environment();
+        for (key, node_value) in &node_owned {
             let matching: Vec<&String> = environment
                 .iter()
                 .filter(|(name, _)| name == key)
@@ -3096,16 +3105,17 @@ mod tests {
                 1,
                 "{key} must appear exactly once in the child environment"
             );
-            assert_eq!(
-                matching[0],
-                environment_policy::baseline_value(key).expect("baseline value"),
-                "{key} must carry the node's value"
-            );
+            assert_eq!(matching[0], node_value, "{key} must carry the node's value");
+            // A differently-cased spelling of a node-owned key is the same key,
+            // so the caller's spelling is discarded too.
+            let lower = key.to_ascii_lowercase();
+            if lower != *key {
+                assert!(
+                    !environment.iter().any(|(name, _)| name == &lower),
+                    "{lower} is a differently-cased spelling of the node-owned {key}"
+                );
+            }
         }
-        assert!(
-            !environment.iter().any(|(name, _)| name == "lang"),
-            "a differently-cased spelling of a node-owned key is the same key"
-        );
     }
 
     /// A denied key is dropped, and only dropped.

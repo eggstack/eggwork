@@ -128,6 +128,37 @@ jobs:
       # test surface is still Linux-only and is not claimed here.
       - name: declared-artifact capture disposition suite
         run: cargo test --locked -p eggwork-server --test artifact_capture_disposition
+  macos-runner:
+    # The release matrix builds macos-x64 and macos-arm64, and nothing in this
+    # workflow exercised a macOS target, so a macOS-only regression could reach
+    # a release candidate unobserved. This job is the native evidence that the
+    # shipped surface compiles and its platform-neutral tests pass on macOS.
+    #
+    # Scope is deliberately narrow and mirrors the Windows job. The runner's
+    # test targets are portable and run here; the server's own unit tests are
+    # `/bin/sh`-shaped and are not claimed here, except for the one portable
+    # integration target the Windows job already runs.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-arm64
+      # The production surface a release binary is built from, linted on the
+      # macOS target.
+      - run: cargo clippy --locked --workspace --lib --bins --all-features -- -D warnings
+      # The runner's test targets: the `OutputChunk` shape and the platform
+      # tree backend are both exercised here.
+      - name: eggwork-runner test targets
+        run: cargo clippy --locked -p eggwork-runner --all-targets --all-features -- -D warnings
+      - name: eggwork-runner test suite
+        run: cargo test --locked -p eggwork-runner --all-targets -- --nocapture
+      # The same portable server integration target the Windows job runs.
+      - name: declared-artifact capture disposition suite
+        run: cargo test --locked -p eggwork-server --test artifact_capture_disposition
   quickstart:
     # The quickstart is a *procedure*, and `docs/quickstart.md` is the
     # user-facing instruction while `scripts/quickstart.sh` is its executed
