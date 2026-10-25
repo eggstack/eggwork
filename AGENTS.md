@@ -103,6 +103,7 @@ and deliberate. Deep dives:
 9. **Windows service management fails closed.** `deployment::windows_scm_manager` is retained but refuses before any mutation; daemon has no SCM dispatcher.
 10. **Protocol contract facts have one owner.** The control-plane API schema version and the `exec.argv.v1` capability name are declared once, publicly, in `eggwork-core`; the runner owns the capability names it produces (`LANDLOCK_WORKSPACE_RW_CAPABILITY`, `CGROUPS_V2_{MEMORY,CPU,PIDS}_CAPABILITY`, `WORKSPACE_RW_PROFILE`); the terminal/non-terminal classification of `ExecutionState` is owned by `eggwork-core`'s `ExecutionState::is_terminal` / `is_non_terminal`. A second copy of any of these in an endpoint crate is a defect, not a convenience. See [ADR-0008](plans/adrs/ADR-0008-core-protocol-contract-ownership.md).
 11. **A capability is advertised only where the node can honour it, and a failed claim fails the execution, not the report.** `artifact.declared.v1` is advertised only when the platform's capture-capability fact (`artifact::capture_capability`) says the capture can complete; an execution whose declared outputs were not captured ends in a truthful non-success state with a first-class disposition (`ExecutionResult::artifact_capture`), never `Succeeded` with the outputs silently dropped. The mapping from a capture attempt to the terminal facts is one decision (`eggwork_server::decide_artifact_capture`).
+12. **The release harness holds no remembered copy of a fact that has an owner.** The workspace version is read once, by `scripts/release_candidate_probe.py`; the install identities and the published target set come from `release/eggpack/distribution.toml`; the service identity comes from the candidate daemon. A second *reader* of one owner is fine — `crates/eggwork-server/tests/release_contract.rs` is exactly that — but a second *rememberer* is a second owner. The same rule governs the design record: a citation names a symbol, never a line number, and `scripts/check_doc_citations.py` is the gate.
 
 ## Code style
 
@@ -133,5 +134,5 @@ and deliberate. Deep dives:
 
 - Report suspected vulnerabilities privately to the maintainers (see `SECURITY.md`); no public issue with exploit detail.
 - Never commit secrets, node private keys, or published state (config, SQLite journal, workspaces, blobs, artifacts) — the latter belong to the installation root and never ship in a release artifact.
-- Node trust requires a verified mTLS client CA and explicit per-principal grants; `config print` redacts private-key paths and certificate fingerprints.
+- Node trust requires a verified mTLS client CA and explicit per-principal grants; a grant may narrow an operation to named resources, and the store's ownership fences remain authoritative; `config print` redacts private-key paths and certificate fingerprints.
 - SHA-256 sidecars are integrity evidence, not authenticity.

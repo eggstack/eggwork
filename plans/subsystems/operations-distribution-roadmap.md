@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M001-M003, M002a, M004a and M004b closed, M004 conditionally closed; M007 ready; M008a and M008b operator-truthfulness correctives proposed
+Status: active roadmap; M001-M003, M002a, M004a and M004b closed, M004 conditionally closed; M007 ready; M008a and M008b operator-truthfulness correctives active
 
 Canonical authority:
 
@@ -365,7 +365,7 @@ Exit conditions:
 
 Class: infrastructure (release harness and CI) / polish (documentation drift and citation hygiene)
 
-Status: proposed
+Status: active
 
 Corrective addendum:
 
