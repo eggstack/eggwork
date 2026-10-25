@@ -316,7 +316,11 @@ fn product_service_manager(
             std::time::Duration::from_secs(60),
         )
         .map_err(|error| error.to_string())?;
-        return Ok(Box::new(manager));
+        // The macOS branch is the branch's tail expression on macOS, so a
+        // `return` here is a needless return that `clippy -D warnings` rejects
+        // on that target. It does not fire on Linux or Windows, where the
+        // branch is compiled out.
+        Ok(Box::new(manager))
     }
     // Windows service management is refused, not merely unqualified.
     //
