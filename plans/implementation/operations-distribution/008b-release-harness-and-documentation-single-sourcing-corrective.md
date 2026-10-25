@@ -1,6 +1,6 @@
 # Operations M008b — Release harness and documentation single-sourcing corrective
 
-Status: proposed
+Status: active
 
 Closure record: `plans/closure/operations-distribution/008b-status.md`
 

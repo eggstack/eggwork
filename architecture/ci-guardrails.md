@@ -163,8 +163,12 @@ The allowlist is keyed by crate name, so a backend that lives inside `eggwork-ru
         run: python3 scripts/check_execution_ownership.py --prove-negative-exit
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: build the sandbox helper the capability probe drives
+        run: cargo build --locked -p eggwork-sandbox-helper
       - run: cargo test --locked --workspace --all-targets
       - run: cargo check --workspace
+      - name: release identity coherence
+        run: python3 scripts/check_release_tag.py --coherence
       - name: release candidate validator tests
         run: python3 -m unittest discover --start-directory tests/release --top-level-directory tests/release
 ```
@@ -178,9 +182,11 @@ Step by step, and what each would miss without it:
 5. **negative-exit proof** — as above. Without it, the guard is a check that has only ever returned 0 in practice.
 6. **`cargo fmt --all -- --check`** — mechanical formatting. Without it, diffs carry noise and review attention moves from substance to whitespace.
 7. **`cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`** — `--all-features` matters because the qualification and test features are where the interesting code lives; `-D warnings` is what makes the promotion from "warn" to "fail" real, matching `[workspace.lints.clippy] all = "warn"`. Without it, warnings accumulate and the workspace lint table becomes decorative.
-8. **`cargo test --locked --workspace --all-targets`** — the whole Rust suite, including `crates/eggwork-server/tests/release_contract.rs` (36 `#[test]` functions), because `--all-targets` pulls in integration tests. This is where most of the release-configuration invariants in the map above are actually enforced.
-9. **`cargo check --workspace`** — a cheap whole-workspace type check *without* `--locked` and without `--all-targets`. It is the fastest possible signal on a broken tree and the first thing a contributor sees go red.
-10. **Python release validator tests** — the harness test suite, below.
+8. **`cargo build --locked -p eggwork-sandbox-helper`** — the runner's capability probe drives the *built* helper and **fails loudly** when it is absent, so the helper has to exist before the test step. Before Operations M008b that probe returned early and passed with zero assertions when it could not find the helper, which made the skip the normal path in CI as well as locally: the test proved nothing and reported success. Building the helper explicitly is what makes the precondition deterministic rather than incidental. The probe is not a separate job because the runner's test targets already run in this job.
+9. **`cargo test --locked --workspace --all-targets`** — the whole Rust suite, including `crates/eggwork-server/tests/release_contract.rs` (36 `#[test]` functions), because `--all-targets` pulls in integration tests. This is where most of the release-configuration invariants in the map above are actually enforced.
+10. **`cargo check --workspace`** — a cheap whole-workspace type check *without* `--locked` and without `--all-targets`. It is the fastest possible signal on a broken tree and the first thing a contributor sees go red.
+11. **`release identity coherence`** — `python3 scripts/check_release_tag.py --coherence`. The release gate has two halves and only one of them needs a tag. The **tag-dependent** half — "does the tag about to be created name the workspace version?" — cannot live in CI: CI never knows the future tag, and the generated release workflow is producer authority. That comparison lives in `scripts/check_release_tag.py` and is run by whoever cuts the tag, before the tag exists. The **tag-independent** half — the workspace manifest's version against the versions `Cargo.lock` pins for this repository's own packages — needs no tag, so it runs here, on every push and every pull request. It is exactly the condition that broke the `v0.1.3` release attempt. The workflow says so in the step's own comment, so a reader does not have to infer where the gate is.
+12. **Python release validator tests** — the harness test suite, below. It now includes the tag guard's own tests, so the code path that decides whether a release may be tagged is **executed against fixtures** by an automated job rather than trusted.
 
 ### Why `--locked` is load-bearing
 
@@ -216,6 +222,20 @@ A second job in the same workflow, on `windows-latest`, added by Foundation M004
         run: cargo test --locked -p eggwork-server --test artifact_capture_disposition
 ```
 
+**The capability probe's loud failure is not expected here, and the reason is
+recorded.** The `rust` job builds the sandbox helper explicitly because
+`crates/eggwork-runner/tests/capability_probe.rs` drives the *built* helper and
+now **fails loudly** when it cannot find it — the previous implementation
+returned early and passed with zero assertions, so the skip was the normal path
+in CI as well as locally. This job runs the same test target
+(`cargo test --locked -p eggwork-runner --all-targets`), so the precondition has
+to be accounted for. It is: the helper-dependent half of the probe is
+`#[cfg(target_os = "linux")]`, so it **does not exist** in a Windows build at
+all, and only the platform-neutral negative case — a missing helper must not
+advertise a Landlock capability — runs here. The Linux `rust` job builds the
+helper and runs the full probe. The workflow says the same thing in the step's
+comment, so the reason is visible where a reader looks for it.
+
 **Why it exists.** The Windows process-tree backend cannot be observed from Linux. Job Object ownership, descendant convergence after leader exit, and pipe inheritance across a process tree only mean something on a real Windows kernel, and a green Linux run must never be readable as Windows coverage. Foundation M004's `runner` tests are `#![cfg(windows)]`, so without this job the entire suite would silently not exist in CI.
 
 **What it deliberately does not run.** `cargo test --workspace` is not used, and test-target clippy is scoped to `eggwork-runner`. The server's and client's unit tests are Linux-shaped: they spawn `/bin/sh` and set `0700`/`0600` modes through `std::os::unix::fs`, so several test helpers do not even *compile* for Windows (`place_trusted_helper` in `crates/eggwork-server/src/lib.rs`, the `PermissionsExt` uses in `artifact.rs`, `blob.rs`, `operations.rs`, and `deployment.rs`). Making them portable is its own milestone.
@@ -238,6 +258,118 @@ path stays qualified by `operational-qualification.yml` from a staged release's
 own bytes; a build-tree job could not prove release identity.
 
 **Cross-check against the local guard.** Before pushing, `cargo check --locked -p eggwork-runner --all-targets --target x86_64-pc-windows-msvc` compiles the Windows-only code paths on a Linux host. It catches types, imports, and lints; it does not catch kernel behaviour, which is the entire point of the hosted job. (A full `--workspace --target x86_64-pc-windows-msvc` check does not work on Linux: `cc-rs` needs MSVC's `lib.exe` for a transitive C dependency.)
+
+## The `installed-qualification` CI job
+
+A third job in the same workflow, on `ubuntu-latest`, added by Operations M008b:
+
+```yaml
+  installed-qualification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+      - name: build the installed product surface
+        run: cargo build --locked -p eggwork-server -p eggwork-sandbox-helper --bins
+      - name: stage the installation root
+        run: |
+          set -euo pipefail
+          root="${{ runner.temp }}/qualification"
+          mkdir -p "$root/bin"
+          install -m 0755 target/debug/eggworkd "$root/bin/eggworkd"
+          install -m 0755 target/debug/eggwork-sandbox-helper "$root/bin/eggwork-sandbox-helper"
+          chmod 0755 "$root" "$root/bin"
+      - name: check the installation root's trust chain
+        env:
+          INSTALL_ROOT: ${{ runner.temp }}/qualification
+        run: |
+          set -euo pipefail
+          current="$INSTALL_ROOT"
+          while true; do
+            mode=$(stat -c '%a' "$current")
+            world="${mode: -1}"
+            group="${mode: -2:1}"
+            if [ $(( world & 2 )) -ne 0 ] || [ $(( group & 2 )) -ne 0 ]; then
+              echo "$current is group/world writable (mode $mode); ..." >&2
+              exit 1
+            fi
+            parent=$(dirname "$current")
+            if [ "$parent" = "$current" ]; then break; fi
+            current="$parent"
+          done
+      - name: materialise the bounded qualification fixture
+        env:
+          EGGWORK_QUALIFY_ROOT: ${{ runner.temp }}/qualification
+        run: |
+          cargo test --locked -p eggwork-server --features qualification \
+            --test installed_qualification -- --ignored --exact qualification_fixture
+      - name: qualify installed execution through the production client
+        env:
+          EGGWORK_QUALIFY_DAEMON: ${{ runner.temp }}/qualification/bin/eggworkd
+          EGGWORK_QUALIFY_CONFIG: ${{ runner.temp }}/qualification/state/node.json
+          EGGWORK_QUALIFY_TLS_DIR: ${{ runner.temp }}/qualification/state/tls
+          EGGWORK_QUALIFY_PLATFORM: linux
+        run: |
+          cargo test --locked -p eggwork-server --features qualification \
+            --test installed_qualification -- --ignored --skip qualification_fixture \
+            --test-threads=1 --nocapture
+```
+
+Three conditions in that job are load-bearing, and each was found by running it,
+not by reading it:
+
+- **The installation root's ancestor chain must be free of group- and
+  world-writable bits.** The installed helper's trust check
+  (`eggwork_runner::verify_trusted_helper`) walks *every* ancestor of its own
+  path and refuses a writable one, because such a directory lets another user
+  replace the binary that enforces the sandbox. A staging directory created
+  under a umask of `002` is therefore `0775` and the node refuses its own
+  helper with `sandbox-resource-backend: configured sandbox helper is missing
+  or fails installation ownership checks`. The job creates its directories
+  `0755` and checks the chain explicitly, so the failure names the cause.
+- **The two qualification tests must run serially.** They share one
+  installation root, one state directory, and one execution-state lock, so a
+  concurrent second daemon cannot start and the first test fails with
+  `the installed daemon exited before reporting ready`. `--test-threads=1` is
+  what makes one installation qualify one test at a time.
+- **The fixture's client grant must name every operation the suite
+  exercises.** The declared-artifact test creates a workspace and then lists
+  the published artifact, so the grant needs `workspace-create` and
+  `artifact-read`; without them the node refuses with a bare `403 forbidden`
+  and the qualification reports a fixture problem as a product one. The
+  repository's fixture now names them.
+
+**Why this is a separate job and not a flag on the default test step.** The
+qualification suite is `crates/eggwork-server/tests/installed_qualification.rs`,
+which is `#![cfg(feature = "qualification")]` and whose three tests are
+`#[ignore]`d. Adding `--all-features` to the default `cargo test` step would
+therefore **not** run them: the `#[ignore]` attributes keep all three tests out
+of every ordinary run regardless of the feature set. And an ordinary run has no
+installed release to drive in the first place — the suite names its subject
+through the environment (`EGGWORK_QUALIFY_DAEMON`, `EGGWORK_QUALIFY_CONFIG`,
+`EGGWORK_QUALIFY_TLS_DIR`), and it starts the installed daemon as a child
+process. So the gap is closed by **executing** the ignored tests in a job that
+has the environment they need: this one stages an installation root, lets the
+repository's own `rcgen`-based fixture materialise the TLS material and the
+node configuration into it, and then drives the installed daemon through the
+production client path.
+
+**What it proves, and what it does not.** It proves that the bytes this
+repository builds admit an execution, report it truthfully, and refuse an
+unsupported isolation request — on the build tree's own bytes. It does not
+prove release identity: the hosted `operational-qualification` workflow runs
+the same suite against a *published* release's exact bytes, and only that can
+say anything about what a consumer would download. The installation root here
+is under the runner's temporary directory for the same reason the hosted
+workflow puts it there: nothing on the installed helper's path may be group- or
+world-writable, and the helper's trust check refuses a tree that is.
+
+**Where the suite runs, in one sentence.** The default `cargo test` step does
+not enable `qualification` because the suite is opt-in, ignored, and needs an
+installed release; it is executed by this job on every push and pull request,
+and by `operational-qualification.yml` against a published release.
 
 ## The `release-drift` job
 
@@ -421,7 +553,11 @@ Both `ci.yml` and the generated release workflow install the same `1.89.0` chann
 
 ## Other guard scripts
 
-**`scripts/check_release_tag.py` (pre-tag guard).** Takes one argument, the exact tag about to be created, e.g. `python3 scripts/check_release_tag.py v0.1.5`. It requires three things to agree: the tag (minus a leading `v`) equals the first `version = "…"` in `Cargo.toml`; every `eggwork-*` package in `Cargo.lock` is pinned at that same version; and the run is otherwise clean. Its docstring names both incidents it exists for — v0.1.3 (bump without lock regeneration, so every `--locked` release build failed closed) and v0.1.4 (bump missed entirely, so staged binaries reported `0.1.3` and hosted qualification refused them with `installed-daemon-version: daemon reports '0.1.3', expected 0.1.4`). Crucially, it is **not** a CI check, and the docstring explains why: "The tag-to-version link cannot live in CI: the generated release workflow is producer authority (the `release-drift` job rejects hand edits to it), and CI never knows the future tag. So the check lives here, run by whoever cuts the tag, before the tag exists." It defends the tag→version→lock identity, and its failure message ends with the remediation: `bump Cargo.toml, regenerate the lock, rerun the gates, then tag.`
+**`scripts/check_release_tag.py` (pre-tag guard).** Takes one argument, the exact tag about to be created, e.g. `python3 scripts/check_release_tag.py v0.1.5`, or `--coherence` to run only the tag-independent half. It requires three things to agree: the tag (minus a leading `v`) equals `[workspace.package].version` in `Cargo.toml`; every package `Cargo.lock` records as built from this repository is pinned at that same version; and every workspace member is pinned in the lock at all. Its docstring names both incidents it exists for — v0.1.3 (bump without lock regeneration, so every `--locked` release build failed closed) and v0.1.4 (bump missed entirely, so staged binaries reported `0.1.3` and hosted qualification refused them with `installed-daemon-version: daemon reports '0.1.3', expected 0.1.4`).
+
+Two changes in Operations M008b are load-bearing rather than cosmetic. First, the guard no longer reads the manifest with a regular expression that took the *first* `version = "…"` line in the file — that was the right answer only by accident of the manifest's current layout — and it no longer parses `Cargo.lock` with regular expressions either. Both are read with real TOML readers now, because **a guard that decides whether a release may be tagged must not depend on the layout of the files it reads**. The workspace version comes from the shared reader in `release_candidate_probe.py`, which every release script uses. Second, the guard is no longer *only* a manual step: its **tag-independent** half now runs in CI on every push and every pull request (`release identity coherence` in the `rust` job), and its logic is exercised against fixtures by `tests/release/test_release_tag_guard.py`, so the code path that decides whether a release may be tagged is executed by an automated job rather than trusted.
+
+The **tag-dependent** half is still a human pre-tag step, and the docstring says why: "The tag-to-version link cannot live in CI: the generated release workflow is producer authority (the `release-drift` job rejects hand edits to it), and CI never knows the future tag. So the check lives here, run by whoever cuts the tag, before the tag exists." It defends the tag→version→lock identity, and its failure message ends with the remediation: `bump Cargo.toml, regenerate the lock, rerun the gates, then tag.` The upstream prerequisite that would move this half into the generated release workflow is recorded in [release-qualification.md](release-qualification.md#where-the-tag-gate-runs-today--and-where-it-does-not).
 
 **`scripts/release_candidate_probe.py` (shared bounded probe library).** Not a validator itself — the shared substrate the two Eggpack-facing validators import. Eggpack invokes each validator as `python3 <script> <candidate>` from the checked-out repository root, and "Nothing else is accepted: there is no release index, no network, no shell, and no ambient Eggwork, Eggup, or service-manager consultation." Its bounding constants are the substance: `MAX_SOURCE_BYTES = 1 << 20`, `MAX_VERSION_BYTES = 64`, `MAX_CANDIDATE_STDOUT`/`STDERR = 64 * 1024`, `CANDIDATE_TIMEOUT_SECONDS = 30`. `run_candidate()` refuses a non-regular file *or a symlink* (`candidate.is_symlink()`), passes `stdin=DEVNULL`, `shell=False`, the fixed argv, and a timeout; it raises `ValidationFailure` on timeout, `OSError`, over-bound output, or nonzero exit. `candidate_environment()` is an **allowlist** — `("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL")` on POSIX, `("SYSTEMROOT", "SystemRoot", "COMSPEC", "PATHEXT", "WINDIR")` on Windows. `workspace_version()` reads `[workspace.package].version` with `tomllib` under a size bound and fails closed on a malformed or unbounded manifest. The security-relevant property is stated at the top: "Candidate output is deliberately never returned. Eggpack records only the validator's exit status, and these helpers print fixed reason phrases so a failing run cannot leak candidate bytes into workflow logs or release evidence." It defends every release surface Eggpack gates on, by being the thing that cannot leak, hang, or shell out.
 
@@ -429,7 +565,7 @@ Both `ci.yml` and the generated release workflow install the same `1.89.0` chann
 
 **`scripts/validate-sandbox-helper.py` (Eggpack consumer validator, Linux helper).** Eggpack selects the helper as bundle entry 1 of a Linux target and runs this after the daemon's core qualification. `check()` runs `eggwork-sandbox-helper --version` and requires **exactly one** non-empty line (`helper did not report exactly one version line`, `helper reported an empty version line`) equal to the workspace version. The docstring names the payoff: "That is the same identity `deployment::check_helper_compatibility` requires at update time, so a helper whose version drifts from the daemon is refused before the release can ship." So this defends the Linux helper bundle member by pre-checking the exact invariant the update path will later enforce at install time.
 
-Both validators are invoked by **Eggpack**, inside the generated release workflow's `validate_build_*` jobs — not by `ci.yml` and not by the qualification harness. `check_release_tag.py` is invoked by **no workflow at all**; it is a human pre-tag step. `verify_windows_reproducibility.py` is invoked by `windows-reproducibility.yml`. `qualify_release.py` is invoked by `operational-qualification.yml` (its `install`, `installer`, `service`, and `update` stages) and is covered in [release-qualification.md](release-qualification.md); its `main()` also exposes `inventory` and a `--public` anonymous-read mode, and defaults `--release-tag` to `f"v{probe.workspace_version()}"` rather than a hard-coded tag, so a stale default qualifies the previous release only if the workspace version is genuinely stale.
+Both validators are invoked by **Eggpack**, inside the generated release workflow's `validate_build_*` jobs — not by `ci.yml` and not by the qualification harness. `check_release_tag.py` is invoked by **no workflow at all** for its tag half; it is a human pre-tag step, and its tag-independent `--coherence` half is invoked by `ci.yml`. `verify_windows_reproducibility.py` is invoked by `windows-reproducibility.yml`. `qualify_release.py` is invoked by `operational-qualification.yml` (its `install`, `installer`, `service`, and `update` stages) and is covered in [release-qualification.md](release-qualification.md); its `main()` also exposes `inventory` and a `--public` anonymous-read mode, and defaults `--release-tag` to `f"v{probe.workspace_version()}"` rather than a hard-coded tag, so a stale default qualifies the previous release only if the workspace version is genuinely stale.
 
 ## Python test suite
 
@@ -440,6 +576,10 @@ python3 -m unittest discover --start-directory tests/release --top-level-directo
 The `--top-level-directory` pin matters: it makes the modules importable as top-level names without depending on the repository root being on `sys.path`, so discovery behaves the same locally and in the `rust` job. There is no Python test runner, no `pytest`, and no dependency manifest — the guard layer's tests are stdlib-only, which is what lets them run in the same job as the Rust suite with no setup step.
 
 **`tests/release/test_qualify_release_harness.py`** — the harness's *network* behavior, driven against a fake `_Response`. `AssetDownloadTest` covers the retry and bound policy: writes the asset, retries a transient 5xx, retries a transient rate limit, retries a transport error, does **not** retry a client error, fails loudly when retries are exhausted, and refuses an oversized asset *without* retrying. `PublicReadTest` covers the token/public distinction that the operational workflow depends on: a tokened read cannot masquerade as public, a public read needs no token, a **draft read still requires a token**, and public is rejected for the privileged stages. That last pair is the regression test for the exact architectural claim in the workflow header — drafts are invisible to the default `GITHUB_TOKEN`.
+
+**`tests/release/test_release_tag_guard.py`** — the pre-tag guard, against fixtures rather than against the repository's own manifest, so a reader can see what it accepts and what it refuses. `TagRuleTest` covers the rule itself: a tag matches the manifest version with and without the `v` prefix, a mismatched tag is refused, the `v` prefix is the *only* permitted difference, and the guard reads the manifest through the shared reader (asserted by recording the call, not by reading the source). `ManifestReaderTest` covers the reader: the package version is read, a manifest whose `[workspace.package]` section is **not first** still yields the right version — demonstrated against a copy of the regular-expression reader this replaced, which reads `9.9.9` from the same fixture — and a malformed manifest, an unreadable manifest, and a manifest with no package version all fail closed. `LockRuleTest` covers the lock half: a coherent lock passes, a stale pin fails, a workspace member missing from the lock fails, registry dependencies are not asserted, and a malformed lock fails closed. `CommandLineTest` runs the command line a person actually types.
+
+**`tests/release/test_release_harness_derivations.py`** — the qualification harness's derivations, and the checks that fail if someone re-adds a constant. `NoRememberedFactsTest` asserts the harness source contains no literal asset count, no literal install or service identity (the identities to forbid are themselves read from the contract and from `deployment.rs`, so the check does not become a second owner), and no classification by triple suffix, and that it does not derive its expected version from the tag. `InstallIdentityTest` asserts the install identities and the service identity resolve from their owners, and that the Rust deployment constants agree with the contract's bundle order. `TargetClassificationTest` asserts the helper ships exactly on the contract's bundle targets, and that this is exactly the Rust contract test's explicit Linux target list. `AssetInventoryTest` asserts the harness's expected asset set equals the set the contract's own asset templates produce.
 
 **`tests/release/test_release_candidate_probe.py`** — the validators. `ValidatorTest` covers both validators in both directions: the helper accepts the workspace version and rejects a different one, an empty line, more than one line, the daemon as a substitute, a nonzero exit, and non-UTF-8 output; the daemon accepts the workspace version and rejects a different one, a missing `version` field, the helper as a substitute, and non-JSON output. It also rejects an unusable candidate and a **symlinked** candidate. `EntrypointTest` pins the two-argument contract and that a failure reports a fixed reason *without* candidate output — the no-leak property. `WorkspaceVersionTest` asserts fail-closed behavior on a malformed manifest, a missing package version, and an out-of-bounds value. `BuiltCandidateTest` runs the *actually built* helper and daemon when they are present, so the validators are checked against real binaries rather than only stand-ins. `BoundednessTest` is the meta-test: the workspace version matches the checked-in manifest, **the probe never shells out**, **the probe never reaches the network**, the candidate environment is an allowlist, and the validators take only the candidate path. These are source-level assertions about the probe itself, and they are the reason the "no shell, no network" claims in its docstring are testable.
 
@@ -506,7 +646,7 @@ Land and tag, push the tag, then run the **Release** workflow with `release_tag`
 
 ## Test coverage and gaps
 
-**What is genuinely verified.** Singular process ownership, as a static property over `crates/*/src/**/*.rs`, with the guard's own failure path continuously tested. Crate dependency direction, from real `cargo metadata`. Lint and formatting cleanliness at full workspace and feature coverage, promoted to hard failures. Tag/version/lock coherence, at the moment the tag is cut. Identity-freedom of the release configuration, and the derivation of the release workflow from it. Deterministic Windows linkage, both statically and natively by two-build byte-identity. Installed-product behavior on hosted Linux, macOS, and Windows, with receipts. Fail-closed dispositions for the platform claims the product does *not* make.
+**What is genuinely verified.** Singular process ownership, as a static property over `crates/*/src/**/*.rs`, with the guard's own failure path continuously tested. Crate dependency direction, from real `cargo metadata`. Lint and formatting cleanliness at full workspace and feature coverage, promoted to hard failures. The **tag-independent** half of tag/version/lock coherence, on every push and every pull request, with the guard's whole logic exercised against fixtures. Identity-freedom of the release configuration, and the derivation of the release workflow from it. Deterministic Windows linkage, both statically and natively by two-build byte-identity. Installed-product behavior on hosted Linux, macOS, and Windows, with receipts, **and** on the build tree's own bytes on every push. Fail-closed dispositions for the platform claims the product does *not* make.
 
 **What is not, stated honestly.**
 
@@ -514,7 +654,9 @@ Land and tag, push the tag, then run the **Release** workflow with `release_tag`
 - **The dependency-direction check is an enumeration, not a graph proof.** It inspects two crates against a fixed forbidden set and one positive requirement. It does not compute a layering, does not detect a new crate that creates processes and is depended upon by the server, and does not check dev-dependencies separately from normal dependencies. A new crate is checked only if it happens to appear in one of those intersections.
 - **The reproducibility proof covers Windows only.** The same revision is not proven byte-reproducible for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, or `aarch64-apple-darwin`. `.cargo/config.toml` asserts those are byte-stable under their own toolchains, and Eggpack's same-name digest/no-clobber behavior would catch a mismatch — but only *after* a same-tag rerun, which is the expensive discovery this layer exists to avoid.
 - **Hosted qualification proves a subset of platform claims.** It runs on `ubuntu-latest`, `macos-14`, `macos-15-intel`, and `windows-latest` — not on every architecture of every platform, not on any non-x86_64 Linux with a different libc, and not on any Linux distribution other than the hosted image. `execution-ownership.md` states that Linux was exercised for this milestone and that non-Unix hosts return an explicit unsupported-platform error.
-- **No invocation of any workflow in this document runs on `pull_request` except `ci.yml`.** Every qualification, reproducibility, and release run is `workflow_dispatch`. These are expensive, secret-bearing, and evidence-producing; they are run deliberately, not automatically. The cost is that a real regression can sit green in `main` until someone dispatches a run.
+- **No invocation of any workflow in this document runs on `pull_request` except `ci.yml`.** Every qualification, reproducibility, and release run is `workflow_dispatch`. These are expensive, secret-bearing, and evidence-producing; they are run deliberately, not automatically. The cost is that a real regression can sit green in `main` until someone dispatches a run. The `installed-qualification` job in `ci.yml` is the deliberate exception: it runs on every push and pull request, but it drives the build tree's own bytes and needs no secret, so it carries none of the cost the hosted runs exist for.
+- **The tag-dependent half of the release gate is still not executed by any automated job.** `scripts/check_release_tag.py` compares a tag against the manifest version, and CI cannot run that comparison because CI never knows the future tag. The tag half is a human pre-tag step; the tag-independent half runs in CI, and the guard's logic is exercised against fixtures. Until Eggpack supports a repository-local preflight step in the generated release workflow, a maintainer can still tag without running the guard — the producer's version-coherence check is the backstop that makes that recoverable rather than shippable. This is recorded in [release-qualification.md](release-qualification.md#where-the-tag-gate-runs-today--and-where-it-does-not) rather than left implicit.
+- **The capability probe's coverage is Linux-only for the positive half.** The `rust` job builds the sandbox helper and runs the full probe on Linux; the Windows job runs only the platform-neutral negative case, because the helper-dependent half is `#[cfg(target_os = "linux")]`. A Windows host with a trusted helper is therefore never probed by that test — the helper is a Linux-only binary, so there is nothing to probe, but the asymmetry is stated rather than assumed.
 - **The Windows determinism policy is a flag-and-observe pairing, not a guarantee.** It is enforced only when `windows-reproducibility.yml` is dispatched. `release_contract.rs` can assert the flags are present and target-scoped; it cannot assert the linker honored them. The native two-build proof is the only real check, and it is manual.
 - **`ci.yml` pins `actions/checkout@v4`, `dtolnay/rust-toolchain@1.89.0`, and `Swatinem/rust-cache@v2` by mutable tag**, while the generated release workflow pins all four of its actions by immutable commit SHA. CI therefore has a supply-chain posture weaker than the release path, and `github-policy.json` does not govern it.
 - **The token path in the qualification workflow is trusted, not verified here.** The claim that `RELEASE_QUALIFICATION_TOKEN` never appears in argv, stdout, or a receipt is asserted in the workflow header and in the harness docstring; this layer does not independently test the workflow's own environment handling.

@@ -11,6 +11,13 @@ validator's exit status, and these helpers print fixed reason phrases so a
 failing run cannot leak candidate bytes into workflow logs or release
 evidence.
 
+This module is also the repository's **single** workspace-manifest reader.
+``read_manifest`` parses ``Cargo.toml`` with a real TOML reader and
+``workspace_version`` reads ``[workspace.package].version`` through it. Every
+release script — the tag guard, the qualification harness, and the consumer
+validators — obtains the workspace version here rather than keeping its own
+parse of the manifest's layout.
+
 Requires Python 3.11 or newer for :mod:`tomllib`.
 """
 
@@ -20,6 +27,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 MAX_SOURCE_BYTES = 1 << 20
 MAX_VERSION_BYTES = 64
@@ -39,20 +47,43 @@ def repository_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def workspace_version() -> str:
-    """Read ``[workspace.package].version`` from the checked-in manifest."""
+def read_manifest(root: Path | None = None) -> dict[str, Any]:
+    """Parse one ``Cargo.toml`` with a real TOML reader.
+
+    This is the repository's single manifest reader. Every release script that
+    needs a fact out of a manifest reads it through here, so no script keeps a
+    second parse of the file's *layout* — a regular expression over the text
+    reads whichever ``version =`` line happens to come first, which is not the
+    one under ``[workspace.package]``.
+
+    The reader fails closed: an unreadable, oversized, or malformed manifest
+    raises :class:`ValidationFailure` rather than falling back to a guess.
+    """
     import tomllib
 
-    manifest = repository_root() / "Cargo.toml"
-    with manifest.open("rb") as handle:
-        raw = handle.read(MAX_SOURCE_BYTES + 1)
+    base = Path(root) if root is not None else repository_root()
+    manifest = base / "Cargo.toml"
+    try:
+        with manifest.open("rb") as handle:
+            raw = handle.read(MAX_SOURCE_BYTES + 1)
+    except OSError as error:
+        raise ValidationFailure("workspace manifest is unreadable") from error
     if len(raw) > MAX_SOURCE_BYTES:
         raise ValidationFailure("workspace manifest exceeds the size bound")
     try:
         document = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise ValidationFailure("workspace manifest is not valid TOML") from error
-    package = document.get("workspace", {}).get("package", {})
+    if not isinstance(document, dict):
+        raise ValidationFailure("workspace manifest is not a TOML table")
+    return document
+
+
+def workspace_version(root: Path | None = None) -> str:
+    """Read ``[workspace.package].version`` from the checked-in manifest."""
+    document = read_manifest(root)
+    workspace = document.get("workspace")
+    package = workspace.get("package") if isinstance(workspace, dict) else None
     version = package.get("version") if isinstance(package, dict) else None
     if not isinstance(version, str) or not 0 < len(version) <= MAX_VERSION_BYTES:
         raise ValidationFailure("workspace package version is missing or out of bounds")

@@ -21,6 +21,17 @@
 //! EGGWORK_QUALIFY_PLATFORM `linux` | `macos` | `windows`
 //! ```
 //!
+//! Where it runs. The default `cargo test` step does not enable the
+//! `qualification` feature, and adding `--all-features` would not help: the
+//! `#[ignore]` attributes keep all three tests out of an ordinary run whatever
+//! the feature set, and an ordinary run has no installed release to drive
+//! anyway.
+//! The suite is therefore *executed* by the `installed-qualification` job in
+//! `.github/workflows/ci.yml`, which stages an installation root and drives
+//! the installed daemon, on every push and pull request; and by the hosted
+//! `operational-qualification` workflow, which drives a *published* release's
+//! exact bytes.
+//!
 //! The node is started as a bounded child of the installed binary and driven
 //! through the repository's own `eggwork-client` over mTLS, so the code path
 //! under test is the production client path rather than a bespoke probe.
@@ -596,7 +607,23 @@ fn qualification_fixture() {
         "clients": [{
             "principal_id": "qualification-controller",
             "certificate_sha256": fingerprint,
-            "operations": ["capabilities", "status", "execute", "observe", "cancel", "renew", "events"],
+            // The grant must name every operation the suite exercises, or the
+            // node refuses the step with a bare `403 forbidden` and the
+            // qualification reports a fixture problem as a product one.
+            // `workspace-create` and `artifact-read` are the two the declared
+            // artifact test needs: it creates a workspace to read a declared
+            // output from and then lists the published artifact.
+            "operations": [
+                "capabilities",
+                "status",
+                "execute",
+                "observe",
+                "cancel",
+                "renew",
+                "events",
+                "workspace-create",
+                "artifact-read",
+            ],
         }],
     });
     let config = state.join("node.json");

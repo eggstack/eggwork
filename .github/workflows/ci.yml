@@ -24,9 +24,38 @@ jobs:
       # release attempt: the `v0.1.3` producer run failed closed on it. CI must
       # catch a stale lock before a release does.
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      # The runner's capability probe drives the *built* sandbox helper and
+      # fails loudly when it is absent, so the helper has to exist before the
+      # test step runs. Building it explicitly is what makes the precondition
+      # deterministic rather than incidental.
+      - name: build the sandbox helper the capability probe drives
+        run: cargo build --locked -p eggwork-sandbox-helper
+      # The default test step does **not** enable the `qualification` feature:
+      # the qualification suite names an installed release as its subject
+      # through the environment, so it belongs in the `installed-qualification`
+      # job below, which stages that installation. Its tests are `#[ignore]`d
+      # as well, so adding `--all-features` here would not run them either.
       - run: cargo test --locked --workspace --all-targets
       - run: cargo check --workspace
+      - name: release identity coherence
+        # The release gate has two halves. The tag-dependent half — "does the
+        # tag about to be created name the workspace version?" — cannot live
+        # in CI: CI never knows the future tag, and the generated release
+        # workflow is producer authority. `scripts/check_release_tag.py` owns
+        # that comparison and is run by whoever cuts the tag, before the tag
+        # exists.
+        #
+        # The tag-independent half is the workspace manifest's version against
+        # the versions `Cargo.lock` pins for this repository's own packages.
+        # That is what this step asserts, on every push and every pull
+        # request, and it is exactly the condition that broke the `v0.1.3`
+        # release attempt.
+        run: python3 scripts/check_release_tag.py --coherence
       - name: release candidate validator tests
+        # These are the tag guard's own tests: they exercise the code path
+        # that decides whether a release may be tagged, against fixtures, so
+        # the guard's correctness is an executed result rather than a trusted
+        # assumption.
         run: python3 -m unittest discover --start-directory tests/release --top-level-directory tests/release
   windows-runner:
     # The Windows process-tree backend cannot be observed from Linux: Job Object
@@ -64,6 +93,13 @@ jobs:
       - name: eggwork-runner test targets
         run: cargo clippy --locked -p eggwork-runner --all-targets --all-features -- -D warnings
       - name: Windows process-tree lifecycle suite
+        # The runner's capability probe drives the built sandbox helper and
+        # fails loudly when it is absent, so this job would need the helper
+        # built too. It does not: the helper-dependent half of that probe is
+        # `#[cfg(target_os = "linux")]`, so it does not exist in this job at
+        # all, and only the platform-neutral negative case — a missing helper
+        # must not advertise a capability — runs here. The Linux `rust` job
+        # builds the helper explicitly and runs the full probe.
         run: cargo test --locked -p eggwork-runner --all-targets -- --nocapture
       # One portable server integration target, and only that target. The
       # declared-artifact capture disposition is a contract about the
@@ -74,6 +110,101 @@ jobs:
       # test surface is still Linux-only and is not claimed here.
       - name: declared-artifact capture disposition suite
         run: cargo test --locked -p eggwork-server --test artifact_capture_disposition
+  installed-qualification:
+    # The `qualification`-feature suite qualifies an *installed* release: it
+    # names its subject through the environment (`EGGWORK_QUALIFY_DAEMON`,
+    # `EGGWORK_QUALIFY_CONFIG`, `EGGWORK_QUALIFY_TLS_DIR`) and its three
+    # tests are `#[ignore]`d.
+    #
+    # That is why the default `cargo test` step does not enable the feature.
+    # Adding `--all-features` there would compile the file, but the
+    # `#[ignore]` attributes would still keep all three tests out of the run,
+    # and an ordinary test run has no installed release to drive in the first
+    # place. The suite is therefore executed here, in the job that stages the
+    # installation it drives, so a green CI run is evidence that the code
+    # ran rather than only that it type-checked.
+    #
+    # The `operational-qualification` workflow runs the same suite against a
+    # *published* release's exact bytes. This job runs it against the bytes
+    # this repository builds, on every push and every pull request.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+      - name: build the installed product surface
+        run: cargo build --locked -p eggwork-server -p eggwork-sandbox-helper --bins
+      - name: stage the installation root
+        # The directories are created 0755 rather than with the shell's umask,
+        # because the installed helper's trust check walks every ancestor of
+        # its own path and refuses a group- or world-writable one.
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="${{ runner.temp }}/qualification"
+          mkdir -p "$root/bin"
+          install -m 0755 target/debug/eggworkd "$root/bin/eggworkd"
+          install -m 0755 target/debug/eggwork-sandbox-helper "$root/bin/eggwork-sandbox-helper"
+          chmod 0755 "$root" "$root/bin"
+      - name: check the installation root's trust chain
+        # The product's own rule, checked before the node is started: the
+        # helper's path and every ancestor of it must be free of group- and
+        # world-writable bits. The qualification harness's `ensure_trusted_root`
+        # fails closed on the same condition; here it is checked explicitly so
+        # a runner whose temporary directory is group-writable reports that
+        # reason instead of the node refusing its own helper.
+        shell: bash
+        env:
+          INSTALL_ROOT: ${{ runner.temp }}/qualification
+        run: |
+          set -euo pipefail
+          current="$INSTALL_ROOT"
+          while true; do
+            mode=$(stat -c '%a' "$current")
+            world="${mode: -1}"
+            group="${mode: -2:1}"
+            if [ $(( world & 2 )) -ne 0 ] || [ $(( group & 2 )) -ne 0 ]; then
+              echo "$current is group/world writable (mode $mode); the installed helper's trust check walks every ancestor and would reject it" >&2
+              exit 1
+            fi
+            parent=$(dirname "$current")
+            if [ "$parent" = "$current" ]; then
+              break
+            fi
+            current="$parent"
+          done
+      - name: materialise the bounded qualification fixture
+        # The TLS fixture and node configuration come from the repository's own
+        # `rcgen`-based harness, not from whichever OpenSSL the runner ships.
+        shell: bash
+        env:
+          EGGWORK_QUALIFY_ROOT: ${{ runner.temp }}/qualification
+        run: |
+          set -euo pipefail
+          cargo test --locked -p eggwork-server --features qualification \
+            --test installed_qualification -- --ignored --exact qualification_fixture
+      - name: qualify installed execution through the production client
+        # Both qualification tests run against the fixture the previous step
+        # materialised; the fixture itself is skipped here so it is not
+        # re-materialised underneath the node that is already running.
+        #
+        # `--test-threads=1` is load-bearing. The two tests share one
+        # installation root, one state directory, and one execution-state
+        # lock, so a concurrent second daemon cannot start: the first test
+        # would fail with "the installed daemon exited before reporting
+        # ready". They are one installation, qualified one at a time.
+        shell: bash
+        env:
+          EGGWORK_QUALIFY_DAEMON: ${{ runner.temp }}/qualification/bin/eggworkd
+          EGGWORK_QUALIFY_CONFIG: ${{ runner.temp }}/qualification/state/node.json
+          EGGWORK_QUALIFY_TLS_DIR: ${{ runner.temp }}/qualification/state/tls
+          EGGWORK_QUALIFY_PLATFORM: linux
+        run: |
+          set -euo pipefail
+          cargo test --locked -p eggwork-server --features qualification \
+            --test installed_qualification -- --ignored --skip qualification_fixture \
+            --test-threads=1 --nocapture
   release-drift:
     # Eggpack is producer authority for the release matrix: the generated
     # release workflow must be exactly what the pinned tool renders from the
