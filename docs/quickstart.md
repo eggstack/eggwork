@@ -214,7 +214,7 @@ Materialize the fixture (it mints its own TLS and node config under
 ```bash
 EGGWORK_QUALIFY_ROOT="$ROOT" \
 EGGWORK_QUALIFY_HELPER="$HOME/.local/lib/eggwork/eggwork-sandbox-helper" \
-  cargo test -p eggwork-server --features qualification \
+  cargo test --locked -p eggwork-server --features qualification \
   --test installed_qualification -- --ignored --exact qualification_fixture
 ```
 
@@ -225,7 +225,7 @@ EGGWORK_QUALIFY_DAEMON=/path/to/repo/target/debug/eggworkd \
 EGGWORK_QUALIFY_CONFIG="$ROOT/state/node.json" \
 EGGWORK_QUALIFY_TLS_DIR="$ROOT/state/tls" \
 EGGWORK_QUALIFY_HELPER="$HOME/.local/lib/eggwork/eggwork-sandbox-helper" \
-  cargo test -p eggwork-server --features qualification \
+  cargo test --locked -p eggwork-server --features qualification \
   --test installed_qualification -- --ignored \
   --exact installed_release_admits_execution_and_refuses_unsupported_isolation --nocapture
 ```

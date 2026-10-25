@@ -35,48 +35,48 @@ node-facing control plane defined here.
 - **Local admission only**, and it is **immediate and bounded**: drain check, three capability
   checks, one `try_acquire_owned`. No awaiting, no waiting for a slot, no backpressure queue.
 - No GC scheduling daemon: `collect_garbage` is a bounded, explicitly-invoked maintenance pass
-  (`lib.rs:459-460` — "no remote GC route is exposed").
+  (`crates/eggwork-server/src/lib.rs::NodeServer::collect_garbage` — "no remote GC route is exposed").
 - No TLS material parsing; `operations.rs` builds the config and certs.
 
 ## Configuration and startup
 
-`NodeConfig` (`lib.rs:166-179`) is a plain cloneable struct, all fields `pub`:
+`crates/eggwork-server/src/lib.rs::NodeConfig` is a plain cloneable struct, all fields `pub`:
 
 | Field | Type | Constraint / role |
 | --- | --- | --- |
 | `node_id` | `NodeId` | Reported in `NodeStatus`. Not validated here. |
 | `bind` | `SocketAddr` | Passed to both `RuntimeConfig` and `Server`; `local_addr()` reflects the real bound port. |
-| `execution_root` | `PathBuf` | Default working root when no `workspace_id` is supplied (`lib.rs:1632-1634`). |
-| `database_path` | `PathBuf` | Opens the execution store, the `.lock` state file, the `.drain` marker, and derives `*.artifacts.sqlite` (`lib.rs:323`). |
+| `execution_root` | `PathBuf` | Default working root when no `workspace_id` is supplied (`crates/eggwork-server/src/lib.rs::execute`). |
+| `database_path` | `PathBuf` | Opens the execution store, the `.lock` state file, the `.drain` marker, and derives `*.artifacts.sqlite` (`crates/eggwork-server/src/lib.rs::NodeServer::start`). |
 | `blob_root` / `blob_quota_bytes` | `PathBuf` / `u64` | `BlobStore::open`; quota failure surfaces as `NodeStartError::EggServe`. |
 | `workspace_root` / `workspace_quota_bytes` | `PathBuf` / `u64` | `WorkspaceManager::open`. |
-| `max_active_executions` | `u32` | Must be `> 0` and `<= Semaphore::MAX_PERMITS`, else `InvalidLimit` (`lib.rs:302-306`). |
-| `lease_ttl` | `Duration` | Must be non-zero, else `InvalidLease` (`lib.rs:312-314`). |
+| `max_active_executions` | `u32` | Must be `> 0` and `<= Semaphore::MAX_PERMITS`, else `InvalidLimit` (`crates/eggwork-server/src/lib.rs::NodeServer::start`). |
+| `lease_ttl` | `Duration` | Must be non-zero, else `InvalidLease` (`crates/eggwork-server/src/lib.rs::NodeServer::start`). |
 | `tls` | `TlsServerConfig` | Must have `ClientAuthMode::Required` and a default identity, else `TlsPolicy`. |
 | `host_telemetry` | `Option<telemetry::HostTelemetryConfig>` | Optional provider. `None` means no provider, no polling task, and no host measurements. |
 
-`NodeStartError` (`lib.rs:140-152`) has five variants: `TlsPolicy`, `EggServe(String)`,
+`crates/eggwork-server/src/lib.rs::NodeStartError` has five variants: `TlsPolicy`, `EggServe(String)`,
 `InvalidLimit`, `InvalidLease`, `AlreadyRunning`.
 
 **Why the hand-written `Debug` re-redacts `EggServe`.** Every other variant is a unit variant, so a
 derived `Debug` would be harmless. `EggServe(String)` carries an underlying Eggserve/IO error whose
 `Display` may embed filesystem paths (key/certificate/CA paths, database paths, bind errors). The
-manual `impl Debug` (`lib.rs:154-164`) therefore prints `NodeStartError::EggServe([REDACTED])` and
+manual `impl Debug` (`crates/eggwork-server/src/lib.rs::NodeStartError`) therefore prints `NodeStartError::EggServe([REDACTED])` and
 discards the payload, while `Display` keeps the real text for direct error reporting. The split
 matters because `{:?}` is what ends up in panic messages, `unwrap`/`expect` chains, `#[derive(Debug)]`
 structs, and test assertion output — surfaces that are routinely logged verbatim. The
-`tls_configuration_diagnostics_redact_certificate_paths` test (`lib.rs:3083`) and
-`secret_sentinels_stay_out_of_error_and_debug_surfaces` (`lib.rs:6104`) pin this.
+`tls_configuration_diagnostics_redact_certificate_paths` test (`crates/eggwork-server/src/lib.rs::tests::tls_configuration_diagnostics_redact_certificate_paths`) and
+`crates/eggwork-server/src/lib.rs::tests::secret_sentinels_stay_out_of_error_and_debug_surfaces` pin this.
 
-**`AlreadyRunning` and the exclusive state lock.** `acquire_state_lock` (`lib.rs:540-556`) opens
+**`AlreadyRunning` and the exclusive state lock.** `crates/eggwork-server/src/lib.rs::acquire_state_lock` opens
 `<database_path>.lock` with mode `0o600` on Unix and takes an exclusive `fs2` lock via
 `try_lock_exclusive`. A failure of the open is an `EggServe` error; a failure of the *lock* alone maps
 to `AlreadyRunning` ("another node process already owns this state directory"). The `File` handle is
-stored in `NodeServer._state_lock` (`lib.rs:229`) so the OS lock is held for the server's whole
+stored in `crates/eggwork-server/src/lib.rs::NodeServer` so the OS lock is held for the server's whole
 lifetime and released only on drop. This is the guard against two processes racing on the same
 SQLite journal and the same drain marker.
 
-**`NodeServer::start` order of operations** (`lib.rs:296-422`):
+**`NodeServer::start` order of operations** (`crates/eggwork-server/src/lib.rs::NodeServer::start`):
 
 1. Validate `max_active_executions` → `InvalidLimit`.
 2. Validate TLS policy → `TlsPolicy`. **Fail-closed**: a node with `ClientAuthMode::Optional` or no
@@ -86,7 +86,7 @@ SQLite journal and the same drain marker.
 5. Open `ExecutionStore`, `BlobStore`, `WorkspaceManager`, `ArtifactStore` (artifact DB path is
    `database_path.with_extension("artifacts.sqlite")`).
 6. `store.recover()` — any non-terminal row is recovered to a terminal state; each recovery bumps
-   `terminal_interrupted` by the recovered count (`lib.rs:326-332`).
+   `terminal_interrupted` by the recovered count (`crates/eggwork-server/src/lib.rs::NodeServer::start`).
 7. `recover_retention`, `recover_manifest_retention` with a horizon of *now + DEFAULT_RETENTION_MILLIS*
    (so nothing expires purely because the process was down), then `reconcile_manifests(…, 1024)`.
 8. Seed `draining` from the persistent marker via `operations::is_persistently_draining(&drain_path)`
@@ -119,14 +119,14 @@ pub trait PeerPrincipalResolver: Send + Sync + 'static {
 }
 ```
 
-`FingerprintPrincipalResolver` (`lib.rs:95-119`) holds `HashMap<String, PrincipalId>` and keys it by
+`crates/eggwork-server/src/lib.rs::FingerprintPrincipalResolver` holds `HashMap<String, PrincipalId>` and keys it by
 `FingerprintPrincipalResolver::fingerprint(leaf_der)`, which is `hex::encode(Sha256::digest(leaf_der))`
-— lowercase hex SHA-256 over the leaf certificate's DER. `operations.rs:313` lowercases configured
+— lowercase hex SHA-256 over the leaf certificate's DER. `crates/eggwork-server/src/operations.rs::OperatorConfig::principals` lowercases configured
 fingerprints with `to_ascii_lowercase()` before insertion, so lookup is case-normalized on both
-sides. `fingerprint_mapping_uses_leaf_der_only` (`lib.rs:2924`) pins that the whole *DER* is
+sides. `crates/eggwork-server/src/lib.rs::tests::fingerprint_mapping_uses_leaf_der_only` pins that the whole *DER* is
 hashed, not the PEM text, not the CN, not a subject-key-id.
 
-`authenticated_principal` (`lib.rs:823-833`) gates in order:
+`crates/eggwork-server/src/lib.rs::authenticated_principal` gates in order:
 
 1. TLS context must exist.
 2. `tls.client_authenticated` must be true **and** `tls.peer_certificates_present` must be true.
@@ -137,7 +137,7 @@ hashed, not the PEM text, not the CN, not a subject-key-id.
 **Why transport-verified material, not caller assertion.** The principal is derived from bytes the
 TLS stack already validated against the configured trust anchor. There is no request field, header,
 or body that can name a principal. The `request_payload_cannot_supply_authoritative_principal` test
-(`lib.rs:2993`) is the executable statement of this: a payload that tries to assert a principal is
+(`crates/eggwork-server/src/lib.rs::tests::request_payload_cannot_supply_authoritative_principal`) is the executable statement of this: a payload that tries to assert a principal is
 ignored. Trust is anchored in the handshake, so a compromised-but-untrusted client cannot reach the
 resolver at all, and a trusted client cannot become a different principal by asking.
 
@@ -145,13 +145,12 @@ resolver at all, and a trusted client cannot become a different principal by ask
 `None`, and `dispatch` answers `401 unauthenticated` / "verified client identity required", bumping
 `rejected_unauthenticated`. An unknown-but-CA-valid certificate is therefore *indistinguishable from*
 no certificate: both take the same 401 path, and no oracle distinguishes "unknown identity" from
-"unauthenticated". The tests `mtls_execution_streams_output_and_missing_certificate_is_rejected`
-(`lib.rs:3724`) and `cross_principal_execution_fencing_without_lease_oracle` (`lib.rs:5766`) cover
+"unauthenticated". The tests `crates/eggwork-server/src/lib.rs::tests::mtls_execution_streams_output_and_missing_certificate_is_rejected` and `crates/eggwork-server/src/lib.rs::tests::cross_principal_execution_fencing_without_lease_oracle` cover
 both halves.
 
 ## Authorization
 
-`Operation` (`lib.rs:56-69`) is `Copy + Hash`, 11 variants:
+`crates/eggwork-server/src/lib.rs::Operation` is `Copy + Hash`, 11 variants:
 
 | Variant | Permits |
 | --- | --- |
@@ -167,49 +166,46 @@ both halves.
 | `WorkspaceCreate` | `POST /v1/workspaces` and `POST /v1/workspaces/derive`. Note: derive reuses `WorkspaceCreate`; there is no separate `WorkspaceDerive` operation. |
 | `ArtifactRead` | `GET /v1/executions/{id}/artifacts` and `GET /v1/artifacts/{artifact_id}`. |
 
-`OperationRequest { operation, resource: Option<ResourceId> }` (`lib.rs:79-83`) pairs the operation
-with `ResourceId::Execution | Blob | Workspace | Artifact` (`lib.rs:71-77`).
+`crates/eggwork-server/src/lib.rs::OperationRequest` pairs the operation
+with `crates/eggwork-server/src/lib.rs::ResourceId`.
 
-**`authorize` vs `authorize_request`.** `Authorizer` (`lib.rs:121-129`) has one required method,
+**`authorize` vs `authorize_request`.** `crates/eggwork-server/src/lib.rs::Authorizer` has one required method,
 `authorize(principal, operation) -> bool`, and one defaulted method,
 `authorize_request(principal, request) -> bool`, whose default body is exactly
 `self.authorize(principal, request.operation)`. A policy that is operation-wide stays valid by
 implementing only `authorize`; a policy that scopes by authenticated ID overrides
-`authorize_request`. `dispatch` always calls `authorize_request` (`lib.rs:744-747`), so the
+`authorize_request`. `dispatch` always calls `authorize_request` (`crates/eggwork-server/src/lib.rs::dispatch`), so the
 resource-aware path is the only one actually on the request path — the coarse method is reachable
 only through the default impl and through direct internal calls. Handlers that learn a resource
-*from the body* (which `resource_for_path` cannot see) re-authorize with `authorize_resource`
-(`lib.rs:808-821`): `blob_missing` checks every digest in the batch (`lib.rs:928-941`),
-`blob_prepare` the prepared digest (`lib.rs:983-994`), `workspace_create`/`workspace_derive` the
+*from the body* (which `resource_for_path` cannot see) re-authorize with `crates/eggwork-server/src/lib.rs::authorize_resource`: `blob_missing` checks every digest in the batch (`crates/eggwork-server/src/lib.rs::blob_missing`),
+`blob_prepare` the prepared digest (`crates/eggwork-server/src/lib.rs::blob_prepare`), `workspace_create`/`workspace_derive` the
 workspace id, and `execute` the execution id and, if present, the workspace id
-(`lib.rs:1518-1536`).
+(`crates/eggwork-server/src/lib.rs::execute`).
 
 **Closure blanket impl.** `impl<F> Authorizer for F where F: Fn(&NodePrincipal, Operation) -> bool
-+ Send + Sync + 'static` (`lib.rs:131-138`) lets tests and embedders express a policy as a closure
++ Send + Sync + 'static` (`crates/eggwork-server/src/lib.rs::tests::resource_aware_authorizer_can_scope_blob_capability::OneBlob::authorize_request`) lets tests and embedders express a policy as a closure
 without declaring a type. Because the bound is on the *function* signature, such an authorizer can
 only ever see the operation — never the resource. Resource scoping requires a named type, as in
-`derived_workspace_denied_and_oversized_bodies_are_typed` (`lib.rs:4499`) and
-`resource_aware_authorizer_can_scope_blob_capability` (`lib.rs:3039`).
+`crates/eggwork-server/src/lib.rs::tests::derived_workspace_denied_and_oversized_bodies_are_typed` and
+`crates/eggwork-server/src/lib.rs::tests::resource_aware_authorizer_can_scope_blob_capability`.
 
-**How `GrantAuthorizer` realizes per-principal grants.** `GrantAuthorizer` (`operations.rs:535-581`) holds a
-`HashMap<PrincipalId, PrincipalGrant>`; a `PrincipalGrant` (`operations.rs:524-527`) is the set of
+**How `GrantAuthorizer` realizes per-principal grants.** `crates/eggwork-server/src/operations.rs::GrantAuthorizer` holds a
+`HashMap<PrincipalId, PrincipalGrant>`; a `crates/eggwork-server/src/operations.rs::PrincipalGrant` is the set of
 `Operation`s the principal holds plus an optional resource-scope table keyed by
-`(Operation, ResourceKind)` and holding typed `ResourceId`s. It is built by `principals()`
-(`operations.rs:472-511`), which walks the configured clients, lowercases each `certificate_sha256` into the
+`(Operation, ResourceKind)` and holding typed `ResourceId`s. It is built by `crates/eggwork-server/src/operations.rs::OperatorConfig::principals`, which walks the configured clients, lowercases each `certificate_sha256` into the
 `FingerprintPrincipalResolver` table, and maps each configured operation *name* to an `Operation` through
-`operation(name)` (`operations.rs:615-631`) — note `filter_map`, so an unrecognized operation name in
+`crates/eggwork-server/src/operations.rs::operation` — note `filter_map`, so an unrecognized operation name in
 configuration is **silently dropped** rather than rejected, shrinking that client's grant set. Absent
 principal ⇒ `None` ⇒ `false` (deny by default).
 
-**Resource-scoped grants.** `ClientGrant` (`operations.rs:156-175`) carries an optional `resource_scopes`
-list. Each `ResourceScope` (`operations.rs:142-153`) names an **operation**, a **resource kind**
+**Resource-scoped grants.** `crates/eggwork-server/src/operations.rs::ClientGrant` carries an optional `resource_scopes`
+list. Each `crates/eggwork-server/src/operations.rs::ResourceScope` names an **operation**, a **resource kind**
 (`execution`, `blob`, `workspace`, `artifact`), and a **resource identifier** — the string form of the
-`ResourceId` variant, parsed back into the typed variant by `parse_resource_id`
-(`operations.rs:600-613`) through the same constructors the request path uses, so configuration and the
+`ResourceId` variant, parsed back into the typed variant by `crates/eggwork-server/src/operations.rs::parse_resource_id` through the same constructors the request path uses, so configuration and the
 request path cannot disagree about what an identifier is. A grant with no scopes keeps exactly its
 operation-level meaning, which is what every configuration written before scopes existed means.
 
-The decision rule (`GrantAuthorizer::authorize_request`, `operations.rs:566-580`) is, in order:
+The decision rule (`GrantAuthorizer::authorize_request`, `crates/eggwork-server/src/operations.rs::GrantAuthorizer::authorize_request`) is, in order:
 
 1. the operation grant must be present — a scope never grants an operation the principal does not hold;
 2. a request that carries no resource falls back to the operation-level grant;
@@ -246,7 +242,7 @@ configuration states is the defect.
 
 
 **Authorization runs BEFORE resource resolution.** In `dispatch` the order is: route lookup (728) →
-authentication (732) → `authorize_request` (744) → handler (755). `resource_for_path` (`lib.rs:783-806`)
+authentication (732) → `authorize_request` (744) → handler (755). `crates/eggwork-server/src/lib.rs::resource_for_path`
 parses ids **from the URL path only** and returns `None` on a malformed id, so it never touches the
 store. Handlers then resolve existence — `store.load_snapshot_for_principal` in `observe`,
 `store.lookup` in `control`/`events_route`, `workspaces.resolve` in `execute`. The implication is
@@ -260,16 +256,16 @@ disclosure to note: the operation-wide gate is uniform across resources, so a pr
 with **no** blob scope can use `POST /v1/blobs/missing` to probe digest presence — presence is data the
 grant explicitly confers, and a blob scope is the only boundary available for a resource that has no
 owner.
-`Route::BlobInvalidDigest` (`lib.rs:767-771`) is reached only *after* authorization, and returns a
+`crates/eggwork-server/src/lib.rs::Route::BlobInvalidDigest` is reached only *after* authorization, and returns a
 distinct `400 invalid_digest`, so an unauthorized caller cannot use it to distinguish "malformed"
 from "well-formed but denied".
 
 ## Request dispatch
 
-`dispatch` (`lib.rs:721-777`) is the single entry point; `NodeHttpService::call` (`lib.rs:289-292`)
+`crates/eggwork-server/src/lib.rs::dispatch` is the single entry point; `crates/eggwork-server/src/lib.rs::NodeHttpService::call`
 clones the `NodeState` and delegates to it.
 
-**Route table** (`operation_for`, `lib.rs:640-700`):
+**Route table** (`operation_for`, `crates/eggwork-server/src/lib.rs::operation_for`):
 
 | Method | Path | Operation | Route variant |
 | --- | --- | --- | --- |
@@ -298,9 +294,9 @@ malformed id in a 4- or 5-segment exec/artifact path therefore returns `404`, no
 no `Route::InvalidExecutionId`. `Route` carries `BlobInvalidDigest` but no execution equivalent, so
 the digest and id validation asymmetry is intentional: the digest shape is part of the blob
 protocol contract (`BlobDigest::parse`), while `ExecutionId`/`ArtifactId` are opaque.
-`route_contract_is_fixed_target_and_versioned` (`lib.rs:2934`) pins this table.
+`crates/eggwork-server/src/lib.rs::tests::route_contract_is_fixed_target_and_versioned` pins this table.
 
-**Body policy** is decided earlier, in `Service::request_body_policy` (`lib.rs:252-287`), by
+**Body policy** is decided earlier, in `Service::request_body_policy` (`crates/eggwork-server/src/lib.rs::NodeHttpService::request_body_policy`), by
 `(method, path)`:
 
 | Routes | Policy | Cap |
@@ -321,56 +317,55 @@ arm is effectively defensive/dead for `PUT` (it remains reachable for the *polic
 if the runtime does not pre-reject). The streaming arm exists precisely so blob uploads are not
 buffered in memory.
 
-`read_limited_body` (`lib.rs:845-858`) pre-allocates
+`crates/eggwork-server/src/lib.rs::read_limited_body` pre-allocates
 `min(declared_length.unwrap_or(0), limit)` and, per chunk, fails closed with
 `saturating_add(chunk.len()) > limit`. Callers map `Err(())` to `413 request_too_large` with a
 route-specific message. The runtime cap and the handler cap agree, so the 413 surfaces from one or
 the other without a size oracle.
 
-**Uniform error rendering.** `error_response(status, code, message)` (`lib.rs:2689-2698`) is
+**Uniform error rendering.** `crates/eggwork-server/src/lib.rs::error_response` is
 `json_response` over an `ApiError { schema_version, code, message }`. Almost nothing escapes as an
 `Err(ServiceError)`: store failures become `ServiceError::internal("execution store unavailable")`
 (uniform, no detail), and handler-level failures become typed status responses. Where a response
-builder can fail, the fallback is `error_response(500, "internal", "internal error")`
-(`lib.rs:2666`, `2686`, `1300`) rather than a panic.
+builder can fail, the fallback is `crates/eggwork-server/src/lib.rs::error_response`, `2686`, `1300`) rather than a panic.
 
 ## Local admission
 
-Admission lives entirely inside `execute` (`lib.rs:1485-1884`) and is a straight-line sequence of
+Admission lives entirely inside `crates/eggwork-server/src/lib.rs::execute` and is a straight-line sequence of
 fail-fast checks followed by a non-blocking permit acquisition.
 
 **Order:**
 
 1. Body read (1 MiB) → `413`; JSON parse → `400`; `wire.schema_version != 1` → `426`
-   (`lib.rs:1511-1517`).
+   (`crates/eggwork-server/src/lib.rs::execute`).
 2. Resource-scoped `Execute` authorization on `execution_id`, and on `workspace_id` if present
-   → `403` (`lib.rs:1518-1536`).
-3. `ExecutionGeneration::new(...)` invalid → `400` (`lib.rs:1537-1543`).
+   → `403` (`crates/eggwork-server/src/lib.rs::execute`).
+3. `ExecutionGeneration::new(...)` invalid → `400` (`crates/eggwork-server/src/lib.rs::execute`).
 4. `spec.schema_version != 1` → `426`; `spec.validate()` error → `400`; both bump
-   `rejected_invalid` (`lib.rs:1544-1560`).
-5. Declared outputs without a workspace → `400 workspace_required` (`lib.rs:1561-1568`).
+   `rejected_invalid` (`crates/eggwork-server/src/lib.rs::execute`).
+5. Declared outputs without a workspace → `400 workspace_required` (`crates/eggwork-server/src/lib.rs::execute`).
 6. **Drain check** (in-memory `draining` **or** the persistent marker) → `503 draining`, metric
-   `rejected_draining` (`lib.rs:1569-1578`).
+   `rejected_draining` (`crates/eggwork-server/src/lib.rs::execute`).
 7. **Capability checks** — `check_isolation_supported`, `check_resources_supported`,
    `check_network_supported` → `409 capability_mismatch`, metric `rejected_capability`
-   (`lib.rs:1579-1602`).
+   (`crates/eggwork-server/src/lib.rs::execute`).
 8. Request digest via `eggwork_core::request_digest_with_workspace` → `400` on failure
-   (`lib.rs:1605-1616`).
+   (`crates/eggwork-server/src/lib.rs::execute`).
 9. Workspace resolution (below), `RunnerRequest::from_spec` → `400` on failure.
 10. **Idempotency lookup** (see next section) — may return an existing execution instead.
-11. **Drain re-check** (`lib.rs:1702-1711`) — a *second* identical drain test, after the store
+11. **Drain re-check** (`crates/eggwork-server/src/lib.rs::execute`) — a *second* identical drain test, after the store
     lookup, before the permit.
 12. **Permit**: `state.permits.clone().try_acquire_owned()` → on `Err`, metric `rejected_busy` and
-    `503 busy` / "node execution limit reached" (`lib.rs:1712-1718`).
+    `503 busy` / "node execution limit reached" (`crates/eggwork-server/src/lib.rs::execute`).
 13. **Map pressure**: if `executions.len() >= MAX_RECENT_EXECUTIONS` (1024), evict terminal records
     and, if still at/over the cap, `503 storage_exhausted` / "recent execution capacity reached"
-    (`lib.rs:1719-1740`).
+    (`crates/eggwork-server/src/lib.rs::execute`).
 14. `workspaces.mark_active` (if a workspace) → `409 workspace_not_ready`, releasing the permit.
 15. `store.reserve(...)` — the durable reservation; `Created` bumps `executions_accepted`.
 
 **Tri-state semantics as applied.** Core's `Requirement<T>` is exactly three states:
-`NotRequested | BestEffort(T) | Required(T)` (`eggwork-core/src/lib.rs:353-357`), and
-`IsolationRequirement` mirrors it as `None | BestEffort | Required` (`eggwork-core/src/lib.rs:446`).
+`NotRequested | BestEffort(T) | Required(T)` (`crates/eggwork-core/src/lib.rs::Requirement`), and
+`IsolationRequirement` mirrors it as `None | BestEffort | Required` (`crates/eggwork-core/src/lib.rs::IsolationRequirement`).
 The node treats them as follows:
 
 - `check_isolation_supported`: `None` and `BestEffort` are *always* accepted;
@@ -407,8 +402,8 @@ and it is pinned by `static_capability_features_do_not_advertise_unsupported_net
 dimension whose advertised feature name differs from the runner's constant by one character.
 
 **What the caller learns.** Acceptance is `202 Accepted` — an `application/x-ndjson` event stream
-from `event_response(state, id, generation, 0, record)` (`lib.rs:1883`) that begins with the
-`Accepted` event already published at `lib.rs:1861-1867`. The caller never gets a bare "yes"; it
+from `crates/eggwork-server/src/lib.rs::event_response` that begins with the
+`Accepted` event already published at `crates/eggwork-server/src/lib.rs::execute`. The caller never gets a bare "yes"; it
 gets the execution's own event stream starting at sequence 0. Rejection is a typed
 `ApiError` with a `rejected_*` metric alongside it, so "busy", "draining", "capability mismatch",
 and "storage exhausted" are all distinguishable *by the authorized caller* while remaining opaque to
@@ -418,7 +413,7 @@ an unauthorized one.
 does not park the request, and does not hold the request body open; it answers `503 busy`
 immediately. Fairness is therefore not provided: under saturation a later arrival can win a permit
 released by an earlier one. The permit is moved into the spawned `run_execution` task
-(`lib.rs:1873-1882`) and held as `_permit` for the task's whole life, so a slot is released exactly
+(`crates/eggwork-server/src/lib.rs::run_execution`) and held as `_permit` for the task's whole life, so a slot is released exactly
 when the execution task ends — including on panic, since the permit's `Drop` runs during unwind.
 
 **The permit count and the non-terminal row count are different facts.**
@@ -438,35 +433,34 @@ checks read an `AtomicBool` plus a *file* (`operations::is_persistently_draining
 binding the check to the permit acquisition, so a `set_draining(true)` landing between the second
 check and `try_acquire_owned` will still admit one more execution. This is bounded to a small number
 of in-flight admissions and is why `set_draining` also writes the persistent marker
-(`lib.rs:428-432`) — a process restart re-reads the marker at `lib.rs:348-350`.
-`concurrent_drain_admission_outcomes_are_closed` (`lib.rs:6180`) and
-`drain_rejects_new_admission_while_terminal_records_survive` (`lib.rs:5906`) assert the *outcome
-set* is closed to {accepted, rejected}, not that the window is zero. `is_draining` (`lib.rs:434-437`)
-and `node_status` (`lib.rs:835-843`) both OR the in-memory flag with the marker so the reported
+(`crates/eggwork-server/src/lib.rs::NodeServer::set_draining`) — a process restart re-reads the marker at `crates/eggwork-server/src/lib.rs::NodeServer::start`.
+`crates/eggwork-server/src/lib.rs::tests::concurrent_drain_admission_outcomes_are_closed` and
+`crates/eggwork-server/src/lib.rs::tests::drain_rejects_new_admission_while_terminal_records_survive` assert the *outcome
+set* is closed to {accepted, rejected}, not that the window is zero. `crates/eggwork-server/src/lib.rs::NodeServer::is_draining`
+and `crates/eggwork-server/src/lib.rs::node_status` both OR the in-memory flag with the marker so the reported
 state is never *more* permissive than the enforced one.
 
 ## Idempotency and reservation
 
 The idempotency key is the **canonical request digest**:
-`eggwork_core::request_digest_with_workspace(&spec, workspace_id)` (`lib.rs:1605-1607`) returns
+`eggwork_core::request_digest_with_workspace(&spec, workspace_id)` (`crates/eggwork-server/src/lib.rs::execute`) returns
 `(canonical_version, digest)`. The workspace id is folded in, so the same spec against a different
 workspace is a different request. The digest is never taken from the request body; it is recomputed
 by the node from the decoded spec.
 
-`execute` first does a **pre-reservation lookup**: `store.lookup(id, generation)` (`lib.rs:1664`).
+`execute` first does a **pre-reservation lookup**: `crates/eggwork-server/src/lib.rs::store`.
 If a row exists:
 
 - `existing.canonical_version != canonical_version` ⇒ `409 canonicalization_version_mismatch`
-  (`lib.rs:1670-1676`). A digest computed under a different canonicalization rule set is refused
+  (`crates/eggwork-server/src/lib.rs::execute`). A digest computed under a different canonicalization rule set is refused
   outright rather than compared — comparing across versions would be meaningless.
 - `existing.principal_id != principal_id` ⇒ `403 forbidden` / "execution belongs to another
-  principal" (`lib.rs:1677-1683`).
+  principal" (`crates/eggwork-server/src/lib.rs::execute`).
 - `existing.digest != digest || existing.lease_token_hash != lease_hash` ⇒
-  `409 execution_identity_conflict` (`lib.rs:1684-1690`).
+  `409 execution_identity_conflict` (`crates/eggwork-server/src/lib.rs::execute`).
 - otherwise: an `ExistingExecution` — the in-memory `Arc<ExecutionRecord>` is reused if its
   generation matches, else a `recovered_record` is synthesized from the stored snapshot
-  (`lib.rs:1691-1698`), and the handler returns `event_response(state, id, generation, 0, record)`
-  (`lib.rs:1700`). A repeat submit *attaches to the existing execution's event stream*; it does not
+  (`crates/eggwork-server/src/lib.rs::recovered_record`), and the handler returns `crates/eggwork-server/src/lib.rs::event_response`. A repeat submit *attaches to the existing execution's event stream*; it does not
   start a second one.
 
 The `lease_hash` comparison is what makes the digest safe as a shared key: the same spec submitted
@@ -475,7 +469,7 @@ one execution by guessing its id — the record is bound to both the spec digest
 lease token.
 
 The durable path is `store.reserve(snapshot, canonical_version, digest, principal_id, lease_hash,
-lease_expires_unix_ms)` (`lib.rs:1763-1773`), which returns `ReserveResult`:
+lease_expires_unix_ms)` (`crates/eggwork-server/src/lib.rs::execute`), which returns `ReserveResult`:
 
 | `ReserveResult` | Response | Metric |
 | --- | --- | --- |
@@ -488,13 +482,12 @@ lease_expires_unix_ms)` (`lib.rs:1763-1773`), which returns `ReserveResult`:
 Every non-`Created` arm calls `workspaces.mark_terminal(workspace_id, now + DEFAULT_RETENTION_MILLIS)`
 first, so a workspace that was materialized for an execution that will not run is not left active —
 otherwise its blobs would stay pinned forever. The same release runs on the `store.reserve` *error*
-path (`lib.rs:1776-1787`).
+path (`crates/eggwork-server/src/lib.rs::store`).
 
 **Generation/lease relationship.** `lease_expires_unix_ms` is computed once as
-`store::unix_millis().saturating_add(state.lease_ttl.as_millis().min(i64::MAX as u128) as i64)`
-(`lib.rs:1661-1662`) — the `.min(i64::MAX as u128)` clamp prevents a pathological TTL from wrapping
+`crates/eggwork-server/src/lib.rs::store` — the `.min(i64::MAX as u128)` clamp prevents a pathological TTL from wrapping
 the `i64` conversion. The store persists it alongside the reservation, and the *in-memory* monitor
-uses a separate `tokio::time::Instant` deadline (`lib.rs:1903`); the two clocks are deliberately
+uses a separate `tokio::time::Instant` deadline (`crates/eggwork-server/src/lib.rs::new_record`); the two clocks are deliberately
 independent (monotonic for the timer, wall clock for the journal). A reservation is a durable claim
 on `(execution_id, generation)` plus a deadline; the journal mechanics are in
 [storage-journal.md](storage-journal.md), and the idempotency/fencing rationale is ADR-0003
@@ -503,16 +496,16 @@ on `(execution_id, generation)` plus a deadline; the journal mechanics are in
 ## Lease lifecycle
 
 An `ExecutionHandle` carries `execution_id`, `generation`, and `lease_id`. The raw lease id is never
-stored or logged: `store::lease_hash(lease_id.as_str())` (`lib.rs:1659`) is a one-way hash, and every
-subsequent comparison is hash-to-hash (`lib.rs:1684`, `2051`, `2086`, `2268`).
+stored or logged: `crates/eggwork-server/src/lib.rs::store` is a one-way hash, and every
+subsequent comparison is hash-to-hash (`crates/eggwork-server/src/lib.rs::execute`, `2051`, `2086`, `2268`).
 
-`LeaseState` (`lib.rs:220-224`) is `expires_at: tokio::time::Instant`, `notify: Arc<Notify>`, and
+`crates/eggwork-server/src/lib.rs::LeaseState` is `expires_at: tokio::time::Instant`, `notify: Arc<Notify>`, and
 `expired: Arc<AtomicBool>`, held behind a `tokio::sync::Mutex` inside the `ExecutionRecord`. A fresh
-record gets `expires_at = now + lease_ttl` (`new_record`, `lib.rs:1886-1908`); a `recovered_record`
-gets `expires_at = now` (already expired) and `finished: true` (`lib.rs:1910-1930`) — a recovered
+record gets `expires_at = now + lease_ttl` (`new_record`, `crates/eggwork-server/src/lib.rs::new_record`); a `recovered_record`
+gets `expires_at = now` (already expired) and `finished: true` (`crates/eggwork-server/src/lib.rs::recovered_record`) — a recovered
 execution is history, never a live lease.
 
-`monitor_lease` (`lib.rs:1932-1954`) is one task per accepted execution:
+`crates/eggwork-server/src/lib.rs::monitor_lease` is one task per accepted execution:
 
 - Returns immediately if the snapshot is already terminal.
 - Snapshots `(deadline, notify)` under the lock, then `select!`s on cancellation, `notify.notified()`,
@@ -522,80 +515,78 @@ execution is history, never a live lease.
   can never expire a renewed lease.
 - On true expiry: `expired.store(true, Release)`, then `record.cancellation.cancel()`.
 
-**Renewal** (`control` with `renew = true`, `lib.rs:2094-2150`): requires a non-empty `renewal_id`
+**Renewal** (`control` with `renew = true`, `crates/eggwork-server/src/lib.rs::BlobReferenceLease::renew`): requires a non-empty `renewal_id`
 bounded by `eggwork_core::MAX_ID_BYTES`; refuses if the snapshot is terminal (`409
 execution_terminal`); refuses if `expired` is set or `now >= expires_at` (`409 lease_expired`);
 computes a new deadline as `now + lease_ttl` (same clamped expression); persists via
 `store.update_lease(id, generation, existing.lease_token_hash, renewal_id, requested_expires)`. If
 the store returns `None` the wall clock has already judged the lease expired ⇒ `409 lease_expired`.
 On success it converts the *persisted wall-clock* deadline into the monotonic one
-(`Instant::now() + Duration::from_millis(remaining_ms)`, `lib.rs:2147-2148`), calls
+(`Instant::now() + Duration::from_millis(remaining_ms)`, `crates/eggwork-server/src/lib.rs::control`), calls
 `notify.notify_waiters()` to interrupt the sleeping monitor, and returns the current snapshot.
 
-**Cancellation** (`lib.rs:2152-2176`): if the state is non-terminal and not already `Cancelling`, it
+**Cancellation** (`crates/eggwork-server/src/lib.rs::control`): if the state is non-terminal and not already `Cancelling`, it
 takes the lease lock, refuses when the lease has expired (`409 lease_expired` — *a lease holder
 cannot cancel after its lease died*), publishes `Cancelling`, re-checks the state under the lock and
 cancels the token if still non-terminal. If the state is already `Cancelling` it re-issues
 `cancellation.cancel()` (idempotent). Returns `202` with the fresh snapshot.
 
-**Preconditions before either branch** (`lib.rs:2023-2092`): schema version must be 1 and
+**Preconditions before either branch** (`crates/eggwork-server/src/lib.rs::control`): schema version must be 1 and
 `request.handle.execution_id` must equal the path id; the row must exist (`404`); `principal_id` must
 match (`403 forbidden`); the lease hash must match the store (`403 invalid_lease`); the *latest*
 snapshot's generation must equal the requested generation (`409 generation_mismatch` / "stale"); and
 the in-memory `record.lease_hash` must equal `existing.lease_token_hash` (`403 invalid_lease`).
 
 **What a stale lease holder can and cannot do after a new generation.** The `latest.generation !=
-request.handle.generation` check (`lib.rs:2072-2078`) is the fence: once a higher generation exists
+request.handle.generation` check (`crates/eggwork-server/src/lib.rs::control`) is the fence: once a higher generation exists
 for that execution id, a request bearing the older generation gets `409 generation_mismatch` and is
 rejected *before* any mutation. Combined with the preceding hash comparisons, a holder of an
 expired generation cannot renew (renewal would push a deadline the store has already superseded),
 cannot cancel another generation's process (`cancellation.cancel()` lives on the *current* record's
 token, and reaching it requires passing the generation check), and cannot read events — `events_route`
-performs the same `store.lookup(id, generation)` and lease-hash check (`lib.rs:2253-2275`) before
+performs the same `store.lookup(id, generation)` and lease-hash check (`crates/eggwork-server/src/lib.rs::store`) before
 selecting the record. The terminal publish funnel adds a second layer: `publish` returns early if
-`is_terminal(&current.state)` (`lib.rs:2576-2578`), so a late-arriving event from a superseded run
-cannot move a terminal snapshot backwards. `cross_principal_execution_fencing_without_lease_oracle`
-(`lib.rs:5766`) exercises cross-principal fencing and asserts the responses do not form a lease
-oracle; `expired_lease_terminates_process_with_a_typed_terminal_result` (`lib.rs:4066`) covers expiry
+`is_terminal(&current.state)` (`crates/eggwork-server/src/lib.rs::publish`), so a late-arriving event from a superseded run
+cannot move a terminal snapshot backwards. `crates/eggwork-server/src/lib.rs::tests::cross_principal_execution_fencing_without_lease_oracle` exercises cross-principal fencing and asserts the responses do not form a lease
+oracle; `crates/eggwork-server/src/lib.rs::tests::expired_lease_terminates_process_with_a_typed_terminal_result` covers expiry
 producing a typed `Interrupted`/`LeaseExpired` result.
 
 **`publish` is also the failure sink.** On a store error it sets `record.draining.store(true)` and
-cancels the execution (`lib.rs:2590-2593`). A journal failure therefore degrades the *node* into
+cancels the execution (`crates/eggwork-server/src/lib.rs::publish`). A journal failure therefore degrades the *node* into
 draining and kills the affected execution rather than continuing with an unrecordable state. This
 shares the node's `draining` `Arc` with the record (`new_record` receives `state.draining.clone()`,
-`lib.rs:1855`), which is why `node_status` reports drain and `execute` refuses admission on the same
+`crates/eggwork-server/src/lib.rs::execute`), which is why `node_status` reports drain and `execute` refuses admission on the same
 flag. Caveat: `recovered_record` installs a *fresh* `AtomicBool::new(false)` for `draining`
-(`lib.rs:1921`) rather than the node's, so a journal failure on a recovered/synthetic record cannot
+(`crates/eggwork-server/src/lib.rs::recovered_record`) rather than the node's, so a journal failure on a recovered/synthetic record cannot
 flip the node into drain.
 
 ## Execution lifecycle
 
-`execute` finishes by publishing `Accepted` (`lib.rs:1861-1867`), spawning `monitor_lease`
-(`lib.rs:1869`), spawning `run_execution` with the permit moved in (`lib.rs:1873-1882`), and
+`execute` finishes by publishing `Accepted` (`crates/eggwork-server/src/lib.rs::execute`), spawning `crates/eggwork-server/src/lib.rs::monitor_lease`, spawning `run_execution` with the permit moved in (`crates/eggwork-server/src/lib.rs::run_execution`), and
 returning `event_response(state, id, generation, 0, record)`.
 
-`run_execution` (`lib.rs:2370-2512`):
+`crates/eggwork-server/src/lib.rs::run_execution`:
 
 1. Publishes `Running` before the runner is spawned.
 2. Creates `mpsc::channel(RUNNER_CHANNEL_CAPACITY)` — 32 — and spawns
    `runner.run(request, cancellation, output_tx)`.
 3. Loops in a **`biased`** `select!`: output is drained first, then the runner task is joined
-   (`lib.rs:2396-2414`). Biasing guarantees no output is lost to task-completion ordering. The loop
+   (`crates/eggwork-server/src/lib.rs::run_execution`). Biasing guarantees no output is lost to task-completion ordering. The loop
    ends when the output channel closes *and* a result is known, then a final
-   `while let Ok(..) = output_rx.try_recv()` sweep (`lib.rs:2416-2423`) drains anything that raced.
+   `while let Ok(..) = output_rx.try_recv()` sweep (`crates/eggwork-server/src/lib.rs::run_execution`) drains anything that raced.
 4. Maps the result. If the runner returned a `RunnerResult`, `result.execution_result()` is the base;
    **if the lease expired, it is rewritten in place** to `ExecutionState::Interrupted` /
-   `ExecutionFailure::LeaseExpired` with `exit_code: None` (`lib.rs:2425-2432`) — the process may
+   `ExecutionFailure::LeaseExpired` with `exit_code: None` (`crates/eggwork-server/src/lib.rs::run_execution`) — the process may
    have exited successfully, but the node had no authority over it at the end, so success is not
-   claimed. Otherwise `failure_for_runner_error` (`lib.rs:2557-2567`) maps: `RunnerError::Spawn(_)` →
+   claimed. Otherwise `crates/eggwork-server/src/lib.rs::failure_for_runner_error` maps: `RunnerError::Spawn(_)` →
    `Spawn`; **lease-expired wins over everything except spawn**; `CancelledBeforeSpawn` →
    `Interrupted`; anything else → `Internal`. The terminal state is `Interrupted` when expired,
-   `Cancelled` when the failure is `Interrupted`, else `Failed` (`lib.rs:2436-2441`).
+   `Cancelled` when the failure is `Interrupted`, else `crates/eggwork-server/src/lib.rs::ArtifactCaptureAttempt::Failed`.
 5. Declared-output capture runs only when the runner *completed*, outputs were declared, the state
-   is `Succeeded`/`Failed`, and the failure is not `OutputLimit` (`lib.rs:2445-2452`). Capture
+   is `Succeeded`/`Failed`, and the failure is not `OutputLimit` (`crates/eggwork-server/src/lib.rs::run_execution`). Capture
    failure becomes `ExecutionFinalizationFailure::ArtifactCapture` rather than changing the outcome;
    `workspaces.mark_terminal` failure becomes `ExecutionFinalizationFailure::Retention`
-   (`lib.rs:2478-2485`). The execution outcome is never rewritten by a finalization problem.
+   (`crates/eggwork-server/src/lib.rs::run_execution`). The execution outcome is never rewritten by a finalization problem.
 6. Emits the terminal metric (`terminal_succeeded` / `terminal_failed` / `terminal_cancelled` /
    `terminal_timed_out` / `terminal_interrupted`), `stdout_bytes`, `stderr_bytes`, and
    `cleanup_failures` if `cleanup_warning` is set.
@@ -608,10 +599,10 @@ path. If the server falls behind (e.g. a slow `store.commit_event` per chunk), t
 back-pressure on the runner. `EVENT_CAPACITY = 32` is the `broadcast` channel capacity for live
 subscribers and is *lossy by design* — a slow subscriber gets `RecvError::Lagged`, and
 `event_stream_response` turns that into a `ResponseStreamError("event consumer exceeded bounded
-retained history")` that terminates the stream (`lib.rs:2628-2635`). This is **safe** precisely
+retained history")` that terminates the stream (`crates/eggwork-server/src/lib.rs::event_stream_response`). This is **safe** precisely
 because the journal is the source of truth: the client reconnects with its last sequence in `after`
 and the page comes from `store.load_page`. No correctness rests on the broadcast. The test
-`slow_event_consumer_is_bounded_and_gets_a_stream_error` (`lib.rs:3102`) pins the failure mode
+`crates/eggwork-server/src/lib.rs::tests::slow_event_consumer_is_bounded_and_gets_a_stream_error` pins the failure mode
 explicitly rather than allowing an unbounded per-subscriber queue.
 
 **Where a degradation diagnostic is published.** The forwarding loop maps the runner's
@@ -637,7 +628,7 @@ after the terminal event and be dropped by the rule above. The runner is the onl
 grammar and bound of the payload are in [protocol.md](protocol.md#the-execution-diagnostic-payload-schema-version-1).
 
 `publish` is the single write funnel, and it takes **two** locks with different jobs.
-`ExecutionRecord::commit_lock` (`lib.rs:205-216`) serialises publishers across the durable commit;
+`ExecutionRecord::commit_lock` (`crates/eggwork-server/src/lib.rs::ExecutionRecord`) serialises publishers across the durable commit;
 `snapshot` is a plain `RwLock` held only for the cheap read and the short assign. The order is:
 commit lock, read lock + terminal short-circuit, clone-and-propose, `store.commit_event` (which
 assigns the sequence), write lock to install the new snapshot, `events.send`. `Ok(None)` means the
@@ -655,16 +646,15 @@ state and then receives the event on the broadcast channel.
 
 ## Observing and control
 
-**`observe`** (`lib.rs:1956-1993`) — `GET /v1/executions/{id}?generation=…`. `generation` is
+**`observe`** (`crates/eggwork-server/src/lib.rs::observe`) — `GET /v1/executions/{id}?generation=…`. `generation` is
 optional; if present it must parse as `u64` and validate via `ExecutionGeneration::new`, else
 `400 invalid_request`. The read is
 `store.load_snapshot_for_principal(id, generation, principal.id)`, so **ownership is enforced inside
 the store**, not by a separate 403. A missing or non-owned row is a single `404
-execution_not_found` — no 403/404 oracle. Query parsing goes through `query_parameter`
-(`lib.rs:2351-2368`), which rejects duplicate keys and any key other than `generation`, `after`, or
+execution_not_found` — no 403/404 oracle. Query parsing goes through `crates/eggwork-server/src/lib.rs::query_parameter`, which rejects duplicate keys and any key other than `generation`, `after`, or
 `lease` (`400 "query is invalid"`).
 
-**`control`** (`lib.rs:1995-2177`) — shared by cancel and renew; the `renew: bool` flag selects the
+**`control`** (`crates/eggwork-server/src/lib.rs::control`) — shared by cancel and renew; the `renew: bool` flag selects the
 branch. Covered in detail under *Lease lifecycle*. Failure modes for a stale caller:
 
 | Condition | Response |
@@ -688,7 +678,7 @@ the lock so the response reflects state at the time of the reply, not at the tim
 
 ## Events and streaming
 
-`GET /v1/executions/{id}/events` → `events_route` (`lib.rs:2179-2301`).
+`GET /v1/executions/{id}/events` → `crates/eggwork-server/src/lib.rs::events_route`.
 
 Query parameters — all three effectively required, each with its own typed error:
 
@@ -700,13 +690,13 @@ Query parameters — all three effectively required, each with its own typed err
   is invalid"`. This is what makes the events route lease-bearing rather than merely authorized.
 
 Then `store.lookup(id, generation)` (`404` if absent), and a single combined check
-(`lib.rs:2267-2275`): if the principal differs **or** the lease hash differs, both yield
+(`crates/eggwork-server/src/lib.rs::events_route`): if the principal differs **or** the lease hash differs, both yield
 `403 forbidden` / "execution event access is not authorized" — deliberately one status for two
 causes, so the route is not an existence oracle.
 
-**Poll vs stream.** There is no separate poll route. `event_response` (`lib.rs:2303-2349`) always
+**Poll vs stream.** There is no separate poll route. `crates/eggwork-server/src/lib.rs::event_response` always
 returns a stream; a client that wants only the current batch reads the stream and closes it. It
-subscribes to the broadcast *before* loading the page (`lib.rs:2310-2311`) — subscribe-then-read is
+subscribes to the broadcast *before* loading the page (`crates/eggwork-server/src/lib.rs::event_response`) — subscribe-then-read is
 the correct order, since anything published after the subscribe is buffered and anything before it
 is in the page.
 
@@ -714,15 +704,15 @@ is in the page.
 `{ base_sequence, next_sequence, events }`:
 
 - `after + 1 < page.base_sequence` ⇒ the requested history has been trimmed: metric
-  `event_history_resync` and `410 history_expired` / "event history has expired" (`lib.rs:2325-2332`).
+  `event_history_resync` and `410 history_expired` / "event history has expired" (`crates/eggwork-server/src/lib.rs::event_response`).
   This is the honest "you are too far behind, resynchronize" answer rather than silently skipping.
 - `after >= page.next_sequence` ⇒ `416 cursor_ahead`.
 - Otherwise the page plus the live receiver is handed to `event_stream_response`.
 
-`event_stream_response` (`lib.rs:2606-2667`) emits `202` with `content-type: application/x-ndjson`
+`crates/eggwork-server/src/lib.rs::event_stream_response` emits `202` with `content-type: application/x-ndjson`
 and headers `eggwork-execution-id` / `eggwork-execution-generation`. It drains the replay
 `VecDeque` first, then the broadcast, and enforces
-`if event.sequence.get() <= last_sequence { continue }` (`lib.rs:2639-2641`) — the dedup that makes
+`if event.sequence.get() <= last_sequence { continue }` (`crates/eggwork-server/src/lib.rs::event_stream_response`) — the dedup that makes
 replay-then-live overlap harmless and is what guarantees a client sees **no gap and no duplicate**.
 The stream ends when it emits a terminal `State` event, when the receiver is `Closed`, or on lag.
 
@@ -731,7 +721,7 @@ one JSON line. If it was disconnected long enough for the journal page to be tri
 and must re-`observe` for the snapshot; if it was merely lagging the broadcast, it gets a mid-stream
 error and reconnects with `after = ` its last sequence, which is still inside the journal and
 therefore resumes cleanly. If the execution is already terminal, `initial_terminal && replay.is_empty()`
-makes the stream end immediately (`lib.rs:2615`).
+makes the stream end immediately (`crates/eggwork-server/src/lib.rs::event_stream_response`).
 
 ## Data-operation handlers
 
@@ -739,20 +729,20 @@ Dispatch-level only; internals are in [data-plane.md](data-plane.md).
 
 | Handler | Operation | Body cap | Reference / lease mechanism |
 | --- | --- | --- | --- |
-| `blob_missing` (`lib.rs:902`) | `BlobRead` | `read_limited_body(64 KiB)` | None. Per-digest `authorize_resource` for the whole batch before `find_missing`. `413 too_many_digests` on batch overflow. |
-| `blob_prepare` (`lib.rs:957`) | `BlobWrite` | `read_limited_body(64 KiB)` | None; `prepare_upload` creates the reference. Per-digest authorization on the *body's* digest. |
-| `blob_upload` (`lib.rs:1253`) | `BlobWrite` | streamed, `blob::MAX_BLOB_BYTES` | None in `lib.rs`; the digest is from the path. Requires `?size=`; declared size must not exceed the max (`413 blob_too_large`) and must equal `Content-Length` when present (`400 length_mismatch`). A body-read error becomes `BlobError::Body`. Metric `blob_upload_bytes`. |
-| `blob_download` (`lib.rs:1306`) | `BlobRead` | streamed 64 KiB chunks | `blobs.open_verified(&digest)` — verified, not merely opened. Per-chunk `blob_download_bytes`. Response carries `eggwork-blob-digest`. **No** reference lease: blob reads are content-addressed and idempotent, so GC has nothing to protect. |
-| `workspace_create` (`lib.rs:1005`) | `WorkspaceCreate` | `read_limited_body(4 MiB)` | `handle` is the owner reference; `materialize` records the workspace against `(execution_id, generation, principal)`. Metric `workspace_manifest_registrations`. |
-| `workspace_derive` (`lib.rs:1125`) | `WorkspaceCreate` | `read_limited_body(4 MiB)` | Same handle binding, `materialize_derived` against a base manifest. Metrics `workspace_derived_requests` / `_hits` / `_patch_entries` / `workspace_base_missing`. |
-| `artifact_list` (`lib.rs:1340`) | `ArtifactRead` | none (query only) | `generation` is **required** and must validate, else `400`. `artifacts.list(&id, generation, &principal.id)` filters by principal. |
-| `artifact_download` (`lib.rs:1394`) | `ArtifactRead` | streamed 64 KiB chunks | `BlobReferenceLease` + `Drop` (below). |
+| `crates/eggwork-server/src/lib.rs::blob_missing` | `BlobRead` | `read_limited_body(64 KiB)` | None. Per-digest `authorize_resource` for the whole batch before `find_missing`. `413 too_many_digests` on batch overflow. |
+| `crates/eggwork-server/src/lib.rs::blob_prepare` | `BlobWrite` | `read_limited_body(64 KiB)` | None; `prepare_upload` creates the reference. Per-digest authorization on the *body's* digest. |
+| `crates/eggwork-server/src/lib.rs::blob_upload` | `BlobWrite` | streamed, `blob::MAX_BLOB_BYTES` | None in `crates/eggwork-server/src/lib.rs`; the digest is from the path. Requires `?size=`; declared size must not exceed the max (`413 blob_too_large`) and must equal `Content-Length` when present (`400 length_mismatch`). A body-read error becomes `BlobError::Body`. Metric `blob_upload_bytes`. |
+| `crates/eggwork-server/src/lib.rs::blob_download` | `BlobRead` | streamed 64 KiB chunks | `blobs.open_verified(&digest)` — verified, not merely opened. Per-chunk `blob_download_bytes`. Response carries `eggwork-blob-digest`. **No** reference lease: blob reads are content-addressed and idempotent, so GC has nothing to protect. |
+| `crates/eggwork-server/src/lib.rs::workspace_create` | `WorkspaceCreate` | `read_limited_body(4 MiB)` | `handle` is the owner reference; `materialize` records the workspace against `(execution_id, generation, principal)`. Metric `workspace_manifest_registrations`. |
+| `crates/eggwork-server/src/lib.rs::workspace_derive` | `WorkspaceCreate` | `read_limited_body(4 MiB)` | Same handle binding, `materialize_derived` against a base manifest. Metrics `workspace_derived_requests` / `_hits` / `_patch_entries` / `workspace_base_missing`. |
+| `crates/eggwork-server/src/lib.rs::artifact_list` | `ArtifactRead` | none (query only) | `generation` is **required** and must validate, else `400`. `artifacts.list(&id, generation, &principal.id)` filters by principal. |
+| `crates/eggwork-server/src/lib.rs::artifact_download` | `ArtifactRead` | streamed 64 KiB chunks | `BlobReferenceLease` + `Drop` (below). |
 
 **`BlobReferenceLease` and why a download must hold one.** Artifacts are *declared outputs* whose
 backing blobs are otherwise garbage-collectable. Without a live reference, a concurrent
 `collect_garbage` could unlink the blob between `artifacts.get` and the first chunk, and the client
 would get a truncated stream with no error it can distinguish from completion. The pattern
-(`lib.rs:1373-1392`, used at `lib.rs:1409-1453`):
+(`crates/eggwork-server/src/lib.rs::BlobReferenceLease`, used at `crates/eggwork-server/src/lib.rs::artifact_download`):
 
 1. Generate a `uuid::Uuid::new_v4()` `owner_id` — unique per download, so two concurrent readers of
    the same artifact do not collide on the reference row.
@@ -760,13 +750,13 @@ would get a truncated stream with no error it can distinguish from completion. T
    file is opened. Failure returns `404 artifact_not_found` rather than a 500, so a reference-store
    failure does not distinguish "artifact absent" from "reference denied".
 3. Construct `BlobReferenceLease { blobs, owner_id }` and **move it into the response stream state**
-   (`lib.rs:1440`). The lease is owned by the stream, so it lives exactly as long as the bytes are
+   (`crates/eggwork-server/src/lib.rs::BlobReferenceLease`). The lease is owned by the stream, so it lives exactly as long as the bytes are
    being produced.
-4. `renew()` (`lib.rs:1379-1385`) pushes the expiry to `now + 30 min` on *every chunk*, so any
+4. `crates/eggwork-server/src/lib.rs::BlobReferenceLease::renew` pushes the expiry to `now + 30 min` on *every chunk*, so any
    download slower than 30 minutes per chunk still holds. A renewal failure aborts the stream
    (`ResponseStreamError::new("artifact lease refresh failed")`) — fail-closed: better a visible
    error than a silently unbacked read.
-5. `Drop` (`lib.rs:1388-1392`) calls `release_references("reader", &owner_id)`, ignoring the result.
+5. `Drop` (`crates/eggwork-server/src/lib.rs::BlobReferenceLease::renew`) calls `release_references("reader", &owner_id)`, ignoring the result.
    Release happens on normal completion, on client disconnect, on stream error, and on task panic
    alike — it is `Drop`, not a happy-path call, so it cannot be skipped. Its only weakness is that
    the residual reference is *not* removed by `Drop` alone if the process dies; the 30-minute
@@ -775,10 +765,10 @@ would get a truncated stream with no error it can distinguish from completion. T
 
 ## Metrics and live GC
 
-`increment_metric(store, name, amount)` (`lib.rs:779-781`) is a thin `async` wrapper that
+`crates/eggwork-server/src/lib.rs::increment_metric` is a thin `async` wrapper that
 **discards its result** (`let _ = …`). Metrics are therefore best-effort and can never fail a
 request or abort a transition. Names are `&'static str`, so the metric key space is closed at compile
-time. Instrumented sites: `terminal_interrupted` (recovered at start, `lib.rs:331`),
+time. Instrumented sites: `terminal_interrupted` (recovered at start, `crates/eggwork-server/src/lib.rs::NodeServer::start`),
 `rejected_route` (728), `rejected_unauthenticated` (733), `rejected_unauthorized` (748),
 `rejected_draining` (1572, 1705), `rejected_capability` (1580, 1588, 1596),
 `rejected_invalid` (1554, 1562, 1624, 1651, 1609, 1051, 1172, 1749),
@@ -788,13 +778,13 @@ time. Instrumented sites: `terminal_interrupted` (recovered at start, `lib.rs:33
 `blob_upload_bytes` / `blob_download_bytes`, `terminal_*` (2488-2495), `stdout_bytes`,
 `stderr_bytes`, `cleanup_failures`.
 
-**`NodeGcReport`** (`lib.rs:232-247`) is a `Serialize` struct of 13 counters plus `dry_run`. It
+**`NodeGcReport`** (`crates/eggwork-server/src/lib.rs::NodeGcReport`) is a `Serialize` struct of 13 counters plus `dry_run`. It
 flattens four sub-reports — workspaces, manifests, artifacts, blobs — into one shape, and
 normalizes `expired_blob_references` to `expired_references` in dry-run mode vs
-`expired_references_removed` in real mode (`lib.rs:496-500`), so a dry run reports what *would* be
+`expired_references_removed` in real mode (`crates/eggwork-server/src/lib.rs::NodeServer::collect_garbage`), so a dry run reports what *would* be
 reclaimed.
 
-**`NodeServer::collect_garbage(dry_run, requested_limit)`** (`lib.rs:460-507`) clamps
+**`NodeServer::collect_garbage(dry_run, requested_limit)`** (`crates/eggwork-server/src/lib.rs::NodeServer`) clamps
 `requested_limit` to `1..=1024`, then runs, in order: `workspaces.garbage_collect`,
 `workspaces.manifest_garbage_collect(now, limit, dry_run, &blobs)`,
 `artifacts.garbage_collect`, `blobs.garbage_collect`. Every one is **bounded** by the same clamped
@@ -817,17 +807,17 @@ stores at once.
 
 Three layers, deliberately ordered from most specific to least revealing:
 
-1. **Typed `ApiError` bodies** (`lib.rs:2689-2698`): `{ schema_version, code, message }` with
+1. **Typed `ApiError` bodies** (`crates/eggwork-server/src/lib.rs::error_response`): `{ schema_version, code, message }` with
    `content-type: application/json`. `code` is the stable machine key; `message` is a fixed,
    human-readable constant. Neither is derived from internal state.
 2. **`ServiceError::internal(fixed string)`** for store unavailability. Every call site uses one of a
    very small set of literals — `"execution store unavailable"`, and `e.to_string()` only in the two
-   places where a builder genuinely fails (stream/response construction, `lib.rs:1337`, `1460`).
+   places where a builder genuinely fails (stream/response construction, `crates/eggwork-server/src/lib.rs::blob_download`, `1460`).
    Internal `ServiceError` never reaches the client as a body.
 3. **`catch-all` arms** that discard the underlying error: `Err(_) => error_response(500,
-   "storage_error", …)` in `blob_missing` (`lib.rs:949`), `artifact_list` (`lib.rs:1365`),
-   `workspace_create` (`lib.rs:1108`); `let _ = error;` in `execute`'s `spec.validate()` branch
-   (`lib.rs:1552-1553`); `let _ = record.events.send(event)` (`lib.rs:2587`).
+   "storage_error", …)` in `crates/eggwork-server/src/lib.rs::blob_missing`, `crates/eggwork-server/src/lib.rs::artifact_list`,
+   `crates/eggwork-server/src/lib.rs::workspace_create`; `let _ = error;` in `execute`'s `spec.validate()` branch
+   (`crates/eggwork-server/src/lib.rs::execute`); `let _ = record.events.send(event)` (`crates/eggwork-server/src/lib.rs::publish`).
 
 **Status mapping summary:**
 
@@ -854,8 +844,7 @@ Three layers, deliberately ordered from most specific to least revealing:
 its `Debug`), lease ids (stored and compared only as hashes), peer certificate bytes (never
 echoed), internal error chains (collapsed into a fixed `code`/`message`), and the *existence* of
 resources behind a 403 (authorization precedes resolution, and observe/control/events return a
-single 404 for both "absent" and "not yours"). `secret_sentinels_stay_out_of_error_and_debug_surfaces`
-(`lib.rs:6104`) is the executable guard for the first two.
+single 404 for both "absent" and "not yours"). `crates/eggwork-server/src/lib.rs::tests::secret_sentinels_stay_out_of_error_and_debug_surfaces` is the executable guard for the first two.
 
 ## The node telemetry read route
 
@@ -879,7 +868,7 @@ telemetry" and from "the provider is down".
 
 The response is the frozen `NodeTelemetry` document described in
 [protocol.md](protocol.md#the-node-telemetry-wire-contract-schema-version-1).
-The projection itself is `node_telemetry` (`lib.rs`), which reads the M001
+The projection itself is `node_telemetry` (`crates/eggwork-server/src/lib.rs`), which reads the M001
 cache and copies its snapshot; it adds no measurement of its own and performs
 no validation the client would not also perform.
 
@@ -950,50 +939,50 @@ echoes its address: a node whose provider happens to be down is still a healthy 
 
 | Invariant | Enforcement site | Test |
 | --- | --- | --- |
-| Only a transport-verified, known peer is admitted | `authenticated_principal` (`lib.rs:823-833`) | `request_payload_cannot_supply_authoritative_principal` (2993), `mtls_execution_streams_output_and_missing_certificate_is_rejected` (3724) |
-| Identity is the SHA-256 of the leaf DER, nothing else | `FingerprintPrincipalResolver::fingerprint` (`lib.rs:107-109`) | `fingerprint_mapping_uses_leaf_der_only` (2924) |
-| TLS must require client auth and a server identity | `NodeServer::start` (`lib.rs:307-311`) | `mtls_authorization_and_fixed_target_execution` (3137) |
+| Only a transport-verified, known peer is admitted | `crates/eggwork-server/src/lib.rs::authenticated_principal` | `request_payload_cannot_supply_authoritative_principal` (2993), `mtls_execution_streams_output_and_missing_certificate_is_rejected` (3724) |
+| Identity is the SHA-256 of the leaf DER, nothing else | `crates/eggwork-server/src/lib.rs::FingerprintPrincipalResolver::fingerprint` | `fingerprint_mapping_uses_leaf_der_only` (2924) |
+| TLS must require client auth and a server identity | `crates/eggwork-server/src/lib.rs::NodeServer::start` | `mtls_authorization_and_fixed_target_execution` (3137) |
 | A node never advertises an unenforceable capability | `server_capability_features` / `check_isolation_supported` / `check_resources_supported` / `check_network_supported` | `static_capability_features_do_not_advertise_unsupported_network_modes`, `admission_helpers_keep_required_capability_gating_active`, `the_resource_admission_rule_reads_the_runner_constants` |
-| Capabilities and status never disagree | single `node_capabilities_for` (`lib.rs:595`, `580-582`) | `capabilities_and_status_features_agree_with_a_unified_snapshot` (4617) |
+| Capabilities and status never disagree | single `crates/eggwork-server/src/lib.rs::node_capabilities_for`, `580-582`) | `capabilities_and_status_features_agree_with_a_unified_snapshot` (4617) |
 | The feature list is single-canonical and deduped | `static_capability_features` + sort/dedup | `static_capability_features_are_a_single_canonical_list`, `server_capability_features_do_not_duplicate_static_dynamic_overlap`, `the_advertised_argv_feature_is_the_one_the_owner_declares` |
-| Only the fixed, versioned route set exists | `operation_for` (`lib.rs:640-700`) | `route_contract_is_fixed_target_and_versioned` (2934) |
-| An authorized op on a different resource is still denied | `authorize_resource` re-checks (`lib.rs:808`, `928`, `983`, `1038`, `1159`, `1518`) | `resource_aware_authorizer_can_scope_blob_capability` (3039), `derived_workspace_denied_and_oversized_bodies_are_typed` (4499) |
-| A resource scope narrows the operation grant and never widens it | `GrantAuthorizer::authorize_request` (`operations.rs:566-580`) | `a_resource_scope_narrows_the_operation_grant_it_names`, `a_scope_never_grants_an_operation_the_principal_does_not_hold` (`tests/resource_scoped_authorization.rs`) |
-| A scope never reaches another principal's resource | the store's `principal_id` fences, unchanged | `a_resource_scope_cannot_reach_a_foreign_principal_resource` (`lib.rs`) |
+| Only the fixed, versioned route set exists | `crates/eggwork-server/src/lib.rs::operation_for` | `route_contract_is_fixed_target_and_versioned` (2934) |
+| An authorized op on a different resource is still denied | `authorize_resource` re-checks (`crates/eggwork-server/src/lib.rs::authorize_resource`, `928`, `983`, `1038`, `1159`, `1518`) | `resource_aware_authorizer_can_scope_blob_capability` (3039), `derived_workspace_denied_and_oversized_bodies_are_typed` (4499) |
+| A resource scope narrows the operation grant and never widens it | `crates/eggwork-server/src/operations.rs::GrantAuthorizer::authorize_request` | `a_resource_scope_narrows_the_operation_grant_it_names`, `a_scope_never_grants_an_operation_the_principal_does_not_hold` (`crates/eggwork-server/tests/resource_scoped_authorization.rs`) |
+| A scope never reaches another principal's resource | the store's `principal_id` fences, unchanged | `a_resource_scope_cannot_reach_a_foreign_principal_resource` (`crates/eggwork-server/src/lib.rs::tests::a_resource_scope_cannot_reach_a_foreign_principal_resource`) |
 | A malformed scope is a configuration error, not an ignored entry | `OperatorConfig::validate` (`operations.rs`) + `principals()` | `a_malformed_resource_scope_is_refused_by_the_configuration`, `a_duplicate_resource_scope_is_refused_by_the_configuration` (`operations.rs`) |
-| A repeat submit never starts a second execution | `store.lookup` pre-check + `ReserveResult::Existing` (`lib.rs:1664`, `1793`) | `blob_protocol_streams_verifies_deduplicates_and_enforces_quota` (3399) |
-| Identity conflicts are refused, not merged | `lib.rs:1670-1690`, `1808-1835` | `mtls_authorization_and_fixed_target_execution` (3137) |
-| Stale generations cannot mutate state | generation preconditions in `control` (`lib.rs:2072`) and `events_route` | `cross_principal_execution_fencing_without_lease_oracle` (5766) |
-| Only the lease holder controls an execution | lease-hash comparisons (`lib.rs:1684`, `2051`, `2086`, `2268`) | `cross_principal_execution_fencing_without_lease_oracle` (5766) |
-| An expired lease cannot be renewed or used to cancel | `lib.rs:2117`, `2154` | `expired_lease_terminates_process_with_a_typed_terminal_result` (4066) |
-| Lease expiry beats a spurious wake | re-check under lock (`lib.rs:1946`), renewal `notify_waiters` (`lib.rs:2149`) | `expired_lease_terminates_process_with_a_typed_terminal_result` (4066) |
-| Lease expiry is not reported as success | in-place rewrite to `Interrupted`/`LeaseExpired` (`lib.rs:2427-2431`) | `expired_lease_terminates_process_with_a_typed_terminal_result` (4066) |
-| A terminal execution is never moved backwards | `publish` terminal short-circuit (`lib.rs:2576`) | `restart_recovers_uncertain_execution_as_interrupted_without_replay` (4133) |
-| Restart recovers, never replays, uncertain executions | `store.recover()` + `recovered_record` `finished: true` (`lib.rs:326`, `1922`) | `restart_recovers_uncertain_execution_as_interrupted_without_replay` (4133) |
-| Concurrent admission is bounded and immediate | `try_acquire_owned` (`lib.rs:1712`) | `drain_rejects_new_admission_while_terminal_records_survive` (5906) |
+| A repeat submit never starts a second execution | `store.lookup` pre-check + `ReserveResult::Existing` (`crates/eggwork-server/src/lib.rs::execute`, `1793`) | `blob_protocol_streams_verifies_deduplicates_and_enforces_quota` (3399) |
+| Identity conflicts are refused, not merged | `crates/eggwork-server/src/lib.rs::tests::blob_protocol_streams_verifies_deduplicates_and_enforces_quota`, `1808-1835` | `mtls_authorization_and_fixed_target_execution` (3137) |
+| Stale generations cannot mutate state | generation preconditions in `crates/eggwork-server/src/lib.rs::control` and `events_route` | `cross_principal_execution_fencing_without_lease_oracle` (5766) |
+| Only the lease holder controls an execution | lease-hash comparisons (`crates/eggwork-server/src/lib.rs::tests::cross_principal_execution_fencing_without_lease_oracle`, `2051`, `2086`, `2268`) | `cross_principal_execution_fencing_without_lease_oracle` (5766) |
+| An expired lease cannot be renewed or used to cancel | `crates/eggwork-server/src/lib.rs::tests::cross_principal_execution_fencing_without_lease_oracle`, `2154` | `expired_lease_terminates_process_with_a_typed_terminal_result` (4066) |
+| Lease expiry beats a spurious wake | re-check under lock (`crates/eggwork-server/src/lib.rs::tests::expired_lease_terminates_process_with_a_typed_terminal_result`), renewal `notify_waiters` (`crates/eggwork-server/src/lib.rs::control`) | `expired_lease_terminates_process_with_a_typed_terminal_result` (4066) |
+| Lease expiry is not reported as success | in-place rewrite to `Interrupted`/`LeaseExpired` (`crates/eggwork-server/src/lib.rs::run_execution`) | `expired_lease_terminates_process_with_a_typed_terminal_result` (4066) |
+| A terminal execution is never moved backwards | `publish` terminal short-circuit (`crates/eggwork-server/src/lib.rs::publish`) | `restart_recovers_uncertain_execution_as_interrupted_without_replay` (4133) |
+| Restart recovers, never replays, uncertain executions | `store.recover()` + `recovered_record` `finished: true` (`crates/eggwork-server/src/lib.rs::NodeServer::start`, `1922`) | `restart_recovers_uncertain_execution_as_interrupted_without_replay` (4133) |
+| Concurrent admission is bounded and immediate | `try_acquire_owned` (`crates/eggwork-server/src/lib.rs::execute`) | `drain_rejects_new_admission_while_terminal_records_survive` (5906) |
 | Drain outcomes are closed under concurrency | double drain check + persistent marker | `concurrent_drain_admission_outcomes_are_closed` (6180) |
-| Drain survives restart | marker re-read at start (`lib.rs:348`) | `operator_drain_persists_across_node_restart` (4574) |
-| Slow event consumers are bounded, not buffered without limit | `EVENT_CAPACITY` + lag→error (`lib.rs:2628`) | `slow_event_consumer_is_bounded_and_gets_a_stream_error` (3102) |
-| Event resume has no gap and no duplicate | subscribe-then-page + sequence filter (`lib.rs:2310`, `2639`) | `mtls_execution_streams_output_and_missing_certificate_is_rejected` (3724) |
-| A download's bytes are protected from concurrent GC | `BlobReferenceLease` + `Drop` (`lib.rs:1373-1392`) | covered indirectly by artifact/blob protocol tests (3399) |
-| Terminal record memory is bounded | `MAX_RECENT_EXECUTIONS` eviction (`lib.rs:1719-1740`) | `drain_rejects_new_admission_while_terminal_records_survive` (5906) |
-| One process per state directory | `acquire_state_lock` (`lib.rs:540-556`) | startup `AlreadyRunning` path (no dedicated test observed) |
-| Secrets never reach error/debug surfaces | redacting `Debug`, hash-only leases (`lib.rs:154`, `1659`) | `tls_configuration_diagnostics_redact_certificate_paths` (3083), `secret_sentinels_stay_out_of_error_and_debug_surfaces` (6104) |
-| Required isolation is enforced, not merely requested | landlock admission + E2E denial (`lib.rs:613`, `606`) | `required_landlock_is_admitted_remotely_and_denies_outside_workspace_access` (4699), `required_landlock_denies_outside_writes_and_confines_descendants` (4846) |
-| Hostile workspace manifests cause no side effect | `WorkspaceError` mapping (`lib.rs:1083-1107`) | `hostile_workspace_manifests_are_rejected_without_side_effect` (6008) |
-| With no provider configured the node claims no host measurements | `TelemetryMonitor::disabled()` creates no task; cache reports `Disabled` | `a_disabled_monitor_never_polls` (`tests/host_telemetry.rs`), `a_configuration_without_host_telemetry_asks_for_none` (`operations.rs`) |
+| Drain survives restart | marker re-read at start (`crates/eggwork-server/src/lib.rs::tests::concurrent_drain_admission_outcomes_are_closed`) | `operator_drain_persists_across_node_restart` (4574) |
+| Slow event consumers are bounded, not buffered without limit | `EVENT_CAPACITY` + lag→error (`crates/eggwork-server/src/lib.rs::EVENT_CAPACITY`) | `slow_event_consumer_is_bounded_and_gets_a_stream_error` (3102) |
+| Event resume has no gap and no duplicate | subscribe-then-page + sequence filter (`crates/eggwork-server/src/lib.rs::tests::slow_event_consumer_is_bounded_and_gets_a_stream_error`, `2639`) | `mtls_execution_streams_output_and_missing_certificate_is_rejected` (3724) |
+| A download's bytes are protected from concurrent GC | `BlobReferenceLease` + `Drop` (`crates/eggwork-server/src/lib.rs::BlobReferenceLease`) | covered indirectly by artifact/blob protocol tests (3399) |
+| Terminal record memory is bounded | `MAX_RECENT_EXECUTIONS` eviction (`crates/eggwork-server/src/lib.rs::MAX_RECENT_EXECUTIONS`) | `drain_rejects_new_admission_while_terminal_records_survive` (5906) |
+| One process per state directory | `crates/eggwork-server/src/lib.rs::acquire_state_lock` | startup `AlreadyRunning` path (no dedicated test observed) |
+| Secrets never reach error/debug surfaces | redacting `Debug`, hash-only leases (`crates/eggwork-server/src/lib.rs::NodeStartError`, `1659`) | `tls_configuration_diagnostics_redact_certificate_paths` (3083), `secret_sentinels_stay_out_of_error_and_debug_surfaces` (6104) |
+| Required isolation is enforced, not merely requested | landlock admission + E2E denial (`crates/eggwork-server/src/lib.rs::tests::secret_sentinels_stay_out_of_error_and_debug_surfaces`, `606`) | `required_landlock_is_admitted_remotely_and_denies_outside_workspace_access` (4699), `required_landlock_denies_outside_writes_and_confines_descendants` (4846) |
+| Hostile workspace manifests cause no side effect | `WorkspaceError` mapping (`crates/eggwork-server/src/lib.rs::workspace_create`) | `hostile_workspace_manifests_are_rejected_without_side_effect` (6008) |
+| With no provider configured the node claims no host measurements | `TelemetryMonitor::disabled()` creates no task; cache reports `Disabled` | `a_disabled_monitor_never_polls` (`crates/eggwork-server/tests/host_telemetry.rs`), `a_configuration_without_host_telemetry_asks_for_none` (`operations.rs`) |
 | The provider endpoint cannot be moved off the loopback interface | `validate_endpoint` (IP literal, explicit port, fixed path, plain HTTP) + a client with no redirect or proxy support | `a_non_loopback_or_ambiguous_endpoint_is_refused`, `a_redirect_is_not_followed` |
 | One provider request per poll, regardless of reader count | one owner task; readers read the cache | `one_owner_polls_for_every_reader` |
 | A missing measurement is never reported as zero | `TelemetryMetric::{Unsupported, Unknown, Value}` | `an_unsupported_capability_is_not_reported_as_a_missing_value` |
 
 ## Test coverage
 
-`mod tests` starts at `lib.rs:2719` and runs to EOF (3,562 lines — by far the largest part of the
+`mod tests` starts at `crates/eggwork-server/src/lib.rs::tests` and runs to EOF (3,562 lines — by far the largest part of the
 file). Fixtures first: `init_tls`, `issue_identity`, `tls_material`, `untrusted_client_identity`,
 `write_client_config`, `post_raw`, `pem`, `tls_server_config`, `execution_spec`,
 `execution_handle`, `place_trusted_helper`, `locate_helper_binary`. Then roughly 30 cases.
 
-**Notable cases and what they pin** (line numbers in `lib.rs`):
+**Notable cases and what they pin** (all in `crates/eggwork-server/src/lib.rs`):
 
 - 2934 `route_contract_is_fixed_target_and_versioned` — the route table is exhaustive; known routes
   are refused unauthenticated.
@@ -1005,7 +994,7 @@ file). Fixtures first: `init_tls`, `issue_identity`, `tls_material`, `untrusted_
 - `a_resource_scope_cannot_reach_a_foreign_principal_resource` — a second principal whose scopes
   name the first principal's execution, workspace, and artifact: the authorizer lets the requests
   through the scope and the store's owner fence refuses them.
-- `tests/resource_scoped_authorization.rs` — the decision rule and the configuration shape, portable
+- `crates/eggwork-server/tests/resource_scoped_authorization.rs` — the decision rule and the configuration shape, portable
   across hosts: the scope narrows, the scope never grants, the scope is per `(operation, kind)`, a
   request without a resource falls back to the operation grant, an older node refuses a configuration
   that carries a scope.
@@ -1065,8 +1054,8 @@ file). Fixtures first: `init_tls`, `issue_identity`, `tls_material`, `untrusted_
   before any handler. Confirm every body-derived resource id is covered by an `authorize_resource`
   re-check (`execute`'s `workspace_id`, `blob_prepare`'s digest, `blob_missing`'s whole batch).
 - **Lease fencing under concurrency.** `control` checks the store row, the latest generation, and the
-  in-memory record across three separate awaits. Can a newer generation land between `lib.rs:2072`
-  and `lib.rs:2163`'s `publish`? `publish` re-checks terminal while holding `commit_lock` and the
+  in-memory record across three separate awaits. Can a newer generation land between `crates/eggwork-server/src/lib.rs::control`
+  and `crates/eggwork-server/src/lib.rs::control`'s `publish`? `publish` re-checks terminal while holding `commit_lock` and the
   snapshot read guard, but does **not** re-check generation.
 - **Digest reuse across callers.** `store.lookup` compares `principal_id` *before* the digest
   (`1677` vs `1684`), so a foreign principal learns an execution id exists from the 403 while a
@@ -1079,7 +1068,7 @@ file). Fixtures first: `init_tls`, `issue_identity`, `tls_material`, `untrusted_
   blob scope can only name digests the operator already knows. Is there an operation that would let
   an operator learn a digest and then scope it, or is "learn the digest, then edit the config"
   the intended workflow?
-- **Silent config-drop in `operation(name)`** (`operations.rs:342-357`): `filter_map` means a typo in
+- **Silent config-drop in `operation(name)`** (`crates/eggwork-server/src/operations.rs::operation`): `filter_map` means a typo in
   a configured operation name quietly narrows a client's grants with no startup error. Should it be
   `OperationsError::Config`?
 - **Capacity-drop correctness.** The only hard bound on buffered stdout/stderr is

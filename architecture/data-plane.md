@@ -45,14 +45,13 @@ All three are crate-private modules with no `pub use` re-export, so nothing outs
 ## Shared discipline
 
 **Content addressing.** Every byte object is named by a `BlobDigest`: exactly 64 lowercase hex
-characters, produced by `BlobDigest::from_bytes` (SHA-256) and re-checked by `BlobDigest::parse`
-(`crates/eggwork-core/src/lib.rs:141-160`). The server turns a digest into a path mechanically; it
+characters, produced by `BlobDigest::from_bytes` (SHA-256) and re-checked by `crates/eggwork-core/src/lib.rs::BlobDigest::parse`. The server turns a digest into a path mechanically; it
 never derives a name from anything the caller controls. Because `path_for` is a pure function of
 the digest, a digest that survives `BlobDigest::parse` cannot name a location outside the blob
-root: `"../secret"` and uppercase hex are rejected before a path is built (`blob.rs:665`).
+root: `"../secret"` and uppercase hex are rejected before a path is built (`crates/eggwork-server/src/blob.rs::tests::empty_blob_and_digest_path_are_canonical`).
 
 **Immutability.** A committed blob is never rewritten: `put_stream` refuses the write when the
-target exists and runs `verify_existing` instead (`blob.rs:408-410`). The only writes touching a
+target exists and runs `verify_existing` instead (`crates/eggwork-server/src/blob.rs::BlobStore::verify_existing`). The only writes touching a
 live path are: create the shard directory, create `.part-<uuid>`, `rename` the part onto the final
 name.
 
@@ -65,8 +64,8 @@ mean nothing at read time.
 
 **Write-once staging.** Blob ingest writes `.part-<uuid v4>` at the blob root, `fsync`s it, renames
 onto the final path, `fsync`s the shard directory, and only then inserts the index row
-(`blob.rs:427-466`). Workspace trees are built in `.staging-<uuid v4>` and renamed to
-`workspace-<uuid v4>` (`workspace.rs:230-292`). A reader never observes a partially written object;
+(`crates/eggwork-server/src/blob.rs::BlobStore::put_stream`). Workspace trees are built in `.staging-<uuid v4>` and renamed to
+`workspace-<uuid v4>` (`crates/eggwork-server/src/workspace.rs::WorkspaceManager::materialize`). A reader never observes a partially written object;
 the rename is the single atomic visibility edge.
 
 **Quota enforcement.** Each tree has a byte budget in its own metadata: the blob store sums
@@ -84,12 +83,12 @@ whole capture instead of producing a partial record set.
 ### On-disk layout
 
 ```
-<blob_root>/                                mode 0700 on unix (blob.rs:74-78)
-  metadata.sqlite                           blobs + blob_references (blob.rs:82-110)
+<blob_root>/                                mode 0700 on unix (crates/eggwork-server/src/blob.rs::BlobStore::open)
+  metadata.sqlite                           blobs + blob_references (crates/eggwork-server/src/blob.rs::BlobStore::open)
   metadata.sqlite-wal / -shm
-  quarantine/                               corrupt blobs, under the 0700 root (blob.rs:79-80)
+  quarantine/                               corrupt blobs, under the 0700 root (crates/eggwork-server/src/blob.rs::BlobStore::open)
   .part-<uuid v4>                           in-flight uploads only; never a valid object name
-  <d0d1>/<64-hex-digest>                    one object, mode 0600 (blob.rs:631-640)
+  <d0d1>/<64-hex-digest>                    one object, mode 0600 (crates/eggwork-server/src/blob.rs::BlobStore::put_stream)
   <d2d3>/...                               one shard directory per first-hex-byte pair
 ```
 
@@ -117,13 +116,13 @@ reference_count INTEGER NOT NULL DEFAULT 0, last_used_unix_ms INTEGER NOT NULL)`
 `blob_references` is `(owner_kind, owner_id, digest, expires_unix_ms)` keyed on
 `(owner_kind, owner_id, digest)` with `FOREIGN KEY(digest) REFERENCES blobs(digest) ON DELETE
 CASCADE`. `reference_count` is never written by Rust - two triggers (`blob_reference_insert` /
-`blob_reference_delete`, `blob.rs:101-110`) maintain it. Reclamation queries deliberately use
+`blob_reference_delete`, `crates/eggwork-server/src/blob.rs::BlobStore::open`) maintain it. Reclamation queries deliberately use
 `NOT EXISTS (SELECT 1 FROM blob_references ...)` rather than the counter: the counter is a
 denormalization maintained only by those triggers, so it can drift from the rows that actually pin
 bytes, and the rows are the truth.
 
 `blob_references.owner_kind` is a small closed set in practice: `"workspace"`, `"manifest"`,
-`"artifact"`, and `"reader"` (in-flight download, `lib.rs:1413`). `owner_id` is the `WorkspaceId`,
+`"artifact"`, and `"reader"` (in-flight download, `crates/eggwork-server/src/lib.rs::artifact_download`). `owner_id` is the `WorkspaceId`,
 the `"{principal}:{manifest_digest}"` composite, the `ArtifactId`, or a fresh UUID. The composite
 has one producer: `manifest_owner_id_for_key(principal_key, manifest_digest)` in `workspace.rs`,
 with `manifest_owner_id(principal_id, manifest_digest)` as the validated-principal entry point
@@ -134,12 +133,12 @@ principal itself contains one.
 
 ### Public surface
 
-- `MAX_BLOB_BYTES: u64 = 256 * 1024 * 1024` (`blob.rs:19`) - per-object ceiling.
-- `MAX_FIND_DIGESTS: usize = 512` (`blob.rs:20`) - per-request digest batch ceiling.
+- `crates/eggwork-server/src/blob.rs::MAX_BLOB_BYTES` - per-object ceiling.
+- `crates/eggwork-server/src/blob.rs::MAX_FIND_DIGESTS` - per-request digest batch ceiling.
 - `GcReport { expired_references, expired_references_removed, candidate_blobs, candidate_bytes,
-  removed_blobs, removed_bytes }` (`blob.rs:23-30`). No `dry_run` field: the caller supplies and
-  records that (`NodeGcReport.dry_run`, `lib.rs:507`).
-- `BlobError` (`blob.rs:33-55`), walked in [Error model](#error-model).
+  removed_blobs, removed_bytes }` (`crates/eggwork-server/src/blob.rs::GcReport`). No `dry_run` field: the caller supplies and
+  records that (`NodeGcReport.dry_run`, `crates/eggwork-server/src/lib.rs::NodeGcReport`).
+- `crates/eggwork-server/src/blob.rs::BlobError`, walked in [Error model](#error-model).
 - `BlobStore::{open, path_for, find_missing, prepare_upload, stored_size, retain,
   set_reference_expiry, clear_reference_expiry, release_references, reference_owners,
   garbage_collect, put_stream, verify_existing, open_verified, copy_verified}`. `BlobStore` is
@@ -160,10 +159,10 @@ principal itself contains one.
 
 ### Ingest
 
-`POST /v1/blobs/prepare` calls `prepare_upload(digest, declared_length)` (`blob.rs:153-179`):
+`POST /v1/blobs/prepare` calls `crates/eggwork-server/src/blob.rs::BlobStore::prepare_upload`:
 reject `> MAX_BLOB_BYTES`; if the target path already exists, run `verify_existing` and answer
 `upload_required: false`; otherwise do a metadata-only quota pre-check and answer
-`upload_required: true`. `POST /v1/blobs/{digest}` calls `put_stream` (`blob.rs:394-493`).
+`upload_required: true`. `POST /v1/blobs/{digest}` calls `crates/eggwork-server/src/blob.rs::BlobStore::put_stream`.
 
 The digest is **declared by the client and verified by the node**. `put_stream` never trusts it: it
 hashes every chunk as it writes, so the digest is computed exactly once, from the bytes actually
@@ -174,14 +173,14 @@ Order inside `put_stream`: (1) `declared_length > MAX_BLOB_BYTES` -> `TooLarge`;
 node-wide; (3) target exists -> `verify_existing` and return, no write; (4) quota, `SUM(size_bytes)
 + declared_length > quota` -> `QuotaExceeded` - the bound uses the *declared* length, so a client
 cannot overshoot by under-declaring; (5) `create_dir_all` the shard and create the part file with
-`private_create_new` (mode 0600, `blob.rs:631-640`); (6) stream chunks, `checked_add`ing size and
+`private_create_new` (mode 0600, `crates/eggwork-server/src/blob.rs::private_create_new`); (6) stream chunks, `checked_add`ing size and
 returning `TooLarge` if `size > MAX_BLOB_BYTES || size > declared_length`; (7) `size !=
 declared_length` -> `LengthMismatch`; (8) `hex::encode(hasher.finalize()) != digest.as_str()` ->
 `DigestMismatch`; (9) `sync_all`, `rename(part, target)`, `sync_directory(shard)`, then
 `INSERT INTO blobs`.
 
 On any error the part file is removed, and if the target exists but has no index row the target is
-removed too - the comment at `blob.rs:469-470` states the rule directly: *a failed metadata commit
+removed too - the comment at `crates/eggwork-server/src/blob.rs::BlobStore::put_stream` states the rule directly: *a failed metadata commit
 must not leave a readable unindexed blob*.
 
 Note an asymmetry worth flagging: an *over*-long body is reported as `TooLarge` (413), not
@@ -191,17 +190,17 @@ too big to upload when the correct action is to re-declare.
 **Partial uploads are not observable.** The part file lives at the blob root - never in a shard,
 never in `blobs` - so `path_for(digest)` does not exist, `find_missing` reports the digest as
 missing, `open_verified` returns `NotFound`, and the HTTP layer answers 404. Aborted part files are
-swept at the next `BlobStore::open` by `remove_stale_parts` (`blob.rs:557-613`), which also
+swept at the next `BlobStore::open` by `crates/eggwork-server/src/blob.rs::BlobStore::remove_stale_parts`, which also
 reconciles the two durable layers in both directions: index rows whose file is gone (or whose digest
 no longer parses) are deleted, and shard files that are not indexed are removed.
 `remove_stale_parts` consults neither `last_used_unix_ms` nor references, so it would delete a live
 concurrent upload's part file; only one `BlobStore` is constructed per process, at startup
-(`lib.rs:318`).
+(`crates/eggwork-server/src/lib.rs::NodeServer::start`).
 
 ### Read
 
-`open_verified` (`blob.rs:552-555`) calls `verify_existing` first, then opens the file.
-`verify_existing` (`blob.rs:495-550`) re-reads the entire object in `spawn_blocking`, compares the
+`crates/eggwork-server/src/blob.rs::BlobStore::open_verified` calls `verify_existing` first, then opens the file.
+`crates/eggwork-server/src/blob.rs::BlobStore::verify_existing` re-reads the entire object in `spawn_blocking`, compares the
 byte count against `blobs.size_bytes` and the fresh SHA-256 against the digest, and on a clean pass
 updates `last_used_unix_ms` to now.
 
@@ -217,22 +216,22 @@ the quota, but they are not deleted by GC either - they are left for an operator
 
 ### Quota
 
-Two enforcement points with different authority. `prepare_upload` (`blob.rs:165-178`) is advisory,
+Two enforcement points with different authority. `crates/eggwork-server/src/blob.rs::BlobStore::prepare_upload` is advisory,
 lock-free, metadata-only - a fast "do I need to transfer this?" answer that can be stale by the
-time the upload starts. `put_stream` (`blob.rs:411-422`) is authoritative, under `write_lock`; that
+time the upload starts. `crates/eggwork-server/src/blob.rs::BlobStore::put_stream` is authoritative, under `write_lock`; that
 is the real bound. A client that skips `prepare` still gets a correct 507.
 
 `SUM(size_bytes)` counts committed, indexed objects only, so part files, quarantined objects, and
 unindexed strays sit outside the accounting. There is no filesystem-level backstop on the blob
 root; `storage_summary` only *reports* `blob_bytes` against `blob_quota_bytes`
-(`operations.rs:770-781`). At the limit the store refuses the new object with `QuotaExceeded` ->
+(`crates/eggwork-server/src/operations.rs::storage_summary`). At the limit the store refuses the new object with `QuotaExceeded` ->
 507; existing objects are never evicted to make room.
 
 ### GC
 
-`garbage_collect(now_unix_ms, limit, dry_run)` (`blob.rs:302-392`) takes `write_lock` and an
+`crates/eggwork-server/src/blob.rs::BlobStore::garbage_collect` takes `write_lock` and an
 `IMMEDIATE` transaction, so it is serialized against `put_stream` (same lock). It also holds the
-`metadata` mutex (`blob.rs:309`) for its entire body, including `commit()`, so it cannot interleave
+`metadata` mutex (`crates/eggwork-server/src/blob.rs::BlobStore::clear_reference_expiry`) for its entire body, including `commit()`, so it cannot interleave
 with `retain` either — the code here is stronger than the older "metadata mutex only" phrasing used
 for divergence 6 in `overview.md`.
 
@@ -294,16 +293,16 @@ unlinked is already the consistent state, so the pass commits what is true and t
 
 GC is **bounded, not exhaustive**: one call removes at most `limit` expired references *and* at
 most `limit` blobs. A backlog drains over repeated invocations, and
-`NodeServer::collect_garbage` clamps `requested_limit` to `1..=1024` (`lib.rs:464`) while calling
+`NodeServer::collect_garbage` clamps `requested_limit` to `1..=1024` (`crates/eggwork-server/src/lib.rs::NodeServer::collect_garbage`) while calling
 each store once.
 
 ### Reference protection during download
 
-`BlobReferenceLease` (`lib.rs:1373-1392`) is a `Drop` guard over a `(BlobStore, owner_id)` pair
+`crates/eggwork-server/src/lib.rs::BlobReferenceLease` is a `Drop` guard over a `(BlobStore, owner_id)` pair
 whose `renew()` calls `set_reference_expiry("reader", owner_id, now + 30 min)` and whose
 `Drop` calls `release_references("reader", owner_id)`.
 
-`artifact_download` (`lib.rs:1409-1452`) retains `"reader"` for the artifact's digest with a
+`crates/eggwork-server/src/lib.rs::artifact_download` retains `"reader"` for the artifact's digest with a
 30-minute expiry *before* opening the file, constructs the lease, and moves the lease into the
 response stream's unfold state; each 64 KiB chunk calls `renew()`, so the reference is refreshed as
 the transfer progresses, and it is dropped as soon as the body is dropped - completion, failure, or
@@ -316,7 +315,7 @@ Without a reference row a concurrent GC pass could select and `remove_file` the 
 verification and the first `read`, and the transfer would fail mid-body with no recovery. The lease
 turns "a file I am currently streaming" into a fact GC can see.
 
-Note the asymmetry: `blob_download` (`lib.rs:1306-1336`) takes **no** lease. It verifies and opens
+Note the asymmetry: `crates/eggwork-server/src/lib.rs::blob_download` takes **no** lease. It verifies and opens
 without a reference. On Unix the already-open descriptor survives `unlink`, so an in-flight blob
 download keeps working even if GC removes the path; on other platforms removing an open file fails
 and the GC aborts. The `reader` owner kind is used only by the artifact handler - a reviewer should
@@ -337,25 +336,25 @@ pub enum WorkspaceEntry {
 }
 ```
 
-(`crates/eggwork-core/src/lib.rs:590-611`). `schema_version` must be `1`. The doc comment at
-`core:587-588` gives the intent: version 1 uses conservative ASCII paths and rejects symlinks so
+(`crates/eggwork-core/src/lib.rs::WorkspaceManifest`). `schema_version` must be `1`. The doc comment at
+`crates/eggwork-core/src/lib.rs::ExecutionSpec` gives the intent: version 1 uses conservative ASCII paths and rejects symlinks so
 materialization is identical across hosts.
 
-`WorkspaceManifest::validate` (`core:622-690`) enforces, in order: `schema_version == 1`;
+`crates/eggwork-core/src/lib.rs::WorkspaceManifest::validate` enforces, in order: `schema_version == 1`;
 `entries.len() <= MAX_WORKSPACE_ENTRIES`; per entry, `validate_portable_workspace_path`, aggregate
 path bytes `<= MAX_WORKSPACE_PATH_BYTES`, ASCII case-collision detection
 (`to_ascii_lowercase()` into a `HashSet`), and no duplicate exact path; `Symlink` ->
-`ValidationError::Forbidden` unconditionally (`core:667-671`), so a symlink can never appear in a
+`ValidationError::Forbidden` unconditionally (`crates/eggwork-core/src/lib.rs::WorkspacePatchEntry::path`), so a symlink can never appear in a
 valid v1 manifest; `File` sizes accumulate into a `u64` capped at `MAX_WORKSPACE_LOGICAL_BYTES`.
 A second pass then requires every parent prefix of every path to be present as a `Directory` entry
-(`core:673-689`), so a `File` can never implicitly create a directory.
+(`crates/eggwork-core/src/lib.rs::WorkspacePatchEntry::path`), so a `File` can never implicitly create a directory.
 
-`WorkspaceManifest::digest` (`core:702-712`) sorts entries by path, serializes
+`crates/eggwork-core/src/lib.rs::WorkspaceManifest::digest` sorts entries by path, serializes
 `eggwork-workspace-manifest\0canonical-json-v1\0` + the normalized JSON, and takes SHA-256. This is
 the workspace identity used for idempotency, conflict detection, and the derived-base cache.
 
-`validate_portable_workspace_path` (`core:828-878`) is the strict validator, and it is stricter than
-`RelativePath::new` (`core:189-210`). `RelativePath::new` enforces: non-empty, at most
+`crates/eggwork-core/src/lib.rs::validate_portable_workspace_path` is the strict validator, and it is stricter than
+`crates/eggwork-core/src/lib.rs::RelativePath::new`. `RelativePath::new` enforces: non-empty, at most
 `MAX_PATH_BYTES` (4096) bytes, no leading `/`, no `\`, no NUL, and no empty, `.` or `..` component.
 The strict validator adds: at most `MAX_WORKSPACE_DEPTH` (128) components; ASCII only; no component
 ending in `.` or a space; no C0 control byte and none of `<`, `>`, `:`, `"`, `?`, `*`; and no
@@ -367,24 +366,23 @@ preflight.
 
 ### `ReadyWorkspace`
 
-`ReadyWorkspace { root: PathBuf, logical_bytes: u64, manifest_digest: String }`
-(`workspace.rs:62-66`) is an ephemeral handle to an on-disk tree, not a guard or a lock: it holds
+`crates/eggwork-server/src/workspace.rs::ReadyWorkspace` is an ephemeral handle to an on-disk tree, not a guard or a lock: it holds
 no reference, no permit, and does nothing on drop. `root` is the absolute path the runner is handed
-as the execution root (`lib.rs:1617-1643`: with a `workspace_id` the root is
+as the execution root (`crates/eggwork-server/src/lib.rs::execute`: with a `workspace_id` the root is
 `workspaces.resolve(...).root`, otherwise `state.execution_root`).
 
 Its lifetime is the *workspace record*, not the function that produced it. `materialize` returns
 one, `resolve` re-derives one later, and the tree persists until retention expiry plus GC. The
 executor pins the record at admission with `mark_active` (`expires_unix_ms = NULL`, blob references
 set to non-expiring) and unpins it at terminalization with `mark_terminal`; a failure to pin is
-reported as 409 `workspace_not_ready` (`lib.rs:1742-1753`).
+reported as 409 `workspace_not_ready` (`crates/eggwork-server/src/lib.rs::execute`).
 
 ### Materialization safety
 
 This is the most security-critical path in the node: a hostile manifest arrives over the network and
 becomes real files on disk.
 
-**Pre-flight, not interleaved.** `materialize` (`workspace.rs:131-308`) validates everything before
+**Pre-flight, not interleaved.** `crates/eggwork-server/src/workspace.rs::WorkspaceManager::materialize` validates everything before
 any directory exists: (1) `manifest.validate()` -> `InvalidManifest`; (2) a single manifest's
 `logical_bytes` against the whole quota -> `QuotaExceeded`; (3) canonical `manifest.digest()`;
 (4) `materialize_lock`, a `tokio::sync::Mutex` serializing materialization node-wide; (5)
@@ -392,20 +390,20 @@ idempotency - an existing `workspace_id` must match on `execution_id`, `generati
 `principal_id`, and `manifest_digest` and must not be expired, else `Conflict`, and a match returns
 the existing tree without re-verifying any bytes; (6) aggregate quota over
 `SUM(logical_bytes) WHERE state = 'Ready'`; (7) **a pre-flight blob check for every `File` entry,
-before any write** (`workspace.rs:184-201`): `size_bytes > MAX_BLOB_BYTES` ->
+before any write** (`crates/eggwork-server/src/workspace.rs::WorkspaceManager::materialize`): `size_bytes > MAX_BLOB_BYTES` ->
 `BlobSizeMismatch`, `stored_size(digest)` must equal `size_bytes`, then
 `blobs.verify_existing(digest).await` - a full re-hash of every input before a single byte is
 written; (8) deduplicate the digests and
 `blobs.retain("workspace", workspace_id, digests, Some(now + DEFAULT_RETENTION_MILLIS))` -
 reference first, bytes second; (9) `store_manifest(...)` registers the canonical manifest as a
 same-principal derived base, pinning the same blobs under owner kind `"manifest"`
-(`workspace.rs:223-228`).
+(`crates/eggwork-server/src/workspace.rs::WorkspaceManager::materialize`).
 
 Only then does it create `.staging-<uuid v4>`, run `materialize_tree` in `spawn_blocking`, rename to
 `workspace-<uuid v4>`, `sync_directory(root)`, and insert the `'Ready'` row. Every failure branch
 removes the stage (or the freshly renamed target) *and* calls
 `release_references("workspace", ...)`. The `store_manifest` registration is deliberately **not**
-rolled back (`workspace.rs:223-227`): a leftover expiring cache entry is harmless, whereas unpinning
+rolled back (`crates/eggwork-server/src/workspace.rs::WorkspaceManager::store_manifest`): a leftover expiring cache entry is harmless, whereas unpinning
 a blob another live workspace is using is not.
 
 Pre-flight is the right choice because the alternative - validating while writing - means a manifest
@@ -413,14 +411,14 @@ failing on its 4096th entry leaves a partially written tree. Staging already pro
 guarantee, so validating first is nearly free: the tree is invisible either way, and the pre-flight
 loop fails without touching the filesystem at all.
 
-**Inside the staging tree** (`materialize_tree`, `workspace.rs:887-939`): `fs::create_dir(stage)`
+**Inside the staging tree** (`materialize_tree`, `crates/eggwork-server/src/workspace.rs::materialize_tree`): `fs::create_dir(stage)`
 (fails if the name exists) then `set_directory_permissions` to 0700; entries are **sorted by path**
 before creation, so parents precede children with no dependency analysis, and parent existence is
 already guaranteed by the second pass of `manifest.validate()`. `Directory` -> `create_dir` + 0700.
 `File` -> `OpenOptions::new().write(true).create_new(true)` with `mode(0o700)` when `executable` else
 `0o600`, copying from `blobs.path_for(digest)` through `BlobStore::copy_verified`; the copy must
 yield exactly `size_bytes` else `BlobSizeMismatch`, then `sync_all()` and `set_file_permissions`.
-`Symlink` -> `InvalidManifest` (`workspace.rs:926`) - defense in depth, since core already rejected
+`Symlink` -> `InvalidManifest` (`crates/eggwork-server/src/workspace.rs::materialize_tree`) - defense in depth, since core already rejected
 it. Afterwards every created directory is `sync_all`ed deepest-first (reverse component count).
 
 **The materializer verifies the bytes it writes.** `BlobStore::copy_verified` hashes the byte
@@ -458,26 +456,25 @@ impossible because `RelativePath` has no `..`, no absolute prefix, and no `\`; a
 `stage.join(entry.path().as_str())` is a plain `Path::join` on a path the strict validator already
 constrained to portable ASCII.
 
-**Resolution re-checks the root** (`resolve`, `workspace.rs:755-786`): the record must be
+**Resolution re-checks the root** (`resolve`, `crates/eggwork-server/src/workspace.rs::WorkspaceManager::resolve`): the record must be
 `state = 'Ready'`, match `execution_id`, `generation`, and `principal_id`, not be expired, satisfy
 `valid_storage_key`, and have a `fs::symlink_metadata` that is a directory and *not* a symlink.
-`valid_storage_key` (`workspace.rs:877-881`) requires the prefix `workspace-` followed by a
+`crates/eggwork-server/src/workspace.rs::valid_storage_key` requires the prefix `workspace-` followed by a
 parseable UUID, which is what stops a hostile or corrupted `storage_key` column from turning
-`root.join(storage_key)` into a path outside the workspace root. `mark_active`
-(`workspace.rs:631-660`) repeats the `valid_storage_key` and `symlink_metadata` checks under an
+`root.join(storage_key)` into a path outside the workspace root. `crates/eggwork-server/src/workspace.rs::WorkspaceManager::mark_active` repeats the `valid_storage_key` and `symlink_metadata` checks under an
 `IMMEDIATE` transaction before clearing the expiry.
 
 ### `workspace_derive`: manifest CAS and reuse
 
-`POST /v1/workspaces/derive` (`lib.rs:1125-1250`) is a bandwidth optimization, not a different
+`POST /v1/workspaces/derive` (`crates/eggwork-server/src/lib.rs::workspace_derive`) is a bandwidth optimization, not a different
 security model. It carries `WorkspaceManifestPatch { schema_version, base_manifest_digest, entries }`
 with `WorkspacePatchEntry::{Remove{path}, Directory{path}, File{path, digest, size_bytes,
-executable}}` (`core:720-747`). `Remove` deletes exactly one path - there is no recursive delete, so
+executable}}` (`crates/eggwork-core/src/lib.rs::WorkspaceManifestPatch`). `Remove` deletes exactly one path - there is no recursive delete, so
 removing a directory requires explicit descendant removals - and rename is `Remove` + upsert.
-Ordering never affects the result because `apply_to` (`core:784-823`) folds into a
+Ordering never affects the result because `crates/eggwork-core/src/lib.rs::WorkspaceManifestPatch::apply_to` folds into a
 `BTreeMap<String, WorkspaceEntry>`.
 
-`materialize_derived` (`workspace.rs:309-327`):
+`crates/eggwork-server/src/workspace.rs::WorkspaceManager::materialize_derived`:
 
 1. `patch.validate()` -> `InvalidPatch` (bounded by `MAX_WORKSPACE_ENTRIES`, unique paths).
 2. `lookup_manifest(principal_id, &patch.base_manifest_digest, blobs)` -> `BaseMissing` on
@@ -492,24 +489,23 @@ Ordering never affects the result because `apply_to` (`core:784-823`) folds into
 
 How content avoids re-transfer: the base manifest body lives in
 `retained_manifests(principal_id, manifest_digest, manifest_json, logical_bytes, created_unix_ms,
-expires_unix_ms)` (`workspace.rs:93-100`) and its blobs stay pinned under owner kind `"manifest"`
+expires_unix_ms)` (`crates/eggwork-server/src/workspace.rs::WorkspaceManager::open`) and its blobs stay pinned under owner kind `"manifest"`
 for the retention horizon. A derived request therefore carries only the patch plus digests for
 genuinely new files; unchanged files are already in the store and are never re-uploaded.
 
 Identity of the derived manifest is the canonical digest of the *final* manifest, so a full create
 and a derived create converge on the same `manifest_digest` and `ReadyWorkspace.logical_bytes`
-without sharing a directory (`workspace.rs:1310`, and over the wire `lib.rs:4249`).
+without sharing a directory (`crates/eggwork-server/src/workspace.rs::ReadyWorkspace`, and over the wire `crates/eggwork-server/src/lib.rs::workspace`).
 
-`store_manifest` (`workspace.rs:333-404`) re-validates the manifest and the digest format,
+`crates/eggwork-server/src/workspace.rs::WorkspaceManager::store_manifest` re-validates the manifest and the digest format,
 serializes the body, and upserts with **monotonic** expiry (`max(existing, now +
 DEFAULT_RETENTION_MILLIS)`), so re-registration extends retention and never shortens it.
-`lookup_manifest` (`workspace.rs:406-454`) treats a base as unusable - and reaps it - when the JSON
+`crates/eggwork-server/src/workspace.rs::WorkspaceManager::lookup_manifest` treats a base as unusable - and reaps it - when the JSON
 fails to parse, validation fails, or any referenced blob's stored size is missing or mismatched
-(`workspace.rs:444-449`); an expired base is reported as `None` without deletion. A base is never
+(`crates/eggwork-server/src/workspace.rs::WorkspaceManager::lookup_manifest`); an expired base is reported as `None` without deletion. A base is never
 served after its blobs are gone.
 
-`reconcile_manifests` (`workspace.rs:535-611`) and `recover_manifest_retention`
-(`workspace.rs:518-533`) run at startup: expired manifests are dropped with their references, and
+`crates/eggwork-server/src/workspace.rs::WorkspaceManager::reconcile_manifests` and `crates/eggwork-server/src/workspace.rs::WorkspaceManager::recover_manifest_retention` run at startup: expired manifests are dropped with their references, and
 any `"manifest"` owner id in `blob_references` with no matching `retained_manifests` row is released
 via `blobs.reference_owners("manifest", after, limit)`.
 
@@ -528,10 +524,10 @@ and is therefore treated as an orphan.
 ### Quota and limits
 
 `workspace_quota_bytes` (`OperatorConfig`) is passed to `WorkspaceManager::open`
-(`lib.rs:320-322`). The manifest-shape limits - `MAX_WORKSPACE_ENTRIES`, `MAX_WORKSPACE_PATH_BYTES`,
+(`crates/eggwork-server/src/lib.rs::NodeServer::start`). The manifest-shape limits - `MAX_WORKSPACE_ENTRIES`, `MAX_WORKSPACE_PATH_BYTES`,
 `MAX_WORKSPACE_DEPTH`, `MAX_WORKSPACE_LOGICAL_BYTES` - are enforced in core, not here; the only
-server-side per-entry size cap is `MAX_BLOB_BYTES` at `workspace.rs:189-191`.
-`MAX_WORKSPACE_REQUEST_BYTES = 4 MiB` (`lib.rs:54`) bounds the buffered derive body.
+server-side per-entry size cap is `MAX_BLOB_BYTES` at `crates/eggwork-server/src/workspace.rs::WorkspaceManager::materialize`.
+`crates/eggwork-server/src/lib.rs::MAX_WORKSPACE_REQUEST_BYTES` bounds the buffered derive body.
 
 Quota counts `state = 'Ready'` rows only, so a workspace whose record is terminal-but-not-yet-GCed
 stops counting toward the quota while still occupying disk. That is deliberate - the workspace is
@@ -542,33 +538,31 @@ filesystem walk) can exceed what the quota accounted for.
 
 ### `capture_declared`
 
-`capture_declared(store, blobs, root, outputs, execution_id, generation, principal, expires_unix_ms)`
-(`artifact.rs:225-323`) is called from the execution finalizer, never by the client. Eligibility is
+`crates/eggwork-server/src/artifact.rs::capture_declared` is called from the execution finalizer, never by the client. Eligibility is
 decided entirely by what the execution declared: `WorkspaceCapture { id, root, principal, outputs }`
-is built from `wire.spec.command.declared_outputs` (`lib.rs:1635-1640`), and capture runs only when
+is built from `wire.spec.command.declared_outputs` (`crates/eggwork-server/src/lib.rs::execute`), and capture runs only when
 `runner_completed && !outputs.is_empty() && state ∈ {Succeeded, Failed} && failure != OutputLimit`
-(`lib.rs:2445-2452`). A timed-out or cancelled execution captures nothing, and one killed for output
+(`crates/eggwork-server/src/lib.rs::run_execution`). A timed-out or cancelled execution captures nothing, and one killed for output
 limit is deliberately excluded.
 
-Flow: `discover_outputs` runs in `spawn_blocking` (`artifact.rs:419-469`) and first requires the
+Flow: `discover_outputs` runs in `spawn_blocking` (`crates/eggwork-server/src/artifact.rs::discover_outputs`) and first requires the
 execution root itself to be a directory and not a symlink. For each
-`DeclaredOutput { path: RelativePath, required: bool }`, `safe_metadata_under_root`
-(`artifact.rs:471-489`) walks the path component by component with `fs::symlink_metadata` and fails
+`DeclaredOutput { path: RelativePath, required: bool }`, `crates/eggwork-server/src/artifact.rs::safe_metadata_under_root` walks the path component by component with `fs::symlink_metadata` and fails
 on **any** symlink component or any non-directory parent; `NotFound` on a non-required output skips
-it, `NotFound` on a required one is `MissingRequired`. `visit_output` (`artifact.rs:491-547`) then
+it, `NotFound` on a required one is `MissingRequired`. `crates/eggwork-server/src/artifact.rs::visit_output` then
 recurses: a symlink is `UnsupportedType`, a non-file/non-dir is `UnsupportedType`, files are
 recorded with their executable bit, and child logical paths are derived by `strip_prefix(root)`,
 never by string concatenation from the declared path. Bounds are checked both during recursion
-(`files + directories > MAX_ARTIFACT_FILES`, `artifact.rs:539-541`) and after the loop
-(`artifact.rs:451-453`).
+(`files + directories > MAX_ARTIFACT_FILES`, `crates/eggwork-server/src/artifact.rs::visit_output`) and after the loop
+(`crates/eggwork-server/src/artifact.rs::discover_outputs`).
 
 A preflight `WorkspaceManifest` built from the discovered files (zero digest, zero size) plus the
 discovered directories is passed to `WorkspaceManifest::validate` -> `InvalidTree`
-(`artifact.rs:245-262`). This is the reuse-the-strict-validator trick: the discovered tree is held
+(`crates/eggwork-server/src/artifact.rs::capture_declared`). This is the reuse-the-strict-validator trick: the discovered tree is held
 to the same portable path rules as a workspace.
 
-Per file, `capture_blob` (`artifact.rs:325-377`) opens the file **descriptor-relatively** with
-`open_file_beneath` (`artifact.rs:379-410`, unix): `open(root, O_RDONLY|DIRECTORY|CLOEXEC|NOFOLLOW)`,
+Per file, `crates/eggwork-server/src/artifact.rs::capture_blob` opens the file **descriptor-relatively** with
+`crates/eggwork-server/src/artifact.rs::open_file_beneath`, unix): `open(root, O_RDONLY|DIRECTORY|CLOEXEC|NOFOLLOW)`,
 then `openat(..., O_NOFOLLOW)` per parent, then
 `openat(final, O_RDONLY|CLOEXEC|NOFOLLOW|NONBLOCK)`. It hashes while reading, enforcing both
 `MAX_BLOB_BYTES` and the remaining capture budget (`MAX_ARTIFACT_TOTAL_BYTES - total`) -> `Limit`,
@@ -580,15 +574,15 @@ silently replaced by a path-based open.
 
 The real `WorkspaceManifest` is then rebuilt with actual digests and validated again, and
 `blobs.retain_per_owner("artifact", …)` establishes every record's blob reference in **one**
-transaction **before** the rows become visible (`artifact.rs:311-322`), and only then does
+transaction **before** the rows become visible (`crates/eggwork-server/src/artifact.rs::capture_declared`), and only then does
 `store.insert_many` publish them. This used to call `retain` once per record; since `retain` opens
 and commits its own transaction under `PRAGMA synchronous=FULL`, that was up to `MAX_ARTIFACT_FILES`
 (4096) fsync-ing commits for a single execution. The ordering itself is unchanged and is the point:
 a crash here can retain extra bytes until expiry, never lose live data.
 
 **Where artifact metadata lives: the artifact store's own SQLite file, not the journal.**
-`ArtifactStore::open` (`artifact.rs:63-97`) opens `<database_path>.with_extension("artifacts.sqlite")`
-(`lib.rs:323`) with `WAL` and `synchronous=FULL`, creating the parent directory and the file with
+`crates/eggwork-server/src/artifact.rs::ArtifactStore::open` opens `<database_path>.with_extension("artifacts.sqlite")`
+(`crates/eggwork-server/src/lib.rs::NodeServer::start`) with `WAL` and `synchronous=FULL`, creating the parent directory and the file with
 mode 0600 on unix. The table is
 
 ```sql
@@ -599,13 +593,13 @@ artifacts(artifact_id TEXT PRIMARY KEY, execution_id TEXT NOT NULL, generation I
 ```
 
 plus `artifacts_owner ON artifacts(execution_id, generation, principal_id, created_unix_ms)`. The
-full `ArtifactRecord` (`core:957-968`) is stored as JSON in `record_json`; `artifact_id`,
+full `crates/eggwork-core/src/lib.rs::ArtifactRecord` is stored as JSON in `record_json`; `artifact_id`,
 `execution_id`, `generation`, `principal_id`, and both timestamps are also projected into columns
 for querying. The `UNIQUE` constraint makes re-inserting an identical record set a constraint error,
 so `insert_many` is not silently idempotent. The execution journal carries only the aggregate:
-`ExecutionResult.artifact_count` and `finalization_failure` (`lib.rs:2459-2474`).
+`ExecutionResult.artifact_count` and `finalization_failure` (`crates/eggwork-server/src/lib.rs::run_execution`).
 
-`ArtifactType` has exactly one variant, `File` (`core:970-974`). Directories are not artifacts;
+`ArtifactType` has exactly one variant, `File` (`crates/eggwork-core/src/lib.rs::ArtifactRecord`). Directories are not artifacts;
 they exist only as entries in the capture preflight manifest so the tree validates.
 
 ### The capture-failure contract and the platform claim
@@ -682,37 +676,34 @@ and they were not captured, and it keeps its own terminal state — which is not
 
 ### Retention
 
-`DEFAULT_RETENTION_MILLIS = 30 * 24 * 60 * 60 * 1000` = 30 days (`artifact.rs:22`). The store owns
+`DEFAULT_RETENTION_MILLIS = 30 * 24 * 60 * 60 * 1000` = 30 days (`crates/eggwork-server/src/artifact.rs::DEFAULT_RETENTION_MILLIS`). The store owns
 neither the clock nor the horizon: the caller computes
 `now_unix_ms().saturating_add(DEFAULT_RETENTION_MILLIS)` and passes `expires_unix_ms` in
-(`lib.rs:2454`, and again at `lib.rs:2478` for `mark_terminal`). `now_unix_ms` is exported
-(`artifact.rs:564`) precisely so all three modules share one clock.
+(`crates/eggwork-server/src/lib.rs::run_execution`, and again at `crates/eggwork-server/src/lib.rs::run_execution` for `mark_terminal`). `now_unix_ms` is exported
+(`crates/eggwork-server/src/artifact.rs::now_unix_ms`) precisely so all three modules share one clock.
 
-Past retention, an artifact is **invisible immediately and reclaimed later**. Both `list`
-(`artifact.rs:126-159`) and `get` (`artifact.rs:161-184`) filter `expires_unix_ms > now`, so an
+Past retention, an artifact is **invisible immediately and reclaimed later**. Both `crates/eggwork-server/src/artifact.rs::ArtifactStore::list` and `crates/eggwork-server/src/artifact.rs::ArtifactStore::get` filter `expires_unix_ms > now`, so an
 expired artifact cannot be listed or downloaded the moment it expires; the row and the bytes survive
-until a GC pass removes them. `artifact_list` (`lib.rs:1340`) is also principal-scoped and requires
+until a GC pass removes them. `crates/eggwork-server/src/lib.rs::artifact_list` is also principal-scoped and requires
 an explicit `generation` query parameter.
 
 The workspace side uses the same 30-day horizon: `materialize` sets the initial expiry, `mark_active`
-clears it to `NULL` (live, no expiry), `mark_terminal` sets it, and `recover_retention`
-(`workspace.rs:667-696`) re-arms every `NULL` workspace at `now + DEFAULT_RETENTION_MILLIS` during
+clears it to `NULL` (live, no expiry), `mark_terminal` sets it, and `crates/eggwork-server/src/workspace.rs::WorkspaceManager::recover_retention` re-arms every `NULL` workspace at `now + DEFAULT_RETENTION_MILLIS` during
 startup, so a crash mid-execution cannot leave a permanently live reference.
 
 ### Bounded cleanup
 
-`ArtifactStore::garbage_collect(now_unix_ms, limit, dry_run)` (`artifact.rs:186-223`) selects the
+`crates/eggwork-server/src/artifact.rs::ArtifactStore` selects the
 bounded candidate window through the module constant `ARTIFACT_CANDIDATES_SQL`
 (`SELECT artifact_id FROM artifacts WHERE expires_unix_ms <= ?1 ORDER BY expires_unix_ms LIMIT ?2`)
 and - when not a dry run - deletes exactly the rows that window named. The constant is the only
 place the artifact candidate predicate is written; `artifact::preview_gc` evaluates the same
 statement against a read-only connection.
-`ArtifactGcReport { candidate_artifacts, deleted_artifacts }` (`artifact.rs:54-57`), where
+`crates/eggwork-server/src/artifact.rs::ArtifactGcReport`, where
 `deleted_artifacts` is the bounded candidate count, not a measured row count.
 
 "Stop at limit" is the important semantic: **one pass never drains a backlog.** Both the artifact
-and blob collectors are `LIMIT`-bounded per invocation, and `NodeServer::collect_garbage`
-(`lib.rs:460-508`) calls each store exactly once with a clamped limit of `1..=1024`. A node with
+and blob collectors are `LIMIT`-bounded per invocation, and `crates/eggwork-server/src/lib.rs::NodeServer::collect_garbage` calls each store exactly once with a clamped limit of `1..=1024`. A node with
 50,000 expired artifacts needs repeated invocations - scheduled or operator-driven - to reclaim
 space. Expiry is therefore *prompt* (reads stop at expiry) but *reclamation* is eventual and
 interruptible, and disk usage between passes is bounded by nothing but the filesystem.
@@ -725,7 +716,7 @@ calling artifact GC before blob GC.
 
 ### Interaction with blob GC and the live `collect_garbage` path
 
-`NodeServer::collect_garbage(dry_run, requested_limit)` (`lib.rs:460-508`) is the single entry
+`crates/eggwork-server/src/lib.rs::NodeServer` is the single entry
 point. In order: workspace GC, retained-manifest GC, artifact GC, blob GC - all with the same `now`
 and the same `limit` - folded into `NodeGcReport`. For a dry run it reports
 `expired_blob_references` (the unbounded count); for a real run `expired_references_removed` (the
@@ -754,24 +745,25 @@ in-process path is not exposed as a remote route.
 
 | Constant | Value | Location | What it bounds |
 | --- | --- | --- | --- |
-| `MAX_BLOB_BYTES` | `256 * 1024 * 1024` (256 MiB) | `blob.rs:19` | One blob object: `prepare_upload`, `put_stream` (declared and streamed), per workspace entry, per artifact file |
-| `MAX_FIND_DIGESTS` | `512` | `blob.rs:20` | Digests per `find_missing` call (`TooManyDigests` -> 413) |
-| `DEFAULT_RETENTION_MILLIS` | `30 * 24 * 60 * 60 * 1000` (30 d) | `artifact.rs:22` | Workspace, retained-manifest, and artifact horizon; applied by the caller |
-| `MAX_ARTIFACT_FILES` | `4096` | `artifact.rs:23` | Files captured per execution (plus directories during recursion) |
-| `MAX_ARTIFACT_TOTAL_BYTES` | `2 * 1024 * 1024 * 1024` (2 GiB) | `artifact.rs:24` | Total bytes captured per execution; decremented per file |
-| `MAX_WORKSPACE_ENTRIES` | `4096` | `core:26` | Manifest entries and patch entries |
-| `MAX_WORKSPACE_PATH_BYTES` | `1024 * 1024` (1 MiB) | `core:27` | Sum of all path lengths in one manifest |
-| `MAX_WORKSPACE_DEPTH` | `128` | `core:28` | Path components in a manifest entry |
-| `MAX_WORKSPACE_LOGICAL_BYTES` | `2 * 1024 * 1024 * 1024` (2 GiB) | `core:29` | Sum of file `size_bytes` in one manifest |
-| `MAX_PATH_BYTES` | `4096` | `core:16` | One `RelativePath`, and one manifest path under the strict validator |
-| `MAX_OUTPUTS` | `128` | `core:20` | Declared outputs per command (I did not verify the enforcement site at submission) |
-| `MAX_CAPTURE_BYTES` | `16 * 1024 * 1024` (16 MiB) | `core:23` | **stdout/stderr** `OutputPolicy::capture_limit_bytes` only (`eggwork-runner/src/lib.rs:731,878`); it does **not** bound artifact size |
-| `MAX_BLOB_FIND_REQUEST_BYTES` | `64 * 1024` (64 KiB) | `lib.rs:53` | Buffered `/v1/blobs/missing` and `/v1/blobs/prepare` bodies |
-| `MAX_WORKSPACE_REQUEST_BYTES` | `4 * 1024 * 1024` (4 MiB) | `lib.rs:54` | Buffered `/v1/workspaces` and `/v1/workspaces/derive` bodies |
-| GC limit | `clamp(1, 1024)` | `lib.rs:464` | Per-invocation work for every collector in `collect_garbage` |
-| Reader lease | `30 * 60 * 1000` (30 min) | `lib.rs:1416`, `lib.rs:1383` | `"reader"` reference expiry, re-armed on each streamed chunk |
-| Reconcile sweep | `1024` | `lib.rs:345` | `reconcile_manifests` orphan-reference limit |
-| `blob_quota_bytes`, `workspace_quota_bytes` | operator-configured | `OperatorConfig` | Per-tree byte budgets, reported by `storage_summary` (`operations.rs:770-781`) |
+| `MAX_BLOB_BYTES` | `256 * 1024 * 1024` (256 MiB) | `crates/eggwork-server/src/blob.rs::MAX_BLOB_BYTES` | One blob object: `prepare_upload`, `put_stream` (declared and streamed), per workspace entry, per artifact file |
+| `MAX_FIND_DIGESTS` | `512` | `crates/eggwork-server/src/blob.rs::MAX_FIND_DIGESTS` | Digests per `find_missing` call (`TooManyDigests` -> 413) |
+| `DEFAULT_RETENTION_MILLIS` | `30 * 24 * 60 * 60 * 1000` (30 d) | `crates/eggwork-server/src/artifact.rs::DEFAULT_RETENTION_MILLIS` | Workspace, retained-manifest, and artifact horizon; applied by the caller |
+| `MAX_ARTIFACT_FILES` | `4096` | `crates/eggwork-server/src/artifact.rs::MAX_ARTIFACT_FILES` | Files captured per execution (plus directories during recursion) |
+| `MAX_ARTIFACT_TOTAL_BYTES` | `2 * 1024 * 1024 * 1024` (2 GiB) | `crates/eggwork-server/src/artifact.rs::MAX_ARTIFACT_TOTAL_BYTES` | Total bytes captured per execution; decremented per file |
+| `MAX_WORKSPACE_ENTRIES` | `4096` | `crates/eggwork-core/src/lib.rs::MAX_WORKSPACE_ENTRIES` | Manifest entries and patch entries |
+| `MAX_WORKSPACE_PATH_BYTES` | `1024 * 1024` (1 MiB) | `crates/eggwork-core/src/lib.rs::MAX_WORKSPACE_PATH_BYTES` | Sum of all path lengths in one manifest |
+| `MAX_WORKSPACE_DEPTH` | `128` | `crates/eggwork-core/src/lib.rs::MAX_WORKSPACE_DEPTH` | Path components in a manifest entry |
+| `MAX_WORKSPACE_LOGICAL_BYTES` | `2 * 1024 * 1024 * 1024` (2 GiB) | `crates/eggwork-core/src/lib.rs::MAX_WORKSPACE_LOGICAL_BYTES` | Sum of file `size_bytes` in one manifest |
+| `MAX_PATH_BYTES` | `4096` | `crates/eggwork-core/src/lib.rs::MAX_PATH_BYTES` | One `RelativePath`, and one manifest path under the strict validator |
+| `MAX_OUTPUTS` | `128` | `crates/eggwork-core/src/lib.rs::MAX_OUTPUTS` | Declared outputs per command (I did not verify the enforcement site at submission) |
+| `MAX_CAPTURE_BYTES` | `16 * 1024 * 1024` (16 MiB) | `crates/eggwork-core/src/lib.rs::MAX_CAPTURE_BYTES` | **stdout/stderr** `OutputPolicy::capture_limit_bytes` only (`crates/eggwork-runner/src/lib.rs::RunnerRequest::from_spec`,
+`crates/eggwork-runner/src/lib.rs::RunnerRequest::validate`); it does **not** bound artifact size |
+| `MAX_BLOB_FIND_REQUEST_BYTES` | `64 * 1024` (64 KiB) | `crates/eggwork-server/src/lib.rs::MAX_BLOB_FIND_REQUEST_BYTES` | Buffered `/v1/blobs/missing` and `/v1/blobs/prepare` bodies |
+| `MAX_WORKSPACE_REQUEST_BYTES` | `4 * 1024 * 1024` (4 MiB) | `crates/eggwork-server/src/lib.rs::MAX_WORKSPACE_REQUEST_BYTES` | Buffered `/v1/workspaces` and `/v1/workspaces/derive` bodies |
+| GC limit | `clamp(1, 1024)` | `crates/eggwork-server/src/lib.rs::NodeServer::collect_garbage` | Per-invocation work for every collector in `collect_garbage` |
+| Reader lease | `30 * 60 * 1000` (30 min) | `crates/eggwork-server/src/lib.rs::artifact_download`, `crates/eggwork-server/src/lib.rs::BlobReferenceLease::renew` | `"reader"` reference expiry, re-armed on each streamed chunk |
+| Reconcile sweep | `1024` | `crates/eggwork-server/src/lib.rs::NodeServer::start` | `reconcile_manifests` orphan-reference limit |
+| `blob_quota_bytes`, `workspace_quota_bytes` | operator-configured | `OperatorConfig` | Per-tree byte budgets, reported by `crates/eggwork-server/src/operations.rs::storage_summary` |
 
 Not verified: the default or source of `blob_quota_bytes` / `workspace_quota_bytes`; the
 enforcement site for `MAX_OUTPUTS`; and any cap on retained-manifest row count (that table is
@@ -780,26 +772,26 @@ bounded only by time via `expires_unix_ms`).
 ## Disk layout and lifecycle
 
 ```
-<blob_root>/                     0700   BlobStore::open (blob.rs:71-121)
+<blob_root>/                     0700   BlobStore::open (crates/eggwork-server/src/blob.rs::BlobStore::open)
   metadata.sqlite, -wal, -shm
   quarantine/
   .part-<uuid>/                  transient
   <xx>/<digest>                  objects
 
-<workspace_root>/                0700   WorkspaceManager::open (workspace.rs:69-129)
+<workspace_root>/                0700   WorkspaceManager::open (crates/eggwork-server/src/workspace.rs::WorkspaceManager::open)
   metadata.sqlite, -wal, -shm
   .staging-<uuid>/               transient
   workspace-<uuid>/              execution-private trees
 
 <execution_root>/                         runner root for workspace-less executions
-<database_path>.artifacts.sqlite  0600   ArtifactStore::open (artifact.rs:63-97)
+<database_path>.artifacts.sqlite  0600   ArtifactStore::open (crates/eggwork-server/src/artifact.rs::ArtifactStore::open)
 ```
 
 Creation: `BlobStore::open` and `WorkspaceManager::open` create their roots (0700 on unix) and
 metadata databases; `ArtifactStore::open` creates only the database's parent and file. Shard
-directories are created lazily by `put_stream` (`blob.rs:425-426`); workspace directories appear via
+directories are created lazily by `crates/eggwork-server/src/blob.rs::BlobStore::put_stream`; workspace directories appear via
 the rename from staging. A materialized workspace tree *is* the execution root for a workspace-bound
-execution (`lib.rs:1617-1643`), and `capture_declared` reads outputs back out of that same tree; the
+execution (`crates/eggwork-server/src/lib.rs::blob`), and `capture_declared` reads outputs back out of that same tree; the
 blob store is the shared backing for both directions.
 
 **After an execution:** the tree remains under `workspace-<uuid>` with its record still
@@ -810,12 +802,10 @@ blobs are present. Nothing is deleted synchronously.
 rows, blob GC removes expired references and then unreferenced blobs. Because each pass is
 `LIMIT`-bounded, GC is incremental and the footprint right after GC is whatever backlog remains.
 
-**After a crash:** each store reconciles at open, in this order in `NodeServer::start`
-(`lib.rs:318-346`). `BlobStore::open` -> `remove_stale_parts` deletes `.part-` files, drops index rows
+**After a crash:** each store reconciles at open, in this order in `crates/eggwork-server/src/lib.rs::NodeServer::start`. `BlobStore::open` -> `remove_stale_parts` deletes `.part-` files, drops index rows
 whose file is missing or whose digest no longer parses, and deletes shard files that are not indexed;
-the comment at `blob.rs:573-574` names both crash windows (rename-then-metadata-commit and
-metadata-commit-then-external-file-loss). `WorkspaceManager::open` -> `reconcile`
-(`workspace.rs:821-863`) drops rows with an invalid `storage_key`, `remove_dir_all`s any
+the comment at `crates/eggwork-server/src/blob.rs::BlobStore::remove_stale_parts` names both crash windows (rename-then-metadata-commit and
+metadata-commit-then-external-file-loss). `WorkspaceManager::open` -> `crates/eggwork-server/src/workspace.rs::WorkspaceManager::reconcile` drops rows with an invalid `storage_key`, `remove_dir_all`s any
 `.staging-*` directory and any directory not in the known storage-key set, and drops rows whose
 directory is gone - so a half-written staging tree is always removed. Then
 `recover_retention` / `recover_manifest_retention` re-arm every `NULL` expiry at the 30-day horizon
@@ -824,12 +814,12 @@ so a crash cannot pin a blob forever, and `reconcile_manifests(&blobs, now, 1024
 
 What is left behind: quarantined blobs (never GC'd), workspaces still inside their 30-day window,
 expired artifacts not yet swept, and unreferenced blobs below the GC threshold. Node startup takes a
-lock file (`<database_path>.lock`, `acquire_state_lock`, `lib.rs:540`) so two processes cannot
+lock file (`<database_path>.lock`, `acquire_state_lock`, `crates/eggwork-server/src/lib.rs::acquire_state_lock`) so two processes cannot
 reconcile the same roots concurrently.
 
 ## Error model
 
-`BlobError` (`blob.rs:33-55`) -> HTTP via `blob_error_response` (`lib.rs:1463-1486`):
+`crates/eggwork-server/src/blob.rs::BlobError` -> HTTP via `crates/eggwork-server/src/lib.rs::blob_error_response`:
 
 | Variant | Status | Retryable | Meaning |
 | --- | --- | --- | --- |
@@ -842,8 +832,8 @@ reconcile the same roots concurrently.
 | `TooManyDigests` | 413 `too_many_digests` | no | Batch over `MAX_FIND_DIGESTS` |
 | `Io`, `Metadata`, `Body`, `Worker` | 500 `storage_error` | depends | Filesystem, SQLite, stream, or lock failure |
 
-`WorkspaceError` (`workspace.rs:20-46`) -> HTTP via the two handler arms (`lib.rs:1083-1103`,
-`lib.rs:1207-1247`):
+`crates/eggwork-server/src/workspace.rs::WorkspaceError` -> HTTP via the two handler arms (`crates/eggwork-server/src/lib.rs::workspace`,
+`crates/eggwork-server/src/lib.rs::workspace_derive`):
 
 | Variant | Status | Retryable | Meaning |
 | --- | --- | --- | --- |
@@ -857,22 +847,22 @@ reconcile the same roots concurrently.
 | `NotFound` | 409 `workspace_not_ready` | no | Absent, wrong owner/generation/principal, expired, or bad storage key |
 | `Metadata`, `Blob`, `Io`, `Json`, `Worker` | 500 `workspace_error` | depends | Infrastructure |
 
-`ArtifactError` (`artifact.rs:27-46`) has no dedicated HTTP mapping; callers collapse it.
+`crates/eggwork-server/src/artifact.rs::ArtifactError` has no dedicated HTTP mapping; callers collapse it.
 `MissingRequired` (required output absent), `UnsupportedType` (symlink, device node, or other
 non-file in the tree), `Limit` (`MAX_ARTIFACT_FILES` or the capture byte budget), `InvalidTree` (the
 discovered tree failed manifest validation, or an `ArtifactId` could not be built), plus `Io`,
 `Blob`, `Sql`, `Json`, `Worker`. `capture_declared` has no partial-success result: any variant aborts
 the whole capture and the caller records `ExecutionFinalizationFailure::ArtifactCapture` while
-leaving the execution's own exit state intact (`lib.rs:2459-2474`).
+leaving the execution's own exit state intact (`crates/eggwork-server/src/lib.rs::run_execution`).
 
 How a caller distinguishes the three cases:
 
 - **Not found** - `BlobError::NotFound`; `WorkspaceError::NotFound`; for artifacts,
   `ArtifactError::MissingRequired` from `get` or an empty `list`.
-- **Denied** - *not* an error type here. Authorization is decided in `lib.rs`
+- **Denied** - *not* an error type here. Authorization is decided in `crates/eggwork-server/src/lib.rs`
   (`authorize_resource` -> 403 `forbidden`), and the stores fence by principal *silently*:
   `artifact_list`/`artifact_download` filter on `principal_id`, and `resolve` returns `NotFound` for
-  another principal's workspace rather than revealing that it exists (`workspace.rs:1378`). Denied
+  another principal's workspace rather than revealing that it exists (`crates/eggwork-server/src/workspace.rs::tests::cross_principal_lookup_behaves_as_missing_with_no_side_effect`). Denied
   is therefore indistinguishable from absent, by design.
 - **Corrupt** - `BlobError::CorruptExisting` (quarantined), `BlobError::DigestMismatch` (inbound
   body), `WorkspaceError::InvalidBlob` (a manifest references a blob that fails re-verification),
@@ -882,42 +872,42 @@ How a caller distinguishes the three cases:
 
 | Invariant | Enforcement site | Test |
 | --- | --- | --- |
-| A digest names one immutable byte string | `blob.rs:408-410` (existing target -> verify) | `interrupted_upload_is_cleaned_and_duplicate_writers_deduplicate` (`blob.rs:720`) |
-| Digest format is 64 lowercase hex; no traversal | `BlobDigest::parse` (`core:146`), `blob.rs:123-128` | `empty_blob_and_digest_path_are_canonical` (`blob.rs:665`) |
-| Committed bytes hash to their name (ingest) | `blob.rs:451-453` | `invalid_uploads_leave_no_readable_blob_or_partial_file` (`blob.rs:685`) |
-| Committed bytes still hash to their name (read) | `blob.rs:495-550` | `quota_corruption_and_startup_cleanup_are_deterministic` (`blob.rs:765`) |
-| No partial upload is observable | `.part-<uuid>` at root; cleanup `blob.rs:557-613` | `blob.rs:685`, `blob.rs:765` |
-| Index and filesystem agree after a crash | `blob.rs:557-613`, `workspace.rs:821-863` | `workspace.rs:1497`, `artifact.rs:856` |
-| Blob bytes stay within `MAX_BLOB_BYTES` | `blob.rs:403-405`, `blob.rs:442-444` | `blob.rs:765` (`TooLarge` at `MAX_BLOB_BYTES + 1`) |
-| Blob store stays within `blob_quota_bytes` | `blob.rs:411-422` (advisory: `blob.rs:165-178`) | `blob.rs:765`; `lib.rs:3399` |
-| A live reference blocks GC | `blob.rs:318-324` (`NOT EXISTS` on `blob_references`) | `artifact.rs:804` |
-| An in-flight download holds a reference | `lib.rs:1409-1426` + `Drop` at `lib.rs:1388` | none dedicated; indirectly `lib.rs:3399` |
-| Every manifest entry is a validated portable path | `core:622` called at `workspace.rs:141-143` | `hostile_workspace_manifests_are_rejected_without_side_effect` (`lib.rs:6008`) |
-| Absolute paths, `..`, `\`, depth, reserved names rejected | `core:828-878` | `lib.rs:6008`; `workspace.rs:1002` |
-| No symlink is ever materialized | `core:667-671`; `workspace.rs:926` | `missing_blobs_and_invalid_symlinks_never_create_ready_workspaces` (`workspace.rs:1088`) |
-| A rejected manifest creates no visible state | pre-flight before any `create_dir` (`workspace.rs:184-201`) | `lib.rs:6008`; `workspace.rs:1088` |
-| A file's parent must be a declared directory | `core:673-689` | `lib.rs:6008` |
-| The workspace tree is invisible until complete | staging + rename (`workspace.rs:230-292`) | `concurrent_materialization_is_idempotent_and_recovery_cleans_unready_state` (`workspace.rs:1145`) |
-| Only `workspace-<uuid>` directories are roots | `valid_storage_key` (`workspace.rs:877`) in `materialize`/`resolve`/`mark_active`/GC | `workspace.rs:1002`; `workspace.rs:1430` |
-| Only the owning principal may resolve | `workspace.rs:759-771`, `lookup_manifest` scoping | `cross_principal_lookup_behaves_as_missing_with_no_side_effect` (`workspace.rs:1378`) |
-| Workspace bytes stay within `workspace_quota_bytes` | `workspace.rs:143-145`, `workspace.rs:171-181` | `workspace_quota_is_checked_before_materialization` (`workspace.rs:1194`) |
-| A live workspace's blobs are never collected | `mark_active` -> `expires NULL` (`workspace.rs:631-660`) | `terminal_retention_gc_preserves_live_workspace_then_reclaims_inputs` (`workspace.rs:1223`) |
-| Materialized bytes equal `size_bytes` | `workspace.rs:919-921` | `workspace.rs:1002` |
-| A derived create equals the equivalent full create | `core:784` + shared `digest` (`core:702`) | `workspace.rs:1310`; `derived_workspace_materialization_loopback` (`lib.rs:4249`) |
-| Only declared outputs are captured | `lib.rs:2445-2452`; `discover_outputs` (`artifact.rs:419`) | `captures_only_declared_files_and_streams_verified_content` (`artifact.rs:577`) |
-| Artifact capture cannot follow a symlink | `open_file_beneath` `NOFOLLOW` chain (`artifact.rs:379-410`) | `descriptor_relative_capture_rejects_parent_swapped_to_symlink` (`artifact.rs:884`); `artifact.rs:663` |
-| A symlinked output is refused, not copied | `artifact.rs:499-501`, `artifact.rs:471-489` | `missing_required_and_symlink_outputs_fail_without_records` (`artifact.rs:663`) |
-| Capture stays within `MAX_ARTIFACT_FILES` / `_TOTAL_BYTES` | `artifact.rs:539-541`, `artifact.rs:451-453`, `artifact.rs:352-355` | `artifact.rs:577`; `disappearing_output_and_storage_quota_fail_without_publishing_records` (`artifact.rs:753`) |
-| Expired artifacts are invisible, then deleted | `artifact.rs:132`, `artifact.rs:168`, `artifact.rs:186-223` | `artifact.rs:804`; `lib.rs:3399` |
-| Capture is all-or-nothing w.r.t. records | retain before insert (`artifact.rs:311-322`) | `artifact.rs:753` |
-| A declared output that was not captured is never a success | `decide_artifact_capture` (server crate root) | `a_declared_output_that_was_not_captured_never_reports_success` (`tests/artifact_capture_disposition.rs`); `a_declared_output_that_was_not_captured_never_reports_success` (server unit test) |
+| A digest names one immutable byte string | `crates/eggwork-server/src/blob.rs::BlobStore::put_stream` (existing target -> verify) | `crates/eggwork-server/src/blob.rs::tests::interrupted_upload_is_cleaned_and_duplicate_writers_deduplicate` |
+| Digest format is 64 lowercase hex; no traversal | `crates/eggwork-core/src/lib.rs::BlobDigest::parse`, `crates/eggwork-server/src/blob.rs::BlobStore::path_for` | `crates/eggwork-server/src/blob.rs::tests::empty_blob_and_digest_path_are_canonical` |
+| Committed bytes hash to their name (ingest) | `crates/eggwork-server/src/blob.rs::BlobStore::put_stream` | `crates/eggwork-server/src/blob.rs::tests::invalid_uploads_leave_no_readable_blob_or_partial_file` |
+| Committed bytes still hash to their name (read) | `crates/eggwork-server/src/blob.rs::BlobStore::verify_existing` | `crates/eggwork-server/src/blob.rs::tests::quota_corruption_and_startup_cleanup_are_deterministic` |
+| No partial upload is observable | `.part-<uuid>` at root; cleanup `crates/eggwork-server/src/blob.rs::BlobStore::remove_stale_parts` | `crates/eggwork-server/src/blob.rs::tests::invalid_uploads_leave_no_readable_blob_or_partial_file`, `crates/eggwork-server/src/blob.rs::tests::quota_corruption_and_startup_cleanup_are_deterministic` |
+| Index and filesystem agree after a crash | `crates/eggwork-server/src/blob.rs::BlobStore::remove_stale_parts`, `crates/eggwork-server/src/workspace.rs::WorkspaceManager::reconcile` | `crates/eggwork-server/src/workspace.rs::tests::manifest_missing_blob_is_reaped_and_crash_reopen_reconciles_bounds`, `crates/eggwork-server/src/artifact.rs::tests::startup_reconciles_a_crash_after_blob_unlink_during_gc` |
+| Blob bytes stay within `MAX_BLOB_BYTES` | `crates/eggwork-server/src/blob.rs::MAX_BLOB_BYTES`, `crates/eggwork-server/src/blob.rs::BlobStore::put_stream` | `crates/eggwork-server/src/blob.rs::tests::quota_corruption_and_startup_cleanup_are_deterministic` (`TooLarge` at `MAX_BLOB_BYTES + 1`) |
+| Blob store stays within `blob_quota_bytes` | `crates/eggwork-server/src/blob.rs::BlobStore::put_stream` (advisory: `crates/eggwork-server/src/blob.rs::BlobStore::prepare_upload`) | `crates/eggwork-server/src/blob.rs::tests::quota_corruption_and_startup_cleanup_are_deterministic`; `crates/eggwork-server/src/lib.rs::blob` |
+| A live reference blocks GC | `crates/eggwork-server/src/blob.rs::BlobStore::garbage_collect` (`NOT EXISTS` on `blob_references`) | `crates/eggwork-server/src/artifact.rs::tests::retention_refs_protect_shared_blobs_and_gc_is_bounded_and_restart_safe` |
+| An in-flight download holds a reference | `crates/eggwork-server/src/lib.rs::artifact` + `Drop` at `crates/eggwork-server/src/lib.rs::BlobReferenceLease::renew` | none dedicated; indirectly `crates/eggwork-server/src/lib.rs::tests::blob_protocol_streams_verifies_deduplicates_and_enforces_quota` |
+| Every manifest entry is a validated portable path | `crates/eggwork-core/src/lib.rs::WorkspacePatchEntry::path` called at `crates/eggwork-server/src/workspace.rs::WorkspaceManager::materialize` | `crates/eggwork-server/src/lib.rs::tests::hostile_workspace_manifests_are_rejected_without_side_effect` |
+| Absolute paths, `..`, `\`, depth, reserved names rejected | `crates/eggwork-core/src/lib.rs::validate_portable_workspace_path` | `crates/eggwork-server/src/lib.rs::tests::hostile_workspace_manifests_are_rejected_without_side_effect`; `crates/eggwork-server/src/workspace.rs::tests::materializes_exact_tree_with_owner_permissions_and_fenced_resolution` |
+| No symlink is ever materialized | `crates/eggwork-core/src/lib.rs::WorkspacePatchEntry::path`; `crates/eggwork-server/src/workspace.rs::materialize_tree` | `crates/eggwork-server/src/workspace.rs::tests::missing_blobs_and_invalid_symlinks_never_create_ready_workspaces` |
+| A rejected manifest creates no visible state | pre-flight before any `create_dir` (`crates/eggwork-server/src/workspace.rs::WorkspaceManager::materialize`) | `crates/eggwork-server/src/lib.rs::workspace`; `crates/eggwork-server/src/workspace.rs::tests::missing_blobs_and_invalid_symlinks_never_create_ready_workspaces` |
+| A file's parent must be a declared directory | `crates/eggwork-core/src/lib.rs::WorkspacePatchEntry::path` | `crates/eggwork-server/src/lib.rs::tests::hostile_workspace_manifests_are_rejected_without_side_effect` |
+| The workspace tree is invisible until complete | staging + rename (`crates/eggwork-server/src/workspace.rs::WorkspaceManager::materialize`) | `crates/eggwork-server/src/workspace.rs::tests::concurrent_materialization_is_idempotent_and_recovery_cleans_unready_state` |
+| Only `workspace-<uuid>` directories are roots | `crates/eggwork-server/src/workspace.rs::valid_storage_key` in `materialize`/`resolve`/`mark_active`/GC | `crates/eggwork-server/src/workspace.rs::WorkspaceManager::mark_active`; `crates/eggwork-server/src/workspace.rs::tests::expired_base_behaves_as_missing_and_gc_releases_pinned_blobs` |
+| Only the owning principal may resolve | `crates/eggwork-server/src/workspace.rs::WorkspaceManager::resolve`, `lookup_manifest` scoping | `crates/eggwork-server/src/workspace.rs::tests::cross_principal_lookup_behaves_as_missing_with_no_side_effect` |
+| Workspace bytes stay within `workspace_quota_bytes` | `crates/eggwork-server/src/workspace.rs::WorkspaceManager::materialize`, `crates/eggwork-server/src/workspace.rs::WorkspaceManager::materialize` | `crates/eggwork-server/src/workspace.rs::tests::workspace_quota_is_checked_before_materialization` |
+| A live workspace's blobs are never collected | `mark_active` -> `expires NULL` (`crates/eggwork-server/src/workspace.rs::WorkspaceManager::mark_active`) | `crates/eggwork-server/src/workspace.rs::tests::terminal_retention_gc_preserves_live_workspace_then_reclaims_inputs` |
+| Materialized bytes equal `size_bytes` | `crates/eggwork-server/src/workspace.rs::materialize_tree` | `crates/eggwork-server/src/workspace.rs::tests::materializes_exact_tree_with_owner_permissions_and_fenced_resolution` |
+| A derived create equals the equivalent full create | `crates/eggwork-core/src/lib.rs::WorkspaceManifestPatch::apply_to` + shared `crates/eggwork-core/src/lib.rs::WorkspaceManifest::digest` | `crates/eggwork-server/src/workspace.rs::tests::full_create_registers_base_and_same_principal_derived_hit_matches_full_digest`; `crates/eggwork-server/src/lib.rs::tests::derived_workspace_materialization_loopback` |
+| Only declared outputs are captured | `crates/eggwork-server/src/lib.rs::run_execution`; `crates/eggwork-server/src/artifact.rs::discover_outputs` | `crates/eggwork-server/src/artifact.rs::tests::captures_only_declared_files_and_streams_verified_content` |
+| Artifact capture cannot follow a symlink | `open_file_beneath` `NOFOLLOW` chain (`crates/eggwork-server/src/artifact.rs::capture_blob`) | `crates/eggwork-server/src/artifact.rs::tests::descriptor_relative_capture_rejects_parent_swapped_to_symlink`; `crates/eggwork-server/src/artifact.rs::tests::missing_required_and_symlink_outputs_fail_without_records` |
+| A symlinked output is refused, not copied | `crates/eggwork-server/src/artifact.rs::visit_output`, `crates/eggwork-server/src/artifact.rs::safe_metadata_under_root` | `crates/eggwork-server/src/artifact.rs::tests::missing_required_and_symlink_outputs_fail_without_records` |
+| Capture stays within `MAX_ARTIFACT_FILES` / `_TOTAL_BYTES` | `crates/eggwork-server/src/artifact.rs::visit_output`, `crates/eggwork-server/src/artifact.rs::discover_outputs`, `crates/eggwork-server/src/artifact.rs::capture_blob` | `crates/eggwork-server/src/artifact.rs::tests::captures_only_declared_files_and_streams_verified_content`; `crates/eggwork-server/src/artifact.rs::tests::disappearing_output_and_storage_quota_fail_without_publishing_records` |
+| Expired artifacts are invisible, then deleted | `crates/eggwork-server/src/artifact.rs::ArtifactStore::list`, `crates/eggwork-server/src/artifact.rs::ArtifactStore::get`, `crates/eggwork-server/src/artifact.rs::ArtifactStore::garbage_collect` | `crates/eggwork-server/src/artifact.rs::tests::retention_refs_protect_shared_blobs_and_gc_is_bounded_and_restart_safe`; `crates/eggwork-server/src/lib.rs::artifact` |
+| Capture is all-or-nothing w.r.t. records | retain before insert (`crates/eggwork-server/src/artifact.rs::capture_declared`) | `crates/eggwork-server/src/artifact.rs::tests::disappearing_output_and_storage_quota_fail_without_publishing_records` |
+| A declared output that was not captured is never a success | `decide_artifact_capture` (server crate root) | `a_declared_output_that_was_not_captured_never_reports_success` (`crates/eggwork-server/tests/artifact_capture_disposition.rs`); `a_declared_output_that_was_not_captured_never_reports_success` (server unit test) |
 | The declared-artifact capability follows the platform's capture fact | `server_capability_features`; `artifact::capture_capability` | `the_declared_artifact_capability_is_advertised_only_when_the_platform_can_capture` (server unit test) |
 | The capture disposition is on the terminal result, not inferred | `ExecutionResult.artifact_capture` (`eggwork_core`) | `a_snapshot_without_the_capture_disposition_decodes_as_unknown` (core unit test) |
-| Retention cannot stay pinned after a crash | `workspace.rs:667-696`, `workspace.rs:518-533` | `workspace.rs:1430`; `workspace.rs:1497` |
-| The GC preview and the GC apply select the same candidates | `UNREFERENCED_CANDIDATES_SQL` / `WORKSPACE_CANDIDATES_SQL` / `MANIFEST_CANDIDATES_SQL` / `ARTIFACT_CANDIDATES_SQL` in the owner modules; the operator holds no candidate predicate | `gc_preview_uses_the_stores_own_blob_predicate_not_the_reference_count_counter` (`operations.rs`); `gc_preview_candidates_are_a_subset_of_what_the_apply_pass_removes`; `gc_preview_and_apply_agree_when_the_store_has_no_expired_references`; `the_operator_module_contains_no_candidate_predicate_of_its_own` (`tests/gc_preview_parity.rs`) |
+| Retention cannot stay pinned after a crash | `crates/eggwork-server/src/workspace.rs::WorkspaceManager::recover_retention`, `crates/eggwork-server/src/workspace.rs::WorkspaceManager::recover_manifest_retention` | `crates/eggwork-server/src/workspace.rs::tests::expired_base_behaves_as_missing_and_gc_releases_pinned_blobs`; `crates/eggwork-server/src/workspace.rs::tests::manifest_missing_blob_is_reaped_and_crash_reopen_reconciles_bounds` |
+| The GC preview and the GC apply select the same candidates | `UNREFERENCED_CANDIDATES_SQL` / `WORKSPACE_CANDIDATES_SQL` / `MANIFEST_CANDIDATES_SQL` / `ARTIFACT_CANDIDATES_SQL` in the owner modules; the operator holds no candidate predicate | `gc_preview_uses_the_stores_own_blob_predicate_not_the_reference_count_counter` (`operations.rs`); `gc_preview_candidates_are_a_subset_of_what_the_apply_pass_removes`; `gc_preview_and_apply_agree_when_the_store_has_no_expired_references`; `the_operator_module_contains_no_candidate_predicate_of_its_own` (`crates/eggwork-server/tests/gc_preview_parity.rs`) |
 | A candidate is selected on the reference rows, not on the counter | `UNREFERENCED_CANDIDATES_SQL` (`NOT EXISTS (SELECT 1 FROM blob_references ...)`) | `gc_preview_uses_the_stores_own_blob_predicate_not_the_reference_count_counter` (`operations.rs`) |
 | The GC preview does not create or reconcile a store | `blob::preview_gc` / `workspace::preview_gc` / `artifact::preview_gc` open the metadata database `SQLITE_OPEN_READ_ONLY`; the owner `open` functions create and reconcile | `gc_preview_does_not_create_a_store_that_does_not_exist` (`operations.rs`) |
-| The store's metadata file name and the blob layout are written once | `blob::metadata_path`, `workspace::metadata_path`, `artifact::metadata_path`, `blob::shard_path`, `blob::object_path` | `the_operator_module_contains_no_candidate_predicate_of_its_own` (`tests/gc_preview_parity.rs`); `inspect_blob_resolves_the_object_through_the_store_path_ownership` (`operations.rs`) |
+| The store's metadata file name and the blob layout are written once | `blob::metadata_path`, `workspace::metadata_path`, `artifact::metadata_path`, `blob::shard_path`, `blob::object_path` | `the_operator_module_contains_no_candidate_predicate_of_its_own` (`crates/eggwork-server/tests/gc_preview_parity.rs`); `inspect_blob_resolves_the_object_through_the_store_path_ownership` (`operations.rs`) |
 | The manifest owner id has one producer | `manifest_owner_id_for_key` / `manifest_owner_id` (`workspace.rs`) | `manifest_owner_id_has_one_producer_for_validated_and_string_principals` (`workspace.rs`); `manifest_gc_releases_the_reference_for_an_unparseable_stored_principal` (`workspace.rs`) |
 | Materialized bytes match the manifest digest, not just its length | `BlobStore::copy_verified` (hash over the copied stream) | `materialize_tree_refuses_blob_bytes_that_do_not_match_the_manifest_digest` (`workspace.rs`) |
 
@@ -981,7 +971,7 @@ store and asserts a recorded size that disagrees with the file's actual length i
 `inspect_blob_refuses_a_symlinked_shard_or_object` (unix) asserts a symlinked shard directory and a
 symlinked object file are both refused.
 
-**`tests/gc_preview_parity.rs` (3 tests).** A structural guard that keeps the two paths from
+**`crates/eggwork-server/tests/gc_preview_parity.rs` (3 tests).** A structural guard that keeps the two paths from
 drifting apart again: the operator module's production code must not spell a reclamation predicate,
 the candidate ordering, a store metadata file name or the shard layout, and the operator's preview
 function must contain no SQL and open no store. The guard is precise - it does not forbid SQL in
@@ -996,7 +986,7 @@ protecting shared blobs with bounded, restart-safe GC (804); startup reconciling
 unlink during GC (856); and the unix-only
 `descriptor_relative_capture_rejects_parent_swapped_to_symlink` (884).
 
-**Server integration (`lib.rs`).**
+**Server integration (`crates/eggwork-server/src/lib.rs`).**
 `blob_protocol_streams_verifies_deduplicates_and_enforces_quota` (3399) is the broad one: a 2 MiB
 blob uploads and downloads, `find_missing` becomes empty, a **same-digest upload is a verified
 no-op even when the quota is full**, a second blob hits 507, a wrong digest hits 422; then it
@@ -1020,7 +1010,7 @@ runner's confinement to the materialized root.
 - No test exercises the non-unix branches: `open_file_beneath` returning `ErrorKind::Unsupported`,
   the `#[cfg(not(unix))]` permission helpers, or the `sync_directory` no-op. The *decision* that a
   platform which cannot capture must refuse a declared output is now covered portably
-  (`tests/artifact_capture_disposition.rs`), but the non-unix capture code itself is still
+  (`crates/eggwork-server/tests/artifact_capture_disposition.rs`), but the non-unix capture code itself is still
   unexecuted, and the Windows job's coverage of it is the `windows-runner` CI step, not this host.
 - No test drives `reconcile_manifests`' orphan-reference sweep past the first page *except*
   `manifest_orphan_sweep_reaches_owners_past_the_first_page`, which pins the resume cursor and the
@@ -1042,7 +1032,7 @@ runner's confinement to the materialized root.
 
 ## Review focus
 
-- **TOCTOU between validation and file creation in `materialize_tree`** (`workspace.rs:887-939`).
+- **TOCTOU between validation and file creation in `materialize_tree`** (`crates/eggwork-server/src/workspace.rs::materialize_tree`).
   The destination is opened with `create_new(true)` on a plain `Path::join`, with no `O_NOFOLLOW` and
   no descriptor-relative walk - unlike artifact capture, which uses `openat`/`NOFOLLOW`. The
   mitigation is that the staging root is fresh, 0700, and contains only this module's own
@@ -1050,7 +1040,7 @@ runner's confinement to the materialized root.
   worth the cost.
 - ~~**GC racing a concurrent `retain`.**~~ **Closed 2026-10-07.** This said GC holds `write_lock`
   while `retain` takes "only the metadata mutex". It does: `garbage_collect` locks `inner.metadata`
-  at entry (`blob.rs:337`) and holds it across `commit()` (`blob.rs:399`), and `retain` needs that
+  at entry (`crates/eggwork-server/src/blob.rs::BlobStore::release_references`) and holds it across `commit()` (`crates/eggwork-server/src/blob.rs::BlobStore::garbage_collect`), and `retain` needs that
   same mutex for its whole body. They are mutually exclusive, so no reference can commit between
   `fs::remove_file` and `DELETE ... AND NOT EXISTS (...)`. The `NOT EXISTS` guard and
   `remove_stale_parts` remain as defence in depth, not as the only thing holding.
@@ -1061,7 +1051,7 @@ runner's confinement to the materialized root.
 - **A leaked or stalled `reader` reference is bounded but invisible.** `Drop` is the only thing
   between a dropped body and a retained blob, and `renew()` is called only on a successful chunk
   read; a download that stalls past 30 minutes loses its protection mid-stream.
-- **Over-long upload bodies report as `TooLarge`, not `LengthMismatch`** (`blob.rs:442-444`). A
+- **Over-long upload bodies report as `TooLarge`, not `LengthMismatch`** (`crates/eggwork-server/src/blob.rs::BlobStore::put_stream`). A
   client that streams more than it declared gets 413 and may conclude the object is too big to
   upload, when the correct action is to re-declare. Check the client handles this.
 - **Quota accounting blind spots.** `SUM(size_bytes)` covers only committed, indexed objects:
@@ -1077,16 +1067,16 @@ runner's confinement to the materialized root.
   cap the decoded manifest and `MAX_WORKSPACE_REQUEST_BYTES` caps the body, but `retained_manifests`
   is bounded only by time. Confirm one principal cannot grow it without limit within 30 days.
 - **Cleanup following symlinks.** Workspace GC does `fs::remove_dir_all(root.join(key))` after
-  `valid_storage_key` (`workspace.rs:734-742`), a plain recursive removal. Since `materialize_tree`
+  `crates/eggwork-server/src/workspace.rs::valid_storage_key`, a plain recursive removal. Since `materialize_tree`
   never creates symlinks the tree cannot contain one, but any other write path into the workspace
   root could introduce one. Artifact capture refuses to follow symlinks; workspace teardown is
   descriptor-relative in no way and is the weaker of the two. Blob GC uses `remove_file` on a leaf,
   so it is unaffected.
-- **`reconcile` deletes any directory it does not recognize** (`workspace.rs:843-851`), including a
+- **`reconcile` deletes any directory it does not recognize** (`crates/eggwork-server/src/workspace.rs::WorkspaceManager::reconcile`), including a
   `.staging-` directory belonging to a live concurrent materialization. Today `reconcile` runs only
   from `WorkspaceManager::open`, and the state lock plus startup ordering prevent that; the safety
   argument lives entirely there.
-- **`retain` requires the digest to exist but does not re-verify** (`blob.rs:199-232`). Reference
+- **`retain` requires the digest to exist but does not re-verify** (`crates/eggwork-server/src/blob.rs::BlobStore::retain`). Reference
   creation is a metadata operation; integrity comes from the caller's preceding `verify_existing`, so
   any future caller that retains without verifying can pin a corrupt blob.
 - **Whether any traversal defense depends on the caller having validated first.** The manifest path
@@ -1095,7 +1085,7 @@ runner's confinement to the materialized root.
   under `valid_storage_key`; `DeclaredOutput.path` is only `RelativePath`-validated, with the strict
   rules arriving one step later via the preflight `WorkspaceManifest::validate`. The code is
   correct, but the guarantee for declared outputs sits one step from where a reader expects it.
-- **Artifact GC does not release blob references** (`artifact.rs:186-223`), so one artifact's bytes
+- **Artifact GC does not release blob references** (`crates/eggwork-server/src/artifact.rs::ArtifactStore::garbage_collect`), so one artifact's bytes
   need both collectors, in the right order - something `NodeServer::collect_garbage` guarantees only
   by call sequence. `deleted_artifacts` is a bounded candidate count, not a measured row count.
 - **`insert_many` is effectively never idempotent.** The

@@ -28,11 +28,31 @@ This page is the **bird's-eye view**: what each module owns, how they compose, a
 
 | Crate | Role | Depends on | Size |
 |---|---|---|---|
-| `eggwork-core` | Protocol-neutral bounded domain types: identities, request/result contracts, validation, events | — | 1,671 LOC |
-| `eggwork-runner` | The single owner of finite process lifecycle; resource/isolation setup abstraction | core | 2,336 LOC |
-| `eggwork-sandbox-helper` | Standalone binary that applies Landlock confinement, verifies the cgroup resource limits, then spawns and supervises the target | — | 401 LOC |
-| `eggwork-client` | Explicit single-node client; all HTTP via Eggfetch, optional egress routing | core | 880 LOC |
-| `eggwork-server` | Node service, mTLS admission, control plane, stores, operator surface, deployment | core, runner | 14,104 LOC |
+| `eggwork-core` | Protocol-neutral bounded domain types: identities, request/result contracts, validation, events | — | see the size script |
+| `eggwork-runner` | The single owner of finite process lifecycle; resource/isolation setup abstraction | core | see the size script |
+| `eggwork-sandbox-helper` | Standalone binary that applies Landlock confinement, verifies the cgroup resource limits, then spawns and supervises the target | — | see the size script |
+| `eggwork-client` | Explicit single-node client; all HTTP via Eggfetch, optional egress routing | core | see the size script |
+| `eggwork-server` | Node service, mTLS admission, control plane, stores, operator surface, deployment | core, runner | see the size script |
+
+The size column is **not a number in this document**, and that is deliberate. A
+checked-in line count is a fact about the tree that rots on the next edit and
+is wrong the moment it is written — which is the same defect the citation gate
+removes from the prose above. The figures are printed on demand instead:
+
+```
+python3 scripts/component_sizes.py
+```
+
+The script counts every line of every `.rs` file a crate owns, split into the
+crate's `src/` (the product) and `tests/` (the evidence), and sums to a
+workspace total so a reader can check the arithmetic. It is stdlib-only and
+deterministic: the same tree always produces the same output, and the output
+depends on nothing but the files on disk.
+
+The **script** is the durable artifact here, not any particular run of it. A
+snapshot of its output belongs in a closure record, where it is evidence about
+one commit, rather than in this document, where it would be a second owner of
+a number the tree already owns.
 
 The dependency graph is intentionally **one-way**. `eggwork-core` and `eggwork-sandbox-helper` have no production dependency on any other workspace crate. `eggwork-client` depends only on `eggwork-core`. `eggwork-server` depends on `eggwork-core` and `eggwork-runner` only; its dependency on `eggwork-client` is a `dev-dependency` used by the qualification harness. Direction is machine-checked — see [CI and guardrails](ci-guardrails.md).
 
@@ -78,12 +98,12 @@ Linux-only machinery is `#[cfg]`-gated so the crate compiles everywhere; a non-L
 
 The largest surface, split into seven library modules plus the `eggworkd` binary:
 
-- **`lib.rs` (6,280 LOC)** — node configuration, `NodeServer`, the mTLS-authenticated HTTP service, operation dispatch, local admission, lease enforcement, and the full execution lifecycle (`execute`, `monitor_lease`, `run_execution`, `publish`, `publish_terminal`). Authorization is two traits: `PeerPrincipalResolver` (verified TLS leaf → `NodePrincipal`, resolved by SHA-256 fingerprint) and `Authorizer` (operation grant, with a resource-aware `authorize_request` hook for scoped policies).
+- **`crates/eggwork-server/src/lib.rs`** — node configuration, `NodeServer`, the mTLS-authenticated HTTP service, operation dispatch, local admission, lease enforcement, and the full execution lifecycle (`execute`, `monitor_lease`, `run_execution`, `publish`, `publish_terminal`). Authorization is two traits: `PeerPrincipalResolver` (verified TLS leaf → `NodePrincipal`, resolved by SHA-256 fingerprint) and `Authorizer` (operation grant, with a resource-aware `authorize_request` hook for scoped policies).
 - **`store.rs`** — the durable SQLite execution and event journal, including idempotency reservation, lease records, and paginated event reads.
 - **`blob.rs`** — node-owned content-addressed blob storage with quota enforcement and GC.
 - **`workspace.rs`** — validated, execution-owned workspace materialization from manifests.
 - **`artifact.rs`** — declared output capture, artifact metadata, retention, and bounded cleanup.
-- **`operations.rs` + `bin/eggworkd.rs`** — the JSON-only operator surface: config, `doctor`, drain, execution listing, storage summary, GC, inspection, and service/deployment commands.
+- **`operations.rs` + `crates/eggwork-server/src/bin/eggworkd.rs`** — the JSON-only operator surface: config, `doctor`, drain, execution listing, storage summary, GC, inspection, and service/deployment commands.
 - **`deployment.rs`** — consumer deployment and service lifecycle backed by Eggup.
 
 → Deep dives: [server node](server-node.md) · [storage journal](storage-journal.md) · [data plane](data-plane.md) · [operations CLI](operations-cli.md) · [deployment lifecycle](deployment-lifecycle.md)
@@ -160,13 +180,15 @@ The deep dives surfaced a set of places where the code, the documentation, and t
 
 None of these are presented as bugs already judged to be bugs. They are the places where a reviewer should decide whether the code, the doc, or the invariant should move.
 
+**Re-verification, 2026-10-25 (M008b).** Every row was re-checked against the tree rather than assumed. Row **3** was corrected (the flag is documented in `docs/deployment.md`, not in a README) and row **20** was closed (the client's transport already caps every decoded body). Every other row was checked and left alone: each observation is still true of the code as it stands, and the already-closed rows **4**, **17**, **22** and **23** still hold, residual boundaries included. Row **24** was preserved verbatim. No row was renumbered; a closed row is closed in place, and a new row takes the next free number at the end of the document.
+
 ### Where the implementation differs from the prose
 
 | # | Observation | Where |
 |---|---|---|
 | 1 | The sandbox helper **does not `execve`**. It `spawn`s the target and `wait`s, because it must stay alive to read post-mortem cgroup counters and report the real resource outcome to the runner. Confinement still holds — the Landlock ruleset is inherited across the fork and survives the target's own `execve`. | [sandbox-helper.md](sandbox-helper.md) |
 | 2 | The helper sets **no `RLIMIT_*`**. `verify_resource_limits` *verifies* that the runner's cgroup already bounds `memory.max`, `memory.swap.max`, `pids.max`, and `cpu.max`. Resource enforcement lives in the runner, not the helper. | [sandbox-helper.md](sandbox-helper.md) |
-| 3 | `--windows-start-type` is documented in the README and passed by `scripts/qualify_release.py`, but **no code path parses it**. This is currently harmless: the Windows arm of `product_service_manager` discards `args` and refuses before reaching a manager. It becomes live work when Windows becomes a service host. | [operations-cli.md](operations-cli.md) |
+| 3 | `--windows-start-type` is documented in `docs/deployment.md` and passed by `scripts/qualify_release.py`, but **no code path parses it**. This is currently harmless: the Windows arm of `product_service_manager` discards `args` and refuses before reaching a manager. It becomes live work when Windows becomes a service host. | [operations-cli.md](operations-cli.md) |
 
 ### Where an invariant is weaker in practice than the wording suggests
 
@@ -174,8 +196,8 @@ None of these are presented as bugs already judged to be bugs. They are the plac
 |---|---|---|
 | 4 | ~~`GrantAuthorizer` implements only `Authorizer::authorize`, **not** the resource-aware `authorize_request` hook. Resource-scoped authorization is therefore inert on the real deployment path; ownership is enforced only in the store, by `principal_id` comparison.~~ **Closed 2026-10-25 by [ADR-0007](../plans/adrs/ADR-0007-resource-scoped-authorization.md) (Option A).** `GrantAuthorizer` now implements `authorize_request`: a grant may carry a bounded, optional list of resource scopes naming an operation, a resource kind, and a typed identifier, and the decision narrows the operation grant against that configuration-derived set. The scope is per `(operation, kind)`, so a scope for `Execute`/`Execution` does not narrow `Execute`/`Workspace`. The store's `principal_id` fences remain authoritative for ownership, so a scope naming another principal's execution, workspace, or artifact is still refused there. **Residual boundary:** a grant with no scope is still operation-wide, so a broad `BlobRead` still reaches any known digest — blob storage is content-addressed and shared, so a blob has no owner to fence it, and a blob scope is an explicit digest list the operator must configure. | [operations-cli.md](operations-cli.md) · [server-node.md](server-node.md) · [threat-model.md](../plans/security/threat-model.md) |
 | 5 | `deployment::check_helper_compatibility_with_timeout` checks the helper **file** only, while `eggwork_runner::verify_trusted_helper` also walks every ancestor directory. The deployment trust path is the weaker subset plus version coherence. | [deployment-lifecycle.md](deployment-lifecycle.md) · [runner-execution.md](runner-execution.md) |
-| 6 | Invariant 2 (no direct node-service manager invocation) has **no dedicated mechanical guard**. The only automated check is the Rust test `no_direct_service_manager_invocation_exists` in `deployment.rs`, and it scans just three files (`src/deployment.rs`, `src/operations.rs`, `src/bin/eggworkd.rs`) for manager *string literals*. `eggwork-runner` is outside that scope entirely. | [ci-guardrails.md](ci-guardrails.md) |
-| 7 | The ownership guard globs only `crates/*/src/**/*.rs`. `tests/`, `examples/`, and `build.rs` are unscanned, and the allowlist is keyed by crate name rather than path. | [ci-guardrails.md](ci-guardrails.md) |
+| 6 | Invariant 2 (no direct node-service manager invocation) has **no dedicated mechanical guard**. The only automated check is the Rust test `no_direct_service_manager_invocation_exists` in `deployment.rs`, and it scans just three files (`crates/eggwork-server/src/deployment.rs`, `crates/eggwork-server/src/operations.rs`, `crates/eggwork-server/src/bin/eggworkd.rs`) for manager *string literals*. `eggwork-runner` is outside that scope entirely. | [ci-guardrails.md](ci-guardrails.md) |
+| 7 | The ownership guard globs only `crates/*/src/**/*.rs`. `tests/`, `examples/`, and a Cargo build script are unscanned, and the allowlist is keyed by crate name rather than path. | [ci-guardrails.md](ci-guardrails.md) |
 | 8 | `--prove-negative-exit` is **narrower than its name**: in that mode the guard runs its self-test and then proves the negative exit, but never runs `scan_sources()` or `check_dependencies()`. It proves the scanner detects, not that the full guard path fails correctly. | [ci-guardrails.md](ci-guardrails.md) |
 | 9 | `blob_download` takes **no reference lease**, unlike `artifact_download`. A concurrent GC can unlink the file mid-transfer; this is safe only because Unix keeps the open descriptor alive. | [data-plane.md](data-plane.md) |
 | 10 | Workspace materialization opens destinations with `create_new(true)` on a plain `Path::join` — no `O_NOFOLLOW`, no `openat2` — whereas artifact capture uses a descriptor-relative `NOFOLLOW` chain. Workspace is the weaker symlink path in the codebase, mitigated by the fresh `0700` staging root. | [data-plane.md](data-plane.md) |
@@ -198,7 +220,7 @@ None of these are presented as bugs already judged to be bugs. They are the plac
 | # | Observation | Where |
 |---|---|---|
 | 19 | `events()` puts the lease id — documented in core as **bearer authority** and redacted from `Debug` — into a **URL query string**, while `cancel`/`renew` put it in a JSON body. | [client-transport.md](client-transport.md) |
-| 20 | `decode_json` calls `response.bytes()` with **no size cap**. The node bounds its own request bodies, but the client bounds only the NDJSON line buffer, leaving the JSON paths open to memory exhaustion from a hostile node. | [client-transport.md](client-transport.md) |
+| 20 | ~~`decode_json` calls `response.bytes()` with **no size cap**. The node bounds its own request bodies, but the client bounds only the NDJSON line buffer, leaving the JSON paths open to memory exhaustion from a hostile node.~~ **Closed 2026-10-25 by the `17ff53f` corrective.** The client's `HttpClient` is built with `.max_decoded_body_size(MAX_BUFFERED_BODY_BYTES)`, so Eggfetch wraps the response body in a limiting stream that refuses to decode more than 16 MiB — on the compressed path and the uncompressed path alike — and `decode_json` reads a body the transport has already bounded. The telemetry route is bounded twice: the transport cap, then a 64 KiB check on the decoded length. **Residual boundary:** the cap is a *transport* bound, not a per-route one, so a hostile node can still make the client buffer up to 16 MiB before the route's own check rejects the reply. The node's own request-body bounds are unchanged. | [client-transport.md](client-transport.md) |
 | 21 | Redirect and retry safety is an **accident of the dependency profile**: the workspace's `standard-http1` omits eggfetch's `redirects` and `logical-retry` features, so 3xx is returned unfollowed. Bumping to the `http1` alias would silently enable both and no test would fail. | [client-transport.md](client-transport.md) |
 
 ### Platform limitations

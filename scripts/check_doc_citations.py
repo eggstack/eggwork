@@ -591,7 +591,85 @@ def rust_items(source: str) -> dict[str, str]:
 
     for name, kind in impl_types.items():
         symbols.setdefault(name, kind)
+    symbols.update(macro_generated_items(source))
     return symbols
+
+
+# --------------------------------------------------------------------------
+# Macro-generated items
+# --------------------------------------------------------------------------
+
+# The item keywords a macro body can expand into, with the metavariable that
+# names the item.
+MACRO_ITEM_SHAPES = (
+    (re.compile(r"\bstruct\s+\$(\w+)"), "struct"),
+    (re.compile(r"\benum\s+\$(\w+)"), "enum"),
+    (re.compile(r"\bunion\s+\$(\w+)"), "union"),
+    (re.compile(r"\btype\s+\$(\w+)"), "type"),
+    (re.compile(r"\btrait\s+\$(\w+)"), "trait"),
+    (re.compile(r"\bmod\s+\$(\w+)"), "mod"),
+    (re.compile(r"\bfn\s+\$(\w+)"), "fn"),
+    (re.compile(r"\bimpl\s+(?:<[^>]*>\s+)?\$(\w+)"), "impl"),
+)
+
+
+def macro_definitions(source: str) -> dict[str, str]:
+    """The body of every ``macro_rules!`` macro defined in a file."""
+    bodies: dict[str, str] = {}
+    pattern = re.compile(
+        r"macro_rules!\s*([A-Za-z_][A-Za-z0-9_]*)\s*\{", re.MULTILINE
+    )
+    for match in pattern.finditer(source):
+        depth = 0
+        cursor = match.end() - 1
+        while cursor < len(source):
+            if source[cursor] == "{":
+                depth += 1
+            elif source[cursor] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            cursor += 1
+        bodies[match.group(1)] = source[match.end() : cursor]
+    return bodies
+
+
+def macro_generated_items(source: str) -> dict[str, str]:
+    """The items a file's own macros generate.
+
+    A macro that expands to an item and is invoked with that item's name
+    *defines* the name. ``id_type!(NodeId, "node id")`` defines ``NodeId``
+    even though the source text never spells ``struct NodeId``. Without this,
+    the checker would refuse a citation to a public type that is demonstrably
+    present, and the document would have to cite the macro instead of the
+    thing it is describing.
+    """
+    bodies = macro_definitions(source)
+    if not bodies:
+        return {}
+    generated: dict[str, str] = {}
+    invocation = re.compile(
+        r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*!\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)"
+    )
+    for match in invocation.finditer(source):
+        macro_name, argument = match.group(1), match.group(2)
+        body = bodies.get(macro_name)
+        if body is None:
+            continue
+        for shape, kind in MACRO_ITEM_SHAPES:
+            bound = shape.search(body)
+            if bound is None:
+                continue
+            metavariable = bound.group(1)
+            # The metavariable must be bound as an identifier for the
+            # invocation's argument to become the item's name.
+            if not re.search(
+                r"\$" + re.escape(metavariable) + r"\s*:\s*ident", body
+            ):
+                continue
+            generated.setdefault(argument, kind)
+            break
+    return generated
 
 
 # --------------------------------------------------------------------------
@@ -640,14 +718,29 @@ def python_items(source: str) -> dict[str, str]:
     return symbols
 
 
+_SYMBOL_CACHE: dict[Path, dict[str, str]] = {}
+
+
 def file_symbols(path: Path) -> dict[str, str]:
-    """The symbols a source file defines, keyed by qualified name."""
+    """The symbols a source file defines, keyed by qualified name.
+
+    The result is cached per file for the life of the run. The design record
+    cites the same source file hundreds of times, and re-parsing a 8,000-line
+    Rust file for each citation turned a two-second check into a multi-minute
+    one. The cache changes the cost, not the result.
+    """
+    cached = _SYMBOL_CACHE.get(path)
+    if cached is not None:
+        return cached
     source = path.read_text(encoding="utf-8")
     if path.suffix == ".rs":
-        return rust_items(source)
-    if path.suffix == ".py":
-        return python_items(source)
-    return {}
+        symbols = rust_items(source)
+    elif path.suffix == ".py":
+        symbols = python_items(source)
+    else:
+        symbols = {}
+    _SYMBOL_CACHE[path] = symbols
+    return symbols
 
 
 # --------------------------------------------------------------------------
@@ -823,6 +916,18 @@ pub mod real_module {
 macro_rules! real_macro {
     () => {};
 }
+macro_rules! real_id_type {
+    ($name:ident, $label:literal) => {
+        pub struct $name(String);
+    };
+}
+real_id_type!(RealId, "real id");
+macro_rules! not_an_item_macro {
+    ($name:ident) => {
+        pub fn helper() {}
+    };
+}
+not_an_item_macro!(NotAnItem);
 pub fn real_function() {}
 impl RealStruct {
     pub fn real_method(&self) -> usize {
@@ -854,7 +959,9 @@ def build_fixture_tree(root: Path) -> None:
     (root / "scripts" / "demo.py").write_text(FIXTURE_PYTHON, encoding="utf-8")
     (root / "architecture" / "good.md").write_text(
         "A correct citation names a symbol that exists: "
-        "`crates/demo/src/lib.rs::real_function`.\n",
+        "`crates/demo/src/lib.rs::real_function`.\n"
+        "A macro-generated item is a symbol the file defines: "
+        "`crates/demo/src/lib.rs::RealId`.\n",
         encoding="utf-8",
     )
     (root / "architecture" / "bad.md").write_text(
@@ -862,7 +969,8 @@ def build_fixture_tree(root: Path) -> None:
         "`crates/demo/src/lib.rs::no_such_symbol`.\n"
         "A legacy citation names a line: `crates/demo/src/lib.rs:12`.\n"
         "An ambiguous basename: `lib.rs::real_function`.\n"
-        "A missing file: `crates/demo/src/absent.rs::real_function`.\n",
+        "A missing file: `crates/demo/src/absent.rs::real_function`.\n"
+        "A macro that generates no item: `crates/demo/src/lib.rs::NotAnItem`.\n",
         encoding="utf-8",
     )
 

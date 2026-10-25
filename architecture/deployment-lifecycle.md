@@ -40,10 +40,10 @@ Two things Eggwork does **not** do, by explicit design and explicit test:
 - **Eggwork never invokes a platform service manager directly.** There is no
   `systemctl`, `launchctl`, `sc.exe`/SCM, or `crontab` call in this module. All
   manager traffic goes through the `eggup_service::ServiceManager` trait. The unit
-  test `no_direct_service_manager_invocation_exists` (`deployment.rs:1510`) is the
+  test `crates/eggwork-server/src/deployment.rs::tests::no_direct_service_manager_invocation_exists` is the
   enforcement site.
 
-`ServiceManagerAdapter` (`deployment.rs:687`) is a pass-through newtype: it holds
+`crates/eggwork-server/src/deployment.rs::ServiceManagerAdapter` is a pass-through newtype: it holds
 `&mut dyn ServiceManager` and forwards all six verbs. It exists to give Eggup a
 mutable manager handle while the plan borrows other state, and it adds no policy.
 
@@ -122,7 +122,7 @@ Parity tests in `crates/eggwork-server/tests/release_contract.rs`:
   data, config, database, workspace, blob, or artifact member is bundled.
 - `consumer_validation_is_gating_and_selects_the_linux_helper`.
 - `the_deployment_module_never_parses_eggpack_configuration` — the mirror-image
-  guarantee: `src/deployment.rs`, `src/operations.rs`, and `src/bin/eggworkd.rs`
+  guarantee: `crates/eggwork-server/src/deployment.rs`, `crates/eggwork-server/src/operations.rs`, and `crates/eggwork-server/src/bin/eggworkd.rs`
   must not contain `release/eggpack`, `ReleaseManifest`, `release-manifest`,
   `DistributionContract`, or `eggpack::`.
 
@@ -140,8 +140,7 @@ staged outside the installation root." Its `validate()` enforces, in order:
 
 `orchestrate_update_with_lifecycle_budgeted` re-validates every source *before*
 building the plan and before any service mutation, so a bad candidate can never
-reach the stop/replace path. The unit test `candidate_validation_failure_happens_before_any_stop`
-(`deployment.rs:1096`) asserts exactly that ordering.
+reach the stop/replace path. The unit test `crates/eggwork-server/src/deployment.rs::tests::candidate_validation_failure_happens_before_any_stop` asserts exactly that ordering.
 
 **`deployment apply` accepts already-local candidates only.** The operator hands it
 absolute local files via `--daemon` (always) and `--helper` (Linux only). The
@@ -203,8 +202,8 @@ the contract:
 **One transaction, both binaries.** Because `bin/eggworkd` and
 `bin/eggwork-sandbox-helper` are members of a single `ArtifactSet`, there is no
 intermediate state in which the daemon is new and the helper is old. Tests
-`update_after_drain_replaces_coherent_daemon_helper_pair` (`deployment.rs:1187`)
-and `rollback_restores_coherent_daemon_helper_pair` (`deployment.rs:1567`) assert
+`crates/eggwork-server/src/deployment.rs::tests::update_after_drain_replaces_coherent_daemon_helper_pair`
+and `crates/eggwork-server/src/deployment.rs::tests::rollback_restores_coherent_daemon_helper_pair` assert
 the pair property on both the commit and the rollback side. The corresponding
 exclusion is explicit: the transaction replaces only `bin/` members, so "execution
 recovery state (database, workspaces, blobs, artifacts) is never part of the
@@ -218,8 +217,7 @@ default, and the product default, is `PostCommitFailurePolicy::RollBack`: if the
 post-commit health check fails, Eggup restores and verifies the previous
 generation while backups are still retained. `KeepInstalled` is documented as
 "explicit operator policy only." The test
-`post_start_health_failure_rolls_back_while_backups_are_retained`
-(`deployment.rs:1307`) pins the retained-backup window.
+`crates/eggwork-server/src/deployment.rs::tests::post_start_health_failure_rolls_back_while_backups_are_retained` pins the retained-backup window.
 
 `RecoveryRequired` is a different thing entirely: it is Eggup's
 recovery-required disposition, meaning Eggup preserved exact transaction evidence
@@ -358,7 +356,7 @@ the authoritative statement: "On failure, `policy` selects `RollBack` (restore a
 verify the previous generation) or `KeepInstalled` (explicit operator policy
 only)."
 
-`OneShotHealthCheck` (`deployment.rs:731`) enforces the shape. It wraps the closure
+`crates/eggwork-server/src/deployment.rs::OneShotHealthCheck` enforces the shape. It wraps the closure
 in a `RefCell<Option<F>>` and fails closed with
 `"health check time budget exhausted"` if `remaining` is zero, or
 `"health check already consumed"` if it is somehow called twice. It accepts the
@@ -438,7 +436,7 @@ bounded failure detail tells the operator which of the two actually happened.
 `NotConfigured` — fails closed and must surface as `capability_mismatch` before
 target spawn, never as best-effort downgrade." There is no third state, no
 partial trust, and no warning path. Test:
-`only_compatible_helper_admits_required_isolation` (`deployment.rs:1542`).
+`crates/eggwork-server/src/deployment.rs::tests::only_compatible_helper_admits_required_isolation`.
 
 `check_helper_compatibility(path, expected_version)` is
 `check_helper_compatibility_with_timeout(..., Duration::from_secs(5))`. The
@@ -473,7 +471,7 @@ A daemon expecting isolation semantics from a helper of a different version is
 running with an unverified sandbox contract; every admission decision the runner
 makes from then on rests on an assumption that was never checked. Failing closed
 keeps required isolation *unsupported* rather than degrading it to best-effort.
-Test: `helper_version_skew_is_detected` (`deployment.rs:1401`).
+Test: `crates/eggwork-server/src/deployment.rs::tests::helper_version_skew_is_detected`.
 
 ### Relationship to `eggwork_runner::verify_trusted_helper`
 
@@ -485,7 +483,7 @@ for the closed Landlock `workspace_rw` profile.
 The two implementations are **not** identical, and the difference is worth
 stating rather than glossing:
 
-- `verify_trusted_helper` (Linux, `lib.rs:596`) checks the helper file (regular,
+- `verify_trusted_helper` (Linux, `crates/eggwork-runner/src/lib.rs::verify_trusted_helper`) checks the helper file (regular,
   non-symlink, root-or-euid owned, `mode & 0o022 == 0`, `mode & 0o111 != 0`) **and
   then walks the parent and every ancestor directory**, applying the same
   ownership and non-writability rule with a `sticky_root_directory` exception
@@ -530,19 +528,17 @@ rules. Accept only a literal path alphabet so the rendered command cannot diverg
 from `ServiceSpec` argv." The rendered unit is `Type=simple`,
 `After=network.target`, `Restart=on-failure`, `RestartSec=2`,
 `NoNewPrivileges=true`, `WantedBy=multi-user.target`. Test:
-`systemd_unit_rendering_is_bounded_and_absolute_only` (`deployment.rs:1430`).
+`crates/eggwork-server/src/deployment.rs::tests::systemd_unit_rendering_is_bounded_and_absolute_only`.
 
 `render_launchd_plist` is the macOS equivalent and is stricter still: the label
 must equal `SERVICE_ID` exactly, paths must be absolute and UTF-8, control
 characters are rejected, and all five XML entities are escaped. argv is a literal
 XML *array* (`executable`, `run`, `--config`, `config`), never a joined string.
-Test: `launchd_policy_uses_literal_argv_and_xml_escapes_paths`
-(`deployment.rs:1463`).
+Test: `crates/eggwork-server/src/deployment.rs::tests::launchd_policy_uses_literal_argv_and_xml_escapes_paths`.
 
 `platform_support()` is the read-only observation path: `eggup_service::inspect_host`
 through a `SystemExecutor`, returning `HostFacts` with no policy choice and no
-mutation. Test `linux_host_reports_manager_facts_without_mutation`
-(`deployment.rs:1423`).
+mutation. Test `crates/eggwork-server/src/deployment.rs::tests::linux_host_reports_manager_facts_without_mutation`.
 
 ### Platform policy is always explicit
 
@@ -607,10 +603,9 @@ flakiness. It is not: registering an external process would produce a working
 installation with **no service behind it**, which is worse than an honest refusal.
 
 **Current behavior.** Every **mutating** `service` verb on Windows is refused
-before any mutation. In `product_service_manager` (`eggworkd.rs:278`) the
-`#[cfg(windows)]` arm returns an `Err` naming the reason; `service_mutation`
-(`eggworkd.rs:269`) calls it *before* `apply_service_operation`, so the refusal
-precedes the mutation. `service_backend()` (`eggworkd.rs:378`) still returns
+before any mutation. In `crates/eggwork-server/src/bin/eggworkd.rs::product_service_manager` the
+`#[cfg(windows)]` arm returns an `Err` naming the reason; `crates/eggwork-server/src/bin/eggworkd.rs::service_mutation` calls it *before* `apply_service_operation`, so the refusal
+precedes the mutation. `crates/eggwork-server/src/bin/eggworkd.rs::service_backend` still returns
 `"windows-scm-unsupported"` for diagnostics, and `deployment status` still reports
 host facts.
 
@@ -625,7 +620,7 @@ recorded ready in `plans/registry.md`). That row adds a standing constraint: the
 interim refusal "must stay until a release containing a real host has hosted
 Windows evidence."
 
-**What is retained.** `windows_scm_manager` (`deployment.rs:904`) is `#[cfg(windows)]`
+**What is retained.** `crates/eggwork-server/src/deployment.rs::windows_scm_manager` is `#[cfg(windows)]`
 and `#[allow(dead_code)]`. It constructs the fixed Eggwork SCM product policy:
 `WindowsScmInstall::new(SERVICE_ID, "Eggwork Node Daemon", start_type,
 WindowsErrorControl::Normal, None).with_transition_timeout(timeout)`, wrapped in
@@ -651,7 +646,7 @@ spaces (a wrapped-literal artifact). Cosmetic, not semantic.
 `DeploymentError::new` truncates `detail` to 256 characters by `char` count, and
 the `From` impls apply `truncate` again for upstream messages — so **every**
 detail is bounded regardless of origin. There are no secrets in these strings;
-`deployment_surfaces_contain_no_secret_material` (`deployment.rs:1604`) asserts
+`crates/eggwork-server/src/deployment.rs::tests::deployment_surfaces_contain_no_secret_material` asserts
 the module never embeds private key, token, or certificate material.
 
 | `kind` | Raised by | Terminal or recoverable |
@@ -786,7 +781,7 @@ Strong on policy and ordering, silent on real systemd/launchd behavior.
 `rollback_restores_coherent_daemon_helper_pair`,
 `deployment_surfaces_contain_no_secret_material`.
 
-### `tests/installed_qualification.rs`
+### `crates/eggwork-server/tests/installed_qualification.rs`
 
 An **ignored** suite naming the installed binary through the environment. Its two
 entry points are `qualification_fixture` and

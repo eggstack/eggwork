@@ -12,7 +12,8 @@ one node said. The crate depends on `eggwork-core` only for domain types; all HT
 streaming is delegated to `eggfetch-core`, with an optional `eggress-route` feature adding an
 outbound TCP route that changes the *path* to the node but never *which* node is addressed.
 
-Architecturally it is a `dev-dependency` of `eggwork-server` (`crates/eggwork-server/Cargo.toml:46`),
+Architecturally it is a `dev-dependency` of `eggwork-server` (declared in
+`crates/eggwork-server/Cargo.toml` as `eggwork-client` with the `eggress-route` feature),
 used by the server's test module and the installed-release qualification harness. It is **not** a
 production dependency of the shipped daemon — `eggworkd` never links it. That inversion is
 deliberate: the client is the consumer of the node's protocol, and keeping it out of the daemon's
@@ -63,16 +64,15 @@ This boundary is the client-side half of
 
 The guarantee is structural, not conventional.
 
-1. **One endpoint, validated once.** `normalize_endpoint` (`lib.rs:532`) trims trailing `/`, parses
+1. **One endpoint, validated once.** `crates/eggwork-client/src/lib.rs::normalize_endpoint` trims trailing `/`, parses
    with `url::Url::parse`, and requires: `scheme() == "https"`, `host_str().is_some()`, no query, no
    fragment, empty username, no password. It returns the normalized string or `ClientError::InvalidEndpoint`.
    It is called from every constructor — `new`, `with_eggress`, `with_eggress_route` — and never again.
-2. **Two fields, no indirection.** `NodeClient { endpoint, http }` (`lib.rs:89`). The `endpoint` is
+2. **Two fields, no indirection.** `crates/eggwork-client/src/lib.rs::NodeClient`. The `endpoint` is
    a `String`, not a resolver, a list, or an enum of candidates. `Clone` copies it verbatim and
    shares the `HttpClient` (and therefore the connection pool) — cloning a client never changes or
    multiplies its target.
-3. **One URL constructor.** `fn url(&self, path) -> String { format!("{}{path}", self.endpoint) }`
-   (`lib.rs:527`). Every request in the crate goes through it. There is no second URL builder, no
+3. **One URL constructor.** `crates/eggwork-client/src/lib.rs::NodeClient::url`. Every request in the crate goes through it. There is no second URL builder, no
    redirect target, no server-supplied URL that the client will follow.
 4. **No discovery, no "latest", no default.** Nothing in the crate resolves a node name, reads a
    registry, consults an environment variable, or defaults to a well-known host. The endpoint is
@@ -81,24 +81,24 @@ The guarantee is structural, not conventional.
 **The egress-route invariant.** The `eggress-route` feature adds a *route* without changing *target
 identity*. Precisely:
 
-- `with_eggress` (`lib.rs:135`) calls the **same** `normalize_endpoint` and builds the same
+- `crates/eggwork-client/src/lib.rs::NodeClient::with_eggress` calls the **same** `normalize_endpoint` and builds the same
   `HttpClient::builder().tls_config(tls)`; it only adds `.dialer(EggressDialer { connector })`.
   `self.endpoint` is byte-identical to what `new` would have produced. The URL, the SNI name, the
   certificate-verification target, and the mTLS peer are all unchanged.
-- `EggressDialer::dial` (`lib.rs:598`) receives the `DialTarget` that eggfetch derived from the
+- `crates/eggwork-client/src/lib.rs::EggressDialer::dial` receives the `DialTarget` that eggfetch derived from the
   endpoint and calls `connect_tcp_timeout_detailed(target.host(), target.port(), 30s)` **exactly
   once**. It returns the Eggress stream as the raw `DialStream`; eggfetch layers its own HTTP/1.1
   framing and destination TLS on top. TLS ownership does not move to Eggress
   ([M003 §2](../plans/implementation/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md),
   [ADR-0002 decision 5/6](../plans/adrs/ADR-0002-eggstack-transport-and-mtls.md)).
 - **No fallback exists.** The dialer returns `Err` on failure. There is no second client, no
-  default dialer, no retry-direct branch. `ClientError::eggress_error()` (`lib.rs:54`) recovers the
+  default dialer, no retry-direct branch. `crates/eggwork-client/src/lib.rs::ClientError::eggress_error` recovers the
   typed `eggress_outbound::OutboundConnectError` by downcasting the `Transport` source chain, so a
   caller can distinguish timeout / authentication / policy / DNS / connection classes without
   parsing display text — and can see *that* it was a route failure rather than a TLS failure.
 - The public failure message is the fixed string `"Eggress route connection failed"`; the typed
   error is attached as a nested source rather than flattened into the message.
-- **Route configuration never enters the protocol.** `ExecuteRequest` (`lib.rs:681`) is
+- **Route configuration never enters the protocol.** `crates/eggwork-client/src/lib.rs::ExecuteRequest` is
   `{ schema_version, handle, workspace_id, spec }`, and `eggwork_core::ExecutionSpec` is
   `{ schema_version, command, metadata }`. No field anywhere in a client-authored body carries a
   route, proxy, or hop. Route selection is a property of the *client object*, and it is not
@@ -135,7 +135,7 @@ consequences the reader should hold onto:
 - `Client::send` compiles to the `send_lean` path: **each request is dispatched exactly once** and
   **3xx responses are returned as ordinary responses**, never followed.
 - `eggress-route` must therefore add `eggfetch-core/advanced-routing` explicitly, which is exactly
-  what `crates/eggwork-client/Cargo.toml:26` does — that is the only reason the explicit
+  what the `eggress-route` feature in `crates/eggwork-client/Cargo.toml` does — that is the only reason the explicit
   `ClientBuilder::dialer` seam is available.
 
 `eggress-outbound` is used with `default-features = false, features = ["pproxy-compat"]`, matching
@@ -187,7 +187,7 @@ with `finish_non_exhaustive()`.
 Prose notes on the non-obvious ones:
 
 - **`execute` is the only method that returns a live stream.** It first calls
-  `ensure_protocol_compatible()` (`lib.rs:230`), then POSTs and requires the response to be 2xx,
+  `crates/eggwork-client/src/lib.rs::NodeClient::ensure_protocol_compatible`, then POSTs and requires the response to be 2xx,
   then reads `eggwork-execution-id` and requires it to parse as an `ExecutionId` **and** to equal
   `handle.execution_id`; otherwise `InvalidResponse`. The generation header
   `eggwork-execution-generation` is sent by the server but is **not** checked by the client.
@@ -297,8 +297,7 @@ Server-side request structs are all `#[serde(deny_unknown_fields)]` (`ExecuteReq
 rather than a silently ignored field. `ExecuteRequest.workspace_id` is `#[serde(default)]`, matching
 the client's `Option`.
 
-**Routing.** The server resolves with `operation_for(method, path)`
-(`crates/eggwork-server/src/lib.rs:640`): seven exact literal matches
+**Routing.** The server resolves with `crates/eggwork-server/src/lib.rs::operation_for`: seven exact literal matches
 (`/v1/capabilities`, `/v1/status`, `/v1/executions`, `/v1/blobs/missing`, `/v1/blobs/prepare`,
 `/v1/workspaces`, `/v1/workspaces/derive`), then segment-count matching for
 `/v1/executions/{id}`, `/v1/executions/{id}/{cancel|renew|events|artifacts}`,
@@ -306,7 +305,7 @@ the client's `Option`.
 `404 not_found`. Every path the client constructs matches one of these.
 
 **Status handling.** Success is `response.status().is_success()` (2xx). Anything else goes to
-`api_error(status, &mut response)` (`lib.rs:750`), which reads the body, attempts
+`crates/eggwork-client/src/lib.rs::api_error`, which reads the body, attempts
 `serde_json::from_slice::<ApiError>`, and yields:
 
 - parsed → `ClientError::Api { status, code, message }` from the node's `ApiError { schema_version, code, message }`;
@@ -323,7 +322,9 @@ table, the error renderer, and the blob/workspace/event handlers, not all ~6,300
 `eggwork-server`; treat it as the codes a caller must be able to recognise, not the full set.
 
 **Response headers the client trusts** (and the server emits, per
-`crates/eggwork-server/src/lib.rs:1335`, `:1457`, `:1458`, `:2660-2663`):
+`crates/eggwork-server/src/lib.rs::blob_download`,
+`crates/eggwork-server/src/lib.rs::artifact_download`,
+`crates/eggwork-server/src/lib.rs::event_stream_response`):
 `content-type: application/x-ndjson` plus `eggwork-execution-id` and
 `eggwork-execution-generation` on `POST /v1/executions` (status **202**);
 `eggwork-blob-digest` on blob download; `eggwork-artifact-id` and `eggwork-artifact-digest` on
@@ -370,8 +371,7 @@ enforced by `from_pem_files` and by ADR-0002, not a type-level invariant. Becaus
 verification stay inside eggfetch on both the direct and routed paths.
 
 **What the node derives, and what the client learns.** The node never trusts a payload. In
-`dispatch`, `authenticated_principal`
-(`crates/eggwork-server/src/lib.rs:823`) requires `tls.client_authenticated` **and**
+`dispatch`, `crates/eggwork-server/src/lib.rs::authenticated_principal` requires `tls.client_authenticated` **and**
 `tls.peer_certificates_present`, a non-empty chain of at most 8 certificates each at most 64 KiB,
 and then calls `resolver.resolve_verified_leaf(&chain[0])`. Failure is `401 unauthenticated`
 ("verified client identity required"). Authorization runs next, on the transport-derived principal,
@@ -445,7 +445,7 @@ in a real deployment is Eggfetch's concern, not this crate's.
 
 ## Test coverage
 
-### `mod security_tests` (`lib.rs:770`, 2 tests, both plain `#[test]`)
+### `crates/eggwork-client/src/lib.rs::security_tests`, 2 tests, both plain `#[test]`)
 
 - `endpoint_rejects_credentials_and_non_tls_schemes` — asserts `https://controller.example/` is
   accepted; `https://user:password@controller.example` is rejected **and** neither the `Debug` nor
@@ -456,7 +456,7 @@ in a real deployment is Eggfetch's concern, not this crate's.
 - `client_error_debug_redacts_remote_message` — builds `ClientError::Api { message: "private-key-material" }`
   and asserts the string appears in neither `Debug` nor `Display`.
 
-### `mod eggress_route_tests` (`lib.rs:801`, gated `#[cfg(all(test, feature = "eggress-route"))]`, 3 `#[tokio::test]`s)
+### `crates/eggwork-client/src/lib.rs::eggress_route_tests`, gated `#[cfg(all(test, feature = "eggress-route"))]`, 3 `#[tokio::test]`s)
 
 - `socks5_route_round_trips` — `Socks5Upstream` + `eggress_testkit::start_echo_server`, dials via
   `EggressDialer`, writes 13 bytes, reads them back.
@@ -496,23 +496,23 @@ All three drive `EggressDialer` directly; none constructs a `NodeClient` or perf
 
 | Invariant | Enforcement site | Test |
 |---|---|---|
-| Endpoint must be `https`, have a host, and carry no query, fragment, or credentials | `normalize_endpoint` — `lib.rs:532` | `security_tests::endpoint_rejects_credentials_and_non_tls_schemes` |
-| Client `Debug` cannot leak endpoint path, query, or credentials | `safe_target_origin` + `impl Debug for NodeClient` — `lib.rs:94` | same test (origin-equality assertion) |
-| Node-supplied error text cannot reach `Debug` or `Display` | `impl Debug for ClientError` — `lib.rs:68`; `#[error(...)]` string — `lib.rs:31` | `security_tests::client_error_debug_redacts_remote_message` |
-| Target identity is fixed at construction and cannot broaden | `NodeClient { endpoint, http }`; single `url()` — `lib.rs:89`, `lib.rs:527` | none directly — structural |
-| Route changes the path, never the target | `with_eggress` reuses `normalize_endpoint`; `EggressDialer::dial` uses eggfetch's `DialTarget` — `lib.rs:135`, `lib.rs:598` | `eggress_route_tests::*` (path-level, via the dialer) |
-| Route failure never falls back direct | one `connect_tcp_timeout_detailed` call; no second client path — `lib.rs:598` | `route_failure_does_not_connect_direct_and_preserves_typed_error` |
-| Typed route failure is recoverable without string parsing | `ClientError::eggress_error()` downcast loop — `lib.rs:54` | `route_failure_does_not_connect_direct_and_preserves_typed_error` (asserts a `source` exists) |
+| Endpoint must be `https`, have a host, and carry no query, fragment, or credentials | `normalize_endpoint` — `crates/eggwork-client/src/lib.rs::normalize_endpoint` | `security_tests::endpoint_rejects_credentials_and_non_tls_schemes` |
+| Client `Debug` cannot leak endpoint path, query, or credentials | `safe_target_origin` + `impl Debug for NodeClient` — `crates/eggwork-client/src/lib.rs::NodeClient` | same test (origin-equality assertion) |
+| Node-supplied error text cannot reach `Debug` or `Display` | `impl Debug for ClientError` — `crates/eggwork-client/src/lib.rs::ClientError::eggress_error`; `#[error(...)]` string — `crates/eggwork-client/src/lib.rs::ClientError` | `security_tests::client_error_debug_redacts_remote_message` |
+| Target identity is fixed at construction and cannot broaden | `NodeClient { endpoint, http }`; single `url()` — `crates/eggwork-client/src/lib.rs::NodeClient::url`, `crates/eggwork-client/src/lib.rs::NodeClient::url` | none directly — structural |
+| Route changes the path, never the target | `with_eggress` reuses `normalize_endpoint`; `EggressDialer::dial` uses eggfetch's `DialTarget` — `crates/eggwork-client/src/lib.rs::NodeClient::with_eggress`, `crates/eggwork-client/src/lib.rs::EggressIo::poll_shutdown` | `eggress_route_tests::*` (path-level, via the dialer) |
+| Route failure never falls back direct | one `connect_tcp_timeout_detailed` call; no second client path — `crates/eggwork-client/src/lib.rs::EggressIo::poll_shutdown` | `route_failure_does_not_connect_direct_and_preserves_typed_error` |
+| Typed route failure is recoverable without string parsing | `ClientError::eggress_error()` downcast loop — `crates/eggwork-client/src/lib.rs::ClientError::eggress_error` | `route_failure_does_not_connect_direct_and_preserves_typed_error` (asserts a `source` exists) |
 | Route credentials never reach route bodies or `Debug` | no route field in `ExecuteRequest`; `Debug` prints only origin | none in this file |
-| SOCKS5 and HTTP CONNECT routes work | `EggressDialer` + `EggressIo` — `lib.rs:553` | `socks5_route_round_trips`, `http_connect_route_round_trips` |
-| Streamed responses are bound to the request that asked for them | `eggwork-execution-id` == `handle.execution_id`; blob/artifact header equality — `lib.rs:220`, `lib.rs:472`, `lib.rs:511` | none in this file |
-| Client buffering is bounded | `eggwork_core::MAX_EVENT_BYTES` partial-line cap; `MAX_BUFFERED_BODY_BYTES` on buffered reads — `lib.rs:656`, `lib.rs:127`, `lib.rs:141-143` | `an_oversized_partial_line_is_still_refused` |
+| SOCKS5 and HTTP CONNECT routes work | `EggressDialer` + `EggressIo` — `crates/eggwork-client/src/lib.rs::EggressIo` | `socks5_route_round_trips`, `http_connect_route_round_trips` |
+| Streamed responses are bound to the request that asked for them | `eggwork-execution-id` == `handle.execution_id`; blob/artifact header equality — `crates/eggwork-client/src/lib.rs::shared_contract_tests::handle`, `crates/eggwork-client/src/lib.rs::NodeClient::download_blob`, `crates/eggwork-client/src/lib.rs::NodeClient::download_artifact` | none in this file |
+| Client buffering is bounded | `eggwork_core::MAX_EVENT_BYTES` partial-line cap; `MAX_BUFFERED_BODY_BYTES` on buffered reads — `crates/eggwork-client/src/lib.rs::MAX_BUFFERED_BODY_BYTES`, `crates/eggwork-client/src/lib.rs::NodeClient::fmt`, `crates/eggwork-client/src/lib.rs::NodeClient` | `an_oversized_partial_line_is_still_refused` |
 | Every request path has a deadline | `transport_timeouts()` on both builders; `unary_timeout()` total on the 7 unary calls | `every_request_path_carries_a_deadline` |
-| Every delivered event is re-validated | `event.validate()` at `lib.rs:651` and `lib.rs:666` | none in this file |
+| Every delivered event is re-validated | `event.validate()` at `crates/eggwork-client/src/lib.rs::ExecutionStream::into_events` and `crates/eggwork-client/src/lib.rs::ExecutionStream::into_events` | none in this file |
 | Framing handles empty lines, split boundaries, and a final partial line | `into_events` newline scan; `ndjson` fixture delivers in 7-byte pieces | `framing_handles_empty_lines_split_boundaries_and_a_final_partial_line` |
 | A protocol-maximum chunk is delivered, not rejected | 64 KiB payload encodes to ~256 KiB, past the old 128 KiB cap | `a_maximum_size_chunk_is_delivered_not_rejected` |
-| Incompatible nodes are refused before submission | `ensure_protocol_compatible` — `lib.rs:230`, called from `execute` (`lib.rs:196`) and `events` (`lib.rs:375`) | none in this file |
-| No `unsafe` | `#![forbid(unsafe_code)]` — `lib.rs:1` | compile-time |
+| Incompatible nodes are refused before submission | `ensure_protocol_compatible` — `crates/eggwork-client/src/lib.rs::NodeClient::ensure_protocol_compatible`, called from `crates/eggwork-client/src/lib.rs::NodeClient::execute` and `crates/eggwork-client/src/lib.rs::NodeClient::events` | none in this file |
+| No `unsafe` | `#![forbid(unsafe_code)]` — `crates/eggwork-client/src/lib.rs` | compile-time |
 
 ## Review focus
 

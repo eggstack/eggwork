@@ -118,6 +118,40 @@ root. Until Eggpack ships that, the tag half is a **process requirement**
 faked it locally: the generated workflow is untouched, and the gap is recorded
 here instead of being papered over.
 
+### Where the documentation gates run today — and where they do not
+
+The same shape applies to the two documentation gates, and it is worth stating
+rather than letting a green release workflow imply more than it proves.
+
+- **Both run in CI on every push and every pull request.**
+  `python3 scripts/check_doc_citations.py` asserts that every citation in
+  `architecture/` and `docs/` names a symbol that still resolves in the file it
+  names, and `python3 scripts/check_quickstart_sync.py` asserts that
+  `docs/quickstart.md` and `scripts/quickstart.sh` describe the same
+  procedure. Both are stdlib-only and read the tree, so they need nothing
+  built and run identically on every host. The quickstart document's shown
+  `doctor` output is compared against the node's real report by the
+  `installed-qualification` job, which already stages an installation root.
+- **Neither runs in the generated release workflow.** `.github/workflows/release.yml`
+  is *generated* by `eggpack ci generate` from `release/eggpack/`, hand-editing
+  it is forbidden, and `eggpack ci check` fails on drift. The generated
+  workflow's steps are build, capture, and qualification steps for the five
+  release targets; it has no hook for a repository-local preflight command, and
+  the `consumer_validators` are per-target scripts that validate the *built
+  artifact*, not the repository's source tree. A documentation gate is the
+  wrong shape for either.
+
+**Upstream prerequisite (Eggpack).** The same preflight hook the tag guard
+needs would carry the documentation gates: a repository-local command run from
+the checked-out repository root, before the first target is built. The
+configuration point is again `release/eggpack/workflow-shape.json` and
+`release/eggpack/github-policy.json`. Until Eggpack ships it, the gates are
+covered by CI on every push and every pull request, and the release path
+inherits that coverage *indirectly* — a release is cut from a tagged commit
+that CI already gated — rather than from a step inside the generated workflow.
+This repository has not hand-edited the generated workflow, and the gap is
+recorded here instead of being papered over.
+
 ## Producer configuration
 
 `release/eggpack/` contains nine files, 593 lines total. Every one is static.
@@ -405,7 +439,7 @@ hand-maintained release matrix exists.
 and no workflow or environment can replace the target-scoped rustflags.
 
 **Sealed boundary.** `the_deployment_module_never_parses_eggpack_configuration`
-reads `src/deployment.rs`, `src/operations.rs`, and `src/bin/eggworkd.rs` and
+reads `crates/eggwork-server/src/deployment.rs`, `crates/eggwork-server/src/operations.rs`, and `crates/eggwork-server/src/bin/eggworkd.rs` and
 requires none of them to mention `release/eggpack`, `ReleaseManifest`,
 `release-manifest`, `DistributionContract`, or `eggpack::`. **`eggwork-server`
 has no runtime Eggpack dependency and never parses a producer contract, a

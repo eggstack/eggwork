@@ -722,17 +722,17 @@ be able to tell them apart from the JSON alone, since the exit code is 2 in ever
 | A private key readable by group/other is refused | `trusted_private_key` | `valid_operator_config_builds_required_mtls_server_identity` |
 | `config print` never emits the key path, client fingerprints, or scope identifiers | `OperatorConfig::redacted_json` | `redacted_config_print_hides_private_key_path_and_client_fingerprints`, `the_printed_configuration_redacts_resource_scope_identifiers` |
 | An unknown operation name is a config error, not a missing permission | `validate` → `operation()` returning `None` | `valid_operator_config_builds_required_mtls_server_identity` |
-| An unknown principal or ungranted operation is denied | `GrantAuthorizer::authorize` via `is_some_and` | `a_scope_never_grants_an_operation_the_principal_does_not_hold` (`tests/resource_scoped_authorization.rs`); see [server-node.md](server-node.md) |
-| A resource scope narrows an operation the grant holds and never widens it | `GrantAuthorizer::authorize_request` | `a_resource_scope_narrows_the_operation_grant_it_names` (`tests/resource_scoped_authorization.rs`) |
+| An unknown principal or ungranted operation is denied | `GrantAuthorizer::authorize` via `is_some_and` | `a_scope_never_grants_an_operation_the_principal_does_not_hold` (`crates/eggwork-server/tests/resource_scoped_authorization.rs`); see [server-node.md](server-node.md) |
+| A resource scope narrows an operation the grant holds and never widens it | `GrantAuthorizer::authorize_request` | `a_resource_scope_narrows_the_operation_grant_it_names` (`crates/eggwork-server/tests/resource_scoped_authorization.rs`) |
 | A malformed scope is a config error, not an ignored entry | `validate` + `principals()` | `a_malformed_resource_scope_is_refused_by_the_configuration`, `a_duplicate_resource_scope_is_refused_by_the_configuration`, `too_many_resource_scopes_in_one_grant_are_refused`, `too_many_resource_scopes_across_the_node_are_refused` |
-| An older node refuses a configuration that carries a scope | `deny_unknown_fields` on `ClientGrant` | `an_older_node_refuses_a_configuration_that_carries_a_resource_scope` (`tests/resource_scoped_authorization.rs`) |
+| An older node refuses a configuration that carries a scope | `deny_unknown_fields` on `ClientGrant` | `an_older_node_refuses_a_configuration_that_carries_a_resource_scope` (`crates/eggwork-server/tests/resource_scoped_authorization.rs`) |
 | `doctor` agrees with the enforcement path on helper trust | `trusted_helper` → `verify_trusted_helper`, shared with the runner | `valid_operator_config_builds_required_mtls_server_identity` (adjacent); see [sandbox-helper.md](sandbox-helper.md) |
 | Execution listings are bounded and paginate | `MAX_EXECUTION_PAGE`, `load_snapshots` `LIMIT 2049` + `Bounds` | `execution_listing_is_bounded_and_paginates_over_durable_records` |
 | Symlinks are never followed when measuring a tree | `tree_bytes` `file_type().is_symlink()` check | `tree_size_never_follows_symlinks` |
 | The reported metric set is fixed and bounded | `METRIC_NAMES` overlay filter | `metrics_report_uses_a_fixed_bounded_counter_set` |
 | GC preview is read-only and reports its bound | `dry_run_gc` asks the owner modules for their candidate sets; no store is opened | `garbage_collection_preview_reads_only_and_reports_bounds`; `gc_preview_does_not_create_a_store_that_does_not_exist` |
-| GC preview and GC apply select the same candidates | the owner modules' canonical candidate statements; the operator holds no candidate predicate | `gc_preview_uses_the_stores_own_blob_predicate_not_the_reference_count_counter`; `gc_preview_candidates_are_a_subset_of_what_the_apply_pass_removes`; `gc_preview_and_apply_agree_when_the_store_has_no_expired_references`; `the_operator_module_contains_no_candidate_predicate_of_its_own` (`tests/gc_preview_parity.rs`) |
-| The operator does not spell a store's file name or the blob layout | `blob::metadata_path`, `workspace::metadata_path`, `artifact::metadata_path`, `blob::shard_path`, `blob::object_path` | `the_operator_module_contains_no_candidate_predicate_of_its_own` (`tests/gc_preview_parity.rs`); `inspect_blob_resolves_the_object_through_the_store_path_ownership` |
+| GC preview and GC apply select the same candidates | the owner modules' canonical candidate statements; the operator holds no candidate predicate | `gc_preview_uses_the_stores_own_blob_predicate_not_the_reference_count_counter`; `gc_preview_candidates_are_a_subset_of_what_the_apply_pass_removes`; `gc_preview_and_apply_agree_when_the_store_has_no_expired_references`; `the_operator_module_contains_no_candidate_predicate_of_its_own` (`crates/eggwork-server/tests/gc_preview_parity.rs`) |
+| The operator does not spell a store's file name or the blob layout | `blob::metadata_path`, `workspace::metadata_path`, `artifact::metadata_path`, `blob::shard_path`, `blob::object_path` | `the_operator_module_contains_no_candidate_predicate_of_its_own` (`crates/eggwork-server/tests/gc_preview_parity.rs`); `inspect_blob_resolves_the_object_through_the_store_path_ownership` |
 | `gc --apply` cannot race a running node | `acquire_maintenance_lock` `try_lock_exclusive` | `applying_gc_refuses_to_race_a_running_node` |
 | The drain marker survives a process restart and `undrain` removes it | `set_persistent_drain` temp+rename+fsync; `NotFound` tolerated on removal | `drain_state_survives_process_restart_and_undrain_removes_marker` |
 | Quiescence fails closed on unreadable state | `active_execution_count` returning `usize::MAX` | No test in this file; exercised by [release-qualification.md](release-qualification.md) |
@@ -764,14 +764,14 @@ resource-scope configuration surface. They build their fixture config inline, wh
 the field set is duplicated in the test helper and why a new `OperatorConfig` field is a
 compile-time reminder there.
 
-`tests/resource_scoped_authorization.rs` is a separate, portable target: it drives the
+`crates/eggwork-server/tests/resource_scoped_authorization.rs` is a separate, portable target: it drives the
 grant table through the public API only, so it needs no filesystem, no process, no TLS
 handshake, and no host platform. It holds the decision rule and the configuration shape —
 that a scope narrows, that it never grants, that it is per `(operation, kind)`, that a
 request without a resource falls back to the operation grant, and that an older node
 refuses a configuration carrying a scope.
 
-**`bin/eggworkd.rs` has no `#[cfg(test)]` module at all.** Every CLI concern is therefore
+**`crates/eggwork-server/src/bin/eggworkd.rs` has no `#[cfg(test)]` module at all.** Every CLI concern is therefore
 untested at the unit level: argv parsing and the `--config` splice, `parse_option`
 coercion, `service_command`'s fail-closed `--service-config`, the platform policy flag
 sets, `parse_sha256`, the `deployment apply` all-or-nothing digest rule, and the exit-code
@@ -792,7 +792,7 @@ harness only by targeted grep, so the list above is grep-verified but not
 exhaustively so.
 
 **Honest gaps.** The `GrantAuthorizer` decision is covered by
-`tests/resource_scoped_authorization.rs` and by the server's own end-to-end test, but the
+`crates/eggwork-server/tests/resource_scoped_authorization.rs` and by the server's own end-to-end test, but the
 *in-file* `operations.rs` module has no test that calls the authorizer directly; no test for
 `active_execution_count`'s fail-closed branches; no test for `storage_summary`'s WAL/shm
 accounting; no test for the three `inspect_*` functions or the blob size cross-check; no

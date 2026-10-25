@@ -17,6 +17,24 @@ jobs:
         run: python3 scripts/check_execution_ownership.py
       - name: execution ownership guard negative-exit proof
         run: python3 scripts/check_execution_ownership.py --prove-negative-exit
+      # The design record used to cite *line numbers*. A line number is a
+      # property of the text, not of the symbol: every unrelated edit above the
+      # target invalidated it, and 85% of the resolvable citations no longer
+      # resolved at the line they named. The gate makes the record cite
+      # symbols instead, so a citation survives an edit that moves the code.
+      # It is stdlib-only Python and reads the tree, so it runs the same on
+      # every host and needs nothing built first.
+      - name: documentation citation guard
+        run: python3 scripts/check_doc_citations.py
+      - name: documentation citation guard negative-exit proof
+        run: python3 scripts/check_doc_citations.py --prove-negative-exit
+      # `docs/quickstart.md` is the user-facing instruction and
+      # `scripts/quickstart.sh` is the executed version of it. They are two
+      # renderings of one procedure, so they are checked against each other:
+      # the document's commands must be the script's commands, and the doctor
+      # output the document shows must be the output the node emits.
+      - name: quickstart document and script sync
+        run: python3 scripts/check_quickstart_sync.py
       - run: cargo fmt --all -- --check
       # `--locked` is load-bearing. A workspace version bump that does not
       # update `Cargo.lock` builds fine locally and passes both of these, then
@@ -110,6 +128,29 @@ jobs:
       # test surface is still Linux-only and is not claimed here.
       - name: declared-artifact capture disposition suite
         run: cargo test --locked -p eggwork-server --test artifact_capture_disposition
+  quickstart:
+    # The quickstart is a *procedure*, and `docs/quickstart.md` is the
+    # user-facing instruction while `scripts/quickstart.sh` is its executed
+    # form. This job runs the script end to end on Linux against a locally
+    # built node with generated TLS material, so the document's claims are
+    # checked against a node that actually ran rather than against prose.
+    #
+    # The script needs `cargo`, `openssl`, `python3` and `stat`; all four are
+    # present on `ubuntu-latest`. It generates its own TLS material, installs
+    # the helper where the helper's trust check accepts it, and stops the node
+    # on every failure path, so a failed step never leaves a process holding
+    # the state directory's lock.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+      - name: run the quickstart end to end
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/quickstart.sh
   installed-qualification:
     # The `qualification`-feature suite qualifies an *installed* release: it
     # names its subject through the environment (`EGGWORK_QUALIFY_DAEMON`,
@@ -205,6 +246,32 @@ jobs:
           cargo test --locked -p eggwork-server --features qualification \
             --test installed_qualification -- --ignored --skip qualification_fixture \
             --test-threads=1 --nocapture
+      - name: quickstart doctor output against the node's report
+        # The quickstart document shows a `doctor` report. The set of check
+        # names it shows must equal the set the node emits, in the same order:
+        # the document once showed seven checks while the node emitted eight,
+        # and nothing caught it. This step runs the installed daemon's own
+        # `doctor` against the fixture this job materialised and compares the
+        # two, so the shown output is a fact rather than a picture.
+        #
+        # `doctor` exits non-zero when any check is not ok, which is a verdict
+        # about the *node*, not about the document. The qualification step
+        # above already requires a healthy node, so this step's assertion is
+        # the comparison alone: the report is captured whatever the verdict,
+        # and an unreadable or empty report fails the comparison with a clear
+        # message.
+        shell: bash
+        env:
+          EGGWORK_QUALIFY_ROOT: ${{ runner.temp }}/qualification
+        run: |
+          set -euo pipefail
+          status=0
+          "$EGGWORK_QUALIFY_ROOT/bin/eggworkd" doctor \
+            --config "$EGGWORK_QUALIFY_ROOT/state/node.json" \
+            > "$EGGWORK_QUALIFY_ROOT/doctor.json" || status=$?
+          printf 'doctor exited %s; the comparison below is the assertion\n' "$status"
+          python3 scripts/check_quickstart_sync.py \
+            --doctor-report "$EGGWORK_QUALIFY_ROOT/doctor.json"
   release-drift:
     # Eggpack is producer authority for the release matrix: the generated
     # release workflow must be exactly what the pinned tool renders from the

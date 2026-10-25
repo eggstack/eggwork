@@ -1,15 +1,15 @@
 # M008b closure record: release harness and documentation single-sourcing corrective
 
-Status: **active** — OP-4 and OP-6 implemented and verified; OP-5 is owned by a
-separate worker and is not recorded here
+Status: **closed** — OP-4, OP-5 and OP-6 implemented and verified; every
+acceptance criterion of the plan is met and the evidence is recorded below.
 Plan: `plans/implementation/operations-distribution/008b-release-harness-and-documentation-single-sourcing-corrective.md`
 Roadmap: `plans/subsystems/operations-distribution-roadmap.md`
-Source authority: `plans/subsystems/operations-distribution-operator-truthfulness-corrective-addendum.md` — findings OP-4 and OP-6
+Source authority: `plans/subsystems/operations-distribution-operator-truthfulness-corrective-addendum.md` — findings OP-4, OP-5 and OP-6
 
-This record covers **OP-4** and **OP-6** only. OP-5 (the documentation citation
-conversion and the quickstart machine-verification) is owned by another worker
-and will be appended as its own section; nothing here should be read as
-covering it.
+Sections 1-8 cover **OP-4** and **OP-6**. Sections 9-18 cover **OP-5** — the
+documentation citation conversion, the CI wiring, the divergences-table
+re-verification, and the quickstart document reconciliation. Nothing in one
+section should be read as covering another finding.
 
 ## 1. The rule this milestone establishes
 
@@ -430,3 +430,526 @@ python3 scripts/check_execution_ownership.py
 To reproduce the *absent-helper* direction of §3.3, delete
 `$CARGO_TARGET_DIR/debug/eggwork-sandbox-helper` (or use a fresh target
 directory) before running the capability probe.
+
+---
+
+# OP-5 — the design record cited line numbers, and the gate that stopped it
+
+Status: **closed** — OP-5 implemented and verified; every acceptance criterion
+the plan states for OP-5 is met, and the evidence is recorded below.
+
+This section covers **OP-5**. Sections 1-8 above cover OP-4 and OP-6 and are
+not restated here.
+
+## 9. What OP-5 found
+
+The design record carried **718 line-number citations**. Re-measured against the
+tree, **85%** of the resolvable ones no longer resolved at the line they named,
+83% were stale within ±3 lines, and 72% were stale allowing ±20 lines of
+drift. The spot check that made the defect concrete: `architecture/deployment-lifecycle.md`
+cited `verify_trusted_helper` as living in `crates/eggwork-server/src/lib.rs`,
+and it is defined in `crates/eggwork-runner/src/lib.rs` — the wrong *file*
+entirely. Citations also frequently used a bare basename (`lib.rs`), which is
+ambiguous across the five crates.
+
+The defect is the *citation form*, not any individual citation. A line number
+is a property of the text, not of the symbol: every unrelated edit above the
+target invalidates it, and no reviewer notices until the citation quietly
+stops meaning anything. The durable form is a **symbol**.
+
+The gate already existed (`scripts/check_doc_citations.py`, added by the
+M008b part-B worker). It failed over the live tree, as it must: a gate that
+only turns on when the tree is already clean protects nothing.
+
+**Before, on the live tree:**
+
+```
+$ python3 scripts/check_doc_citations.py ; echo "EXIT=$?"
+- architecture/data-plane.md:11: legacy-line-citation: `lib.rs:10-29` names a line number; cite a symbol instead
+… 680 findings …
+EXIT=1
+```
+
+| Finding class | Count |
+|---|---|
+| `legacy-line-citation` | 627 |
+| `unresolved-path` | 53 |
+| **total** | **680** |
+
+| Document | Findings before |
+|---|---|
+| `architecture/data-plane.md` | 202 |
+| `architecture/server-node.md` | 192 |
+| `architecture/core-domain.md` | 96 |
+| `architecture/storage-journal.md` | 94 |
+| `architecture/client-transport.md` | 42 |
+| `architecture/deployment-lifecycle.md` | 22 |
+| `architecture/sandbox-helper.md` | 8 |
+| `architecture/operations-cli.md` | 8 |
+| `architecture/overview.md` | 6 |
+| `architecture/release-qualification.md` | 3 |
+| `architecture/execution-ownership.md` | 3 |
+| `architecture/ci-guardrails.md` | 3 |
+| `architecture/runner-execution.md` | 1 |
+| **total** | **680** |
+
+## 10. The conversion
+
+### 10.1 How a citation's symbol was determined
+
+A citation's line number was true **when the document was written**. The file
+has moved since. So the conversion did not ask "what is at line N *today*",
+which is the question that produces a plausible wrong answer (the cited line
+has drifted by hundreds of lines, and the symbol nearest a drifted line is
+usually the wrong one). It asked, for each citation:
+
+> **Which symbol did the cited line point at in the file as it stood when the
+> citing document was written?**
+
+That is answerable from the repository's own history. For every document, each
+legacy citation occurrence was aligned against the occurrences in each
+historical version of that document (`difflib` over the citation sequence), and
+the cited line was resolved against the *file at the commit that introduced the
+citation*. The symbol's name is stable where the line number is not, so the
+resolution survives every edit since. 646 of the 657 citations resolved this
+way; the remaining 11 were ranges or bare-continuation forms that name no
+single item and were resolved by reading the code and naming the item the
+sentence means.
+
+Where the sentence's own subject named an item in the cited file, that subject
+won: a cited line that lands on a boundary, on a trait implementation, or on
+an attribute resolves to the *neighbouring* item, and the sentence is about the
+thing it names. This is what corrected `EggressDialer::dial` (the line landed
+inside the enclosing `impl`'s helper) and `ExecuteRequest` (the line landed
+one line above the struct's `#[derive]`).
+
+### 10.2 The result
+
+**651 net new symbol citations** (14 before, 665 after), spread over ten
+documents:
+
+| Document | Symbol citations after |
+|---|---|
+| `architecture/data-plane.md` | 221 |
+| `architecture/server-node.md` | 186 |
+| `architecture/core-domain.md` | 98 |
+| `architecture/storage-journal.md` | 91 |
+| `architecture/client-transport.md` | 38 |
+| `architecture/deployment-lifecycle.md` | 18 |
+| `architecture/ci-guardrails.md` | 11 |
+| `architecture/runner-execution.md` | 1 |
+| `architecture/sandbox-helper.md` | 1 |
+| **total** | **665** |
+
+The form is a repository-relative path, optionally with `::symbol`:
+
+```
+`crates/eggwork-server/src/lib.rs::run_execution`
+`crates/eggwork-runner/src/lib.rs::verify_trusted_helper`
+`crates/eggwork-server/src/workspace.rs::WorkspaceManager::materialize`
+```
+
+Where a sentence refers to a *concept* rather than to one item — a family of
+constants, a module, a general rule — a **path-only** citation is used, which
+the gate accepts and which is honest about what the sentence claims.
+
+### 10.3 The gate's own extension, and why it was needed
+
+The gate rejects a symbol it cannot find in the named file. It did not find
+`NodeId`, `PrincipalId`, `ExecutionId`, `LeaseId`, `WorkspaceId` and
+`ArtifactId` — because those are generated by the `id_type!` macro, and the
+checker did not expand macros. The document genuinely needs to name them:
+they are the crate's public identity types, and citing the macro instead of
+the type is a weaker statement about a stronger fact.
+
+**Change made** (`scripts/check_doc_citations.py`): the checker now records the
+items a file's *own* macros generate. When a `macro_rules!` macro defined in
+the file binds an `ident` metavariable in an item position (`struct $name`,
+`enum $name`, `type $name`, `trait $name`, `mod $name`, `union $name`,
+`fn $name`, `impl $name`) and is invoked with an identifier as its first
+argument, that identifier is an item the file defines. `id_type!(NodeId, "node
+id")` therefore defines `NodeId`.
+
+This is a **strict addition** to the symbol table: more names resolve, and
+every rejection rule the gate enforces is untouched — the legacy `file.rs:NNN`
+form is still rejected outright, a path that does not exist is still rejected, a
+symbol absent from the named file is still rejected, an ambiguous in-file
+symbol is still rejected, and a bare basename that is not unique in the tree is
+still rejected. The macro rule is deliberately narrow: a macro whose body does
+*not* put the metavariable in an item position generates nothing, so
+`not_an_item_macro!(NotAnItem)` does **not** define `NotAnItem`, and the
+fixture asserts exactly that in both directions.
+
+**Two other changes to the gate, both stated because they are changes to the
+gate:**
+
+1. **A per-file cache of the symbol table** (`_SYMBOL_CACHE`). The design
+   record cites the same source file hundreds of times, and re-parsing an
+   8,000-line Rust file for each citation turned a check that should take
+   seconds into one that took minutes. The cache changes the cost, not the
+   result: the same tree produces the same findings, in the same order.
+2. **The fixture grew the macro case** (`FIXTURE_RUST` now defines
+   `real_id_type!` and invokes it, and defines `not_an_item_macro!` and
+   invokes it). `--prove-negative-exit` now asserts that `RealId` resolves and
+   that `NotAnItem` does not, so the new rule is covered by the gate's own
+   proof rather than by assertion.
+
+The gate's own test module (`tests/release/test_doc_citations.py`) was **not**
+edited: it is outside this worker's ownership. It still passes unchanged (see
+§14), and the new behaviour is covered by the gate's own
+`--prove-negative-exit` fixture, which lives in the script this worker owns.
+
+### 10.4 Substantive corrections, not just reference corrections
+
+The conversion is not a find-and-replace. Where the record was wrong, the
+substance was corrected:
+
+- **`architecture/storage-journal.md`'s metrics section was stale.** It claimed
+  20 metric names lived in `operations::METRIC_NAMES`, that five workspace
+  counters were written but "silently discarded" by the report, and that the
+  gap was worth knowing about. The M008a corrective had already closed that:
+  the vocabulary is now a typed `Metric` enumeration declared with the
+  producers, the report reads that same declaration, and a counter that is not
+  named cannot be incremented. The section now says that, counts 25 names,
+  lists the five workspace counters in the table, and the "Observability gap"
+  bullet is replaced by the closed statement.
+- **`architecture/overview.md` row 3 was corrected**: the flag is documented
+  in `docs/deployment.md`, not in a README.
+- **`architecture/client-transport.md`'s doctor output was already correct**
+  (see §13); the M008a worker had already put `host-telemetry` in it.
+- **`build.rs` citations were prose about a Cargo build script**, not
+  citations to a file that does not exist. They now say "a Cargo build
+  script" in four places rather than naming a path the tree does not have.
+- **The `server-node.md` "Notable cases" list** carried bare line numbers as
+  list-item prefixes (`- 2934 \`route_contract_is_fixed_target_and_versioned\``).
+  The gate does not catch those — a bare number is not a path — but they are the
+  same defect, so the list now names each test.
+
+## 11. The CI wiring
+
+`.github/workflows/ci.yml` is **hand-maintained** (unlike
+`.github/workflows/release.yml`, which is generated by `eggpack ci generate` and
+must never be hand-edited; `eggpack ci check` fails on drift).
+
+Three steps were added to the **`rust` job** — `ubuntu-latest`, triggered on
+every `push` and every `pull_request`:
+
+```yaml
+      - name: documentation citation guard
+        run: python3 scripts/check_doc_citations.py
+      - name: documentation citation guard negative-exit proof
+        run: python3 scripts/check_doc_citations.py --prove-negative-exit
+      - name: quickstart document and script sync
+        run: python3 scripts/check_quickstart_sync.py
+```
+
+They sit immediately after the execution-ownership guard steps, because they
+are the same class of check: repository-shape guards that read the tree rather
+than build it. Both scripts are **stdlib-only**, read only files on disk, and
+depend on nothing that exists on one platform only, so the steps behave
+identically on every host and need no build product.
+
+One further **job** was added — `quickstart` — which runs
+`scripts/quickstart.sh` end to end on `ubuntu-latest`:
+
+```yaml
+  quickstart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+      - name: run the quickstart end to end
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/quickstart.sh
+```
+
+The script needs `cargo`, `openssl`, `python3` and `stat`; all four are present
+on `ubuntu-latest`, and it generates its own TLS material with `openssl`. It
+installs the helper where the helper's trust check accepts it, and stops the
+node on every failure path, so a failed step never leaves a process holding
+the state directory's lock. This is the job the plan's criterion 10 asks for:
+the quickstart **executed** by CI against a locally built node with generated
+TLS material, not merely asserted to be true.
+
+One further step was added to the **`installed-qualification` job**, which
+already stages an installation root and materialises a node configuration into
+it:
+
+```yaml
+      - name: quickstart doctor output against the node's report
+        env:
+          EGGWORK_QUALIFY_ROOT: ${{ runner.temp }}/qualification
+        run: |
+          set -euo pipefail
+          "$EGGWORK_QUALIFY_ROOT/bin/eggworkd" doctor \
+            --config "$EGGWORK_QUALIFY_ROOT/state/node.json" \
+            > "$EGGWORK_QUALIFY_ROOT/doctor.json"
+          python3 scripts/check_quickstart_sync.py \
+            --doctor-report "$EGGWORK_QUALIFY_ROOT/doctor.json"
+```
+
+This makes the document's shown `doctor` output an **executed** fact: the
+installed daemon's own report is compared against the document's shown check
+names, set **and order**. It runs after the qualification execution because the
+fixture step is what materialises `state/node.json`.
+
+The step captures the report whatever `doctor`'s exit status, because `doctor`
+exits non-zero when any check is not ok — a verdict about the *node*, which the
+qualification step above already requires to be healthy, not a statement about
+the document. The step's assertion is the comparison alone; an unreadable or
+empty report fails the comparison with an explicit message.
+
+`architecture/ci-guardrails.md` gained the three `rust`-job steps (with the
+step-by-step explanation renumbered), the new `installed-qualification` step,
+and the reason the doctor comparison lives in that job.
+
+### 11.1 The release path — an upstream prerequisite, recorded not faked
+
+`.github/workflows/release.yml` is **generated** by `eggpack ci generate` from
+`release/eggpack/`. The generated workflow's steps are build, capture and
+qualification steps for the five release targets; it has **no hook** for a
+repository-local preflight command, and its `consumer_validators` are per-target
+scripts that validate the *built artifact*, not the repository's source tree. A
+documentation gate is the wrong shape for either.
+
+The upstream prerequisite is recorded in `architecture/release-qualification.md`
+in a new section, *Where the documentation gates run today — and where they do
+not*: Eggpack must support a repository-local preflight step in the generated
+release workflow — the same hook the tag guard already needs — configured at
+`release/eggpack/workflow-shape.json` and `release/eggpack/github-policy.json`.
+Until it ships, the gates are covered by CI on every push and every pull
+request, and the release path inherits that coverage *indirectly* (a release is
+cut from a tagged commit CI already gated) rather than from a step inside the
+generated workflow. **The generated workflow was not hand-edited.**
+
+## 12. The divergences table, re-verified entry by entry
+
+`architecture/overview.md`'s divergences table was re-verified against the tree
+row by row — not assumed. Every row was checked by reading the code it names.
+
+| # | What was checked | Evidence | Outcome |
+|---|---|---|---|
+| 1 | The helper does not `execve` | `crates/eggwork-sandbox-helper/src/main.rs` builds a `Command` and calls `command.spawn()` (line 129) then `child.wait()` (line 138) | **left alone** — still true |
+| 2 | The helper sets no `RLIMIT_*` | no `rlimit`/`setrlimit`/`RLIMIT` occurrence anywhere under `crates/eggwork-sandbox-helper/src/` | **left alone** — still true |
+| 3 | `--windows-start-type` is parsed by no code path | `scripts/qualify_release.py:798` emits the flag; no occurrence of `windows_start_type` or `windows-start-type` in any `.rs` file | **corrected** — the flag is documented in `docs/deployment.md`, not in a README |
+| 4 | The `GrantAuthorizer` resource-scope boundary (closed by ADR-0007) | `crates/eggwork-server/src/operations.rs`: `GrantAuthorizer` implements `authorize_request`; the scope lookup is `grant.scopes.get(&(request.operation, resource.kind()))` — per `(operation, kind)`; `authorize` is called first, so a scope never grants; ownership stays with the store | **left alone, verbatim** — the closed claim and its residual boundary still hold |
+| 5 | `check_helper_compatibility_with_timeout` checks the file only | `crates/eggwork-server/src/deployment.rs`: `symlink_metadata`, `is_file()`, ownership and mode checks — no ancestor walk | **left alone** — still true |
+| 6 | Invariant 2 has no dedicated mechanical guard | `no_direct_service_manager_invocation_exists` scans exactly `src/deployment.rs`, `src/operations.rs`, `src/bin/eggworkd.rs`; `eggwork-runner` is outside it | **left alone** — still true |
+| 7 | The ownership guard globs only `crates/*/src/**/*.rs` | `scripts/check_execution_ownership.py:203` — `(ROOT / "crates").glob("*/src/**/*.rs")` | **left alone** — still true |
+| 8 | `--prove-negative-exit` is narrower than its name | `scripts/check_execution_ownership.py`: `main()` returns `prove_negative_exit()` before `scan_sources()` and `check_dependencies()` are called | **left alone** — still true |
+| 9 | `blob_download` takes no reference lease | no `retain`/`lease` call in `blob_download`; `artifact_download` calls `.retain(` | **left alone** — still true |
+| 10 | Workspace materialization has no `O_NOFOLLOW` | `crates/eggwork-server/src/workspace.rs:1118` — `options.write(true).create_new(true)` on a plain path; `crates/eggwork-server/src/artifact.rs` uses `OFlags::NOFOLLOW` chains | **left alone** — still true |
+| 11 | No schema version or migration path | no `PRAGMA user_version` in any server source file | **left alone** — still true |
+| 12 | The store does not enforce the state machine | `commit_event` rejects only a *terminal* current state; no legality check on the transition | **left alone** — still true |
+| 13 | `generation.get() as i64` in eleven places | `grep -c 'generation.get() as i64' crates/eggwork-server/src/store.rs` → **11**; `after_sequence as i64` at store.rs:442 | **left alone** — the count is still eleven |
+| 14 | `load_page` has no `LIMIT` | the three statements in `load_page` carry no `LIMIT` clause | **left alone** — still true |
+| 15 | `MAX_EXECUTION_IDENTITIES` never evicts | `store.rs:19` — `const MAX_EXECUTION_IDENTITIES: i64 = 2048`; `store.rs:179` — `if execution_count >= MAX_EXECUTION_IDENTITIES` with no eviction path | **left alone** — still true |
+| 16 | TOCTOU between admission and launch | `crates/eggwork-server/src/lib.rs`: permit acquired at 2123, idempotency `reserve` at 2179, runner task spawned at 2283/2287 | **left alone** — still true |
+| 17 | Blob GC cannot race `retain` (closed) | `garbage_collect` locks `self.inner.metadata` at entry (blob.rs:492); `retain` takes that same mutex (blob.rs:313) — mutually exclusive | **left alone, verbatim** — the closed claim still holds |
+| 18 | Artifact GC does not release blob references | no `release_references`/`retain`/`clear_reference` call in `ArtifactStore::garbage_collect` | **left alone** — still true |
+| 19 | `events()` puts the lease id in a URL query string | `crates/eggwork-client/src/lib.rs:496` — `"/v1/executions/{}/events?generation={}&after={after_sequence}&lease={}"` | **left alone** — still true |
+| 20 | `decode_json` has no size cap | **the observation is no longer true.** The client's `HttpClient` is built with `.max_decoded_body_size(MAX_BUFFERED_BODY_BYTES)` (16 MiB) at `crates/eggwork-client/src/lib.rs:182` and `:200`; Eggfetch 0.2.0's `compression.rs` wraps the response body in a `LimitingStream` that enforces the bound on both the compressed and the uncompressed path. The telemetry route is bounded twice (transport cap, then 64 KiB). The cap was added by `17ff53f`, after the row was written | **closed** — struck, with `**Closed 2026-10-25 by the 17ff53f corrective.**`, what now enforces it, and the residual boundary (a transport-wide cap, not a per-route one) |
+| 21 | Redirect/retry safety is an accident of the dependency profile | `Cargo.toml:35` — `eggfetch-core` with `default-features = false, features = ["standard-http1", "tls-rustls"]`; eggfetch 0.2.0's `standard-http1` is `transport-http1 + standard-route + high-level-url` and does **not** enable `redirects` or `logical-retry` — only the `http1`/`http2` aliases do | **left alone** — still true |
+| 22 | Declared artifacts are refused, not captured, on a platform that cannot open a file beneath the workspace root | `crates/eggwork-server/src/artifact.rs`: the `#[cfg(not(unix))]` `open_file_beneath` returns `Unsupported`; `#[cfg(not(unix))] capture_capability()` returns `Unavailable`; `decide_artifact_capture` maps `Unavailable` to `ArtifactCaptureDisposition::Failed` and rewrites `Succeeded` to `Failed` | **left alone, verbatim** — the closed claim and the remaining platform limitation both hold |
+| 23 | The operator surface's metric vocabulary (closed by M008a) | preserved verbatim; the underlying code was inspected for §10.4 and found consistent with the closure | **left alone, verbatim** |
+| 24 | `active_executions` carried two facts (closed by M008a) | preserved verbatim | **left alone, verbatim** |
+
+**Numbering was not disturbed.** No row was renumbered, no row was moved
+between tables, and the rows cited by number elsewhere in `architecture/` and
+`plans/` still mean what they meant. A closed row is closed **in place**, using
+the document's own convention — the old text struck through, followed by
+`**Closed <date> by <what>.**`, then what now enforces it and what residual
+boundary remains — as rows 17 and 22 already did. A new row takes the next
+free number at the end of the document; none was needed.
+
+A short paragraph recording the re-verification, its date, and which rows
+changed was added above the table in `architecture/overview.md`.
+
+## 13. The component size table is now a script
+
+The same defect class as a line-number citation: a checked-in line count is a
+fact about the tree that rots on the next edit and is wrong the moment it is
+written. `architecture/overview.md` carried five such counts
+(`1,671 LOC` … `14,104 LOC`); they were stale by 70-100% and had no owner.
+
+**`scripts/component_sizes.py`** (new, stdlib-only, deterministic) prints the
+figures on demand. It counts every line of every `.rs` file a crate owns,
+split into the crate's `src/` (the product) and `tests/` (the evidence), and
+sums to a workspace total so a reader can check the arithmetic.
+
+```
+$ python3 scripts/component_sizes.py
+| Crate | `src/` lines | `tests/` lines | files | total lines |
+|---|---|---|---|---|
+| `eggwork-core` | 2,938 | 434 | 3 | 3,372 |
+| `eggwork-runner` | 3,820 | 2,000 | 8 | 5,820 |
+| `eggwork-sandbox-helper` | 651 | 1,930 | 5 | 2,581 |
+| `eggwork-client` | 1,350 | 0 | 1 | 1,350 |
+| `eggwork-server` | 20,998 | 5,162 | 20 | 26,160 |
+| **total** | **29,757** | **9,526** | **37** | **39,283** |
+```
+
+`--markdown` prints one table row per crate; `--json` prints the counts
+machine-readably. The document's size column now says *see the size script* and
+points at the command. **The document carries no size figures at all** —
+acceptance criterion 8 says the component table carries no hand-written size
+figures, and a snapshot table beside it would be the same fact in a different
+place. The snapshot lives here, in the closure record, where it is evidence
+about one commit rather than a second owner of a number the tree owns.
+
+## 14. The quickstart document, reconciled
+
+`scripts/check_quickstart_sync.py` compares the document's command blocks with
+the script's steps, by *shape* rather than by literal text, so the document's
+`$ROOT` and the script's `$ROOT` are the same command.
+
+**What was wrong.** The document's two `cargo test` commands in blocks 13-14
+lacked `--locked`, while `scripts/quickstart.sh` uses it. `--locked` is
+load-bearing on `clippy` and `test` for the same reason it is load-bearing on
+a release: a version bump that skips `Cargo.lock` passes both and then fails
+every release build. The document is the user-facing instruction, so it must
+carry the flag a user needs to reproduce the locked build.
+
+**Fixed:** `--locked` added to both commands. The sync check then passed:
+
+```
+$ python3 scripts/check_quickstart_sync.py ; echo "EXIT=$?"
+quickstart sync check passed: the document's command blocks and shown doctor output agree with scripts/quickstart.sh
+EXIT=0
+```
+
+**The doctor output.** The earlier worker's finding — the document showing
+seven check names while the node emits eight — **no longer holds**: the M008a
+worker had already added `host-telemetry` to the document. The node emits
+eight, in this order, and the document now shows the same eight in the same
+order:
+
+| Node (`crates/eggwork-server/src/operations.rs`) | Document |
+|---|---|
+| `configuration` | `configuration` |
+| `host-telemetry` | `host-telemetry` |
+| `sandbox-resource-backend` | `sandbox-resource-backend` |
+| `listener` | `listener` |
+| `execution-root`, `blob-root`, `workspace-root` | the same three, in the same order |
+| `storage-headroom` | `storage-headroom` |
+
+The comparison is now **executed** rather than read: the new
+`installed-qualification` CI step runs the installed daemon's own `doctor`
+report and compares it with the document (§11), and `scripts/quickstart.sh`
+performs the same comparison when it runs the flow end to end.
+
+`bash scripts/quickstart.sh` was run end to end in this tree: it completed
+successfully, and its final step reported
+`quickstart sync check passed: the document's command blocks and shown doctor
+output agree with scripts/quickstart.sh`. The two ignored qualification tests
+passed inside it (`test result: ok. 1 passed; 0 failed`).
+
+## 15. Verification actually run
+
+Every command below was executed in this working tree. Commands that were
+**not** run are in §17 with the reason.
+
+| Command | Result |
+|---|---|
+| `python3 scripts/check_doc_citations.py` (before the conversion) | **exit 1** — 680 findings (627 `legacy-line-citation`, 53 `unresolved-path`) |
+| `python3 scripts/check_doc_citations.py` (after the conversion) | **exit 0** — `doc citation guard passed; every citation names a symbol that resolves`, 21 documents scanned |
+| `python3 scripts/check_doc_citations.py --prove-negative-exit` | **exit 0** — `doc citation guard negative-exit proof passed: the deliberately wrong citation was rejected (legacy-line-citation, unresolved-path, unresolved-symbol); the correct citation was accepted` |
+| `python3 scripts/check_quickstart_sync.py` | **exit 0** — `quickstart sync check passed: the document's command blocks and shown doctor output agree with scripts/quickstart.sh` |
+| `python3 -m unittest discover --start-directory tests/release --top-level-directory tests/release` | **OK** — 139 tests, 0 failures, 0 errors, 0 skipped |
+| `python3 scripts/check_execution_ownership.py` | **exit 0** — the ownership guard and its negative scanner self-test both pass |
+| `python3 scripts/component_sizes.py` | exit 0 — the table in §13 |
+| `bash scripts/quickstart.sh` | **OK** — `quickstart completed successfully`; the final sync check passed and both ignored qualification tests passed |
+| `cargo fmt --all -- --check` | **exit 0** — no formatting diff |
+| `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` | **exit 0** — no warnings |
+| `cargo check --workspace` | **exit 0** |
+| `cargo test --locked --workspace --all-targets` | **OK** — the whole workspace suite passes |
+| `eggpack ci check --workflow-shape … --contract … --github-policy … --workflow …` | **exit 0** — `ci check: match (51529 bytes)`; the generated release workflow is unchanged |
+
+### 15.1 The Rust toolchain
+
+**No Rust source file was changed by this work.** The changes are to
+`architecture/*.md`, `docs/quickstart.md`, `.github/workflows/ci.yml`, and
+`scripts/`. The Rust-toolchain commands were nevertheless run against the
+whole branch, so the pre-submit gate is verified over everything the branch
+carries and not merely over this diff — criterion 13 asks for the full
+pre-submit gate, and the branch's other workers' commits are part of it.
+
+### 15.2 Code inspection versus executed evidence
+
+| Claim | How it was established |
+|---|---|
+| Every row of the divergences table | **Code inspection**, each row against the file it names — the evidence is in §12's table |
+| The citation conversion resolves | **Executed** — the gate, 680 findings to 0 |
+| The gate rejects a wrong citation | **Executed** — `--prove-negative-exit`, and the 139-test release suite |
+| The macro-generated item rule | **Executed** — the gate's own fixture asserts `RealId` resolves and `NotAnItem` does not |
+| The quickstart document matches the script | **Executed** — the sync check, and the script run end to end |
+| The document's doctor output matches the node | **Executed** — `scripts/quickstart.sh` compared the installed daemon's report with the document |
+| The new CI steps run | **Partly executed.** The `rust`-job steps were run as the commands they are. The new `quickstart` job and the new `installed-qualification` step were **not** executed as GitHub jobs: only the coordinator can dispatch them. The `quickstart` job's body is exactly `bash scripts/quickstart.sh`, which **was** run in this tree and completed successfully; the `installed-qualification` step's body is the same daemon `doctor` comparison the script performed. So the *commands* are executed evidence; the *jobs in the workflow file* are not |
+| The release path carries the documentation gates | **Not covered, by design.** The release workflow is generated; the upstream prerequisite is recorded in `architecture/release-qualification.md` (§11.1) |
+
+## 16. What changed, file by file
+
+| File | Change |
+|---|---|
+| `architecture/ci-guardrails.md` | the three new `rust`-job steps, the new `installed-qualification` step, the renumbered step-by-step explanation, and the reason the doctor comparison lives in that job |
+| `architecture/client-transport.md` | 38 citations converted; the two `cargo test` commands' `--locked`; the doctor's `forbid(unsafe_code)` row |
+| `architecture/core-domain.md` | 98 citations converted; the `RunnerRequest` contrast now cites the runner |
+| `architecture/data-plane.md` | 221 citations converted; the storage-layout code blocks' line references converted |
+| `architecture/deployment-lifecycle.md` | 18 citations converted; `verify_trusted_helper` now cites `crates/eggwork-runner/src/lib.rs` — **the wrong-file citation the plan's spot check named** |
+| `architecture/execution-ownership.md` | one relative path made repository-relative |
+| `architecture/operations-cli.md` | relative paths made repository-relative |
+| `architecture/overview.md` | the component size column replaced by the size script; divergence row 3 corrected; row 20 closed; the re-verification note |
+| `architecture/release-qualification.md` | the new "where the documentation gates run today — and where they do not" section with the upstream prerequisite |
+| `architecture/runner-execution.md` | one relative path made repository-relative |
+| `architecture/sandbox-helper.md` | the Cargo build script prose |
+| `architecture/server-node.md` | 186 citations converted; the "Notable cases" list names each test instead of a line number |
+| `architecture/storage-journal.md` | 91 citations converted; the metrics section corrected against the M008a corrective |
+| `docs/quickstart.md` | `--locked` on the two `cargo test` commands |
+| `.github/workflows/ci.yml` | three steps in the `rust` job, a new `quickstart` job, one step in the `installed-qualification` job |
+| `scripts/check_doc_citations.py` | the macro-generated item rule; the symbol-table cache; the fixture's macro case |
+| `scripts/component_sizes.py` | **new** — the per-crate size report |
+
+## 17. Residual work
+
+**Medium — the documentation gates do not run inside the generated release
+workflow.** This is the milestone's stated boundary, not an oversight: the
+workflow is generated by Eggpack and has no repository-local preflight hook.
+The upstream prerequisite is recorded in `architecture/release-qualification.md`
+(§11.1) and the generated workflow was not hand-edited.
+
+**Medium — `CONTRIBUTING.md`'s pre-submit list does not mention the citation
+gate.** That file is outside this worker's ownership. The exact proposed
+change is in the handoff report.
+
+**Low — the new CI jobs have not run as GitHub jobs.** The `quickstart` job's
+body is exactly the command that was run in this tree, and the
+`installed-qualification` step's body is the same daemon `doctor` comparison
+the script performed; the hosted jobs themselves need the coordinator to
+dispatch them.
+
+**Low — the gate is not a substitute for a reviewer's judgement.** It proves
+that a cited symbol still exists and is still named that. It does not prove
+that the symbol is the one the sentence means. The divergences re-verification
+in §12 is the part of this work that could not be automated.
+
+**Informational — the conversion made the documents more verbose.** A citation
+is now a full repository-relative path, sometimes twice the length of the
+symbol it names. That is the cost of a form that survives an edit, and the
+gate's rule set is what makes it worth paying. Where a sentence refers to a
+concept rather than to one item, a path-only citation keeps it short.
+
+## 18. Reproducing this record
+
+```bash
+python3 scripts/check_doc_citations.py
+python3 scripts/check_doc_citations.py --prove-negative-exit
+python3 scripts/check_quickstart_sync.py
+python3 -m unittest discover --start-directory tests/release --top-level-directory tests/release
+python3 scripts/check_execution_ownership.py
+python3 scripts/component_sizes.py
+bash scripts/quickstart.sh
+```
