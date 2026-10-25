@@ -21,7 +21,7 @@ Follow-up accepted ADR: `plans/adrs/ADR-0006-optional-gregg-host-telemetry.md` (
 
 Follow-up accepted ADR: `plans/adrs/ADR-0008-core-protocol-contract-ownership.md` (2026-10-23) — `eggwork-core` owns the control-plane API schema version, the `exec.argv.v1` capability name, and the terminal/non-terminal classification of `ExecutionState`; the runner keeps producer ownership of the capability names it produces and of the sandbox profile name. No wire value, wire field, or capability byte changes. This is the `plans/003-planning-process.md` §8 record that Control-plane M004's §12.3 stop condition requires.
 
-Proposed ADR, **not yet accepted**: `plans/adrs/ADR-0007-resource-scoped-authorization.md` (decides whether resource-scoped grants are implemented or the inert hook and its plumbing are removed). Security M005c is blocked on it.
+Accepted ADR: `plans/adrs/ADR-0007-resource-scoped-authorization.md` (2026-10-25) — **Option A: implement resource-scoped grants.** The node gains a real per-resource authorization boundary: `GrantAuthorizer` implements the existing `authorize_request` hook so the typed `ResourceId` is consulted, `ClientGrant` gains an optional, additive, bounded resource-scope list, the store's `principal_id` fences remain authoritative for ownership (the authorizer narrows, never widens), and blobs are governed by an explicit digest list because content-addressed blob storage has no owner. No wire value, wire field, capability byte, or `API_SCHEMA_VERSION` changes. Security M005c is unblocked and implements Branch A.
 
 ## Status vocabulary
 

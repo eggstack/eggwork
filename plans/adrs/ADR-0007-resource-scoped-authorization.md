@@ -1,8 +1,12 @@
 # ADR-0007: Resource-Scoped Authorization — Implement the Boundary or Remove the Hook
 
-Status: proposed — **not yet accepted**. This ADR records a decision that has not been made. No implementation work may be handed off on the strength of this document.
+Status: accepted
 
 Date: 2026-10-23
+
+Decision: **Option A — implement resource-scoped grants.** The node gains a real per-resource authorization boundary. `GrantAuthorizer` implements the existing `Authorizer::authorize_request` hook so the typed `ResourceId` is consulted; `ClientGrant` gains an optional, additive, bounded resource-scope list; the store's `principal_id` fences remain authoritative for ownership and the authorizer may narrow, never widen; blobs are governed by an explicit digest list because content-addressed blob storage has no owner to fence against. No wire value, wire field, capability byte, or `API_SCHEMA_VERSION` changes.
+
+Decision date: 2026-10-25
 
 Decision owners: project maintainers
 
@@ -15,7 +19,7 @@ Related authority:
 - `plans/security/threat-model.md`
 - `architecture/overview.md` — divergence #4
 - `plans/subsystems/security-isolation-resource-isolation-truthfulness-corrective-addendum.md` — finding SI-3
-- `plans/implementation/security-isolation-resource/005c-resource-scoped-authorization-corrective.md` — the implementation plan, **blocked** on this ADR
+- `plans/implementation/security-isolation-resource/005c-resource-scoped-authorization-corrective.md` — the implementation plan this decision authorises (Branch A)
 - `plans/003-planning-process.md` §4 (dependency discipline) and §8 (architecture changes)
 
 ## Context
@@ -152,13 +156,60 @@ The review must also confirm that the chosen option does not move Eggwork toward
 
 ## Decision
 
-**Not yet made.** This ADR is `proposed`.
+**Option A — implement resource-scoped grants.** Accepted on 2026-10-25.
 
-When the decision is made, this section is completed with the selected option, the decision date, and the constraints that apply to it, and the `Status:` line above is changed from `proposed` to `accepted`. Until then:
+The node gains a real per-resource authorization boundary. The hook that is already built and publicly exported becomes live instead of inert, the threat model's open boundary can be closed with evidence rather than with a caveat, and the published API of `eggwork-server` is not broken.
 
-- `plans/implementation/security-isolation-resource/005c-resource-scoped-authorization-corrective.md` remains `blocked`, with this ADR named as its concrete blocker;
-- per `plans/003-planning-process.md` §4, that plan must not be handed off as ready merely because adjacent implementation exists;
-- the implementation plan's Branch A (§5) and Branch B (§6) are written to be executable without re-deriving the design, so that whichever option is selected, the implementation is mechanical.
+The constraints that apply to this decision are these, and they bind the implementation.
+
+### 1. The scope is additive and never widens an operation grant
+
+`ClientGrant` gains an optional resource-scope list. A grant without scopes keeps exactly today's operation-level meaning, so an existing deployment's behaviour is unchanged. A scope names the **operation** it applies to, the **resource kind**, and the **resource identifier**; a scope can only narrow an operation the grant already holds, and a scope for an operation the grant does not hold is a configuration error. The identifier is the string form of the corresponding `ResourceId` variant and is parsed back into the typed variant (`ExecutionId::new`, `BlobDigest::parse`, `WorkspaceId::new`, `ArtifactId::new`), so the configuration and the wire path agree on what an identifier is.
+
+### 2. The store remains authoritative for ownership
+
+For `Execution`, `Workspace`, and `Artifact` the store's existing `principal_id` fences stay authoritative: `ExecutionStore::load_snapshot_for_principal`, the artifact store's `load`, and the workspace store's `lookup_manifest` continue to select by owner. The authorizer's resource-scoped decision is consistent with that ownership and may only narrow it. A resource-scoped grant must never be usable to reach a resource owned by another principal, even if the grant list is misconfigured.
+
+For `Blob` there is no owner — blob storage is content-addressed and shared — so a blob scope is an **explicit digest list** and never an ownership comparison. This is the boundary `plans/security/threat-model.md` names.
+
+### 3. The scope applies to every operation whose resource is already resolved
+
+The scope applies to the operations the existing call sites already name — `BlobRead`/`Blob`, `BlobWrite`/`Blob`, `WorkspaceCreate`/`Workspace`, `Execute`/`Execution`, `Execute`/`Workspace` — **and** to the operations `resource_for_path` already resolves for `dispatch`: `Observe`, `Cancel`, `Renew`, `Events`, and `ArtifactRead`. Scoping the handler-level call sites while leaving `dispatch` unscoped would produce an inconsistent boundary, and `dispatch` already constructs the resource.
+
+### 4. The decision rule is bounded and in-memory
+
+The operation grant must be present; when a scope is configured for that operation and resource kind the resource must be within the granted set; when no scope is configured for that operation and resource kind, and when the request carries no resource, the decision falls back to the operation-level grant. The decision consults a configuration-derived set only. It must not require the authorizer to consult the store in a way that introduces a lock or an ordering dependency that authorization does not have today.
+
+### 5. The configuration fails closed, and is bounded
+
+Every configuration error class is refused at load time, before the node accepts traffic, and the node refuses to start rather than degrade to a permissive decision: an unknown operation name, an unknown resource kind, a malformed identifier, a scope for an unheld operation, a duplicate scope, and an over-cap grant count. The scope list is bounded by a per-grant cap and a per-node cap on the total number of resource-scoped grants, validated in `OperatorConfig::validate` alongside the existing caps. `ClientGrant` remains `#[serde(deny_unknown_fields)]`, so a typo in a scope is a refusal rather than a silently absent scope.
+
+### 6. A denial is indistinguishable from any other denial
+
+Authorization still strictly precedes resource resolution in `dispatch`. A resource-scoped denial must be indistinguishable from an operation-level denial and from a missing resource, in both status code and response body. The store's existing ownership fences must not be weakened.
+
+### 7. No wire change, and no new authority
+
+No request or response wire shape changes, so `API_SCHEMA_VERSION` is unchanged and no coordination with the control-plane shared-protocol contract corrective is required. The change is additive at the wire and API level. It introduces no policy language, no rule engine, no role system, and no multi-tenant IAM: a scope is a name, a kind, and an identifier, and it can only narrow an existing per-principal grant.
+
+### 8. The `deny_unknown_fields` refusal is deliberate
+
+An **older** node reading a **newer** configuration that contains a resource scope will refuse to start, because `ClientGrant` denies unknown fields. That refusal is correct — a node must not silently ignore a scope it does not understand — and it is documented as a configuration-compatibility note rather than treated as a defect.
+
+### 9. Alternatives not selected, and why
+
+Option B (remove the hook and its plumbing) was not selected: it is a breaking removal from the public API of a published workspace crate, and it would leave the blob boundary open while removing the only mechanism that could close it. Option C (defer and mark the mechanism unavailable) was not selected: it is a deferral, not a decision, and it does not satisfy the truthfulness driver that this ADR exists to satisfy — the mechanism would still *look* like a working resource-scoped hook to a reader of the code.
+
+### 10. The architecture review's confirmation
+
+This decision class requires architecture review, and this ADR is that review's vehicle. The review confirms that the chosen option does **not** move Eggwork toward owning policy, roles, or a multi-tenant IAM product — a scope narrows one existing operation grant and does nothing else — and that it does **not** weaken the store's ownership fences, which remain authoritative and become the backstop behind the authorizer's decision.
+
+### 11. Documentation that must follow the decision
+
+The implementation milestone must update, in this order of authority: `architecture/overview.md`'s divergences table (divergence #4), `plans/security/threat-model.md`'s remaining-boundary column for the "Authenticated unauthorized principal" row, `architecture/server-node.md`, `architecture/operations-cli.md`, and `examples/eggworkd.example.json`. The divergences row must state what now enforces the boundary and what residual boundary remains; it must not describe the blob boundary as closed.
+
+The implementation plan is `plans/implementation/security-isolation-resource/005c-resource-scoped-authorization-corrective.md`, whose §5 (Branch A) is the work this decision authorises.
+
 
 ## Supersession
 
