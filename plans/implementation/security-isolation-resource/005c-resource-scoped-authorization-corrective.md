@@ -1,6 +1,6 @@
 # Security M005c — Resource-scoped authorization disposition corrective
 
-Status: active
+Status: closed
 
 Decision: `plans/adrs/ADR-0007-resource-scoped-authorization.md` is **accepted** — Option A, implement resource-scoped grants. The blocker that held this plan is discharged; §5 (Branch A) is the work in flight, and §4, §7, §8, §9, §11, §12, and §14 hold as written.
 

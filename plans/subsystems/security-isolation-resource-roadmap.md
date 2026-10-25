@@ -1,6 +1,6 @@
 # Security, Isolation, and Resource Enforcement Roadmap
 
-Status: closed through M004 (remote-admission C001 and Operations M002 included); M005a conditionally closed, M005b closed, M005c implemented against accepted ADR-0007
+Status: closed through M004 (remote-admission C001 and Operations M002 included); M005a conditionally closed, M005b closed, M005c closed
 
 Canonical authority:
 
@@ -214,7 +214,7 @@ Exit conditions:
 
 Class: invariant
 
-Status: **implemented** — ADR-0007 is **accepted** (`plans/adrs/ADR-0007-resource-scoped-authorization.md`, Option A: implement resource-scoped grants) and Branch A of the implementation plan is in the tree.
+Status: closed — implementation commit `721768d`. ADR-0007 is **accepted** (`plans/adrs/ADR-0007-resource-scoped-authorization.md`, Option A: implement resource-scoped grants) and Branch A of the implementation plan is implemented and verified.
 
 Closure evidence: `plans/closure/security-isolation-resource/005c-status.md`
 

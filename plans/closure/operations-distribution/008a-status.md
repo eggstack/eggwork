@@ -1,6 +1,6 @@
 # M008a closure record: operator surface truthfulness corrective
 
-Status: **implemented, awaiting the pre-submit gate** — the three findings are closed in
+Status: **closed** — the three findings are closed in the code, the closure evidence is complete, and the coordinator's pre-submit gate is green.
 the working tree; the coordinator owns the final status
 Closed: — (the coordinator sets this when the gate passes)
 Plan: `plans/implementation/operations-distribution/008a-operator-surface-truthfulness-corrective.md`

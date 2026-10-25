@@ -1,6 +1,6 @@
 # Foundation M005 Closure — Runner Request Validation Parity Corrective
 
-Status: active
+Status: **closed** — the core owns the request-validation rules, the runner consumes them, and the coordinator's pre-submit gate is green.
 
 Source plan: `plans/implementation/foundation-execution-core/005-runner-request-validation-parity-corrective.md`
 
@@ -11,7 +11,7 @@ Roadmap: `plans/subsystems/foundation-execution-core-roadmap.md`
 ## Reviewed baseline
 
 - Reviewed head before implementation: `af5a21709573e20f26eca77df83bd5560c46e936` ("docs(plans): accept ADR-0007 — implement resource-scoped grants").
-- Implementation commits: **none yet**. The implementation is in the working tree; the coordinator commits.
+- Implementation commit: `496f4c8` (the coordinator committed the implementation; the worker left the working tree dirty for it).
 - Workspace version at the reviewed head: `0.1.5`.
 
 ## Executive finding

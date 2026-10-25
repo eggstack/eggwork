@@ -1,6 +1,6 @@
 # Security M005c — Resource-scoped authorization corrective
 
-Status: closing — implementation is in the working tree; the coordinator runs
+Status: **closed** — the ADR-0007 Option A boundary is implemented, the closure evidence is complete, and the coordinator's pre-submit gate is green.
 the full pre-submit gate and sets the final status.
 
 Source implementation plan:
@@ -22,7 +22,7 @@ follows them as written, and §2 below maps each of them to the code.
 
 Reviewed repository head before implementation: `af5a217`
 (`af5a21709573e20f26eca77df83bd5560c46e936`)
-Implementation commit: **none** — the working tree was left dirty for the
+Implementation commit: `721768d` (the coordinator committed the implementation; the worker left the working tree dirty for the
 coordinator to review and commit; no commit was made by the implementing
 agent.
 

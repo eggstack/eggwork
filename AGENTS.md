@@ -11,6 +11,7 @@ Rust-native, fixed-target remote execution fabric: a caller selects one node, su
 - Check:        `cargo check --workspace`
 - Ownership guard: `python3 scripts/check_execution_ownership.py` (also `--prove-negative-exit`)
 - Harness tests: `python3 -m unittest discover --start-directory tests/release --top-level-directory tests/release`
+- Documentation gates: `python3 scripts/check_doc_citations.py` (also `--prove-negative-exit`) and `python3 scripts/check_quickstart_sync.py` — a citation under `architecture/` or `docs/` must name a **symbol**, never a line number, and `docs/quickstart.md` must agree with `scripts/quickstart.sh`
 - Run the node: `cargo run -p eggwork-server --bin eggworkd -- run --config <node.json>`
 
 `--locked` is load-bearing on `clippy` and `test`: a version bump that skips `Cargo.lock` passes both and then fails every release build.

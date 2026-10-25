@@ -1,6 +1,6 @@
 # Foundation and Execution Core Roadmap
 
-Status: M001-M004 closed (M004 conditional on a release containing it); C001 post-closure CI corrective closed; M005 request-validation parity corrective active
+Status: M001-M004 closed (M004 conditional on a release containing it); C001 post-closure CI corrective closed; M005 request-validation parity corrective closed
 
 Canonical authority:
 
@@ -155,7 +155,7 @@ Dependencies:
 
 Class: invariant
 
-Status: active
+Status: closed — implementation commit `496f4c8`
 
 Corrective addendum:
 

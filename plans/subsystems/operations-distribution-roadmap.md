@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M001-M003, M002a, M004a and M004b closed, M004 conditionally closed; M007 ready; M008a and M008b operator-truthfulness correctives active
+Status: active roadmap; M001-M003, M002a, M004a and M004b closed, M004 conditionally closed; M007 ready; M008a and M008b operator-truthfulness correctives closed
 
 Canonical authority:
 
@@ -340,7 +340,7 @@ Verification is deliberately split: state/contract tests plus source-built hoste
 
 Class: capability
 
-Status: proposed
+Status: closed — implementation commit `5df1b69`
 
 Corrective addendum:
 
@@ -365,7 +365,7 @@ Exit conditions:
 
 Class: infrastructure (release harness and CI) / polish (documentation drift and citation hygiene)
 
-Status: active
+Status: closed — implementation commits `c8999e1` (release harness and CI), `8e056f8` (the citation gate and the machine-executed quickstart), and `ec67c56` (the citation conversion and the CI wiring of the gate)
 
 Corrective addendum:
 
