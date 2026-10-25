@@ -9,11 +9,17 @@ use rusqlite::TransactionBehavior;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::{
     collections::HashSet,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+// `File` is only used by `sync_directory`, whose directory-sync call is
+// Unix-only. Importing it unconditionally made the Windows build fail
+// clippy's `-D warnings` on an unused import, which stopped the hosted
+// Windows job before it could prove anything.
+#[cfg(unix)]
+use std::fs::File;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
