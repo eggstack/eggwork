@@ -156,7 +156,7 @@ both halves.
 | Variant | Permits |
 | --- | --- |
 | `Capabilities` | `GET /v1/capabilities` — read the advertised feature/limit set. |
-| `Status` | `GET /v1/status` — node id, drain flag, active count, capabilities. |
+| `Status` | `GET /v1/status` — node id, drain flag, permit count, capabilities. |
 | `Execute` | `POST /v1/executions` — start work; also re-checked per execution id and per workspace id. |
 | `Observe` | `GET /v1/executions/{id}` — read the current snapshot. |
 | `Cancel` | `POST /v1/executions/{id}/cancel` — request cancellation. |
@@ -420,6 +420,18 @@ immediately. Fairness is therefore not provided: under saturation a later arriva
 released by an earlier one. The permit is moved into the spawned `run_execution` task
 (`lib.rs:1873-1882`) and held as `_permit` for the task's whole life, so a slot is released exactly
 when the execution task ends — including on panic, since the permit's `Drop` runs during unwind.
+
+**The permit count and the non-terminal row count are different facts.**
+`NodeStatus::active_executions` is `max_active - permits.available_permits()`: the number of
+execution permits the node holds *right now*. The number of durable execution rows in a
+non-terminal state is a different measurement, and the two legitimately disagree — an
+execution whose process died keeps its row until the node recovers it, and an idempotent
+re-request releases its permit while the original execution still holds one. Only the running
+node knows the permit count, so the node publishes it beside the execution database and the
+operator surface reads it from there (`execution_permits_held`), naming the row count
+separately (`non_terminal_executions`). The wire field keeps its published name and its
+published meaning; renaming or adding a field on `NodeStatus` would break every deployed
+client that deserializes it.
 
 **Drain-check race.** The drain flag is checked twice (before and after the store lookup) but both
 checks read an `AtomicBool` plus a *file* (`operations::is_persistently_draining`). There is no lock

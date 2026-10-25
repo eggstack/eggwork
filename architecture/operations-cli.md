@@ -222,7 +222,8 @@ removes both from the argument vector. The remaining vector keeps the subcommand
 | `config print` | `--config` | The redacted configuration document, pretty-printed |
 | `doctor` | `--config` | `DoctorReport`; exit 2 when `report.ready` is false |
 | `run` | `--config` | `{"ready": true, "node_id": ..., "local_addr": ...}`, then blocks on `ctrl_c` and shuts the server down |
-| `status` | `--config` | `schema_version`, `node_id`, `draining`, `active_executions`, `max_active_executions`, `execution_records`, `execution_states`, `stdout_bytes`, `stderr_bytes`, `cleanup_failures`, `metrics`, `doctor` |
+| `status` | `--config` | `schema_version`, `node_id`, `draining`, `execution_permits_held`, `non_terminal_executions`, `max_active_executions`, `execution_records`, `execution_states`, `stdout_bytes`, `stderr_bytes`, `cleanup_failures`, `metrics`, `doctor` |
+| `metrics` | `--config` | `OperatorMetrics` — the node's counters |
 | `drain` | `--config` | `{"draining": true, "persistent": true}` |
 | `undrain` | `--config` | `{"draining": false, "persistent": true}` |
 | `executions list` | `--config`, optional `--limit N` (default 50, clamped 1..=200), `--offset N` (default 0, capped at 2048) | `ExecutionPage` |
@@ -288,13 +289,25 @@ machine-readable record of the attempt survives while the exit code still report
 failure. This matches the release path, which treats the same value as a hard failure —
 a `deployment apply` that leaves the node not-transitioned is not a successful apply.
 
-**Error text is a fixed vocabulary.** The library's `OperationsError` renders to strings
-like "operator configuration is invalid", and the binary discards them entirely
-(`map_err(|_| "configuration is invalid or unreadable")`). Two consequences follow. The
-first is that a bad config path never reveals *why* — the underlying `Io` error, including
-its path and errno, is dropped. The second is that this is also a redaction boundary:
-because the binary never interpolates an error's source text for library errors, no
-filesystem path, key detail, or child-process output can reach stderr through that path.
+**Error text is a fixed vocabulary, and a configuration fault is a classified
+one.** The library's `OperationsError` renders to strings like "operator data could not be
+read", and the binary renders them without their source text. A configuration fault is the
+one kind that carries detail: `OperationsError::Config(ConfigFault)` renders as
+`[<rule>] <item>: <action>`, where `<rule>` is a stable identifier from the `ConfigRule`
+enumeration, `<item>` is the file, path, or value that failed — named by its *role* alone
+when it is secret-bearing — and `<action>` is one sentence saying what to change.
+
+Two consequences follow. The first is that a bad config path no longer hides *why*: the
+underlying `Io` error, including its path and errno, is still dropped, but the classified
+rule is not, so "which rule did I break" is answered. The second is that the redaction
+boundary survives: because a configuration fault carries only the classified rule, the
+offending path, and the action — never the underlying `io` or `serde_json` text, never a
+private-key path, never a certificate fingerprint or subject — no filesystem path, key
+detail, or child-process output can reach stderr through that path. The rule identifiers
+are greppable, so a runbook can name one; `config print`, `config validate`, `doctor`'s
+`configuration` check, and the daemon's startup failure all report the same identifier for
+the same fault, and the CLI never re-detects a fault in order to describe it — it renders
+the kind the loader produced.
 
 **Redaction on every path.** The only command that emits configuration content is
 `config print`, and it emits only the redacted form. `config validate` emits the doctor
@@ -311,22 +324,32 @@ non-secret; that trust is an assumption, not something enforced in this file.
 
 `DoctorReport` is `schema_version: 1`, `ready: bool`, and `checks: Vec<DoctorCheck>`;
 `DoctorCheck` is a `&'static str` name, an `ok` bool, and a free-text `detail`. `ready` is
-simply `checks.iter().all(|check| check.ok)`. Seven checks, in order:
+simply `checks.iter().all(|check| check.ok)`. Eight checks, in order:
 
-1. **`configuration`** — `config.validate().is_ok()`. Its detail distinguishes "valid" from
-   "configuration or TLS material is invalid", but not which field.
-2. **`sandbox-resource-backend`** — the helper check. `trusted_helper` delegates to
+1. **`configuration`** — `config.validate()`. Its detail is "configuration and TLS policy
+   are valid" when the configuration validates, and otherwise the classified fault
+   itself: the rule identifier, the offending item, and the corrective action. The detail
+   is the same line `config validate` and the daemon's startup failure print, so an
+   operator who reads one of them has read all of them.
+2. **`host-telemetry`** — the provider endpoint check. The endpoint is named by its role
+   and never by its value, so a diagnostic line cannot carry a provider address into a
+   log.
+3. **`sandbox-resource-backend`** — the helper check. `trusted_helper` delegates to
    `eggwork_runner::verify_trusted_helper(path).is_ok()`. When a helper is configured and
    trusted, the runner is constructed as `LocalProcessRunner::new(TrustedLandlockSetup::new(helper))`
    and `execution_capabilities()` is awaited, and the detail lists the runtime-probed
    capabilities. A trusted helper that passed ownership checks but advertises nothing
-   reports ok with "no execution capability passed runtime probes".
-3. **`listener`** — `TcpListener::bind` succeeds, *or* a `TcpStream::connect_timeout` with
+   reports ok with "no execution capability passed runtime probes". A helper that fails
+   the trust boundary is reported by the rule the failure falls under — unavailable, not
+   trusted, an unresolvable location, a directory that cannot be trusted, or an ancestor
+   that is world-writable — because the runner's fixed failure phrases are classified
+   into this crate's own rules and then discarded.
+4. **`listener`** — `TcpListener::bind` succeeds, *or* a `TcpStream::connect_timeout` with
    a 150 ms timeout succeeds. The second disjunct is what makes the check meaningful while
    the node is already running: a bound port is a healthy port here.
-4. **`execution-root`**, 5. **`blob-root`**, 6. **`workspace-root`** — `fs::metadata` shows
+5. **`execution-root`**, 6. **`blob-root`**, 7. **`workspace-root`** — `fs::metadata` shows
    a directory and `read_dir` succeeds.
-7. **`storage-headroom`** — `fs2::available_space(&execution_root)` is `Some(n)` with
+8. **`storage-headroom`** — `fs2::available_space(&execution_root)` is `Some(n)` with
    `n > 0`.
 
 Two honest notes on these checks. The root checks use `fs::metadata`, which follows
@@ -412,15 +435,28 @@ that state visible.
 non-symlink regular file, then loads *all* durable snapshots via `load_snapshots` — which
 caps its query at `LIMIT 2049` and returns `OperationsError::Bounds` above 2048 rows.
 That is the honest bound: **this is not a database-level page.** The whole bounded set is
-decoded, then `total`, `active_executions` (Accepted, Preparing, Running, Cancelling), a
-`BTreeMap` of state labels, `stdout_bytes`, `stderr_bytes`, and `cleanup_failures` are
+decoded, then `total`, `non_terminal_executions` (Accepted, Preparing, Running, Cancelling),
+a `BTreeMap` of state labels, `stdout_bytes`, `stderr_bytes`, and `cleanup_failures` are
 aggregated over the entire set; only then is the vector sorted by
 `(execution_id, generation)`, offset-drained, and truncated to `limit`, with `next_offset`
 `Some` only when `offset + returned < total`. The reported `states`, byte totals, and
 `total` describe the whole database, not the page. Byte accumulation is `saturating_add`.
 
-`ExecutionPage` is: `limit`, `offset`, `total`, `active_executions`, `states`,
+`ExecutionPage` is: `limit`, `offset`, `total`, `non_terminal_executions`, `states`,
 `stdout_bytes`, `stderr_bytes`, `cleanup_failures`, `next_offset`, `executions`.
+
+**The count is a row count, not a permit count.** `non_terminal_executions` counts durable
+rows in a non-terminal state. The node's *permit* count — how many execution permits the
+running node holds — is a different measurement, and the two legitimately disagree: an
+execution whose process died keeps its row until the node recovers it, and an idempotent
+re-request releases its permit while the original execution still holds one. The operator
+surface therefore names them apart: `non_terminal_executions` for the row count, and
+`execution_permits_held` for the permit count, which the node publishes beside the
+execution database and the operator reads back. The published number is reported only
+while the node's bind address is accepting connections, because a number left behind by a
+stopped node describes a node that is gone. The API's own `NodeStatus::active_executions`
+keeps its published name and its published meaning — the permit count — because it is a
+wire field that deployed clients deserialize.
 
 `execution_show(config, id, generation)` is the narrow, targeted read: validate
 `ExecutionId`, optionally wrap `generation` in `ExecutionGeneration`, require a regular
@@ -455,20 +491,34 @@ footprint includes un-checkpointed WAL. The artifact database path is
 the measurement fails, and quotas are echoed so the operator computes utilisation — the
 CLI does not.
 
-`metrics_snapshot` pre-seeds every name in `METRIC_NAMES` with `0` and then overlays
-values from the `node_metrics` table. Three behaviors matter: a missing database returns
-all zeros; a *missing table* also returns all zeros rather than failing, so a
+`metrics_snapshot` pre-seeds every metric the node can increment with `0` and then
+overlays values from the `node_metrics` table. Three behaviors matter: a missing database
+returns all zeros; a *missing table* also returns all zeros rather than failing, so a
 pre-metrics database reports a clean zeroed snapshot; and negative stored values are
-clamped to `0`. Only names present in `METRIC_NAMES` are ever surfaced — the overlay does
-`if let Some(counter) = counters.get_mut(&name)`, so an unlisted row is silently ignored.
-`METRIC_NAMES` has 20 entries: `executions_accepted`, `rejected_route`,
+clamped to `0`.
+
+**The vocabulary belongs to the producers.** The set of names is declared once, with the
+code that increments them, as the `Metric` enumeration in `crates/eggwork-server/src/lib.rs`.
+`increment_metric` and `increment_metrics` accept a `Metric` and nothing else, so a
+counter the server increments but the operator surface does not name cannot exist: the
+report reads `Metric::ALL`, so the list that decides what may be incremented is the same
+list that decides what is reported. This replaces a hand-maintained `METRIC_NAMES` in this
+module whose overlay was `if let Some(counter) = counters.get_mut(&name)` — an unlisted
+row was *silently ignored*, and five live counters (the workspace derivation counters)
+were incremented on real traffic and never appeared in the report.
+
+A row whose name the vocabulary does not know is reported **under its own name**, not
+dropped: a counter that vanishes from the report is a counter an operator cannot see. The
+vocabulary has 25 entries: `executions_accepted`, `rejected_route`,
 `rejected_unauthenticated`, `rejected_unauthorized`, `rejected_invalid`,
 `rejected_draining`, `rejected_capability`, `rejected_busy`, `rejected_storage`,
 `event_history_resync`, `blob_upload_bytes`, `blob_download_bytes`, `stdout_bytes`,
 `stderr_bytes`, `terminal_succeeded`, `terminal_failed`, `terminal_cancelled`,
-`terminal_timed_out`, `terminal_interrupted`, `cleanup_failures`. The store can write
-counters beyond this list; those are not reported here. [storage-journal.md](storage-journal.md)
-covers the schema and the write side, and a test asserts the set is fixed and bounded.
+`terminal_timed_out`, `terminal_interrupted`, `cleanup_failures`,
+`workspace_manifest_registrations`, `workspace_derived_requests`, `workspace_derived_hits`,
+`workspace_patch_entries`, `workspace_base_missing`.
+[storage-journal.md](storage-journal.md) covers the schema and the write side, and a test
+asserts that the reported set is exactly the producers' vocabulary.
 
 All read paths use `read_only_database`, which opens with
 `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_NO_MUTEX` — the CLI never writes to the execution or
@@ -787,10 +837,11 @@ and the Windows refusal are, by their nature, only exercisable on those hosts.
   possible at *both* call sites — `service` and `deployment apply` — and the
   "unsupported platform" branch is unreachable from `deployment apply` on any other
   target. Re-check both on any refactor.
-- **Redaction covers two fields.** `tls.certificate_chain`, `tls.client_ca`, and
-  `clients[].principal_id` are printed in the clear. That is a considered trade-off, but
-  the file does not state why *those* three are safe to publish and the two redacted ones
-  are not.
+- **Redaction covers three fields.** `tls.private_key`, `clients[].certificate_sha256`, and
+  `clients[].resource_scopes[].resource_id` are printed as `[REDACTED]`, while
+  `tls.certificate_chain`, `tls.client_ca`, and `clients[].principal_id` are printed in the
+  clear. That is a considered trade-off, but the file does not state why *those* three
+  are safe to publish and the three redacted ones are not.
 - **`is_persistently_draining` is a bare `is_file` check.** It never validates the
   `draining\n` contents, and a directory at that path reads as "not draining". Relatedly,
   `drain_path` uses `with_extension`, which *replaces*: a `database_path` ending in

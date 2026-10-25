@@ -1,6 +1,6 @@
 # Operations M008a — Operator surface truthfulness corrective
 
-Status: proposed
+Status: active
 
 Closure record: `plans/closure/operations-distribution/008a-status.md`
 

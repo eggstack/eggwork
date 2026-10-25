@@ -16,6 +16,7 @@ eggworkd config print    --config <node.json>
 eggworkd doctor          --config <node.json>
 eggworkd run             --config <node.json>
 eggworkd status          --config <node.json>
+eggworkd metrics         --config <node.json>
 eggworkd drain           --config <node.json>
 eggworkd undrain         --config <node.json>
 eggworkd executions list --config <node.json> --limit 50 --offset 0
@@ -51,6 +52,11 @@ of them pass:
 
 `config validate` runs the same checks and additionally requires
 `valid: true`; it is the non-mutating form to use in a deployment script.
+
+When the `configuration` check fails, its `detail` names the rule that was
+broken, the item that broke it, and the corrective action — the same line
+`config print` and the daemon's startup failure print. See
+[configuration security](#configuration-security).
 
 `sandbox-resource-backend` is a **runtime probe**, not a static claim. It
 reports what this host can enforce right now. The same trust decision —
@@ -223,6 +229,7 @@ references.
 eggworkd executions list --config <node.json> --limit 50 --offset 0
 eggworkd executions show  --config <node.json> <execution-id>
 eggworkd inspect blob|workspace|artifact <id> --config <node.json>
+eggworkd metrics          --config <node.json>
 ```
 
 `executions list` is paginated; pass the returned `next_offset` back as
@@ -231,6 +238,32 @@ eggworkd inspect blob|workspace|artifact <id> --config <node.json>
 error, and never reveals whether a different id exists — authorization runs
 before resource resolution, so a denied caller cannot distinguish an existing
 resource from an absent one.
+
+### Two execution counts, two names
+
+`status` and `executions list` both report how many executions are still
+running, and they do **not** report the same measurement:
+
+| Key | Where it appears | What it counts |
+|---|---|---|
+| `execution_permits_held` | `status` | How many execution permits the **running node** holds right now. `null` when the node is not running — a stopped node has no live permit count. |
+| `non_terminal_executions` | `status`, `executions list` | How many durable execution rows are still in a non-terminal state (`Accepted`, `Preparing`, `Running`, `Cancelling`). |
+
+The two are independent samples and they legitimately disagree. An execution
+whose process died keeps its row until the node recovers it, so
+`non_terminal_executions` can be higher than `execution_permits_held`; and an
+idempotent re-request releases its permit while the original execution still
+holds one, so the reverse is possible too. An operator investigating a stuck
+execution wants both numbers, and neither of them is called `active_executions`
+here: that name is the API's, and on the API it means the permit count.
+
+The API's own status response keeps its published shape: `NodeStatus` carries
+`active_executions` for the permit count, and that field name and meaning are
+unchanged.
+
+`metrics` prints the node's counters. Every counter the node can increment is
+present, with `0` before it is first incremented, so a missing key never means
+a missing measurement.
 
 `executions show` prints the terminal snapshot, including the result's
 `artifact_capture` field. It is the field to read when an execution declared
@@ -250,14 +283,24 @@ marker stays on the result as a secondary signal.
 
 ## Redaction
 
-`config print` prints the effective config with the private key path and every
-client certificate fingerprint replaced by `[REDACTED]`, so the output is safe
-to paste into a ticket.
+`config print` prints the effective config with the private key path, every
+client certificate fingerprint, and every resource-scope identifier replaced by
+`[REDACTED]`, so the output is safe to paste into a ticket.
 
 ## Configuration security
 
-The loader is strict, and the failure mode is deliberately unhelpful — a single
-`configuration is invalid or unreadable`. The requirements:
+The loader is strict, and a failure now says **which rule** was broken, **which
+item** broke it, and **what to do** — one line, on stderr:
+
+```text
+eggworkd: [config_file_world_writable] /etc/eggwork/node.json: remove group- and world-write permission from the configuration file
+```
+
+The bracketed identifier is stable and greppable, so a runbook can name it. The
+same fault is reported the same way by `config print`, `config validate`,
+`doctor`'s `configuration` check, and the daemon's own startup failure.
+
+The requirements it enforces:
 
 - The config file must be owned by the invoking user (or root) and **not**
   group- or world-writable.
@@ -266,6 +309,14 @@ The loader is strict, and the failure mode is deliberately unhelpful — a singl
 - `execution_root`, `blob_root`, `workspace_root` and the database's parent
   must be owner-only directories (`0700`).
 - The config is capped in size and rejects symlinks and unknown fields.
+
+The message names the file or path that failed — the config file, a state
+directory, the sandbox helper, the bind address. It never names a
+**secret-bearing** item: a fault about the private key says *the private key*,
+never its path, and a fault about a client certificate says *the client
+certificate fingerprint*, never the value or the subject. Underlying `io` or
+JSON-parser text is never interpolated either: the rule, the item, and the
+action are all the message carries.
 
 The [quickstart](quickstart.md#5-set-permissions-required)
 has the exact `chmod` incantation.

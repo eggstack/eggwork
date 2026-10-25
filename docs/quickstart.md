@@ -136,7 +136,11 @@ interface.
 
 Eggwork refuses to load a config or certificate that others could tamper with,
 and refuses a state directory that others could write. Getting this wrong
-produces the single unhelpful message `configuration is invalid or unreadable`.
+names the rule that was broken, the file that broke it, and the fix:
+
+```text
+eggworkd: [config_file_world_writable] /srv/eggwork/node.json: remove group- and world-write permission from the configuration file
+```
 
 ```bash
 chmod 700 "$ROOT" "$ROOT"/{state,blobs,workspaces,executions,tls}
@@ -161,6 +165,8 @@ A ready node reports every check green:
   "ready": true,
   "checks": [
     { "name": "configuration", "ok": true, "detail": "configuration and TLS policy are valid" },
+    { "name": "host-telemetry", "ok": true,
+      "detail": "host telemetry is disabled; the node reports no host measurements" },
     { "name": "sandbox-resource-backend", "ok": true,
       "detail": "runtime-probed capabilities: isolation.landlock.workspace-rw.v1, resources.cgroups-v2.memory, resources.cgroups-v2.cpu, resources.cgroups-v2.pids" },
     { "name": "listener", "ok": true, "detail": "bind address is available" },
@@ -247,7 +253,9 @@ its own would only mean the node could enforce isolation.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `configuration is invalid or unreadable` | Wrong permissions, or the file is unreadable | `chmod 600` the config; see step 5 |
+| `[config_file_world_writable] …` on stderr | The config file is group- or world-writable | `chmod 600` the config; see step 5 |
+| `[tls_private_key_readable_by_others] the private key` | The private key is readable by other users | `chmod 600` the private key; see step 5 |
+| `[state_root_not_owner_only] …` | A state directory is not `0700` | `chmod 700` the state directories; see step 5 |
 | `doctor` says `configuration and TLS policy are valid` is false | A certificate is malformed, or expired | Re-check the chain; `openssl x509 -in ca.pem -noout -text` |
 | `sandbox-resource-backend` fails | Helper missing, group/world writable, or under a world-writable ancestor | Move it to `~/.local/lib/eggwork` (step 3) |
 | `listener` fails | Port already bound | Change `bind`, or stop the other process |

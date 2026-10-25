@@ -2,7 +2,7 @@ use eggwork_server::deployment;
 use eggwork_server::operations::{
     OperatorConfig, collect_garbage, doctor, execution_page, execution_show, inspect_artifact,
     inspect_blob, inspect_workspace, is_persistently_draining, metrics_snapshot,
-    set_persistent_drain, start_server, storage_summary,
+    observed_permit_count, set_persistent_drain, start_server, storage_summary,
 };
 use serde::Serialize;
 use std::{env, path::PathBuf, process::ExitCode};
@@ -41,8 +41,13 @@ async fn run(args: Vec<String>) -> Result<(), String> {
     let mut args = args;
     args.drain(config_index..=config_index + 1);
     let index = 1;
-    let config = OperatorConfig::load(&config_path)
-        .map_err(|_| "configuration is invalid or unreadable".to_owned())?;
+    // A configuration fault renders as `[rule] item: action`. The rule is a
+    // stable identifier an operator can grep for, the item is the file or
+    // path that failed — named by role alone when it is secret-bearing — and
+    // the action says what to change. No other error text is interpolated:
+    // the library's other errors are fixed phrases, and a configuration fault
+    // never carries the underlying `io` or `serde_json` message.
+    let config = OperatorConfig::load(&config_path).map_err(|error| error.to_string())?;
     match command.as_str() {
         "config" => match args.get(index).map(String::as_str) {
             Some("validate") => {
@@ -58,9 +63,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             Some("print") => {
                 println!(
                     "{}",
-                    config
-                        .redacted_json()
-                        .map_err(|_| "configuration could not be rendered".to_owned())?
+                    config.redacted_json().map_err(|error| error.to_string())?
                 );
                 Ok(())
             }
@@ -83,30 +86,37 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             // going to print anyway.
             let report = doctor(&config).await;
             if !report.configuration_ok() {
-                return Err("configuration is invalid".to_owned());
+                // The same rule, item, and action every other surface reports.
+                return Err(report
+                    .configuration_detail()
+                    .unwrap_or("configuration is invalid")
+                    .to_owned());
             }
             let page = execution_page(&config, 1, 0)
                 .await
                 .map_err(|_| "execution state is unavailable".to_owned())?;
             let metrics = metrics_snapshot(&config)
                 .map_err(|_| "operator metrics are unavailable".to_owned())?;
+            // The two execution counts are different facts and are reported
+            // under different names: `execution_permits_held` is how many
+            // execution permits the running node holds, and
+            // `non_terminal_executions` is how many durable rows are still in
+            // a non-terminal state. An execution whose process died keeps its
+            // row long after its permit was released, so the two disagree on
+            // exactly the cases an operator is investigating.
             output(
-                &serde_json::json!({"schema_version":1,"node_id":config.node_id,"draining":is_persistently_draining(&config.drain_path()),"active_executions":page.active_executions,"max_active_executions":config.max_active_executions,"execution_records":page.total,"execution_states":page.states,"stdout_bytes":page.stdout_bytes,"stderr_bytes":page.stderr_bytes,"cleanup_failures":page.cleanup_failures,"metrics":metrics,"doctor":report}),
+                &serde_json::json!({"schema_version":1,"node_id":config.node_id,"draining":is_persistently_draining(&config.drain_path()),"execution_permits_held":observed_permit_count(&config),"non_terminal_executions":page.non_terminal_executions,"max_active_executions":config.max_active_executions,"execution_records":page.total,"execution_states":page.states,"stdout_bytes":page.stdout_bytes,"stderr_bytes":page.stderr_bytes,"cleanup_failures":page.cleanup_failures,"metrics":metrics,"doctor":report}),
             )
         }
         "drain" | "undrain" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            config.validate().map_err(|error| error.to_string())?;
             let draining = command == "drain";
             set_persistent_drain(&config.drain_path(), draining)
                 .map_err(|_| "drain state could not be updated".to_owned())?;
             output(&serde_json::json!({"draining":draining,"persistent":true}))
         }
         "executions" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            config.validate().map_err(|error| error.to_string())?;
             match args.get(index).map(String::as_str) {
                 Some("list") => {
                     let options = &args[index + 1..];
@@ -131,10 +141,15 @@ async fn run(args: Vec<String>) -> Result<(), String> {
                 _ => Err(usage().into()),
             }
         }
+        "metrics" => {
+            config.validate().map_err(|error| error.to_string())?;
+            output(
+                &metrics_snapshot(&config)
+                    .map_err(|_| "operator metrics are unavailable".to_owned())?,
+            )
+        }
         "storage" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            config.validate().map_err(|error| error.to_string())?;
             match args.get(index).map(String::as_str) {
                 Some("summary") => output(
                     &storage_summary(&config)
@@ -144,9 +159,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             }
         }
         "inspect" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            config.validate().map_err(|error| error.to_string())?;
             let kind = args
                 .get(index)
                 .map(String::as_str)
@@ -162,9 +175,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             output(&result)
         }
         "gc" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            config.validate().map_err(|error| error.to_string())?;
             let dry_run = !args[index..].iter().any(|arg| arg == "--apply");
             let limit = parse_option(&args[index..], "--limit", 128usize)?.clamp(1, 1024);
             output(
@@ -174,12 +185,10 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             )
         }
         "run" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            config.validate().map_err(|error| error.to_string())?;
             let server = start_server(&config)
                 .await
-                .map_err(|_| "node failed to start; check doctor and service logs".to_owned())?;
+                .map_err(|error| error.to_string())?;
             println!(
                 "{}",
                 serde_json::json!({"ready":true,"node_id":config.node_id,"local_addr":server.local_addr()})
@@ -191,9 +200,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         "deployment" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            config.validate().map_err(|error| error.to_string())?;
             match args.get(index).map(String::as_str) {
                 Some("status") => {
                     let helper_required = config.sandbox_helper.is_some();
@@ -219,9 +226,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             }
         }
         "service" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            config.validate().map_err(|error| error.to_string())?;
             service_command(&args[index..]).await
         }
         _ => Err(usage().into()),
@@ -686,5 +691,5 @@ fn output(value: &impl Serialize) -> Result<(), String> {
 }
 
 fn usage() -> &'static str {
-    "usage: eggworkd <run|config validate|config print|doctor|status|drain|undrain|executions list|executions show|storage summary|inspect|gc|deployment status|deployment apply|service spec|service status|service install|service uninstall|service start|service stop|service restart|version> --config <file>; deployment apply accepts local --daemon/--helper candidates; service backends require explicit systemd, launchd, or Windows SCM policy"
+    "usage: eggworkd <run|config validate|config print|doctor|status|metrics|drain|undrain|executions list|executions show|storage summary|inspect|gc|deployment status|deployment apply|service spec|service status|service install|service uninstall|service start|service stop|service restart|version> --config <file>; deployment apply accepts local --daemon/--helper candidates; service backends require explicit systemd, launchd, or Windows SCM policy"
 }

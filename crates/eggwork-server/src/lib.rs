@@ -55,6 +55,77 @@ const MAX_RECENT_EXECUTIONS: usize = 1024;
 const MAX_BLOB_FIND_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_WORKSPACE_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
+/// Declare the metric vocabulary the node can increment.
+///
+/// The producers own the vocabulary: `increment_metric` and `increment_metrics`
+/// accept a `Metric` and nothing else, so a counter the server increments but
+/// the operator surface does not name cannot exist. The report path reads
+/// `Metric::ALL`, so the list that decides what may be incremented is the same
+/// list that decides what is reported.
+///
+/// This list used to live in `operations.rs` as a hand-maintained
+/// `METRIC_NAMES`, and the report path copied a stored value only when the
+/// name was already in its map. Five live counters — the workspace derivation
+/// counters — were incremented on real traffic and silently dropped by the
+/// report, so the operator surface could not see them at all.
+macro_rules! node_metrics {
+    ($($variant:ident => $name:literal),* $(,)?) => {
+        /// One counter the node can increment.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum Metric {
+            $($variant),*
+        }
+
+        impl Metric {
+            /// Every metric the node can increment.
+            pub const ALL: &'static [Metric] = &[$(Metric::$variant),*];
+
+            /// The name the metric is stored under.
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $(Metric::$variant => $name),*
+                }
+            }
+
+            /// The metric a stored name refers to, if this vocabulary knows it.
+            pub fn from_name(name: &str) -> Option<Metric> {
+                match name {
+                    $($name => Some(Metric::$variant),)*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+node_metrics! {
+    ExecutionsAccepted => "executions_accepted",
+    RejectedRoute => "rejected_route",
+    RejectedUnauthenticated => "rejected_unauthenticated",
+    RejectedUnauthorized => "rejected_unauthorized",
+    RejectedInvalid => "rejected_invalid",
+    RejectedDraining => "rejected_draining",
+    RejectedCapability => "rejected_capability",
+    RejectedBusy => "rejected_busy",
+    RejectedStorage => "rejected_storage",
+    EventHistoryResync => "event_history_resync",
+    BlobUploadBytes => "blob_upload_bytes",
+    BlobDownloadBytes => "blob_download_bytes",
+    StdoutBytes => "stdout_bytes",
+    StderrBytes => "stderr_bytes",
+    TerminalSucceeded => "terminal_succeeded",
+    TerminalFailed => "terminal_failed",
+    TerminalCancelled => "terminal_cancelled",
+    TerminalTimedOut => "terminal_timed_out",
+    TerminalInterrupted => "terminal_interrupted",
+    CleanupFailures => "cleanup_failures",
+    WorkspaceManifestRegistrations => "workspace_manifest_registrations",
+    WorkspaceDerivedRequests => "workspace_derived_requests",
+    WorkspaceDerivedHits => "workspace_derived_hits",
+    WorkspacePatchEntries => "workspace_patch_entries",
+    WorkspaceBaseMissing => "workspace_base_missing",
+}
+
 /// The declared-artifact capture capability of the running platform.
 ///
 /// The re-export is the crate's public answer to "can this node capture
@@ -358,6 +429,14 @@ struct NodeState {
     permits: Arc<Semaphore>,
     draining: Arc<AtomicBool>,
     drain_path: PathBuf,
+    /// Where the node publishes its live execution-permit count.
+    ///
+    /// The count is a fact of the *running* node: it is how many execution
+    /// permits the admission semaphore currently holds. The store cannot
+    /// re-derive it — an execution that crashed keeps a non-terminal row long
+    /// after its permit was released — so the node publishes the number beside
+    /// the execution database and the operator surface reads it from there.
+    permit_report_path: PathBuf,
     runner: Arc<LocalProcessRunner>,
     store: store::ExecutionStore,
     blobs: blob::BlobStore,
@@ -513,7 +592,7 @@ impl NodeServer {
             .await
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
         if !recovered.is_empty() {
-            increment_metric(&store, "terminal_interrupted", recovered.len() as u64).await;
+            increment_metric(&store, Metric::TerminalInterrupted, recovered.len() as u64).await;
         }
         workspaces
             .recover_retention(
@@ -530,6 +609,7 @@ impl NodeServer {
             .reconcile_manifests(&blobs, artifact::now_unix_ms(), 1024)
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
         let drain_path = config.database_path.with_extension("drain");
+        let permit_report_path = config.database_path.with_extension("permits");
         let draining = Arc::new(AtomicBool::new(operations::is_persistently_draining(
             &drain_path,
         )));
@@ -579,6 +659,7 @@ impl NodeServer {
             permits: Arc::new(Semaphore::new(config.max_active_executions as usize)),
             draining,
             drain_path,
+            permit_report_path,
             runner,
             store,
             blobs,
@@ -612,6 +693,11 @@ impl NodeServer {
             .ready()
             .await
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
+        // The node publishes its live permit count for the operator surface.
+        // It is published at startup, before the node accepts anything, so a
+        // number left behind by a previous run is never reported as this
+        // node's.
+        publish_permit_count(&state);
         Ok(Self {
             handle,
             state,
@@ -655,6 +741,9 @@ impl NodeServer {
         // node stops contacting its provider instead of leaving a polling
         // task behind it.
         self.state.telemetry.shutdown().await;
+        // A stopped node leaves no permit count behind: the number would
+        // describe a node that is no longer running.
+        operations::clear_permit_count(&self.state.permit_report_path);
         self.handle.shutdown();
     }
 
@@ -958,11 +1047,11 @@ async fn dispatch(
     let path = request.head().target().path().to_owned();
     let query = request.head().target().query().map(str::to_owned);
     let Some((operation, route)) = operation_for(&method, &path) else {
-        increment_metric(&state.store, "rejected_route", 1).await;
+        increment_metric(&state.store, Metric::RejectedRoute, 1).await;
         return Ok(error_response(404, "not_found", "operation not found"));
     };
     let Some(principal) = authenticated_principal(&state, &request) else {
-        increment_metric(&state.store, "rejected_unauthenticated", 1).await;
+        increment_metric(&state.store, Metric::RejectedUnauthenticated, 1).await;
         return Ok(error_response(
             401,
             "unauthenticated",
@@ -977,7 +1066,7 @@ async fn dispatch(
         .authorizer
         .authorize_request(&principal, &authorization)
     {
-        increment_metric(&state.store, "rejected_unauthorized", 1).await;
+        increment_metric(&state.store, Metric::RejectedUnauthorized, 1).await;
         return Ok(error_response(
             403,
             "forbidden",
@@ -1009,8 +1098,8 @@ async fn dispatch(
     }
 }
 
-async fn increment_metric(store: &store::ExecutionStore, name: &'static str, amount: u64) {
-    let _ = store.increment_metric(name, amount).await;
+async fn increment_metric(store: &store::ExecutionStore, metric: Metric, amount: u64) {
+    let _ = store.increment_metric(metric.name(), amount).await;
 }
 
 /// Record several counters under one connection acquisition and one commit.
@@ -1018,8 +1107,12 @@ async fn increment_metric(store: &store::ExecutionStore, name: &'static str, amo
 /// Prefer this wherever a single request or a single execution terminal state
 /// moves more than one counter: the store's connection mutex is the same one
 /// `commit_event` needs, so unbatched accounting delays durable event commits.
-async fn increment_metrics(store: &store::ExecutionStore, deltas: &[(&'static str, u64)]) {
-    let _ = store.increment_metrics(deltas).await;
+async fn increment_metrics(store: &store::ExecutionStore, deltas: &[(Metric, u64)]) {
+    let names = deltas
+        .iter()
+        .map(|(metric, amount)| (metric.name(), *amount))
+        .collect::<Vec<_>>();
+    let _ = store.increment_metrics(&names).await;
 }
 
 fn resource_for_path(operation: Operation, path: &str) -> Option<ResourceId> {
@@ -1072,6 +1165,51 @@ fn authenticated_principal(state: &NodeState, request: &Request) -> Option<NodeP
         return None;
     }
     state.resolver.resolve_verified_leaf(&chain[0])
+}
+
+/// The node's live execution-permit count, published for the operator surface.
+///
+/// The admission semaphore owns the count; this publishes a copy of it so the
+/// operator surface can report the live number. The store cannot re-derive
+/// it: an execution that crashed keeps a non-terminal row long after its
+/// permit was released, so "non-terminal execution rows" and "permits held"
+/// are different facts and only the running node knows the second one.
+fn publish_permit_count(state: &NodeState) {
+    let held = state.max_active - state.permits.available_permits() as u32;
+    let _ = operations::publish_permit_count(&state.permit_report_path, held);
+}
+
+/// An execution permit that republishes the node's permit count on release.
+///
+/// The count is published *after* the permit is released, so the published
+/// number always describes the permits the node holds once the change has
+/// happened.
+struct PublishedPermit {
+    permit: Option<OwnedSemaphorePermit>,
+    semaphore: Arc<Semaphore>,
+    max_active: u32,
+    report_path: PathBuf,
+}
+
+impl PublishedPermit {
+    fn new(permit: OwnedSemaphorePermit, state: &NodeState) -> Self {
+        Self {
+            permit: Some(permit),
+            semaphore: state.permits.clone(),
+            max_active: state.max_active,
+            report_path: state.permit_report_path.clone(),
+        }
+    }
+}
+
+impl Drop for PublishedPermit {
+    fn drop(&mut self) {
+        // Release the permit before publishing: the published count must
+        // describe the permits held *after* this one is gone.
+        drop(self.permit.take());
+        let held = self.max_active - self.semaphore.available_permits() as u32;
+        let _ = operations::publish_permit_count(&self.report_path, held);
+    }
 }
 
 fn node_status(state: &NodeState) -> NodeStatus {
@@ -1308,7 +1446,7 @@ async fn workspace_create(
         ));
     }
     if ExecutionGeneration::new(wire.handle.generation.get()).is_err() {
-        increment_metric(&state.store, "rejected_invalid", 1).await;
+        increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
         return Ok(error_response(
             400,
             "invalid_request",
@@ -1327,7 +1465,7 @@ async fn workspace_create(
         .await
     {
         Ok(ready) => {
-            increment_metric(&state.store, "workspace_manifest_registrations", 1).await;
+            increment_metric(&state.store, Metric::WorkspaceManifestRegistrations, 1).await;
             Ok(json_response(
                 201,
                 &WorkspaceReadyResponse {
@@ -1382,12 +1520,27 @@ struct DeriveWorkspaceRequest {
     patch: eggwork_core::WorkspaceManifestPatch,
 }
 
+/// The counters one successful workspace derivation moves.
+///
+/// The derivation path moves three counters in one batch: the derivation that
+/// was asked for, the manifest the derivation registered, and the patch
+/// entries it applied. They are named in one place so the batch is one
+/// decision — and so a test can assert that all three move, which is the
+/// property the old hand-maintained metric list broke.
+fn workspace_derive_metrics(patch_entries: u64) -> [(Metric, u64); 3] {
+    [
+        (Metric::WorkspaceDerivedHits, 1),
+        (Metric::WorkspaceManifestRegistrations, 1),
+        (Metric::WorkspacePatchEntries, patch_entries),
+    ]
+}
+
 async fn workspace_derive(
     state: NodeState,
     request: Request,
     principal: NodePrincipal,
 ) -> Result<Response, eggserve_core::server::ServiceError> {
-    increment_metric(&state.store, "workspace_derived_requests", 1).await;
+    increment_metric(&state.store, Metric::WorkspaceDerivedRequests, 1).await;
     let (_head, body, _context) = request.into_parts_with_context();
     let bytes = match read_limited_body(body, MAX_WORKSPACE_REQUEST_BYTES).await {
         Ok(bytes) => bytes,
@@ -1429,7 +1582,7 @@ async fn workspace_derive(
         ));
     }
     if ExecutionGeneration::new(wire.handle.generation.get()).is_err() {
-        increment_metric(&state.store, "rejected_invalid", 1).await;
+        increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
         return Ok(error_response(
             400,
             "invalid_request",
@@ -1449,15 +1602,7 @@ async fn workspace_derive(
         .await
     {
         Ok(ready) => {
-            increment_metrics(
-                &state.store,
-                &[
-                    ("workspace_derived_hits", 1),
-                    ("workspace_manifest_registrations", 1),
-                    ("workspace_patch_entries", patch_entries),
-                ],
-            )
-            .await;
+            increment_metrics(&state.store, &workspace_derive_metrics(patch_entries)).await;
             Ok(json_response(
                 201,
                 &WorkspaceReadyResponse {
@@ -1471,7 +1616,7 @@ async fn workspace_derive(
             ))
         }
         Err(workspace::WorkspaceError::BaseMissing) => {
-            increment_metric(&state.store, "workspace_base_missing", 1).await;
+            increment_metric(&state.store, Metric::WorkspaceBaseMissing, 1).await;
             Ok(error_response(
                 409,
                 "base_manifest_missing",
@@ -1559,7 +1704,7 @@ async fn blob_upload(
     });
     match state.blobs.put_stream(digest, declared, input).await {
         Ok(()) => {
-            increment_metric(&state.store, "blob_upload_bytes", declared).await;
+            increment_metric(&state.store, Metric::BlobUploadBytes, declared).await;
             Ok(Response::builder()
                 .status(StatusCode::new(201).expect("valid HTTP status"))
                 .body(ResponseBody::Empty)
@@ -1587,7 +1732,7 @@ async fn blob_download(
                 Ok(size) => {
                     chunk.truncate(size);
                     let _ = metric_store
-                        .increment_metric("blob_download_bytes", size as u64)
+                        .increment_metric(Metric::BlobDownloadBytes.name(), size as u64)
                         .await;
                     Ok(Some((Bytes::from(chunk), (file, metric_store))))
                 }
@@ -1808,7 +1953,7 @@ async fn execute(
         ));
     }
     if wire.spec.schema_version != API_SCHEMA_VERSION {
-        increment_metric(&state.store, "rejected_invalid", 1).await;
+        increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
         return Ok(error_response(
             426,
             "protocol_version",
@@ -1817,7 +1962,7 @@ async fn execute(
     }
     if let Err(error) = wire.spec.validate() {
         let _ = error;
-        increment_metric(&state.store, "rejected_invalid", 1).await;
+        increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
         return Ok(error_response(
             400,
             "invalid_request",
@@ -1825,7 +1970,7 @@ async fn execute(
         ));
     }
     if !wire.spec.command.declared_outputs.is_empty() && wire.workspace_id.is_none() {
-        increment_metric(&state.store, "rejected_invalid", 1).await;
+        increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
         return Ok(error_response(
             400,
             "workspace_required",
@@ -1835,7 +1980,7 @@ async fn execute(
     if state.draining.load(Ordering::Acquire)
         || operations::is_persistently_draining(&state.drain_path)
     {
-        increment_metric(&state.store, "rejected_draining", 1).await;
+        increment_metric(&state.store, Metric::RejectedDraining, 1).await;
         return Ok(error_response(
             503,
             "draining",
@@ -1843,7 +1988,7 @@ async fn execute(
         ));
     }
     if !check_isolation_supported(&state.capabilities_features, &wire.spec.command.isolation) {
-        increment_metric(&state.store, "rejected_capability", 1).await;
+        increment_metric(&state.store, Metric::RejectedCapability, 1).await;
         return Ok(error_response(
             409,
             "capability_mismatch",
@@ -1851,7 +1996,7 @@ async fn execute(
         ));
     }
     if !check_resources_supported(&state.capabilities_features, &wire.spec.command.resources) {
-        increment_metric(&state.store, "rejected_capability", 1).await;
+        increment_metric(&state.store, Metric::RejectedCapability, 1).await;
         return Ok(error_response(
             409,
             "capability_mismatch",
@@ -1859,7 +2004,7 @@ async fn execute(
         ));
     }
     if !check_network_supported(&wire.spec.command.network) {
-        increment_metric(&state.store, "rejected_capability", 1).await;
+        increment_metric(&state.store, Metric::RejectedCapability, 1).await;
         return Ok(error_response(
             409,
             "capability_mismatch",
@@ -1872,7 +2017,7 @@ async fn execute(
         match eggwork_core::request_digest_with_workspace(&wire.spec, wire.workspace_id.as_ref()) {
             Ok((version, digest)) => (version, digest.as_str().to_owned()),
             Err(_) => {
-                increment_metric(&state.store, "rejected_invalid", 1).await;
+                increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
                 return Ok(error_response(
                     400,
                     "invalid_request",
@@ -1887,7 +2032,7 @@ async fn execute(
         {
             Ok(workspace) => workspace.root,
             Err(_) => {
-                increment_metric(&state.store, "rejected_invalid", 1).await;
+                increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
                 return Ok(error_response(
                     409,
                     "workspace_not_ready",
@@ -1914,7 +2059,7 @@ async fn execute(
     ) {
         Ok(request) => request,
         Err(_) => {
-            increment_metric(&state.store, "rejected_invalid", 1).await;
+            increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
             return Ok(error_response(
                 400,
                 "invalid_request",
@@ -1968,7 +2113,7 @@ async fn execute(
     if state.draining.load(Ordering::Acquire)
         || operations::is_persistently_draining(&state.drain_path)
     {
-        increment_metric(&state.store, "rejected_draining", 1).await;
+        increment_metric(&state.store, Metric::RejectedDraining, 1).await;
         return Ok(error_response(
             503,
             "draining",
@@ -1976,12 +2121,15 @@ async fn execute(
         ));
     }
     let permit = match state.permits.clone().try_acquire_owned() {
-        Ok(permit) => permit,
+        Ok(permit) => PublishedPermit::new(permit, &state),
         Err(_) => {
-            increment_metric(&state.store, "rejected_busy", 1).await;
+            increment_metric(&state.store, Metric::RejectedBusy, 1).await;
             return Ok(error_response(503, "busy", "node execution limit reached"));
         }
     };
+    // The permit count the operator surface reads is published here, so the
+    // published number describes the node as soon as it holds the permit.
+    publish_permit_count(&state);
     if executions.len() >= MAX_RECENT_EXECUTIONS {
         let mut terminal = Vec::new();
         for (old_id, old_record) in executions.iter() {
@@ -1997,7 +2145,7 @@ async fn execute(
         }
     }
     if executions.len() >= MAX_RECENT_EXECUTIONS {
-        increment_metric(&state.store, "rejected_storage", 1).await;
+        increment_metric(&state.store, Metric::RejectedStorage, 1).await;
         return Ok(error_response(
             503,
             "storage_exhausted",
@@ -2012,7 +2160,7 @@ async fn execute(
     {
         drop(permit);
         drop(executions);
-        increment_metric(&state.store, "rejected_invalid", 1).await;
+        increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
         return Ok(error_response(
             409,
             "workspace_not_ready",
@@ -2054,7 +2202,7 @@ async fn execute(
     };
     match reservation {
         store::ReserveResult::Created => {
-            increment_metric(&state.store, "executions_accepted", 1).await;
+            increment_metric(&state.store, Metric::ExecutionsAccepted, 1).await;
         }
         store::ReserveResult::Existing(snapshot) => {
             drop(permit);
@@ -2100,7 +2248,7 @@ async fn execute(
             ));
         }
         store::ReserveResult::StorageFull => {
-            increment_metric(&state.store, "rejected_storage", 1).await;
+            increment_metric(&state.store, Metric::RejectedStorage, 1).await;
             if let Some(workspace_id) = &wire.workspace_id {
                 let expiry =
                     artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
@@ -2591,7 +2739,7 @@ async fn event_response(
         ));
     };
     if after.saturating_add(1) < page.base_sequence {
-        increment_metric(&state.store, "event_history_resync", 1).await;
+        increment_metric(&state.store, Metric::EventHistoryResync, 1).await;
         return Ok(error_response(
             410,
             "history_expired",
@@ -2640,7 +2788,7 @@ async fn run_execution(
     record: Arc<ExecutionRecord>,
     request: RunnerRequest,
     workspace: Option<WorkspaceCapture>,
-    _permit: OwnedSemaphorePermit,
+    _permit: PublishedPermit,
 ) {
     publish(
         &record,
@@ -2810,15 +2958,15 @@ async fn run_execution(
         execution_result.artifact_capture = ArtifactCaptureDisposition::NotRequested;
     }
     let terminal = execution_result.state.clone();
-    let terminal_metric = terminal_metric_name(&terminal);
+    let terminal_metric = terminal_metric(&terminal);
     let mut terminal_counters = Vec::with_capacity(4);
     if let Some(name) = terminal_metric {
         terminal_counters.push((name, 1u64));
     }
-    terminal_counters.push(("stdout_bytes", execution_result.stdout_bytes));
-    terminal_counters.push(("stderr_bytes", execution_result.stderr_bytes));
+    terminal_counters.push((Metric::StdoutBytes, execution_result.stdout_bytes));
+    terminal_counters.push((Metric::StderrBytes, execution_result.stderr_bytes));
     if execution_result.cleanup_warning.is_some() {
-        terminal_counters.push(("cleanup_failures", 1u64));
+        terminal_counters.push((Metric::CleanupFailures, 1u64));
     }
     increment_metrics(&record.store, &terminal_counters).await;
     publish_terminal(
@@ -3037,13 +3185,13 @@ fn event_stream_response(
 /// compiler refuses the new variant until it is placed here. The non-terminal
 /// arms return `None`, which keeps this map total over the enum and
 /// consistent with the core-owned terminal classification.
-fn terminal_metric_name(state: &ExecutionState) -> Option<&'static str> {
+fn terminal_metric(state: &ExecutionState) -> Option<Metric> {
     match state {
-        ExecutionState::Succeeded => Some("terminal_succeeded"),
-        ExecutionState::Failed => Some("terminal_failed"),
-        ExecutionState::Cancelled => Some("terminal_cancelled"),
-        ExecutionState::TimedOut => Some("terminal_timed_out"),
-        ExecutionState::Interrupted => Some("terminal_interrupted"),
+        ExecutionState::Succeeded => Some(Metric::TerminalSucceeded),
+        ExecutionState::Failed => Some(Metric::TerminalFailed),
+        ExecutionState::Cancelled => Some(Metric::TerminalCancelled),
+        ExecutionState::TimedOut => Some(Metric::TerminalTimedOut),
+        ExecutionState::Interrupted => Some(Metric::TerminalInterrupted),
         ExecutionState::Accepted
         | ExecutionState::Preparing
         | ExecutionState::Running
@@ -7253,8 +7401,9 @@ mod tests {
     fn the_terminal_metric_mapping_is_total_over_the_terminal_set() {
         let mut seen: Vec<(&str, &str)> = Vec::new();
         for state in &eggwork_core::ALL_EXECUTION_STATES {
-            match terminal_metric_name(state) {
-                Some(name) => {
+            match terminal_metric(state) {
+                Some(metric) => {
+                    let name = metric.name();
                     assert!(
                         state.is_terminal(),
                         "{state:?} is not terminal but has the metric {name}"
@@ -7277,6 +7426,99 @@ mod tests {
                 ("Interrupted", "terminal_interrupted"),
             ]
         );
+    }
+
+    /// Every metric the server can increment is reported by the operator
+    /// surface.
+    ///
+    /// The increments go through the same helper the server uses, so this
+    /// proves that the real increment path and the real report agree — not
+    /// that a test wrote a row and read it back.
+    #[tokio::test]
+    async fn every_metric_the_server_increments_reaches_the_operator_report() {
+        let temp = TempDir::new().unwrap();
+        let database_path = temp.path().join("executions.sqlite");
+        let store = store::ExecutionStore::open(&database_path).unwrap();
+        let workspace_counters = [
+            Metric::WorkspaceManifestRegistrations,
+            Metric::WorkspaceDerivedRequests,
+            Metric::WorkspaceDerivedHits,
+            Metric::WorkspacePatchEntries,
+            Metric::WorkspaceBaseMissing,
+        ];
+        for metric in workspace_counters {
+            increment_metric(&store, metric, 3).await;
+        }
+        let config = operator_config(temp.path(), &database_path);
+        let report = operations::metrics_snapshot(&config).unwrap();
+        for metric in workspace_counters {
+            assert_eq!(
+                report.counters.get(metric.name()),
+                Some(&3),
+                "{} was incremented but the operator report does not carry it",
+                metric.name()
+            );
+        }
+    }
+
+    /// The workspace derivation moves three counters at once.
+    ///
+    /// The three are the derivation that was asked for, the manifest the
+    /// derivation registered, and the patch entries it applied. The batch is
+    /// one decision, so all three move together.
+    #[tokio::test]
+    async fn the_workspace_derivation_moves_three_counters_at_once() {
+        let temp = TempDir::new().unwrap();
+        let database_path = temp.path().join("executions.sqlite");
+        let store = store::ExecutionStore::open(&database_path).unwrap();
+        increment_metrics(&store, &workspace_derive_metrics(7)).await;
+        let config = operator_config(temp.path(), &database_path);
+        let report = operations::metrics_snapshot(&config).unwrap();
+        assert_eq!(
+            report.counters.get(Metric::WorkspaceDerivedHits.name()),
+            Some(&1)
+        );
+        assert_eq!(
+            report
+                .counters
+                .get(Metric::WorkspaceManifestRegistrations.name()),
+            Some(&1)
+        );
+        assert_eq!(
+            report.counters.get(Metric::WorkspacePatchEntries.name()),
+            Some(&7)
+        );
+    }
+
+    /// An operator configuration that reads the given database.
+    fn operator_config(
+        root: &std::path::Path,
+        database_path: &std::path::Path,
+    ) -> operations::OperatorConfig {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "node_id": "node-test",
+            "bind": "127.0.0.1:0",
+            "execution_root": root.join("execution"),
+            "database_path": database_path,
+            "blob_root": root.join("blobs"),
+            "blob_quota_bytes": 4096,
+            "workspace_root": root.join("workspaces"),
+            "workspace_quota_bytes": 4096,
+            "max_active_executions": 2,
+            "lease_ttl_seconds": 60,
+            "tls": {
+                "certificate_chain": root.join("server.pem"),
+                "private_key": root.join("server-key.pem"),
+                "client_ca": root.join("client-ca.pem")
+            },
+            "clients": [{
+                "principal_id": "controller",
+                "certificate_sha256": "ab".repeat(32),
+                "operations": ["status"]
+            }]
+        });
+        serde_json::from_value(value).expect("config")
     }
 
     #[test]
