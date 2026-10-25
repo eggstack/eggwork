@@ -9,7 +9,7 @@
 //! dev-only workspace member, and the release contract enumerates workspace
 //! members.
 
-use eggwork_runner::{LocalProcessRunner, TrustedLandlockSetup};
+use eggwork_runner::{LANDLOCK_WORKSPACE_RW_CAPABILITY, LocalProcessRunner, TrustedLandlockSetup};
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
@@ -20,31 +20,56 @@ use std::path::PathBuf;
 #[path = "../../eggwork-sandbox-helper/tests/support/helper_fixture.rs"]
 mod helper_fixture;
 
+/// The built sandbox helper, located deterministically.
+///
+/// The helper belongs to another package, so `CARGO_BIN_EXE_eggwork-sandbox-helper`
+/// is not available here: Cargo only sets that variable for the package that
+/// owns the binary. What *is* available is this test's own executable, which
+/// Cargo places under the target directory's `deps` directory, one level below
+/// the profile directory that holds the package's binaries. The helper is
+/// therefore the sibling of the `deps` directory — the same walk
+/// `eggwork_server`'s `locate_helper_binary` performs.
+///
+/// The lookup fails **loudly**. A test that returns early when it cannot find
+/// its fixture reports success without asserting anything, which is a hole
+/// rather than a check: the previous implementation did exactly that, and the
+/// skip was the normal path in CI as well as locally.
 #[cfg(target_os = "linux")]
-fn built_helper() -> Option<PathBuf> {
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("OUT_DIR").map(PathBuf::from))?;
-    let candidate = target.join("debug").join("eggwork-sandbox-helper");
-    candidate.exists().then_some(candidate)
+fn built_helper() -> PathBuf {
+    let executable = std::env::current_exe().expect("the test executable has a path");
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(directory) = executable.parent() {
+        candidates.push(directory.join("eggwork-sandbox-helper"));
+        if let Some(profile) = directory.parent() {
+            candidates.push(profile.join("eggwork-sandbox-helper"));
+        }
+    }
+    if let Some(found) = candidates.iter().find(|candidate| candidate.is_file()) {
+        return found.clone();
+    }
+    panic!(
+        "eggwork-sandbox-helper was not found next to this test executable.\n\
+         expected one of: {}\n\
+         build it first: cargo build --locked -p eggwork-sandbox-helper",
+        candidates
+            .iter()
+            .map(|candidate| candidate.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn trusted_helper_advertises_landlock_workspace_rw_capability() {
-    let Some(source) = built_helper() else {
-        // The helper binary only exists once it has been built. CI builds it
-        // before running this suite, so this skip is a local-only convenience.
-        eprintln!("eggwork-sandbox-helper is not built; skipping");
-        return;
-    };
+    let source = built_helper();
     let fixture = helper_fixture::TrustedHelperFixture::stage(&source);
     let runner = LocalProcessRunner::new(TrustedLandlockSetup::new(fixture.path()));
     let capabilities = runner.execution_capabilities().await;
     assert!(
         capabilities
             .iter()
-            .any(|feature| feature == "isolation.landlock.workspace-rw.v1"),
+            .any(|feature| feature == LANDLOCK_WORKSPACE_RW_CAPABILITY),
         "expected Landlock workspace-rw capability on a kernel with ABI V4; got {capabilities:?}"
     );
 }
@@ -61,7 +86,7 @@ async fn missing_helper_advertises_no_landlock_capability() {
     assert!(
         !capabilities
             .iter()
-            .any(|feature| feature == "isolation.landlock.workspace-rw.v1"),
+            .any(|feature| feature == LANDLOCK_WORKSPACE_RW_CAPABILITY),
         "missing helper must not advertise Landlock capability; got {capabilities:?}"
     );
 }

@@ -16,8 +16,17 @@ cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo test --locked --workspace --all-targets
 cargo check --workspace
 python3 -m unittest discover --start-directory tests/release --top-level-directory tests/release
+python3 scripts/check_doc_citations.py
+python3 scripts/check_doc_citations.py --prove-negative-exit
+python3 scripts/check_quickstart_sync.py
 git diff --check
 ```
+
+The two documentation gates are load-bearing for any change under `architecture/`
+or `docs/`: a citation must name a **symbol**, never a line number, and the
+quickstart document must agree with `scripts/quickstart.sh`, which is the
+executed form of it. Both gates fail the build on a finding — see
+[`.skills/pre-submit-gate/`](.skills/pre-submit-gate/).
 
 `--locked` on the clippy and test steps is load-bearing. A workspace version bump
 that does not update `Cargo.lock` builds fine locally and passes both without it,

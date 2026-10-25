@@ -11,6 +11,7 @@ Rust-native, fixed-target remote execution fabric: a caller selects one node, su
 - Check:        `cargo check --workspace`
 - Ownership guard: `python3 scripts/check_execution_ownership.py` (also `--prove-negative-exit`)
 - Harness tests: `python3 -m unittest discover --start-directory tests/release --top-level-directory tests/release`
+- Documentation gates: `python3 scripts/check_doc_citations.py` (also `--prove-negative-exit`) and `python3 scripts/check_quickstart_sync.py` — a citation under `architecture/` or `docs/` must name a **symbol**, never a line number, and `docs/quickstart.md` must agree with `scripts/quickstart.sh`
 - Run the node: `cargo run -p eggwork-server --bin eggworkd -- run --config <node.json>`
 
 `--locked` is load-bearing on `clippy` and `test`: a version bump that skips `Cargo.lock` passes both and then fails every release build.
@@ -59,12 +60,16 @@ reasoning and boundary evidence goes in `architecture/`.
 | [docs/deployment.md](docs/deployment.md) | Install/update a node as service software via Eggup |
 | [docs/releases.md](docs/releases.md) | Consume a published release; release identity, Windows reproducibility |
 
-Quickstart commands in `docs/` are **executed and verified**, not illustrative.
-The config loader's strictness (owner-only state directories `0700`, private key
-`0600`, nothing group/world writable, and a sandbox helper outside world-writable
-ancestors) is undocumented anywhere else and produces a single unhelpful
-`configuration is invalid or unreadable` — if that message ever appears, check
-permissions first.
+Quickstart commands in `docs/` are **executed and verified**, not illustrative:
+`scripts/quickstart.sh` runs the whole flow end to end and
+`scripts/check_quickstart_sync.py` keeps the document and that script in
+agreement. The config loader's strictness (owner-only state directories `0700`,
+private key `0600`, nothing group/world writable, and a sandbox helper outside
+world-writable ancestors) is undocumented anywhere else — since the M008a
+corrective it is reported as a stable rule identifier, the offending file or
+path, and the corrective action, and a secret-bearing item is named by its
+role, never by its path. If a configuration fault still surfaces without a rule
+id, check permissions first.
 
 ## Architecture index
 
@@ -95,12 +100,15 @@ and deliberate. Deep dives:
 1. **Process ownership is singular.** Only `eggwork-runner` and `eggwork-sandbox-helper` may create child processes; `eggwork-core`, `eggwork-client`, `eggwork-server` must not. Also banned outright: `command-group`, `duct`, `process-wrap`, `portable-pty`, `subprocess`. The allowlist lives in `scripts/check_execution_ownership.py`; adding an owner requires an architecture review. The guard scans only `crates/*/src/**/*.rs` — `tests/`, `examples/`, `build.rs`, and new top-level dirs are unscanned. The dependency denylist is the exception: every crate is checked against it, and the one recorded exemption is `eggwork-runner` → `process-wrap` (Windows Job Object ownership, `cfg(windows)` only), in `APPROVED_PROCESS_DEP_EXCEPTIONS`.
 2. **No direct service-manager invocation for the *node service*.** Eggwork never manages its own service by shelling out — the node service lifecycle goes through Eggup adapters. **Exception, and it is not a violation:** `eggwork-runner` invokes `systemd-run --scope` and `systemctl show`/`stop` for *per-execution transient cgroup units*, which is resource enforcement owned by the process-lifecycle crate, not service lifecycle. A new `systemctl`-shaped call must pick a side and match the code to it. (No dedicated Python guard; the only automated check, `no_direct_service_manager_invocation_exists`, scans three `eggwork-server` files. `eggwork-runner` is not covered — discipline is on you.)
 3. **Crate dependencies stay one-way.** core/helper → nothing; client → core; server → core + runner (`eggwork-client` is dev-only for the server).
-4. **Isolation claims are earned.** Advertise filesystem isolation only when `verify_trusted_helper` accepts the installed helper; the same function backs capability advertisement, `doctor`, and admission.
+4. **Isolation claims are earned.** Advertise filesystem isolation only when `verify_trusted_helper` accepts the installed helper; the same function backs capability advertisement, `doctor`, and admission. The node's environment policy has one owner — `crates/eggwork-runner/policy/environment-policy.toml` — generated into each crate and pinned by a parity test, so the runner and the sandbox helper cannot enforce different rules.
 5. **Fail closed** on untrusted helper, version skew, missing prior-generation digest, unsupported service backend. Degrade only when the caller never demanded a guarantee, and always record `NotApplied`.
 6. **No release identity in `release/eggpack/`** — no tag, source SHA, artifact digest, or size.
 7. **`.github/workflows/release.yml` is generated** by `eggpack ci generate`. Never hand-edit; `eggpack ci check` fails on drift.
 8. **Never set `RUSTFLAGS`/`CARGO_*RUSTFLAGS`** — the env would silently replace the target-scoped Windows link policy in `.cargo/config.toml` (`/BREPRO`, `/DEBUG:NONE`) that makes MSVC release binaries reproducible.
 9. **Windows service management fails closed.** `deployment::windows_scm_manager` is retained but refuses before any mutation; daemon has no SCM dispatcher.
+10. **Protocol contract facts have one owner.** The control-plane API schema version and the `exec.argv.v1` capability name are declared once, publicly, in `eggwork-core`; the runner owns the capability names it produces (`LANDLOCK_WORKSPACE_RW_CAPABILITY`, `CGROUPS_V2_{MEMORY,CPU,PIDS}_CAPABILITY`, `WORKSPACE_RW_PROFILE`); the terminal/non-terminal classification of `ExecutionState` is owned by `eggwork-core`'s `ExecutionState::is_terminal` / `is_non_terminal`. A second copy of any of these in an endpoint crate is a defect, not a convenience. See [ADR-0008](plans/adrs/ADR-0008-core-protocol-contract-ownership.md).
+11. **A capability is advertised only where the node can honour it, and a failed claim fails the execution, not the report.** `artifact.declared.v1` is advertised only when the platform's capture-capability fact (`artifact::capture_capability`) says the capture can complete; an execution whose declared outputs were not captured ends in a truthful non-success state with a first-class disposition (`ExecutionResult::artifact_capture`), never `Succeeded` with the outputs silently dropped. The mapping from a capture attempt to the terminal facts is one decision (`eggwork_server::decide_artifact_capture`).
+12. **The release harness holds no remembered copy of a fact that has an owner.** The workspace version is read once, by `scripts/release_candidate_probe.py`; the install identities and the published target set come from `release/eggpack/distribution.toml`; the service identity comes from the candidate daemon. A second *reader* of one owner is fine — `crates/eggwork-server/tests/release_contract.rs` is exactly that — but a second *rememberer* is a second owner. The same rule governs the design record: a citation names a symbol, never a line number, and `scripts/check_doc_citations.py` is the gate.
 
 ## Code style
 
@@ -131,5 +139,5 @@ and deliberate. Deep dives:
 
 - Report suspected vulnerabilities privately to the maintainers (see `SECURITY.md`); no public issue with exploit detail.
 - Never commit secrets, node private keys, or published state (config, SQLite journal, workspaces, blobs, artifacts) — the latter belong to the installation root and never ship in a release artifact.
-- Node trust requires a verified mTLS client CA and explicit per-principal grants; `config print` redacts private-key paths and certificate fingerprints.
+- Node trust requires a verified mTLS client CA and explicit per-principal grants; a grant may narrow an operation to named resources, and the store's ownership fences remain authoritative; `config print` redacts private-key paths and certificate fingerprints.
 - SHA-256 sidecars are integrity evidence, not authenticity.

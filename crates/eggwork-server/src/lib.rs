@@ -6,6 +6,7 @@ mod artifact;
 mod blob;
 pub mod deployment;
 pub mod operations;
+pub mod service_host;
 mod store;
 pub mod telemetry;
 mod workspace;
@@ -20,14 +21,16 @@ use eggserve_core::{
     tls::{ClientAuthMode, TlsServerConfig},
 };
 use eggwork_core::{
-    ApiError, ExecutionEvent, ExecutionEventKind, ExecutionFailure, ExecutionFinalizationFailure,
+    API_SCHEMA_VERSION, ApiError, ArtifactCaptureDisposition,
+    DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED, DiagnosticPayload, EXEC_ARGV_CAPABILITY,
+    ExecutionEvent, ExecutionEventKind, ExecutionFailure, ExecutionFinalizationFailure,
     ExecutionGeneration, ExecutionHandle, ExecutionId, ExecutionResult, ExecutionSnapshot,
     ExecutionSpec, ExecutionState, LeaseId, NodeCapabilities, NodeId, NodeStatus, ProtocolVersion,
     ProtocolVersionRange,
 };
 use eggwork_runner::{
-    ExecutionProvenance, LocalProcessRunner, ResourceSetupRequest, RunnerError, RunnerRequest,
-    SandboxRequest,
+    ExecutionProvenance, LocalProcessRunner, OutputChunk, ResourceSetupRequest, RunnerError,
+    RunnerRequest, SandboxRequest,
 };
 use futures_util::stream;
 use serde::{Deserialize, Serialize};
@@ -46,13 +49,192 @@ use thiserror::Error;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-const API_SCHEMA_VERSION: u16 = 1;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const EVENT_CAPACITY: usize = 32;
 const RUNNER_CHANNEL_CAPACITY: usize = 32;
 const MAX_RECENT_EXECUTIONS: usize = 1024;
 const MAX_BLOB_FIND_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_WORKSPACE_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
+/// Declare the metric vocabulary the node can increment.
+///
+/// The producers own the vocabulary: `increment_metric` and `increment_metrics`
+/// accept a `Metric` and nothing else, so a counter the server increments but
+/// the operator surface does not name cannot exist. The report path reads
+/// `Metric::ALL`, so the list that decides what may be incremented is the same
+/// list that decides what is reported.
+///
+/// This list used to live in `operations.rs` as a hand-maintained
+/// `METRIC_NAMES`, and the report path copied a stored value only when the
+/// name was already in its map. Five live counters — the workspace derivation
+/// counters — were incremented on real traffic and silently dropped by the
+/// report, so the operator surface could not see them at all.
+macro_rules! node_metrics {
+    ($($variant:ident => $name:literal),* $(,)?) => {
+        /// One counter the node can increment.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum Metric {
+            $($variant),*
+        }
+
+        impl Metric {
+            /// Every metric the node can increment.
+            pub const ALL: &'static [Metric] = &[$(Metric::$variant),*];
+
+            /// The name the metric is stored under.
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $(Metric::$variant => $name),*
+                }
+            }
+
+            /// The metric a stored name refers to, if this vocabulary knows it.
+            pub fn from_name(name: &str) -> Option<Metric> {
+                match name {
+                    $($name => Some(Metric::$variant),)*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+node_metrics! {
+    ExecutionsAccepted => "executions_accepted",
+    RejectedRoute => "rejected_route",
+    RejectedUnauthenticated => "rejected_unauthenticated",
+    RejectedUnauthorized => "rejected_unauthorized",
+    RejectedInvalid => "rejected_invalid",
+    RejectedDraining => "rejected_draining",
+    RejectedCapability => "rejected_capability",
+    RejectedBusy => "rejected_busy",
+    RejectedStorage => "rejected_storage",
+    EventHistoryResync => "event_history_resync",
+    BlobUploadBytes => "blob_upload_bytes",
+    BlobDownloadBytes => "blob_download_bytes",
+    StdoutBytes => "stdout_bytes",
+    StderrBytes => "stderr_bytes",
+    TerminalSucceeded => "terminal_succeeded",
+    TerminalFailed => "terminal_failed",
+    TerminalCancelled => "terminal_cancelled",
+    TerminalTimedOut => "terminal_timed_out",
+    TerminalInterrupted => "terminal_interrupted",
+    CleanupFailures => "cleanup_failures",
+    WorkspaceManifestRegistrations => "workspace_manifest_registrations",
+    WorkspaceDerivedRequests => "workspace_derived_requests",
+    WorkspaceDerivedHits => "workspace_derived_hits",
+    WorkspacePatchEntries => "workspace_patch_entries",
+    WorkspaceBaseMissing => "workspace_base_missing",
+}
+
+/// The declared-artifact capture capability of the running platform.
+///
+/// The re-export is the crate's public answer to "can this node capture
+/// declared outputs?". The data plane owns the fact because it owns the
+/// capture, and the fact is re-exported rather than reimplemented here so a
+/// caller cannot answer it from its own `cfg` and disagree with the node.
+pub use artifact::ArtifactCaptureCapability;
+
+/// The declared-artifact capture capability of the running platform.
+///
+/// See [`ArtifactCaptureCapability`].
+pub use artifact::capture_capability as artifact_capture_capability;
+
+/// What a declared-artifact capture attempt produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactCaptureAttempt {
+    /// No capture was attempted: either the execution declared no outputs, or
+    /// the execution ended in a state where a capture is not performed.
+    NotAttempted,
+    /// The capture completed and published its artifacts.
+    Completed,
+    /// The capture was attempted and did not complete.
+    Failed,
+}
+
+/// The facts the terminal disposition of a declared-artifact capture is
+/// decided from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactCaptureFacts {
+    /// The running platform's capture capability.
+    pub capability: ArtifactCaptureCapability,
+    /// Whether the execution declared any outputs.
+    pub declared_outputs: bool,
+    /// The terminal state the target produced.
+    pub target_state: ExecutionState,
+    /// The failure the target produced, if any.
+    pub target_failure: Option<ExecutionFailure>,
+    /// What the capture attempt produced.
+    pub attempt: ArtifactCaptureAttempt,
+}
+
+/// The terminal facts a declared-artifact capture produces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactCaptureDecision {
+    /// The terminal state the execution reports.
+    pub state: ExecutionState,
+    /// The failure the execution reports, if any.
+    pub failure: Option<ExecutionFailure>,
+    /// The capture disposition the execution reports.
+    pub disposition: ArtifactCaptureDisposition,
+}
+
+/// The one mapping from a capture attempt to the terminal facts of the
+/// execution.
+///
+/// The mapping lives here, and not in the finalization's match arms, because
+/// it is a contract rather than an implementation detail: a node must not
+/// report a successful execution whose declared outputs were dropped, and a
+/// contract that is only reachable through a live execution cannot be checked
+/// on a platform where the capture is impossible.
+///
+/// The rules are:
+///
+/// * an execution that declared no outputs reports
+///   [`ArtifactCaptureDisposition::NotRequested`] and keeps the target's own
+///   terminal facts — nothing was asked for, so nothing was lost;
+/// * a capture that completed reports
+///   [`ArtifactCaptureDisposition::Completed`] and keeps the target's own
+///   terminal facts;
+/// * a declared output that was not captured reports
+///   [`ArtifactCaptureDisposition::Failed`], and a target that had succeeded
+///   becomes [`ExecutionState::Failed`] with the node's own
+///   [`ExecutionFailure::Internal`]. The target's failure is never overwritten:
+///   a target that failed for its own reason keeps that failure, so a caller
+///   can still tell "the target failed" from "the target succeeded and its
+///   declared outputs could not be collected";
+/// * a platform that cannot capture safely fails every declared output, so the
+///   capability decides the disposition before the attempt does.
+pub fn decide_artifact_capture(facts: ArtifactCaptureFacts) -> ArtifactCaptureDecision {
+    if !facts.declared_outputs {
+        return ArtifactCaptureDecision {
+            state: facts.target_state,
+            failure: facts.target_failure,
+            disposition: ArtifactCaptureDisposition::NotRequested,
+        };
+    }
+    let disposition = match (facts.capability, facts.attempt) {
+        (ArtifactCaptureCapability::Unavailable, _) => ArtifactCaptureDisposition::Failed,
+        (ArtifactCaptureCapability::Available, ArtifactCaptureAttempt::Completed) => {
+            ArtifactCaptureDisposition::Completed
+        }
+        (ArtifactCaptureCapability::Available, _) => ArtifactCaptureDisposition::Failed,
+    };
+    if disposition == ArtifactCaptureDisposition::Failed
+        && facts.target_state == ExecutionState::Succeeded
+    {
+        return ArtifactCaptureDecision {
+            state: ExecutionState::Failed,
+            failure: Some(facts.target_failure.unwrap_or(ExecutionFailure::Internal)),
+            disposition,
+        };
+    }
+    ArtifactCaptureDecision {
+        state: facts.target_state,
+        failure: facts.target_failure,
+        disposition,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Operation {
@@ -70,12 +252,60 @@ pub enum Operation {
     ArtifactRead,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Operation {
+    /// The resource kinds this operation's requests can name.
+    ///
+    /// A resource scope is refused when its `(operation, kind)` pair is not
+    /// in this table: a scope that could never be consulted would narrow
+    /// nothing while the operator believed it did. The table is exactly the
+    /// set the request path resolves — `resource_for_path` for the
+    /// path-derived operations, and the handler-level `authorize_resource`
+    /// calls for the body-derived ones — so a scope can never be written
+    /// for a resource the node does not resolve.
+    pub fn resource_kinds(&self) -> &'static [ResourceKind] {
+        match self {
+            Self::Execute => &[ResourceKind::Execution, ResourceKind::Workspace],
+            Self::Observe | Self::Cancel | Self::Renew | Self::Events => &[ResourceKind::Execution],
+            Self::BlobRead | Self::BlobWrite => &[ResourceKind::Blob],
+            Self::WorkspaceCreate => &[ResourceKind::Workspace],
+            Self::ArtifactRead => &[ResourceKind::Artifact, ResourceKind::Execution],
+            Self::Capabilities | Self::Status | Self::Telemetry => &[],
+        }
+    }
+}
+
+/// The kind of resource a request names.
+///
+/// A resource scope names a kind and an identifier, and the two must agree:
+/// a scope for `Blob` is compared against blob identifiers only. The kind is
+/// derived from the typed [`ResourceId`] variant so the configuration and
+/// the request path cannot disagree about what an identifier is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResourceKind {
+    Execution,
+    Blob,
+    Workspace,
+    Artifact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ResourceId {
     Execution(ExecutionId),
     Blob(eggwork_core::BlobDigest),
     Workspace(eggwork_core::WorkspaceId),
     Artifact(eggwork_core::ArtifactId),
+}
+
+impl ResourceId {
+    /// The kind of resource this identifier names.
+    pub fn kind(&self) -> ResourceKind {
+        match self {
+            Self::Execution(_) => ResourceKind::Execution,
+            Self::Blob(_) => ResourceKind::Blob,
+            Self::Workspace(_) => ResourceKind::Workspace,
+            Self::Artifact(_) => ResourceKind::Artifact,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +355,13 @@ pub trait Authorizer: Send + Sync + 'static {
 
     /// Resource-aware hook. Existing operation-wide policies remain valid;
     /// scoped policies can override this method to inspect authenticated IDs.
+    ///
+    /// The default body is exactly the operation-level decision, which is the
+    /// behaviour a deployment that configures no resource scope keeps. An
+    /// override may only *narrow* that decision: the store's `principal_id`
+    /// fences remain authoritative for ownership, so an authorizer that
+    /// permits a resource the principal does not own still gets refused by
+    /// the store.
     fn authorize_request(&self, principal: &NodePrincipal, request: &OperationRequest) -> bool {
         self.authorize(principal, request.operation)
     }
@@ -193,6 +430,14 @@ struct NodeState {
     permits: Arc<Semaphore>,
     draining: Arc<AtomicBool>,
     drain_path: PathBuf,
+    /// Where the node publishes its live execution-permit count.
+    ///
+    /// The count is a fact of the *running* node: it is how many execution
+    /// permits the admission semaphore currently holds. The store cannot
+    /// re-derive it — an execution that crashed keeps a non-terminal row long
+    /// after its permit was released — so the node publishes the number beside
+    /// the execution database and the operator surface reads it from there.
+    permit_report_path: PathBuf,
     runner: Arc<LocalProcessRunner>,
     store: store::ExecutionStore,
     blobs: blob::BlobStore,
@@ -340,7 +585,7 @@ impl NodeServer {
         let workspaces =
             workspace::WorkspaceManager::open(&config.workspace_root, config.workspace_quota_bytes)
                 .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
-        let artifact_path = config.database_path.with_extension("artifacts.sqlite");
+        let artifact_path = artifact::metadata_path(&config.database_path);
         let artifacts = artifact::ArtifactStore::open(&artifact_path)
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
         let recovered = store
@@ -348,7 +593,7 @@ impl NodeServer {
             .await
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
         if !recovered.is_empty() {
-            increment_metric(&store, "terminal_interrupted", recovered.len() as u64).await;
+            increment_metric(&store, Metric::TerminalInterrupted, recovered.len() as u64).await;
         }
         workspaces
             .recover_retention(
@@ -365,6 +610,7 @@ impl NodeServer {
             .reconcile_manifests(&blobs, artifact::now_unix_ms(), 1024)
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
         let drain_path = config.database_path.with_extension("drain");
+        let permit_report_path = config.database_path.with_extension("permits");
         let draining = Arc::new(AtomicBool::new(operations::is_persistently_draining(
             &drain_path,
         )));
@@ -414,6 +660,7 @@ impl NodeServer {
             permits: Arc::new(Semaphore::new(config.max_active_executions as usize)),
             draining,
             drain_path,
+            permit_report_path,
             runner,
             store,
             blobs,
@@ -447,6 +694,11 @@ impl NodeServer {
             .ready()
             .await
             .map_err(|e| NodeStartError::EggServe(e.to_string()))?;
+        // The node publishes its live permit count for the operator surface.
+        // It is published at startup, before the node accepts anything, so a
+        // number left behind by a previous run is never reported as this
+        // node's.
+        publish_permit_count(&state);
         Ok(Self {
             handle,
             state,
@@ -481,7 +733,7 @@ impl NodeServer {
             .collect();
         for record in records {
             if !record.finished.load(Ordering::Acquire)
-                && !is_terminal(&record.snapshot.read().await.state)
+                && !record.snapshot.read().await.state.is_terminal()
             {
                 record.cancellation.cancel();
             }
@@ -490,6 +742,9 @@ impl NodeServer {
         // node stops contacting its provider instead of leaving a polling
         // task behind it.
         self.state.telemetry.shutdown().await;
+        // A stopped node leaves no permit count behind: the number would
+        // describe a node that is no longer running.
+        operations::clear_permit_count(&self.state.permit_report_path);
         self.handle.shutdown();
     }
 
@@ -560,7 +815,7 @@ impl NodeServer {
             let mut active = false;
             for record in records {
                 if !record.finished.load(Ordering::Acquire)
-                    && !is_terminal(&record.snapshot.read().await.state)
+                    && !record.snapshot.read().await.state.is_terminal()
                 {
                     active = true;
                     break;
@@ -592,6 +847,14 @@ fn acquire_state_lock(database_path: &std::path::Path) -> Result<std::fs::File, 
     Ok(file)
 }
 
+/// The declared-artifact capture capability name.
+///
+/// The name is a wire value and does not change. Whether a node advertises it
+/// does: a node whose platform cannot capture declared outputs must not
+/// advertise a capability it does not have, because the advertisement is what
+/// a caller uses to decide whether to declare outputs at all.
+const ARTIFACT_DECLARED_CAPABILITY: &str = "artifact.declared.v1";
+
 /// Static protocol/transport/workspace/artifact feature list. Network is
 /// always advertised as unrestricted because Eggwork does not yet implement a
 /// network-restriction backend; the admission gate therefore rejects
@@ -599,7 +862,7 @@ fn acquire_state_lock(database_path: &std::path::Path) -> Result<std::fs::File, 
 /// silently downgrading them.
 fn static_capability_features() -> &'static [&'static str] {
     &[
-        "exec.argv.v1",
+        EXEC_ARGV_CAPABILITY,
         "events.live.v1",
         "auth.mtls.v1",
         "blob.sha256.v1",
@@ -607,7 +870,7 @@ fn static_capability_features() -> &'static [&'static str] {
         "workspace.manifest.v1",
         "workspace.materialize.v1",
         "workspace.derive.v1",
-        "artifact.declared.v1",
+        ARTIFACT_DECLARED_CAPABILITY,
         "artifact.stream.v1",
         "artifact.retention.v1",
         "network.unrestricted.v1",
@@ -617,9 +880,18 @@ fn static_capability_features() -> &'static [&'static str] {
 /// One capability feature construction. Both `Route::Capabilities` and
 /// `NodeStatus.capabilities` MUST go through this function so a single node
 /// always reports the same execution-capability feature set.
+///
+/// The declared-artifact capability is conditional on the platform's capture
+/// capability: a node that cannot capture declared outputs safely must not
+/// advertise that it can. The capability name is a wire value and is
+/// unchanged; only its advertisement follows the fact.
 fn server_capability_features(dynamic: Vec<String>) -> Vec<String> {
     let mut features: Vec<String> = static_capability_features()
         .iter()
+        .filter(|feature| {
+            **feature != ARTIFACT_DECLARED_CAPABILITY
+                || artifact_capture_capability() == ArtifactCaptureCapability::Available
+        })
         .map(|feature| (*feature).to_owned())
         .collect();
     features.extend(dynamic);
@@ -640,33 +912,44 @@ fn node_capabilities_for(state: &NodeState) -> NodeCapabilities {
     }
 }
 
+/// Whether the node's advertised features satisfy an isolation requirement.
+///
+/// The advertised feature list is passed in rather than the whole node state
+/// so the admission rule can be exercised directly: the decision is about
+/// names, and a rule about names should not need a whole service to be
+/// constructed before it can be tested.
 fn check_isolation_supported(
-    state: &NodeState,
+    features: &[String],
     isolation: &eggwork_core::IsolationRequirement,
 ) -> bool {
     match isolation {
         eggwork_core::IsolationRequirement::None
         | eggwork_core::IsolationRequirement::BestEffort => true,
-        eggwork_core::IsolationRequirement::Required => state
-            .capabilities_features
+        eggwork_core::IsolationRequirement::Required => features
             .iter()
             .any(|feature| feature == eggwork_runner::LANDLOCK_WORKSPACE_RW_CAPABILITY),
     }
 }
 
+/// Whether the node's advertised features satisfy a resource requirement.
+///
+/// The three names compared here are the runner's exported constants, not
+/// spellings typed into this file: the runner produces them and this crate
+/// consumes them, and a name that differed by one character would turn every
+/// required resource dimension into a capability refusal.
 fn check_resources_supported(
-    state: &NodeState,
+    features: &[String],
     resources: &eggwork_core::ResourceRequirements,
 ) -> bool {
-    let has = |feature: &str| state.capabilities_features.iter().any(|f| f == feature);
+    let has = |feature: &str| features.iter().any(|advertised| advertised == feature);
     let memory_ok = !matches!(
         resources.memory_bytes,
         eggwork_core::Requirement::Required(_)
-    ) || has("resources.cgroups-v2.memory");
+    ) || has(eggwork_runner::CGROUPS_V2_MEMORY_CAPABILITY);
     let cpu_ok = !matches!(resources.cpu_millis, eggwork_core::Requirement::Required(_))
-        || has("resources.cgroups-v2.cpu");
+        || has(eggwork_runner::CGROUPS_V2_CPU_CAPABILITY);
     let pids_ok = !matches!(resources.pids, eggwork_core::Requirement::Required(_))
-        || has("resources.cgroups-v2.pids");
+        || has(eggwork_runner::CGROUPS_V2_PIDS_CAPABILITY);
     memory_ok && cpu_ok && pids_ok
 }
 
@@ -765,11 +1048,11 @@ async fn dispatch(
     let path = request.head().target().path().to_owned();
     let query = request.head().target().query().map(str::to_owned);
     let Some((operation, route)) = operation_for(&method, &path) else {
-        increment_metric(&state.store, "rejected_route", 1).await;
+        increment_metric(&state.store, Metric::RejectedRoute, 1).await;
         return Ok(error_response(404, "not_found", "operation not found"));
     };
     let Some(principal) = authenticated_principal(&state, &request) else {
-        increment_metric(&state.store, "rejected_unauthenticated", 1).await;
+        increment_metric(&state.store, Metric::RejectedUnauthenticated, 1).await;
         return Ok(error_response(
             401,
             "unauthenticated",
@@ -784,7 +1067,7 @@ async fn dispatch(
         .authorizer
         .authorize_request(&principal, &authorization)
     {
-        increment_metric(&state.store, "rejected_unauthorized", 1).await;
+        increment_metric(&state.store, Metric::RejectedUnauthorized, 1).await;
         return Ok(error_response(
             403,
             "forbidden",
@@ -816,8 +1099,8 @@ async fn dispatch(
     }
 }
 
-async fn increment_metric(store: &store::ExecutionStore, name: &'static str, amount: u64) {
-    let _ = store.increment_metric(name, amount).await;
+async fn increment_metric(store: &store::ExecutionStore, metric: Metric, amount: u64) {
+    let _ = store.increment_metric(metric.name(), amount).await;
 }
 
 /// Record several counters under one connection acquisition and one commit.
@@ -825,8 +1108,12 @@ async fn increment_metric(store: &store::ExecutionStore, name: &'static str, amo
 /// Prefer this wherever a single request or a single execution terminal state
 /// moves more than one counter: the store's connection mutex is the same one
 /// `commit_event` needs, so unbatched accounting delays durable event commits.
-async fn increment_metrics(store: &store::ExecutionStore, deltas: &[(&'static str, u64)]) {
-    let _ = store.increment_metrics(deltas).await;
+async fn increment_metrics(store: &store::ExecutionStore, deltas: &[(Metric, u64)]) {
+    let names = deltas
+        .iter()
+        .map(|(metric, amount)| (metric.name(), *amount))
+        .collect::<Vec<_>>();
+    let _ = store.increment_metrics(&names).await;
 }
 
 fn resource_for_path(operation: Operation, path: &str) -> Option<ResourceId> {
@@ -879,6 +1166,51 @@ fn authenticated_principal(state: &NodeState, request: &Request) -> Option<NodeP
         return None;
     }
     state.resolver.resolve_verified_leaf(&chain[0])
+}
+
+/// The node's live execution-permit count, published for the operator surface.
+///
+/// The admission semaphore owns the count; this publishes a copy of it so the
+/// operator surface can report the live number. The store cannot re-derive
+/// it: an execution that crashed keeps a non-terminal row long after its
+/// permit was released, so "non-terminal execution rows" and "permits held"
+/// are different facts and only the running node knows the second one.
+fn publish_permit_count(state: &NodeState) {
+    let held = state.max_active - state.permits.available_permits() as u32;
+    let _ = operations::publish_permit_count(&state.permit_report_path, held);
+}
+
+/// An execution permit that republishes the node's permit count on release.
+///
+/// The count is published *after* the permit is released, so the published
+/// number always describes the permits the node holds once the change has
+/// happened.
+struct PublishedPermit {
+    permit: Option<OwnedSemaphorePermit>,
+    semaphore: Arc<Semaphore>,
+    max_active: u32,
+    report_path: PathBuf,
+}
+
+impl PublishedPermit {
+    fn new(permit: OwnedSemaphorePermit, state: &NodeState) -> Self {
+        Self {
+            permit: Some(permit),
+            semaphore: state.permits.clone(),
+            max_active: state.max_active,
+            report_path: state.permit_report_path.clone(),
+        }
+    }
+}
+
+impl Drop for PublishedPermit {
+    fn drop(&mut self) {
+        // Release the permit before publishing: the published count must
+        // describe the permits held *after* this one is gone.
+        drop(self.permit.take());
+        let held = self.max_active - self.semaphore.available_permits() as u32;
+        let _ = operations::publish_permit_count(&self.report_path, held);
+    }
 }
 
 fn node_status(state: &NodeState) -> NodeStatus {
@@ -1115,7 +1447,7 @@ async fn workspace_create(
         ));
     }
     if ExecutionGeneration::new(wire.handle.generation.get()).is_err() {
-        increment_metric(&state.store, "rejected_invalid", 1).await;
+        increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
         return Ok(error_response(
             400,
             "invalid_request",
@@ -1134,7 +1466,7 @@ async fn workspace_create(
         .await
     {
         Ok(ready) => {
-            increment_metric(&state.store, "workspace_manifest_registrations", 1).await;
+            increment_metric(&state.store, Metric::WorkspaceManifestRegistrations, 1).await;
             Ok(json_response(
                 201,
                 &WorkspaceReadyResponse {
@@ -1189,12 +1521,27 @@ struct DeriveWorkspaceRequest {
     patch: eggwork_core::WorkspaceManifestPatch,
 }
 
+/// The counters one successful workspace derivation moves.
+///
+/// The derivation path moves three counters in one batch: the derivation that
+/// was asked for, the manifest the derivation registered, and the patch
+/// entries it applied. They are named in one place so the batch is one
+/// decision — and so a test can assert that all three move, which is the
+/// property the old hand-maintained metric list broke.
+fn workspace_derive_metrics(patch_entries: u64) -> [(Metric, u64); 3] {
+    [
+        (Metric::WorkspaceDerivedHits, 1),
+        (Metric::WorkspaceManifestRegistrations, 1),
+        (Metric::WorkspacePatchEntries, patch_entries),
+    ]
+}
+
 async fn workspace_derive(
     state: NodeState,
     request: Request,
     principal: NodePrincipal,
 ) -> Result<Response, eggserve_core::server::ServiceError> {
-    increment_metric(&state.store, "workspace_derived_requests", 1).await;
+    increment_metric(&state.store, Metric::WorkspaceDerivedRequests, 1).await;
     let (_head, body, _context) = request.into_parts_with_context();
     let bytes = match read_limited_body(body, MAX_WORKSPACE_REQUEST_BYTES).await {
         Ok(bytes) => bytes,
@@ -1236,7 +1583,7 @@ async fn workspace_derive(
         ));
     }
     if ExecutionGeneration::new(wire.handle.generation.get()).is_err() {
-        increment_metric(&state.store, "rejected_invalid", 1).await;
+        increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
         return Ok(error_response(
             400,
             "invalid_request",
@@ -1256,15 +1603,7 @@ async fn workspace_derive(
         .await
     {
         Ok(ready) => {
-            increment_metrics(
-                &state.store,
-                &[
-                    ("workspace_derived_hits", 1),
-                    ("workspace_manifest_registrations", 1),
-                    ("workspace_patch_entries", patch_entries),
-                ],
-            )
-            .await;
+            increment_metrics(&state.store, &workspace_derive_metrics(patch_entries)).await;
             Ok(json_response(
                 201,
                 &WorkspaceReadyResponse {
@@ -1278,7 +1617,7 @@ async fn workspace_derive(
             ))
         }
         Err(workspace::WorkspaceError::BaseMissing) => {
-            increment_metric(&state.store, "workspace_base_missing", 1).await;
+            increment_metric(&state.store, Metric::WorkspaceBaseMissing, 1).await;
             Ok(error_response(
                 409,
                 "base_manifest_missing",
@@ -1366,7 +1705,7 @@ async fn blob_upload(
     });
     match state.blobs.put_stream(digest, declared, input).await {
         Ok(()) => {
-            increment_metric(&state.store, "blob_upload_bytes", declared).await;
+            increment_metric(&state.store, Metric::BlobUploadBytes, declared).await;
             Ok(Response::builder()
                 .status(StatusCode::new(201).expect("valid HTTP status"))
                 .body(ResponseBody::Empty)
@@ -1394,7 +1733,7 @@ async fn blob_download(
                 Ok(size) => {
                     chunk.truncate(size);
                     let _ = metric_store
-                        .increment_metric("blob_download_bytes", size as u64)
+                        .increment_metric(Metric::BlobDownloadBytes.name(), size as u64)
                         .await;
                     Ok(Some((Bytes::from(chunk), (file, metric_store))))
                 }
@@ -1615,7 +1954,7 @@ async fn execute(
         ));
     }
     if wire.spec.schema_version != API_SCHEMA_VERSION {
-        increment_metric(&state.store, "rejected_invalid", 1).await;
+        increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
         return Ok(error_response(
             426,
             "protocol_version",
@@ -1624,7 +1963,7 @@ async fn execute(
     }
     if let Err(error) = wire.spec.validate() {
         let _ = error;
-        increment_metric(&state.store, "rejected_invalid", 1).await;
+        increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
         return Ok(error_response(
             400,
             "invalid_request",
@@ -1632,7 +1971,7 @@ async fn execute(
         ));
     }
     if !wire.spec.command.declared_outputs.is_empty() && wire.workspace_id.is_none() {
-        increment_metric(&state.store, "rejected_invalid", 1).await;
+        increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
         return Ok(error_response(
             400,
             "workspace_required",
@@ -1642,23 +1981,23 @@ async fn execute(
     if state.draining.load(Ordering::Acquire)
         || operations::is_persistently_draining(&state.drain_path)
     {
-        increment_metric(&state.store, "rejected_draining", 1).await;
+        increment_metric(&state.store, Metric::RejectedDraining, 1).await;
         return Ok(error_response(
             503,
             "draining",
             "node is not accepting executions",
         ));
     }
-    if !check_isolation_supported(&state, &wire.spec.command.isolation) {
-        increment_metric(&state.store, "rejected_capability", 1).await;
+    if !check_isolation_supported(&state.capabilities_features, &wire.spec.command.isolation) {
+        increment_metric(&state.store, Metric::RejectedCapability, 1).await;
         return Ok(error_response(
             409,
             "capability_mismatch",
             "requested filesystem isolation capability is unavailable",
         ));
     }
-    if !check_resources_supported(&state, &wire.spec.command.resources) {
-        increment_metric(&state.store, "rejected_capability", 1).await;
+    if !check_resources_supported(&state.capabilities_features, &wire.spec.command.resources) {
+        increment_metric(&state.store, Metric::RejectedCapability, 1).await;
         return Ok(error_response(
             409,
             "capability_mismatch",
@@ -1666,7 +2005,7 @@ async fn execute(
         ));
     }
     if !check_network_supported(&wire.spec.command.network) {
-        increment_metric(&state.store, "rejected_capability", 1).await;
+        increment_metric(&state.store, Metric::RejectedCapability, 1).await;
         return Ok(error_response(
             409,
             "capability_mismatch",
@@ -1679,7 +2018,7 @@ async fn execute(
         match eggwork_core::request_digest_with_workspace(&wire.spec, wire.workspace_id.as_ref()) {
             Ok((version, digest)) => (version, digest.as_str().to_owned()),
             Err(_) => {
-                increment_metric(&state.store, "rejected_invalid", 1).await;
+                increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
                 return Ok(error_response(
                     400,
                     "invalid_request",
@@ -1694,7 +2033,7 @@ async fn execute(
         {
             Ok(workspace) => workspace.root,
             Err(_) => {
-                increment_metric(&state.store, "rejected_invalid", 1).await;
+                increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
                 return Ok(error_response(
                     409,
                     "workspace_not_ready",
@@ -1721,7 +2060,7 @@ async fn execute(
     ) {
         Ok(request) => request,
         Err(_) => {
-            increment_metric(&state.store, "rejected_invalid", 1).await;
+            increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
             return Ok(error_response(
                 400,
                 "invalid_request",
@@ -1775,7 +2114,7 @@ async fn execute(
     if state.draining.load(Ordering::Acquire)
         || operations::is_persistently_draining(&state.drain_path)
     {
-        increment_metric(&state.store, "rejected_draining", 1).await;
+        increment_metric(&state.store, Metric::RejectedDraining, 1).await;
         return Ok(error_response(
             503,
             "draining",
@@ -1783,16 +2122,19 @@ async fn execute(
         ));
     }
     let permit = match state.permits.clone().try_acquire_owned() {
-        Ok(permit) => permit,
+        Ok(permit) => PublishedPermit::new(permit, &state),
         Err(_) => {
-            increment_metric(&state.store, "rejected_busy", 1).await;
+            increment_metric(&state.store, Metric::RejectedBusy, 1).await;
             return Ok(error_response(503, "busy", "node execution limit reached"));
         }
     };
+    // The permit count the operator surface reads is published here, so the
+    // published number describes the node as soon as it holds the permit.
+    publish_permit_count(&state);
     if executions.len() >= MAX_RECENT_EXECUTIONS {
         let mut terminal = Vec::new();
         for (old_id, old_record) in executions.iter() {
-            if is_terminal(&old_record.snapshot.read().await.state) {
+            if old_record.snapshot.read().await.state.is_terminal() {
                 terminal.push(old_id.clone());
             }
             if executions.len() - terminal.len() < MAX_RECENT_EXECUTIONS {
@@ -1804,7 +2146,7 @@ async fn execute(
         }
     }
     if executions.len() >= MAX_RECENT_EXECUTIONS {
-        increment_metric(&state.store, "rejected_storage", 1).await;
+        increment_metric(&state.store, Metric::RejectedStorage, 1).await;
         return Ok(error_response(
             503,
             "storage_exhausted",
@@ -1819,7 +2161,7 @@ async fn execute(
     {
         drop(permit);
         drop(executions);
-        increment_metric(&state.store, "rejected_invalid", 1).await;
+        increment_metric(&state.store, Metric::RejectedInvalid, 1).await;
         return Ok(error_response(
             409,
             "workspace_not_ready",
@@ -1861,11 +2203,11 @@ async fn execute(
     };
     match reservation {
         store::ReserveResult::Created => {
-            increment_metric(&state.store, "executions_accepted", 1).await;
+            increment_metric(&state.store, Metric::ExecutionsAccepted, 1).await;
         }
         store::ReserveResult::Existing(snapshot) => {
             drop(permit);
-            if is_terminal(&snapshot.state)
+            if snapshot.state.is_terminal()
                 && let Some(workspace_id) = &wire.workspace_id
             {
                 let expiry =
@@ -1907,7 +2249,7 @@ async fn execute(
             ));
         }
         store::ReserveResult::StorageFull => {
-            increment_metric(&state.store, "rejected_storage", 1).await;
+            increment_metric(&state.store, Metric::RejectedStorage, 1).await;
             if let Some(workspace_id) = &wire.workspace_id {
                 let expiry =
                     artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
@@ -2006,7 +2348,7 @@ fn recovered_record(
 
 async fn monitor_lease(record: Arc<ExecutionRecord>) {
     loop {
-        if is_terminal(&record.snapshot.read().await.state) {
+        if record.snapshot.read().await.state.is_terminal() {
             return;
         }
         let (deadline, notify) = {
@@ -2181,7 +2523,7 @@ async fn control(
                 "renewal identifier is invalid",
             ));
         }
-        if is_terminal(&snapshot.state) {
+        if snapshot.state.is_terminal() {
             return Ok(error_response(
                 409,
                 "execution_terminal",
@@ -2224,7 +2566,7 @@ async fn control(
         lease.notify.notify_waiters();
         return Ok(json_response(200, &snapshot));
     }
-    if !is_terminal(&snapshot.state) && snapshot.state != ExecutionState::Cancelling {
+    if !snapshot.state.is_terminal() && snapshot.state != ExecutionState::Cancelling {
         let lease = record.lease.lock().await;
         if lease.expired.load(Ordering::Acquire) || tokio::time::Instant::now() >= lease.expires_at
         {
@@ -2242,7 +2584,7 @@ async fn control(
             ExecutionEventKind::State(ExecutionState::Cancelling),
         )
         .await;
-        if !is_terminal(&record.snapshot.read().await.state) {
+        if !record.snapshot.read().await.state.is_terminal() {
             record.cancellation.cancel();
         }
     } else if snapshot.state == ExecutionState::Cancelling {
@@ -2398,7 +2740,7 @@ async fn event_response(
         ));
     };
     if after.saturating_add(1) < page.base_sequence {
-        increment_metric(&state.store, "event_history_resync", 1).await;
+        increment_metric(&state.store, Metric::EventHistoryResync, 1).await;
         return Ok(error_response(
             410,
             "history_expired",
@@ -2412,7 +2754,7 @@ async fn event_response(
             "event cursor is ahead of the journal",
         ));
     }
-    let terminal = is_terminal(&record.snapshot.read().await.state);
+    let terminal = record.snapshot.read().await.state.is_terminal();
     Ok(event_stream_response(
         id,
         generation,
@@ -2447,7 +2789,7 @@ async fn run_execution(
     record: Arc<ExecutionRecord>,
     request: RunnerRequest,
     workspace: Option<WorkspaceCapture>,
-    _permit: OwnedSemaphorePermit,
+    _permit: PublishedPermit,
 ) {
     publish(
         &record,
@@ -2471,11 +2813,23 @@ async fn run_execution(
             biased;
             output = output_rx.recv(), if !output_closed => {
                 if let Some(output) = output {
-                    let kind = if output.stderr { ExecutionEventKind::Stderr(output.bytes) } else { ExecutionEventKind::Stdout(output.bytes) };
+                    // A diagnostic rides the same channel as the target's
+                    // output and is forwarded in the order it was received, so
+                    // a degradation the runner reported before it spawned the
+                    // target is published before anything the target wrote.
+                    let kind = match output {
+                        OutputChunk::Stdout(bytes) => ExecutionEventKind::Stdout(bytes),
+                        OutputChunk::Stderr(bytes) => ExecutionEventKind::Stderr(bytes),
+                        OutputChunk::Diagnostic(payload) => ExecutionEventKind::Diagnostic(payload),
+                    };
                     publish(&record, ExecutionState::Running, None, kind).await;
                 } else {
                     output_closed = true;
-                    if result.is_some() { break; }
+                    // The channel is closed and drained, so no further output
+                    // can arrive. The runner's outcome may still be unknown, in
+                    // which case the `joined` branch below is still enabled and
+                    // the loop waits for it.
+                    if result.is_some() || runner_error.is_some() { break; }
                 }
             }
             joined = &mut runner_task, if result.is_none() && runner_error.is_none() => {
@@ -2489,10 +2843,10 @@ async fn run_execution(
         }
     }
     while let Ok(output) = output_rx.try_recv() {
-        let kind = if output.stderr {
-            ExecutionEventKind::Stderr(output.bytes)
-        } else {
-            ExecutionEventKind::Stdout(output.bytes)
+        let kind = match output {
+            OutputChunk::Stdout(bytes) => ExecutionEventKind::Stdout(bytes),
+            OutputChunk::Stderr(bytes) => ExecutionEventKind::Stderr(bytes),
+            OutputChunk::Diagnostic(payload) => ExecutionEventKind::Diagnostic(payload),
         };
         publish(&record, ExecutionState::Running, None, kind).await;
     }
@@ -2518,38 +2872,79 @@ async fn run_execution(
         failed_result(terminal, failure, sandbox_request, resource_request)
     };
     if let Some(workspace) = workspace {
-        let should_capture = runner_completed
-            && !workspace.outputs.is_empty()
-            && matches!(
-                execution_result.state,
-                ExecutionState::Succeeded | ExecutionState::Failed
-            )
+        let declared_outputs = !workspace.outputs.is_empty();
+        // The capture rule is unchanged: the runner completed, the execution
+        // declared outputs, the terminal state is eligible, and the target was
+        // not killed for its output volume. What changed is what an execution
+        // reports when a capture that was required did not complete.
+        let eligible = runner_completed
+            && declared_outputs
+            && artifact_capture_eligible(&execution_result.state)
             && execution_result.failure != Some(ExecutionFailure::OutputLimit);
-        if should_capture {
-            let expiry = artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
-            let (execution_id, generation) = {
-                let snapshot = record.snapshot.read().await;
-                (snapshot.execution_id.clone(), snapshot.generation)
-            };
-            match artifact::capture_declared(
-                &state.artifacts,
-                &state.blobs,
-                &workspace.root,
-                &workspace.outputs,
-                &execution_id,
-                generation,
-                &workspace.principal,
-                expiry,
-            )
-            .await
-            {
-                Ok(count) => execution_result.artifact_count = count,
-                Err(_) => {
-                    execution_result.finalization_failure =
-                        Some(ExecutionFinalizationFailure::ArtifactCapture);
+        let mut attempt = ArtifactCaptureAttempt::NotAttempted;
+        if eligible {
+            if artifact_capture_capability() == ArtifactCaptureCapability::Unavailable {
+                // The platform cannot open a file beneath the workspace root
+                // safely, so the capture is refused instead of attempted. A
+                // refused capture must not read like a capture that found
+                // nothing, so the refusal is reported and the execution ends
+                // in a state that is not a success.
+                attempt = ArtifactCaptureAttempt::Failed;
+                execution_result.finalization_failure =
+                    Some(ExecutionFinalizationFailure::ArtifactCapture);
+                publish_capture_diagnostic(
+                    &record,
+                    "platform_unavailable",
+                    "safe artifact capture is unavailable on this platform",
+                )
+                .await;
+            } else {
+                let expiry =
+                    artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
+                let (execution_id, generation) = {
+                    let snapshot = record.snapshot.read().await;
+                    (snapshot.execution_id.clone(), snapshot.generation)
+                };
+                match artifact::capture_declared(
+                    &state.artifacts,
+                    &state.blobs,
+                    &workspace.root,
+                    &workspace.outputs,
+                    &execution_id,
+                    generation,
+                    &workspace.principal,
+                    expiry,
+                )
+                .await
+                {
+                    Ok(count) => {
+                        execution_result.artifact_count = count;
+                        attempt = ArtifactCaptureAttempt::Completed;
+                    }
+                    Err(_) => {
+                        execution_result.finalization_failure =
+                            Some(ExecutionFinalizationFailure::ArtifactCapture);
+                        attempt = ArtifactCaptureAttempt::Failed;
+                        publish_capture_diagnostic(
+                            &record,
+                            "capture_failed",
+                            "a declared output could not be captured",
+                        )
+                        .await;
+                    }
                 }
             }
         }
+        let decision = decide_artifact_capture(ArtifactCaptureFacts {
+            capability: artifact_capture_capability(),
+            declared_outputs,
+            target_state: execution_result.state.clone(),
+            target_failure: execution_result.failure.clone(),
+            attempt,
+        });
+        execution_result.state = decision.state;
+        execution_result.failure = decision.failure;
+        execution_result.artifact_capture = decision.disposition;
         let expiry = artifact::now_unix_ms().saturating_add(artifact::DEFAULT_RETENTION_MILLIS);
         if state
             .workspaces
@@ -2558,24 +2953,21 @@ async fn run_execution(
         {
             execution_result.finalization_failure = Some(ExecutionFinalizationFailure::Retention);
         }
+    } else {
+        // No workspace means the execution declared no outputs, so there was
+        // nothing to capture and nothing that could be lost.
+        execution_result.artifact_capture = ArtifactCaptureDisposition::NotRequested;
     }
     let terminal = execution_result.state.clone();
-    let terminal_metric = match terminal {
-        ExecutionState::Succeeded => Some("terminal_succeeded"),
-        ExecutionState::Failed => Some("terminal_failed"),
-        ExecutionState::Cancelled => Some("terminal_cancelled"),
-        ExecutionState::TimedOut => Some("terminal_timed_out"),
-        ExecutionState::Interrupted => Some("terminal_interrupted"),
-        _ => None,
-    };
+    let terminal_metric = terminal_metric(&terminal);
     let mut terminal_counters = Vec::with_capacity(4);
     if let Some(name) = terminal_metric {
         terminal_counters.push((name, 1u64));
     }
-    terminal_counters.push(("stdout_bytes", execution_result.stdout_bytes));
-    terminal_counters.push(("stderr_bytes", execution_result.stderr_bytes));
+    terminal_counters.push((Metric::StdoutBytes, execution_result.stdout_bytes));
+    terminal_counters.push((Metric::StderrBytes, execution_result.stderr_bytes));
     if execution_result.cleanup_warning.is_some() {
-        terminal_counters.push(("cleanup_failures", 1u64));
+        terminal_counters.push((Metric::CleanupFailures, 1u64));
     }
     increment_metrics(&record.store, &terminal_counters).await;
     publish_terminal(
@@ -2614,6 +3006,9 @@ fn failed_result(
         cleanup_warning: None,
         finalization_failure: None,
         artifact_count: 0,
+        // The runner produced no result, so the finalization has not decided
+        // the capture disposition yet. The placeholder claims nothing.
+        artifact_capture: ArtifactCaptureDisposition::Unknown,
         sandbox: Some(match sandbox_request {
             SandboxRequest::None => eggwork_core::SandboxResult::NotRequested,
             SandboxRequest::BestEffort { .. } => eggwork_core::SandboxResult::NotApplied {
@@ -2643,6 +3038,40 @@ fn failure_for_runner_error(
     }
 }
 
+/// Publishes the diagnostic that reports a declared-artifact capture that did
+/// not complete.
+///
+/// The diagnostic rides the server's existing event-publishing path: a
+/// diagnostic is an `ExecutionEventKind::Diagnostic`, and this is the one
+/// place the server produces one, so a consumer reads every diagnostic from
+/// the same stream and under the same grammar.
+///
+/// The payload is bounded by the diagnostic grammar itself
+/// (`MAX_DIAGNOSTIC_PAYLOAD_BYTES`), which is well inside the event envelope
+/// (`MAX_EVENT_CHUNK_BYTES`), so a diagnostic can never overflow the event it
+/// rides in.
+async fn publish_capture_diagnostic(record: &ExecutionRecord, outcome: &str, reason: &str) {
+    let Ok(mut payload) = DiagnosticPayload::new(DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED) else {
+        return;
+    };
+    // `requirement` and `reason` are the minimum key set the diagnostic
+    // grammar requires, and `outcome` says which of the two capture failures
+    // this is. The keys are fixed so a consumer can dispatch on them.
+    if payload.set("requirement", "declared").is_err()
+        || payload.set("outcome", outcome).is_err()
+        || payload.set("reason", reason).is_err()
+    {
+        return;
+    }
+    publish(
+        record,
+        ExecutionState::Running,
+        None,
+        ExecutionEventKind::Diagnostic(payload.build()),
+    )
+    .await;
+}
+
 async fn publish(
     record: &ExecutionRecord,
     state: ExecutionState,
@@ -2656,7 +3085,7 @@ async fn publish(
     // and then receives the event on the broadcast channel.
     let _writer = record.commit_lock.lock().await;
     let base = record.snapshot.read().await;
-    if is_terminal(&base.state) {
+    if base.state.is_terminal() {
         return;
     }
     let mut proposed = base.clone();
@@ -2726,7 +3155,7 @@ fn event_stream_response(
                 last_sequence = event.sequence.get();
                 let terminal = matches!(
                     &event.kind,
-                    ExecutionEventKind::State(state) if is_terminal(state)
+                    ExecutionEventKind::State(state) if state.is_terminal()
                 );
                 let bytes = serde_json::to_vec(&event).unwrap_or_default();
                 let mut line = bytes;
@@ -2750,15 +3179,46 @@ fn event_stream_response(
         .unwrap_or_else(|_| error_response(500, "internal", "internal error"))
 }
 
-fn is_terminal(state: &ExecutionState) -> bool {
-    matches!(
-        state,
-        ExecutionState::Succeeded
-            | ExecutionState::Failed
-            | ExecutionState::Cancelled
-            | ExecutionState::TimedOut
-            | ExecutionState::Interrupted
-    )
+/// The metric name a terminal state contributes, if any.
+///
+/// Written as an exhaustive match over the whole enum rather than a wildcard
+/// arm, so a newly added terminal variant cannot silently lose its metric: the
+/// compiler refuses the new variant until it is placed here. The non-terminal
+/// arms return `None`, which keeps this map total over the enum and
+/// consistent with the core-owned terminal classification.
+fn terminal_metric(state: &ExecutionState) -> Option<Metric> {
+    match state {
+        ExecutionState::Succeeded => Some(Metric::TerminalSucceeded),
+        ExecutionState::Failed => Some(Metric::TerminalFailed),
+        ExecutionState::Cancelled => Some(Metric::TerminalCancelled),
+        ExecutionState::TimedOut => Some(Metric::TerminalTimedOut),
+        ExecutionState::Interrupted => Some(Metric::TerminalInterrupted),
+        ExecutionState::Accepted
+        | ExecutionState::Preparing
+        | ExecutionState::Running
+        | ExecutionState::Cancelling => None,
+    }
+}
+
+/// Whether declared outputs of an execution are captured.
+///
+/// This is deliberately *not* the terminal set. A capture happens for an
+/// execution that ran and produced a result the caller may want — `Succeeded`
+/// or `Failed` — and not for an execution that was cancelled, timed out, or
+/// interrupted, where the partial output is not a declared artifact. Folding
+/// the two together would either capture artifacts for cancelled work or
+/// drop the artifacts of a failed run.
+fn artifact_capture_eligible(state: &ExecutionState) -> bool {
+    match state {
+        ExecutionState::Succeeded | ExecutionState::Failed => true,
+        ExecutionState::Accepted
+        | ExecutionState::Preparing
+        | ExecutionState::Running
+        | ExecutionState::Cancelling
+        | ExecutionState::Cancelled
+        | ExecutionState::TimedOut
+        | ExecutionState::Interrupted => false,
+    }
 }
 
 fn json_response<T: Serialize>(status: u16, value: &T) -> Response {
@@ -2942,7 +3402,7 @@ mod tests {
 
     fn execution_spec(argv: Vec<String>) -> ExecutionSpec {
         ExecutionSpec {
-            schema_version: 1,
+            schema_version: API_SCHEMA_VERSION,
             command: CommandSpec {
                 argv,
                 cwd: None,
@@ -3456,6 +3916,466 @@ mod tests {
         server.wait().await.unwrap();
     }
 
+    /// Build the node's grant table from client grants.
+    ///
+    /// `OperatorConfig::principals` reads only the client grants, so the
+    /// paths and the TLS material below are never touched: this is the same
+    /// table the daemon builds, reached without a configuration file.
+    fn scoped_grant_table(
+        clients: Vec<crate::operations::ClientGrant>,
+    ) -> crate::operations::GrantAuthorizer {
+        crate::operations::OperatorConfig {
+            schema_version: 1,
+            node_id: "node-scoped".into(),
+            bind: "127.0.0.1:0".into(),
+            execution_root: PathBuf::from("unused"),
+            database_path: PathBuf::from("unused"),
+            blob_root: PathBuf::from("unused"),
+            blob_quota_bytes: 1,
+            workspace_root: PathBuf::from("unused"),
+            workspace_quota_bytes: 1,
+            max_active_executions: 1,
+            lease_ttl_seconds: 1,
+            sandbox_helper: None,
+            tls: crate::operations::TlsFiles {
+                certificate_chain: PathBuf::from("unused"),
+                private_key: PathBuf::from("unused"),
+                client_ca: PathBuf::from("unused"),
+            },
+            clients,
+            host_telemetry: None,
+        }
+        .principals()
+        .expect("the grant table builds")
+        .1
+    }
+
+    fn scoped_grant(
+        principal: &str,
+        fingerprint: u64,
+        operations: &[&str],
+        resource_scopes: Vec<crate::operations::ResourceScope>,
+    ) -> crate::operations::ClientGrant {
+        crate::operations::ClientGrant {
+            principal_id: principal.into(),
+            certificate_sha256: format!("{fingerprint:064x}"),
+            operations: operations.iter().map(|name| (*name).to_string()).collect(),
+            resource_scopes,
+        }
+    }
+
+    fn scoped_scope(
+        operation: &str,
+        resource_kind: &str,
+        resource_id: &str,
+    ) -> crate::operations::ResourceScope {
+        crate::operations::ResourceScope {
+            operation: operation.into(),
+            resource_kind: resource_kind.into(),
+            resource_id: resource_id.into(),
+        }
+    }
+
+    /// A resource scope is a narrowing, never a grant.
+    ///
+    /// The second principal's scopes name the *first* principal's resources.
+    /// The authorizer lets those requests through the scope — it consults a
+    /// configuration-derived set and cannot know who owns a resource — and the
+    /// store's `principal_id` fence refuses them. That is the whole claim:
+    /// a resource-scoped grant naming another principal's resource does not
+    /// reach it, for an execution, a workspace, and an artifact.
+    #[tokio::test]
+    async fn a_resource_scope_cannot_reach_a_foreign_principal_resource() {
+        init_tls();
+        let (root, server_identity, owner_identity, intruder_identity) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let owner = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let intruder = eggwork_core::PrincipalId::new("controller-b").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([
+            (
+                FingerprintPrincipalResolver::fingerprint(owner_identity.cert.as_ref()),
+                owner.clone(),
+            ),
+            (
+                FingerprintPrincipalResolver::fingerprint(intruder_identity.cert.as_ref()),
+                intruder.clone(),
+            ),
+        ]));
+        // Both principals hold the same operations. The second one's scopes
+        // name the first one's resources.
+        let authorizer = Arc::new(scoped_grant_table(vec![
+            scoped_grant(
+                "controller-a",
+                1,
+                &[
+                    "capabilities",
+                    "status",
+                    "execute",
+                    "observe",
+                    "workspace-create",
+                    "artifact-read",
+                    "blob-write",
+                ],
+                vec![],
+            ),
+            scoped_grant(
+                "controller-b",
+                2,
+                &[
+                    "capabilities",
+                    "status",
+                    "execute",
+                    "observe",
+                    "workspace-create",
+                    "artifact-read",
+                    "blob-write",
+                ],
+                vec![
+                    scoped_scope("execute", "execution", "exec-owned-by-a"),
+                    scoped_scope("observe", "execution", "exec-owned-by-a"),
+                    scoped_scope("workspace-create", "workspace", "ws-owned-by-a"),
+                    scoped_scope("artifact-read", "execution", "exec-owned-by-a"),
+                    scoped_scope("artifact-read", "artifact", "art-owned-by-a"),
+                ],
+            ),
+        ]));
+        let server = NodeServer::start(
+            NodeConfig {
+                host_telemetry: None,
+                node_id: NodeId::new("node-scoped").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 2,
+                lease_ttl: std::time::Duration::from_secs(30),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            authorizer.clone(),
+        )
+        .await
+        .unwrap();
+        let owner_temp = TempDir::new().unwrap();
+        let owner_client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&owner_temp, root.as_ref(), &owner_identity),
+        )
+        .unwrap();
+        let intruder_temp = TempDir::new().unwrap();
+        let intruder_client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&intruder_temp, root.as_ref(), &intruder_identity),
+        )
+        .unwrap();
+
+        // The owner creates the execution the intruder's scopes name.
+        let owner_handle = execution_handle("exec-owned-by-a");
+        let accepted = owner_client
+            .execute(
+                &execution_spec(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]),
+                &owner_handle,
+            )
+            .await;
+        let detail = match &accepted {
+            Ok(_) => "accepted".to_string(),
+            Err(eggwork_client::ClientError::Api {
+                status,
+                code,
+                message,
+            }) => format!("{status} {code} {message}"),
+            Err(other) => format!("{other:?}"),
+        };
+        assert!(
+            accepted.is_ok(),
+            "the owner must be able to execute: {detail}"
+        );
+        let execution_id = ExecutionId::new("exec-owned-by-a").unwrap();
+        // The owner reads its own execution.
+        assert!(owner_client.observe(&execution_id).await.is_ok());
+        // The scope lets the intruder through the authorizer: the scope names
+        // the execution, so the authorizer has no reason to refuse it.
+        assert!(authorizer.authorize_request(
+            &NodePrincipal {
+                id: intruder.clone(),
+            },
+            &OperationRequest {
+                operation: Operation::Observe,
+                resource: Some(ResourceId::Execution(execution_id.clone())),
+            },
+        ));
+        // The store's owner fence refuses it anyway.
+        assert!(matches!(
+            intruder_client.observe(&execution_id).await,
+            Err(eggwork_client::ClientError::Api { status: 404, .. })
+        ));
+
+        // The owner creates the workspace the intruder's scope names.
+        let workspace_id = eggwork_core::WorkspaceId::new("ws-owned-by-a").unwrap();
+        let manifest = eggwork_core::WorkspaceManifest {
+            schema_version: 1,
+            entries: vec![],
+        };
+        assert!(
+            owner_client
+                .create_workspace(
+                    &workspace_id,
+                    &execution_handle("ws-owned-by-a-execution"),
+                    &manifest,
+                )
+                .await
+                .is_ok(),
+            "the owner must be able to create the workspace"
+        );
+        assert!(authorizer.authorize_request(
+            &NodePrincipal {
+                id: intruder.clone(),
+            },
+            &OperationRequest {
+                operation: Operation::WorkspaceCreate,
+                resource: Some(ResourceId::Workspace(workspace_id.clone())),
+            },
+        ));
+        // The workspace belongs to the owner; the intruder's create conflicts
+        // with it rather than taking it over.
+        assert!(matches!(
+            intruder_client
+                .create_workspace(
+                    &workspace_id,
+                    &execution_handle("ws-owned-by-a-intruder-execution"),
+                    &manifest,
+                )
+                .await,
+            Err(eggwork_client::ClientError::Api { status: 409, .. })
+        ));
+
+        // The owner publishes an artifact the intruder's scope names.
+        let payload = b"artifact-owned-by-a";
+        let digest = eggwork_core::BlobDigest::from_bytes(payload);
+        let chunks = payload
+            .chunks(32 * 1024)
+            .map(|chunk| Ok::<_, eggfetch_core::Error>(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        owner_client
+            .upload_blob(
+                &digest,
+                payload.len() as u64,
+                Box::pin(stream::iter(chunks)),
+            )
+            .await
+            .unwrap();
+        let record = eggwork_core::ArtifactRecord {
+            artifact_id: eggwork_core::ArtifactId::new("art-owned-by-a").unwrap(),
+            execution_id: execution_id.clone(),
+            generation: ExecutionGeneration::new(1).unwrap(),
+            path: eggwork_core::RelativePath::new("out.txt").unwrap(),
+            kind: eggwork_core::ArtifactType::File,
+            digest: digest.clone(),
+            size_bytes: payload.len() as u64,
+            executable: false,
+            created_unix_ms: artifact::now_unix_ms(),
+            expires_unix_ms: artifact::now_unix_ms() + 3_600_000,
+        };
+        let artifact_store = artifact::ArtifactStore::open(artifact::metadata_path(
+            &temp.path().join("node.sqlite"),
+        ))
+        .unwrap();
+        artifact_store
+            .insert_many(std::slice::from_ref(&record), &owner)
+            .unwrap();
+        // The owner sees its own artifact and can read it.
+        assert_eq!(
+            owner_client
+                .artifacts(&execution_id, 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(owner_client.download_artifact(&record).await.is_ok());
+        // The scope lets the intruder through the authorizer for both kinds
+        // the artifact read names.
+        assert!(authorizer.authorize_request(
+            &NodePrincipal {
+                id: intruder.clone(),
+            },
+            &OperationRequest {
+                operation: Operation::ArtifactRead,
+                resource: Some(ResourceId::Artifact(record.artifact_id.clone())),
+            },
+        ));
+        assert!(authorizer.authorize_request(
+            &NodePrincipal {
+                id: intruder.clone(),
+            },
+            &OperationRequest {
+                operation: Operation::ArtifactRead,
+                resource: Some(ResourceId::Execution(execution_id.clone())),
+            },
+        ));
+        // The store's owner fence refuses both: the intruder's list is empty
+        // and the artifact itself is not found.
+        assert!(
+            intruder_client
+                .artifacts(&execution_id, 1)
+                .await
+                .unwrap()
+                .is_empty(),
+            "another principal's artifacts must stay invisible"
+        );
+        assert!(matches!(
+            intruder_client.download_artifact(&record).await,
+            Err(eggwork_client::ClientError::Api { status: 404, .. })
+        ));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// The status code, error code, and message a denied caller sees.
+    fn denial_shape(error: &eggwork_client::ClientError) -> (u16, String, String) {
+        match error {
+            eggwork_client::ClientError::Api {
+                status,
+                code,
+                message,
+            } => (*status, code.clone(), message.clone()),
+            other => panic!("expected an API error, got {other:?}"),
+        }
+    }
+
+    /// A resource-scoped denial is indistinguishable from an operation-level
+    /// denial, and from the denial of a resource that does not exist.
+    ///
+    /// A scoped principal must not be able to tell "that resource exists but is
+    /// outside my scope" from "that resource does not exist" from "you may not
+    /// read blobs at all": the same status code, the same error code, and the
+    /// same message in all three cases.
+    #[tokio::test]
+    async fn a_resource_scoped_denial_is_indistinguishable_from_an_operation_level_denial() {
+        init_tls();
+        let (root, server_identity, scoped_identity, ungranted_identity) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let scoped_principal = eggwork_core::PrincipalId::new("scoped-controller").unwrap();
+        let ungranted_principal = eggwork_core::PrincipalId::new("ungranted-controller").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([
+            (
+                FingerprintPrincipalResolver::fingerprint(scoped_identity.cert.as_ref()),
+                scoped_principal.clone(),
+            ),
+            (
+                FingerprintPrincipalResolver::fingerprint(ungranted_identity.cert.as_ref()),
+                ungranted_principal.clone(),
+            ),
+        ]));
+        let in_scope = eggwork_core::BlobDigest::from_bytes(b"blob-inside-the-scope");
+        let out_of_scope = eggwork_core::BlobDigest::from_bytes(b"blob-outside-the-scope");
+        let absent = eggwork_core::BlobDigest::from_bytes(b"blob-never-published");
+        let authorizer = Arc::new(scoped_grant_table(vec![
+            scoped_grant(
+                "scoped-controller",
+                1,
+                &["capabilities", "status", "blob-read", "blob-write"],
+                vec![scoped_scope("blob-read", "blob", in_scope.as_str())],
+            ),
+            scoped_grant(
+                "ungranted-controller",
+                2,
+                &["capabilities", "status"],
+                vec![],
+            ),
+        ]));
+        let server = NodeServer::start(
+            NodeConfig {
+                host_telemetry: None,
+                node_id: NodeId::new("node-scoped").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 2,
+                lease_ttl: std::time::Duration::from_secs(30),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            authorizer.clone(),
+        )
+        .await
+        .unwrap();
+        let scoped_temp = TempDir::new().unwrap();
+        let scoped_client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&scoped_temp, root.as_ref(), &scoped_identity),
+        )
+        .unwrap();
+        let ungranted_temp = TempDir::new().unwrap();
+        let ungranted_client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&ungranted_temp, root.as_ref(), &ungranted_identity),
+        )
+        .unwrap();
+        // The scoped principal publishes two blobs: one inside its scope and
+        // one outside it.
+        for payload in [
+            b"blob-inside-the-scope".as_slice(),
+            b"blob-outside-the-scope".as_slice(),
+        ] {
+            let digest = eggwork_core::BlobDigest::from_bytes(payload);
+            let chunks = payload
+                .chunks(32 * 1024)
+                .map(|chunk| Ok::<_, eggfetch_core::Error>(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>();
+            scoped_client
+                .upload_blob(
+                    &digest,
+                    payload.len() as u64,
+                    Box::pin(stream::iter(chunks)),
+                )
+                .await
+                .unwrap();
+        }
+        let scoped_digest = in_scope;
+        let out_of_scope_digest = out_of_scope;
+        let absent_digest = absent;
+        // The digest inside the scope is readable: the scope is consulted and
+        // it let this one through.
+        assert!(scoped_client.download_blob(&scoped_digest).await.is_ok());
+        // A digest outside the scope is refused, whether or not it exists.
+        let scoped_denial = scoped_client
+            .download_blob(&out_of_scope_digest)
+            .await
+            .map(|_| ())
+            .expect_err("an out-of-scope digest must be refused");
+        let absent_denial = scoped_client
+            .download_blob(&absent_digest)
+            .await
+            .map(|_| ())
+            .expect_err("an absent digest must be refused the same way");
+        // A principal with no blob grant at all is refused the same way.
+        let operation_denial = ungranted_client
+            .download_blob(&scoped_digest)
+            .await
+            .map(|_| ())
+            .expect_err("an ungranted operation must be refused");
+        let scoped_shape = denial_shape(&scoped_denial);
+        assert_eq!(scoped_shape.0, 403);
+        assert_eq!(scoped_shape, denial_shape(&absent_denial));
+        assert_eq!(scoped_shape, denial_shape(&operation_denial));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
     async fn routed_mtls_execution(route: &str, execution_id: &str) {
         init_tls();
         let (root, server_identity, client_identity, _) = tls_material();
@@ -3718,6 +4638,11 @@ mod tests {
         let result = final_snapshot.result.unwrap();
         assert_eq!(result.artifact_count, 1);
         assert_eq!(result.finalization_failure, None);
+        assert_eq!(
+            result.artifact_capture,
+            ArtifactCaptureDisposition::Completed,
+            "a capture that produced the declared artifact reports a completed capture"
+        );
         let artifacts = client
             .artifacts(
                 &workspace_handle.execution_id,
@@ -3757,7 +4682,7 @@ mod tests {
             path: eggwork_core::RelativePath::new("required-missing.txt").unwrap(),
             required: true,
         }];
-        client
+        let missing_events = client
             .execute_in_workspace(&missing_output_spec, &missing_handle, &missing_workspace)
             .await
             .unwrap()
@@ -3774,9 +4699,50 @@ mod tests {
             .unwrap()
             .result
             .unwrap();
-        assert_eq!(failed_finalization.state, ExecutionState::Succeeded);
+        // The terminal event and the terminal result agree about the failure,
+        // and the diagnostic that explains it is published before the terminal
+        // state event, so a consumer reading the stream sees the reason before
+        // the outcome.
+        let diagnostic_position = missing_events.iter().position(|event| {
+            matches!(
+                &event.kind,
+                ExecutionEventKind::Diagnostic(payload)
+                    if payload.contains(eggwork_core::DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED)
+            )
+        });
+        let terminal_position = missing_events.iter().position(|event| {
+            matches!(&event.kind, ExecutionEventKind::State(state) if *state == ExecutionState::Failed)
+        });
+        assert!(
+            diagnostic_position.is_some(),
+            "a capture failure must be visible in the event stream: {missing_events:?}"
+        );
+        assert!(
+            terminal_position.is_some(),
+            "the terminal state event must report the failure: {missing_events:?}"
+        );
+        assert!(
+            diagnostic_position < terminal_position,
+            "the capture diagnostic must be published before the terminal state event"
+        );
+        // A declared output that could not be captured is a failed execution,
+        // not a successful one with nothing in it. The target's own outcome
+        // is still reported (its exit code stays), and the capture failure is
+        // reported separately so a caller can tell "the target failed" from
+        // "the target succeeded and its declared outputs could not be
+        // collected".
+        assert_eq!(failed_finalization.state, ExecutionState::Failed);
         assert_eq!(failed_finalization.exit_code, Some(0));
         assert_eq!(failed_finalization.artifact_count, 0);
+        assert_eq!(
+            failed_finalization.failure,
+            Some(ExecutionFailure::Internal),
+            "the node owns a capture failure, so the failure is the node's own"
+        );
+        assert_eq!(
+            failed_finalization.artifact_capture,
+            ArtifactCaptureDisposition::Failed
+        );
         assert_eq!(
             failed_finalization.finalization_failure,
             Some(ExecutionFinalizationFailure::ArtifactCapture)
@@ -3824,6 +4790,12 @@ mod tests {
             .unwrap();
         assert_eq!(timed_out.state, ExecutionState::TimedOut);
         assert_eq!(timed_out.artifact_count, 0);
+        assert_eq!(
+            timed_out.artifact_capture,
+            ArtifactCaptureDisposition::Failed,
+            "the execution declared an output and the capture did not complete, \
+             so the declared output is not available"
+        );
         assert!(
             client
                 .artifacts(
@@ -3851,6 +4823,135 @@ mod tests {
             Err(eggwork_client::ClientError::Api { status: 500, .. })
         ));
         assert!(!server.state.blobs.path_for(&digest).exists());
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// The client and the node agree on the control-plane schema version.
+    ///
+    /// This is the test that would have caught the defect this milestone removes.
+    /// Before it, the client and the server each declared a private
+    /// `API_SCHEMA_VERSION`; the two happened to agree by value, but nothing
+    /// connected them, so a bump on either side would have made every client
+    /// request fail with HTTP 426 `protocol_version` — and neither the compiler
+    /// nor the test suite would have said why.
+    ///
+    /// The proof has three links:
+    ///
+    /// 1. The node refuses any body whose version is not the shared constant, and
+    ///    accepts the shared constant.
+    /// 2. A body in the client's exact shape — same fields, same order — carrying
+    ///    the shared constant is accepted, so the client's body and the node's
+    ///    accepted body are the same bytes.
+    /// 3. The real client, building the real body, is accepted by the real node.
+    ///    A private copy on either side would have broken link 3 immediately.
+    #[tokio::test]
+    async fn the_client_and_the_node_agree_on_the_control_plane_schema_version() {
+        init_tls();
+        let (root, server_identity, client_identity, _) = tls_material();
+        let temp = TempDir::new().unwrap();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            eggwork_core::PrincipalId::new("controller-schema").unwrap(),
+        )]));
+        let server = NodeServer::start(
+            NodeConfig {
+                host_telemetry: None,
+                node_id: NodeId::new("node-schema").unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024 * 1024,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(30),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            Arc::new(LocalProcessRunner::default()),
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+
+        let address = format!("https://localhost:{}", server.local_addr().port());
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            &address,
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+
+        // Link 1: only the shared constant is accepted.
+        //
+        // The accepted body carries an invalid specification on purpose: the
+        // version check runs before the specification check, so a
+        // `400 invalid_request` proves the body got past the version gate,
+        // and no execution is started that would occupy the node's only
+        // permit.
+        let handle = execution_handle("schema-agreement");
+        let spec = execution_spec(vec!["/bin/true".into()]);
+        let accepted = serde_json::to_vec(&ExecuteRequest {
+            schema_version: eggwork_core::API_SCHEMA_VERSION,
+            handle: handle.clone(),
+            workspace_id: None,
+            spec: execution_spec(vec![]),
+        })
+        .unwrap();
+        let status = post_raw(
+            &format!("{address}/v1/executions"),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+            accepted,
+        )
+        .await;
+        assert_ne!(
+            status, 426,
+            "a body carrying the shared schema version must not be refused as protocol_version"
+        );
+
+        let refused = serde_json::to_vec(&ExecuteRequest {
+            schema_version: eggwork_core::API_SCHEMA_VERSION + 1,
+            handle: execution_handle("schema-refused"),
+            workspace_id: None,
+            spec: spec.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            post_raw(
+                &format!("{address}/v1/executions"),
+                write_client_config(&client_temp, root.as_ref(), &client_identity),
+                refused,
+            )
+            .await,
+            426,
+            "a body carrying any other schema version must be refused as protocol_version"
+        );
+
+        // Link 3: the real client, building the real body, is accepted.
+        let execution = client
+            .execute(
+                &execution_spec(vec!["/bin/echo".into(), "schema-agreement".into()]),
+                &execution_handle("client-built-schema"),
+            )
+            .await
+            .expect("a client-built request must not be refused as protocol_version");
+        let id = execution.execution_id.clone();
+        let event_read = tokio::time::timeout(
+            ROUND_TRIP_BUDGET,
+            execution.into_events().collect::<Vec<_>>(),
+        )
+        .await;
+        assert!(
+            event_read.is_ok(),
+            "the event stream must reach a terminal state"
+        );
+        let snapshot = client.observe(&id).await.unwrap();
+        assert_eq!(snapshot.state, ExecutionState::Succeeded);
+
         server.shutdown().await;
         server.wait().await.unwrap();
     }
@@ -4249,7 +5350,7 @@ mod tests {
         let snapshot = tokio::time::timeout(ROUND_TRIP_BUDGET, async {
             loop {
                 let snapshot = client.observe(&handle.execution_id).await.unwrap();
-                if is_terminal(&snapshot.state) {
+                if snapshot.state.is_terminal() {
                     break snapshot;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -5286,6 +6387,356 @@ mod tests {
         server.wait().await.unwrap();
     }
 
+    /// A setup that advertises the Landlock capability but cannot enforce it.
+    ///
+    /// The admission gate refuses a `Required` isolation request on a node that
+    /// does not advertise the capability, so the runner's own fail-closed
+    /// refusal would be unreachable from a server test without this fixture.
+    /// The fixture is deliberately inconsistent — it advertises what it cannot
+    /// deliver — and exists only to reach that refusal.
+    struct AdvertisesLandlockButCannotEnforce;
+
+    #[async_trait::async_trait]
+    impl eggwork_runner::ExecutionSetup for AdvertisesLandlockButCannotEnforce {
+        async fn prepare(
+            &self,
+            sandbox: &SandboxRequest,
+            resources: &ResourceSetupRequest,
+            root: &std::path::Path,
+        ) -> Result<eggwork_runner::SetupOutcome, RunnerError> {
+            eggwork_runner::ExecutionSetup::prepare(
+                &eggwork_runner::NoExecutionSetup,
+                sandbox,
+                resources,
+                root,
+            )
+            .await
+        }
+
+        async fn execution_capabilities(&self) -> Vec<String> {
+            vec![eggwork_runner::LANDLOCK_WORKSPACE_RW_CAPABILITY.to_owned()]
+        }
+    }
+
+    /// Starts a node with the given runner and returns it with a connected
+    /// client. The runner is injected explicitly so a test can pin what the
+    /// node is able to enforce.
+    async fn node_with_runner(
+        runner: Arc<LocalProcessRunner>,
+        node_id: &str,
+        temp: &TempDir,
+    ) -> (NodeServer, NodeClient) {
+        let (root, server_identity, client_identity, _) = tls_material();
+        let work_root = temp.path().join("work");
+        fs::create_dir_all(&work_root).unwrap();
+        let principal = eggwork_core::PrincipalId::new("controller-a").unwrap();
+        let resolver = Arc::new(FingerprintPrincipalResolver::new([(
+            FingerprintPrincipalResolver::fingerprint(client_identity.cert.as_ref()),
+            principal,
+        )]));
+        let server = NodeServer::start(
+            NodeConfig {
+                host_telemetry: None,
+                node_id: NodeId::new(node_id).unwrap(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                execution_root: work_root,
+                database_path: temp.path().join("node.sqlite"),
+                blob_root: temp.path().join("blob-store"),
+                blob_quota_bytes: 1024 * 1024,
+                workspace_root: temp.path().join("workspace-store"),
+                workspace_quota_bytes: 1024 * 1024,
+                max_active_executions: 1,
+                lease_ttl: std::time::Duration::from_secs(30),
+                tls: tls_server_config(root.clone(), &server_identity),
+            },
+            runner,
+            resolver,
+            Arc::new(|_: &NodePrincipal, _| true),
+        )
+        .await
+        .unwrap();
+        let client_temp = TempDir::new().unwrap();
+        let client = NodeClient::new(
+            format!("https://localhost:{}", server.local_addr().port()),
+            write_client_config(&client_temp, root.as_ref(), &client_identity),
+        )
+        .unwrap();
+        (server, client)
+    }
+
+    /// The sequence number of the terminal state event.
+    fn terminal_sequence(events: &[eggwork_core::ExecutionEvent]) -> EventSequence {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                ExecutionEventKind::State(state) if *state != ExecutionState::Running => {
+                    Some(event.sequence)
+                }
+                _ => None,
+            })
+            .expect("the execution must reach a terminal state")
+    }
+
+    /// The diagnostic events of a page, in order.
+    fn diagnostic_payloads(events: &[eggwork_core::ExecutionEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ExecutionEventKind::Diagnostic(payload) => Some(payload.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// M005a: a degraded best-effort execution says so in the stream, before
+    /// the target writes anything and before the terminal event. The terminal
+    /// state alone is not enough — a caller watching the stream has to be able
+    /// to see that the execution ran without the enforcement it asked for.
+    #[tokio::test]
+    async fn a_degraded_best_effort_execution_publishes_its_diagnostic_before_output_and_terminal()
+    {
+        init_tls();
+        let temp = TempDir::new().unwrap();
+        // `NoExecutionSetup` is chosen explicitly: the default setup depends on
+        // the environment, and this test needs a node that cannot enforce
+        // anything.
+        let runner = Arc::new(LocalProcessRunner::new(eggwork_runner::NoExecutionSetup));
+        let (server, client) = node_with_runner(runner, "node-degraded-best-effort", &temp).await;
+
+        let mut spec = execution_spec(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "echo target-output".into(),
+        ]);
+        spec.command.isolation = IsolationRequirement::BestEffort;
+        let handle = execution_handle("degraded-best-effort");
+        let stream = client.execute(&spec, &handle).await.unwrap();
+        let events = tokio::time::timeout(
+            ROUND_TRIP_BUDGET,
+            stream.into_events().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("best-effort execution must terminate")
+        .unwrap();
+
+        let payloads = diagnostic_payloads(&events);
+        assert_eq!(
+            payloads.len(),
+            1,
+            "one degraded dimension produces exactly one diagnostic; got {payloads:?}"
+        );
+        let payload = payloads[0];
+        assert!(
+            payload.starts_with("eggwork.diagnostic.isolation.degraded.v1 "),
+            "unexpected diagnostic payload: {payload}"
+        );
+        assert!(payload.contains(" requirement=best_effort"));
+        assert!(payload.contains(" reason="));
+        assert!(
+            eggwork_core::DiagnosticPayload::parse(payload).is_ok(),
+            "the payload must match the documented grammar: {payload}"
+        );
+
+        let diagnostic_sequence = events
+            .iter()
+            .find(|event| matches!(event.kind, ExecutionEventKind::Diagnostic(_)))
+            .expect("a diagnostic event")
+            .sequence;
+        let first_output_sequence = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.kind,
+                    ExecutionEventKind::Stdout(_) | ExecutionEventKind::Stderr(_)
+                )
+            })
+            .expect("the target produced output")
+            .sequence;
+        assert!(
+            diagnostic_sequence < first_output_sequence,
+            "the diagnostic has to precede the target's first output; got {events:?}"
+        );
+        let terminal = terminal_sequence(&events);
+        assert!(
+            diagnostic_sequence < terminal,
+            "the diagnostic has to precede the terminal event; got {events:?}"
+        );
+
+        // The terminal evidence still records the degradation, so the stream
+        // and the snapshot cannot disagree.
+        let snapshot = client
+            .observe_generation(&handle.execution_id, handle.generation.get())
+            .await
+            .unwrap();
+        assert!(matches!(
+            snapshot.result.unwrap().sandbox,
+            Some(eggwork_core::SandboxResult::NotApplied { .. })
+        ));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// M005a: the diagnostic is durable. It is committed to the journal, so a
+    /// later read of the event page replays it — it was not merely broadcast to
+    /// a live subscriber.
+    #[tokio::test]
+    async fn the_diagnostic_is_replayed_from_the_journal_after_the_execution_ended() {
+        init_tls();
+        let temp = TempDir::new().unwrap();
+        let runner = Arc::new(LocalProcessRunner::new(eggwork_runner::NoExecutionSetup));
+        let (server, client) = node_with_runner(runner, "node-diagnostic-replay", &temp).await;
+
+        let mut spec = execution_spec(vec!["/bin/true".into()]);
+        spec.command.isolation = IsolationRequirement::BestEffort;
+        let handle = execution_handle("diagnostic-replay");
+        let stream = client.execute(&spec, &handle).await.unwrap();
+        let events = tokio::time::timeout(
+            ROUND_TRIP_BUDGET,
+            stream.into_events().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("best-effort execution must terminate")
+        .unwrap();
+        let payloads = diagnostic_payloads(&events);
+        assert_eq!(payloads.len(), 1, "got {payloads:?}");
+
+        // The execution is over; a fresh read of the event page has to carry
+        // the diagnostic.
+        let page = client.events(&handle, 0).await.unwrap();
+        let bytes = tokio::time::timeout(ROUND_TRIP_BUDGET, page.try_collect::<Vec<_>>())
+            .await
+            .expect("the event page must terminate")
+            .unwrap();
+        let page = bytes
+            .iter()
+            .flat_map(|chunk| chunk.to_vec())
+            .collect::<Vec<u8>>();
+        let page = String::from_utf8_lossy(&page);
+        assert!(
+            page.contains(payloads[0]),
+            "the replayed page must carry the committed diagnostic; got {page}"
+        );
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// M005a: a required request is refused, not degraded. The target never
+    /// runs, and the refusal is never dressed up as a degradation.
+    #[tokio::test]
+    async fn a_required_sandbox_never_reaches_the_target_and_is_not_reported_as_a_degradation() {
+        init_tls();
+        let temp = TempDir::new().unwrap();
+        let marker = temp.path().join("marker");
+        let runner = Arc::new(LocalProcessRunner::new(AdvertisesLandlockButCannotEnforce));
+        let (server, client) = node_with_runner(runner, "node-required-refusal", &temp).await;
+
+        let mut spec = execution_spec(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("touch {}", marker.display()),
+        ]);
+        spec.command.isolation = IsolationRequirement::Required;
+        let handle = execution_handle("required-refusal");
+        let stream = client.execute(&spec, &handle).await.unwrap();
+        let events = tokio::time::timeout(
+            ROUND_TRIP_BUDGET,
+            stream.into_events().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the refused execution must terminate")
+        .unwrap();
+
+        // The observable side effect: the child never ran.
+        assert!(
+            !marker.exists(),
+            "the target must not have run for a refused required request"
+        );
+        // The terminal classification is unchanged: a refusal is a failure with
+        // an internal cause, and the sandbox result says the requirement could
+        // not be met.
+        let snapshot = client
+            .observe_generation(&handle.execution_id, handle.generation.get())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.state, ExecutionState::Failed);
+        let result = snapshot.result.unwrap();
+        assert_eq!(result.failure, Some(ExecutionFailure::Internal));
+        assert!(matches!(
+            result.sandbox,
+            Some(eggwork_core::SandboxResult::Failed { .. })
+        ));
+        // And it is never reported as a degradation.
+        assert!(
+            diagnostic_payloads(&events).is_empty(),
+            "a refusal is not a degradation; got {:?}",
+            diagnostic_payloads(&events)
+        );
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// M005a: an execution with nothing degraded publishes no diagnostic.
+    #[tokio::test]
+    async fn an_execution_with_nothing_degraded_publishes_no_diagnostic() {
+        init_tls();
+        let temp = TempDir::new().unwrap();
+        let runner = Arc::new(LocalProcessRunner::new(eggwork_runner::NoExecutionSetup));
+        let (server, client) = node_with_runner(runner, "node-nothing-degraded", &temp).await;
+
+        let spec = execution_spec(vec!["/bin/true".into()]);
+        let handle = execution_handle("nothing-degraded");
+        let stream = client.execute(&spec, &handle).await.unwrap();
+        let events = tokio::time::timeout(
+            ROUND_TRIP_BUDGET,
+            stream.into_events().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the execution must terminate")
+        .unwrap();
+        assert!(
+            diagnostic_payloads(&events).is_empty(),
+            "an execution with no degradation must publish no diagnostic; got {:?}",
+            diagnostic_payloads(&events)
+        );
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
+    /// M005a: a degraded best-effort resource request publishes a diagnostic
+    /// that names the affected dimension.
+    #[tokio::test]
+    async fn a_degraded_best_effort_resource_request_publishes_a_dimension_scoped_diagnostic() {
+        init_tls();
+        let temp = TempDir::new().unwrap();
+        let runner = Arc::new(LocalProcessRunner::new(eggwork_runner::NoExecutionSetup));
+        let (server, client) = node_with_runner(runner, "node-degraded-resources", &temp).await;
+
+        let mut spec = execution_spec(vec!["/bin/true".into()]);
+        spec.command.resources.memory_bytes = Requirement::BestEffort(64 * 1024 * 1024);
+        let handle = execution_handle("degraded-resources");
+        let stream = client.execute(&spec, &handle).await.unwrap();
+        let events = tokio::time::timeout(
+            ROUND_TRIP_BUDGET,
+            stream.into_events().try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the execution must terminate")
+        .unwrap();
+
+        let payloads = diagnostic_payloads(&events);
+        assert_eq!(payloads.len(), 1, "got {payloads:?}");
+        assert!(
+            payloads[0].starts_with("eggwork.diagnostic.resources.degraded.v1 "),
+            "unexpected diagnostic payload: {}",
+            payloads[0]
+        );
+        assert!(payloads[0].contains(" dimension=memory"));
+        assert!(payloads[0].contains(" requirement=best_effort"));
+        server.shutdown().await;
+        server.wait().await.unwrap();
+    }
+
     #[tokio::test]
     async fn required_resource_admission_rejects_with_capability_mismatch_when_dimension_unavailable()
      {
@@ -5816,7 +7267,7 @@ mod tests {
     #[test]
     fn static_capability_features_are_a_single_canonical_list() {
         let features = static_capability_features();
-        assert!(features.contains(&"exec.argv.v1"));
+        assert!(features.contains(&eggwork_core::EXEC_ARGV_CAPABILITY));
         assert!(features.contains(&"network.unrestricted.v1"));
         let mut sorted = features.to_vec();
         sorted.sort_unstable();
@@ -5828,14 +7279,257 @@ mod tests {
         );
     }
 
+    /// The advertised argv feature is the one the owner declares.
+    ///
+    /// The server produces this name and the client consumes it, so the two
+    /// must be the same string. This is the server's half of that agreement:
+    /// the advertised list carries `eggwork_core::EXEC_ARGV_CAPABILITY` and
+    /// not a spelling typed into this crate.
+    #[test]
+    fn the_advertised_argv_feature_is_the_one_the_owner_declares() {
+        assert_eq!(eggwork_core::EXEC_ARGV_CAPABILITY, "exec.argv.v1");
+        let features = static_capability_features();
+        assert_eq!(
+            features
+                .iter()
+                .filter(|feature| **feature == eggwork_core::EXEC_ARGV_CAPABILITY)
+                .count(),
+            1,
+            "the owned argv feature must be advertised exactly once"
+        );
+    }
+
+    /// The resource admission rule reads the runner's exported constants.
+    ///
+    /// The runner produces the three cgroup feature names and this crate
+    /// consumes them, so a required dimension is admitted exactly when the
+    /// node advertises the runner's constant. The refusal case is the
+    /// regression test: a name that differs by one character must not
+    /// satisfy the requirement, because that is what server/runner drift
+    /// would look like.
+    #[test]
+    fn the_resource_admission_rule_reads_the_runner_constants() {
+        let required = eggwork_core::ResourceRequirements {
+            memory_bytes: eggwork_core::Requirement::Required(1024 * 1024),
+            cpu_millis: eggwork_core::Requirement::Required(100),
+            pids: eggwork_core::Requirement::Required(4),
+        };
+        let advertised = vec![
+            eggwork_runner::CGROUPS_V2_MEMORY_CAPABILITY.to_owned(),
+            eggwork_runner::CGROUPS_V2_CPU_CAPABILITY.to_owned(),
+            eggwork_runner::CGROUPS_V2_PIDS_CAPABILITY.to_owned(),
+        ];
+        assert!(
+            check_resources_supported(&advertised, &required),
+            "the runner's constants must satisfy a required resource request"
+        );
+
+        for constant in [
+            eggwork_runner::CGROUPS_V2_MEMORY_CAPABILITY,
+            eggwork_runner::CGROUPS_V2_CPU_CAPABILITY,
+            eggwork_runner::CGROUPS_V2_PIDS_CAPABILITY,
+        ] {
+            let mut drifting = advertised.clone();
+            let index = drifting
+                .iter()
+                .position(|feature| feature == constant)
+                .expect("the advertised list holds the constant");
+            drifting[index] = format!("{constant}x");
+            assert!(
+                !check_resources_supported(&drifting, &required),
+                "a feature name differing by one character must not satisfy {constant}"
+            );
+        }
+
+        let without_memory: Vec<String> = advertised
+            .iter()
+            .filter(|feature| *feature != eggwork_runner::CGROUPS_V2_MEMORY_CAPABILITY)
+            .cloned()
+            .collect();
+        assert!(
+            !check_resources_supported(&without_memory, &required),
+            "a missing memory capability must refuse a required memory dimension"
+        );
+    }
+
+    /// Artifact capture is eligible for exactly two states, and that subset is
+    /// not the terminal set.
+    ///
+    /// A cancelled, timed-out or interrupted execution has partial output that
+    /// is not a declared artifact, while a failed one still produced a result
+    /// the caller may want. Folding the subset into the terminal set would
+    /// capture artifacts for cancelled work; folding the terminal set into the
+    /// subset would drop the artifacts of a failed run.
+    #[test]
+    fn artifact_capture_eligibility_is_exactly_succeeded_and_failed() {
+        let eligible: Vec<&str> = eggwork_core::ALL_EXECUTION_STATES
+            .iter()
+            .filter(|state| artifact_capture_eligible(state))
+            .map(|state| state.wire_name())
+            .collect();
+        assert_eq!(eligible, ["Succeeded", "Failed"]);
+
+        for state in &eggwork_core::ALL_EXECUTION_STATES {
+            if matches!(state, ExecutionState::Succeeded | ExecutionState::Failed) {
+                continue;
+            }
+            assert!(
+                !artifact_capture_eligible(state),
+                "{state:?} must not be eligible for artifact capture"
+            );
+        }
+
+        let eligible_count = eggwork_core::ALL_EXECUTION_STATES
+            .iter()
+            .filter(|state| artifact_capture_eligible(state))
+            .count();
+        let terminal_count = eggwork_core::ALL_EXECUTION_STATES
+            .iter()
+            .filter(|state| state.is_terminal())
+            .count();
+        assert!(
+            eligible_count < terminal_count,
+            "the capture-eligible subset must stay a strict subset of the terminal set"
+        );
+    }
+
+    /// Every terminal state has a metric name, and no other state has one.
+    ///
+    /// The mapping is written as an exhaustive match over the enum, so a new
+    /// terminal variant cannot lose its metric silently: the compiler refuses
+    /// the new variant until it is placed in the map.
+    #[test]
+    fn the_terminal_metric_mapping_is_total_over_the_terminal_set() {
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for state in &eggwork_core::ALL_EXECUTION_STATES {
+            match terminal_metric(state) {
+                Some(metric) => {
+                    let name = metric.name();
+                    assert!(
+                        state.is_terminal(),
+                        "{state:?} is not terminal but has the metric {name}"
+                    );
+                    seen.push((state.wire_name(), name));
+                }
+                None => assert!(
+                    !state.is_terminal(),
+                    "{state:?} is terminal but has no metric name"
+                ),
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                ("Succeeded", "terminal_succeeded"),
+                ("Failed", "terminal_failed"),
+                ("Cancelled", "terminal_cancelled"),
+                ("TimedOut", "terminal_timed_out"),
+                ("Interrupted", "terminal_interrupted"),
+            ]
+        );
+    }
+
+    /// Every metric the server can increment is reported by the operator
+    /// surface.
+    ///
+    /// The increments go through the same helper the server uses, so this
+    /// proves that the real increment path and the real report agree — not
+    /// that a test wrote a row and read it back.
+    #[tokio::test]
+    async fn every_metric_the_server_increments_reaches_the_operator_report() {
+        let temp = TempDir::new().unwrap();
+        let database_path = temp.path().join("executions.sqlite");
+        let store = store::ExecutionStore::open(&database_path).unwrap();
+        let workspace_counters = [
+            Metric::WorkspaceManifestRegistrations,
+            Metric::WorkspaceDerivedRequests,
+            Metric::WorkspaceDerivedHits,
+            Metric::WorkspacePatchEntries,
+            Metric::WorkspaceBaseMissing,
+        ];
+        for metric in workspace_counters {
+            increment_metric(&store, metric, 3).await;
+        }
+        let config = operator_config(temp.path(), &database_path);
+        let report = operations::metrics_snapshot(&config).unwrap();
+        for metric in workspace_counters {
+            assert_eq!(
+                report.counters.get(metric.name()),
+                Some(&3),
+                "{} was incremented but the operator report does not carry it",
+                metric.name()
+            );
+        }
+    }
+
+    /// The workspace derivation moves three counters at once.
+    ///
+    /// The three are the derivation that was asked for, the manifest the
+    /// derivation registered, and the patch entries it applied. The batch is
+    /// one decision, so all three move together.
+    #[tokio::test]
+    async fn the_workspace_derivation_moves_three_counters_at_once() {
+        let temp = TempDir::new().unwrap();
+        let database_path = temp.path().join("executions.sqlite");
+        let store = store::ExecutionStore::open(&database_path).unwrap();
+        increment_metrics(&store, &workspace_derive_metrics(7)).await;
+        let config = operator_config(temp.path(), &database_path);
+        let report = operations::metrics_snapshot(&config).unwrap();
+        assert_eq!(
+            report.counters.get(Metric::WorkspaceDerivedHits.name()),
+            Some(&1)
+        );
+        assert_eq!(
+            report
+                .counters
+                .get(Metric::WorkspaceManifestRegistrations.name()),
+            Some(&1)
+        );
+        assert_eq!(
+            report.counters.get(Metric::WorkspacePatchEntries.name()),
+            Some(&7)
+        );
+    }
+
+    /// An operator configuration that reads the given database.
+    fn operator_config(
+        root: &std::path::Path,
+        database_path: &std::path::Path,
+    ) -> operations::OperatorConfig {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "node_id": "node-test",
+            "bind": "127.0.0.1:0",
+            "execution_root": root.join("execution"),
+            "database_path": database_path,
+            "blob_root": root.join("blobs"),
+            "blob_quota_bytes": 4096,
+            "workspace_root": root.join("workspaces"),
+            "workspace_quota_bytes": 4096,
+            "max_active_executions": 2,
+            "lease_ttl_seconds": 60,
+            "tls": {
+                "certificate_chain": root.join("server.pem"),
+                "private_key": root.join("server-key.pem"),
+                "client_ca": root.join("client-ca.pem")
+            },
+            "clients": [{
+                "principal_id": "controller",
+                "certificate_sha256": "ab".repeat(32),
+                "operations": ["status"]
+            }]
+        });
+        serde_json::from_value(value).expect("config")
+    }
+
     #[test]
     fn server_capability_features_do_not_duplicate_static_dynamic_overlap() {
-        let dynamic = vec!["isolation.landlock.workspace-rw.v1".to_owned()];
+        let dynamic = vec![eggwork_runner::LANDLOCK_WORKSPACE_RW_CAPABILITY.to_owned()];
         let features = server_capability_features(dynamic.clone());
         assert_eq!(
             features
                 .iter()
-                .filter(|feature| *feature == "exec.argv.v1")
+                .filter(|feature| *feature == eggwork_core::EXEC_ARGV_CAPABILITY)
                 .count(),
             1,
             "static features must not be duplicated"
@@ -5843,7 +7537,9 @@ mod tests {
         assert_eq!(
             features
                 .iter()
-                .filter(|feature| feature.as_str() == "isolation.landlock.workspace-rw.v1")
+                .filter(|feature| {
+                    feature.as_str() == eggwork_runner::LANDLOCK_WORKSPACE_RW_CAPABILITY
+                })
                 .count(),
             1,
             "dynamic features must be preserved"
@@ -5865,6 +7561,171 @@ mod tests {
         );
     }
 
+    /// The declared-artifact capability follows the platform's capture fact.
+    ///
+    /// The name is a wire value and never changes; whether the node advertises
+    /// it does. A node that cannot capture declared outputs must not claim
+    /// that it can, because the advertisement is what a caller uses to decide
+    /// whether to declare outputs at all.
+    #[test]
+    fn the_declared_artifact_capability_is_advertised_only_when_the_platform_can_capture() {
+        let features = server_capability_features(Vec::new());
+        let advertised = features
+            .iter()
+            .filter(|feature| feature.as_str() == ARTIFACT_DECLARED_CAPABILITY)
+            .count();
+        match artifact_capture_capability() {
+            ArtifactCaptureCapability::Available => assert_eq!(
+                advertised, 1,
+                "a platform that can capture must advertise the declared-artifact capability"
+            ),
+            ArtifactCaptureCapability::Unavailable => assert_eq!(
+                advertised, 0,
+                "a platform that cannot capture must not advertise the \
+                 declared-artifact capability"
+            ),
+        }
+    }
+
+    /// A declared output that was not captured is never a success.
+    ///
+    /// This is the regression the corrective exists for: the terminal state of
+    /// an execution whose declared outputs could not be collected must not
+    /// read as a successful execution with nothing in it.
+    #[test]
+    fn a_declared_output_that_was_not_captured_never_reports_success() {
+        for capability in [
+            ArtifactCaptureCapability::Available,
+            ArtifactCaptureCapability::Unavailable,
+        ] {
+            for attempt in [
+                ArtifactCaptureAttempt::NotAttempted,
+                ArtifactCaptureAttempt::Failed,
+            ] {
+                let decision = decide_artifact_capture(ArtifactCaptureFacts {
+                    capability,
+                    declared_outputs: true,
+                    target_state: ExecutionState::Succeeded,
+                    target_failure: None,
+                    attempt,
+                });
+                assert_ne!(
+                    decision.state,
+                    ExecutionState::Succeeded,
+                    "a capture that did not complete must not leave the execution successful"
+                );
+                assert_eq!(decision.state, ExecutionState::Failed);
+                assert_eq!(
+                    decision.failure,
+                    Some(ExecutionFailure::Internal),
+                    "the capture failure is the node's own failure"
+                );
+                assert_eq!(decision.disposition, ArtifactCaptureDisposition::Failed);
+            }
+        }
+    }
+
+    /// A capture that completed leaves the target's own outcome alone.
+    #[test]
+    fn a_completed_capture_keeps_the_targets_own_outcome() {
+        let decision = decide_artifact_capture(ArtifactCaptureFacts {
+            capability: ArtifactCaptureCapability::Available,
+            declared_outputs: true,
+            target_state: ExecutionState::Succeeded,
+            target_failure: None,
+            attempt: ArtifactCaptureAttempt::Completed,
+        });
+        assert_eq!(decision.state, ExecutionState::Succeeded);
+        assert_eq!(decision.failure, None);
+        assert_eq!(decision.disposition, ArtifactCaptureDisposition::Completed);
+    }
+
+    /// A failed target keeps its own failure.
+    ///
+    /// A capture failure must not overwrite the target's failure: a caller has
+    /// to be able to tell "the target failed" from "the target succeeded and
+    /// its declared outputs could not be collected".
+    #[test]
+    fn a_failed_target_keeps_its_own_failure_when_the_capture_also_fails() {
+        let decision = decide_artifact_capture(ArtifactCaptureFacts {
+            capability: ArtifactCaptureCapability::Available,
+            declared_outputs: true,
+            target_state: ExecutionState::Failed,
+            target_failure: Some(ExecutionFailure::Spawn),
+            attempt: ArtifactCaptureAttempt::Failed,
+        });
+        assert_eq!(decision.state, ExecutionState::Failed);
+        assert_eq!(
+            decision.failure,
+            Some(ExecutionFailure::Spawn),
+            "the target's own failure must survive a capture failure"
+        );
+        assert_eq!(decision.disposition, ArtifactCaptureDisposition::Failed);
+    }
+
+    /// An execution that declared nothing reports that nothing was requested.
+    #[test]
+    fn an_execution_without_declared_outputs_reports_not_requested() {
+        for capability in [
+            ArtifactCaptureCapability::Available,
+            ArtifactCaptureCapability::Unavailable,
+        ] {
+            let decision = decide_artifact_capture(ArtifactCaptureFacts {
+                capability,
+                declared_outputs: false,
+                target_state: ExecutionState::Succeeded,
+                target_failure: None,
+                attempt: ArtifactCaptureAttempt::NotAttempted,
+            });
+            assert_eq!(decision.state, ExecutionState::Succeeded);
+            assert_eq!(decision.failure, None);
+            assert_eq!(
+                decision.disposition,
+                ArtifactCaptureDisposition::NotRequested
+            );
+        }
+    }
+
+    /// The capture diagnostic is a bounded payload in the closed class set.
+    ///
+    /// The diagnostic rides inside an event, so it has to satisfy the event
+    /// envelope as well as the diagnostic grammar, and a consumer has to be
+    /// able to parse it back.
+    #[test]
+    fn the_capture_diagnostic_is_a_bounded_payload_in_the_closed_class_set() {
+        let mut payload = eggwork_core::DiagnosticPayload::new(
+            eggwork_core::DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED,
+        )
+        .expect("the capture failure class is in the closed class set");
+        payload
+            .set("requirement", "declared")
+            .expect("requirement is a valid diagnostic key");
+        payload
+            .set("outcome", "platform_unavailable")
+            .expect("outcome is a valid diagnostic key");
+        payload
+            .set(
+                "reason",
+                "safe artifact capture is unavailable on this platform",
+            )
+            .expect("reason is a valid diagnostic key");
+        let built = payload.build();
+        assert!(
+            built.len() <= eggwork_core::MAX_DIAGNOSTIC_PAYLOAD_BYTES,
+            "the diagnostic payload must stay inside its bound"
+        );
+        assert!(
+            built.len() <= eggwork_core::MAX_EVENT_CHUNK_BYTES,
+            "the diagnostic payload must stay inside the event envelope"
+        );
+        let parsed = eggwork_core::DiagnosticPayload::parse(&built)
+            .expect("the built diagnostic must parse back");
+        assert_eq!(
+            parsed.class(),
+            eggwork_core::DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED
+        );
+    }
+
     #[test]
     fn admission_helpers_keep_required_capability_gating_active() {
         // This test does not exercise live sockets; it pins the admission
@@ -5872,37 +7733,41 @@ mod tests {
         // `IsolationRequirement::None && NetworkRequirement::Unrestricted`
         // gate is caught here even if the integration tests are skipped on
         // hosts without Landlock.
-        let features = vec!["isolation.landlock.workspace-rw.v1".to_owned()];
-        struct Probe {
-            features: Vec<String>,
-        }
-        impl Probe {
-            fn isolation_supported(&self, requirement: &IsolationRequirement) -> bool {
-                match requirement {
-                    IsolationRequirement::None | IsolationRequirement::BestEffort => true,
-                    IsolationRequirement::Required => self
-                        .features
-                        .iter()
-                        .any(|f| f == "isolation.landlock.workspace-rw.v1"),
-                }
-            }
-            fn network_supported(&self, network: &NetworkRequirement) -> bool {
-                matches!(network, NetworkRequirement::Unrestricted)
-            }
-        }
-        let probe = Probe { features };
-        assert!(probe.isolation_supported(&IsolationRequirement::None));
-        assert!(probe.isolation_supported(&IsolationRequirement::BestEffort));
-        assert!(probe.isolation_supported(&IsolationRequirement::Required));
-        let empty = Probe { features: vec![] };
-        assert!(empty.isolation_supported(&IsolationRequirement::None));
-        assert!(empty.isolation_supported(&IsolationRequirement::BestEffort));
-        assert!(!empty.isolation_supported(&IsolationRequirement::Required));
-        assert!(probe.network_supported(&NetworkRequirement::Unrestricted));
-        assert!(!probe.network_supported(&NetworkRequirement::Disabled));
-        assert!(
-            !probe.network_supported(&NetworkRequirement::AllowListed(vec!["example.com".into()]))
-        );
+        //
+        // It calls the real admission helpers rather than a local copy of
+        // them: a copy would keep passing after the production rule drifted,
+        // which is the failure mode this milestone exists to remove.
+        let features = vec![eggwork_runner::LANDLOCK_WORKSPACE_RW_CAPABILITY.to_owned()];
+        assert!(check_isolation_supported(
+            &features,
+            &IsolationRequirement::None
+        ));
+        assert!(check_isolation_supported(
+            &features,
+            &IsolationRequirement::BestEffort
+        ));
+        assert!(check_isolation_supported(
+            &features,
+            &IsolationRequirement::Required
+        ));
+        let empty: Vec<String> = vec![];
+        assert!(check_isolation_supported(
+            &empty,
+            &IsolationRequirement::None
+        ));
+        assert!(check_isolation_supported(
+            &empty,
+            &IsolationRequirement::BestEffort
+        ));
+        assert!(!check_isolation_supported(
+            &empty,
+            &IsolationRequirement::Required
+        ));
+        assert!(check_network_supported(&NetworkRequirement::Unrestricted));
+        assert!(!check_network_supported(&NetworkRequirement::Disabled));
+        assert!(!check_network_supported(&NetworkRequirement::AllowListed(
+            vec!["example.com".into()]
+        )));
     }
 
     /// M004 adversarial: two authorized principals, one execution.
@@ -6315,11 +8180,10 @@ mod tests {
             Ok(_) => panic!("required isolation without a helper must be rejected"),
         }
         // Debug rendering of output and environment types redacts content.
-        let chunk = eggwork_runner::OutputChunk {
-            stderr: false,
-            bytes: sentinel.as_bytes().to_vec(),
-        };
+        let chunk = eggwork_runner::OutputChunk::Stdout(sentinel.as_bytes().to_vec());
         assert!(!format!("{chunk:?}").contains(sentinel));
+        let diagnostic = eggwork_runner::OutputChunk::Diagnostic(sentinel.to_owned());
+        assert!(!format!("{diagnostic:?}").contains(sentinel));
         let entry = eggwork_core::EnvironmentEntry::new("DEPLOY_TOKEN", sentinel).unwrap();
         assert!(!format!("{entry:?}").contains(sentinel));
         server.shutdown().await;

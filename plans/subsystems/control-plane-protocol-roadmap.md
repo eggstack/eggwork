@@ -1,6 +1,6 @@
 # Control-Plane Protocol Roadmap
 
-Status: active roadmap
+Status: active roadmap; M001-M004 closed; no milestone in flight
 
 Canonical authority:
 
@@ -122,6 +122,40 @@ Exit conditions:
 - route failure never falls back direct;
 - protocol-version mismatch is typed;
 - slow event consumers cannot produce unbounded node memory.
+
+### M004 — Shared protocol contract corrective
+
+Class: invariant
+
+Status: closed
+
+Corrective addendum:
+
+- `plans/subsystems/control-plane-protocol-shared-contract-corrective-addendum.md`
+
+Implementation plan:
+
+- `plans/implementation/control-plane-protocol/004-shared-protocol-contract-corrective.md`
+
+Decision record:
+
+- `plans/adrs/ADR-0008-core-protocol-contract-ownership.md`
+
+Closure record:
+
+- `plans/closure/control-plane-protocol/004-status.md`
+
+Objective:
+
+Give each protocol contract fact a single owner so that a change to it is a compile-time or test-detectable event rather than a convention. The batch covers the API schema version, which is currently declared independently by the client that sends it and the server that hard-rejects on it; the capability feature-name strings, which are re-typed across the runner, the server, and the client; and the terminal-state classification, which is enumerated in roughly nine places because `eggwork-core` owns no terminal concept.
+
+Exit conditions:
+
+- the client and the server consume one schema-version constant from `eggwork-core`;
+- capability feature names have one producer-side owner and the consumers import it;
+- the terminal/non-terminal classification has one owner in `eggwork-core` and is total and disjoint over the state enum;
+- no capability feature-string value changes — the frozen semantics in the security remote-admission corrective remain byte-for-byte;
+- no wire representation changes.
 
 ## 4. Local admission model
 

@@ -4,17 +4,28 @@
 //!
 //! Embedding API: construct a validated [`RunnerRequest`] from an
 //! [`eggwork_core::ExecutionSpec`] with [`RunnerRequest::from_spec`], then run
-//! it through [`LocalProcessRunner`]. Request fields remain private so callers
-//! cannot bypass protocol bounds. Platform setup is supplied through
+//! it through [`LocalProcessRunner`]. Request fields remain private, and every
+//! public construction path is covered by the `eggwork_core` domain contract:
+//! [`RunnerRequest::contract_error`] reports a violation without running
+//! anything, and [`LocalProcessRunner::run`] refuses one before setup and
+//! before any child exists. Platform setup is supplied through
 //! [`ExecutionSetup`]; neither this API nor its result types carry scheduler
 //! placement, priority, or project fairness policy.
 
 use eggwork_core::{
-    CommandSpec, ExecutionFailure, ExecutionGeneration, ExecutionId, ExecutionResult,
-    ExecutionSpec, ExecutionState, MAX_CAPTURE_BYTES, MAX_ENV_COUNT, MAX_ENV_NAME_BYTES,
-    MAX_ENV_VALUE_BYTES, MAX_EVENT_CHUNK_BYTES, OverflowPolicy as CoreOverflowPolicy, RelativePath,
-    Requirement, StdinPolicy as CoreStdinPolicy,
+    CommandSpec, EnvironmentEntry, ExecutionFailure, ExecutionGeneration, ExecutionId,
+    ExecutionResult, ExecutionSpec, ExecutionState, MAX_CAPTURE_BYTES, MAX_EVENT_CHUNK_BYTES,
+    OutputPolicy, OverflowPolicy as CoreOverflowPolicy, RelativePath, Requirement,
+    ResourceRequirements, ValidationError, validate_argv, validate_environment_entries,
+    validate_timeout,
 };
+// The runner consumes the core domain type rather than keeping a local copy of
+// it. The public path `eggwork_runner::StdinPolicy` is retained as a re-export
+// so that embedders and the in-tree suites keep compiling against the path they
+// already use; the type that path names is `eggwork_core::StdinPolicy`, and the
+// runner's former local duplicate -- with its own `Debug` and its own copy of
+// the stdin bound -- is gone.
+pub use eggwork_core::StdinPolicy;
 #[cfg(target_os = "linux")]
 use serde::Serialize;
 #[cfg(target_os = "linux")]
@@ -39,6 +50,20 @@ use tokio_util::sync::CancellationToken;
 
 mod process_tree;
 
+/// The node's environment policy.
+///
+/// The policy — the denied-key list and its matching rule, the node-owned
+/// (reserved) keys, the node-owned baseline, and the `PATH` value contract —
+/// has exactly one owner: `crates/eggwork-runner/policy/environment-policy.toml`.
+/// This module is the runner's generated copy of it.
+///
+/// The standalone sandbox helper enforces the same policy and may not depend
+/// on any workspace crate, so it compiles its own generated copy of the same
+/// source. The two copies are pinned together by a parity test, which is what
+/// makes a one-sided edit fail the build instead of silently changing what is
+/// enforced.
+pub mod environment_policy;
+
 use process_tree::{ProcessTree, TreeConvergence};
 
 const READ_BUFFER: usize = 8192;
@@ -51,19 +76,51 @@ pub struct ExecutionProvenance {
     pub generation: Option<ExecutionGeneration>,
 }
 
-/// A bounded output chunk. Consumers must treat bytes as arbitrary binary data.
+/// A bounded output chunk, or a diagnostic about the execution's enforcement.
+///
+/// Consumers must treat the bytes of `Stdout`/`Stderr` as arbitrary binary
+/// data.
+///
+/// `Diagnostic` is the only way a degradation reaches the caller, and it is
+/// deliberately carried on the *same* channel as the target's output: the
+/// server's forwarding loop drains one channel in order, so a diagnostic the
+/// runner sends before it spawns the target is published before any output the
+/// target produces. A diagnostic derived from the runner's result instead
+/// would necessarily arrive after all target output, which is the gap this
+/// carrier exists to close.
 #[derive(Clone, PartialEq, Eq)]
-pub struct OutputChunk {
-    pub stderr: bool,
-    pub bytes: Vec<u8>,
+pub enum OutputChunk {
+    /// Target standard output.
+    Stdout(Vec<u8>),
+    /// Target standard error.
+    Stderr(Vec<u8>),
+    /// A bounded diagnostic payload about the execution's isolation or
+    /// resource enforcement. See [`eggwork_core::DiagnosticPayload`] for the
+    /// grammar and the bound.
+    Diagnostic(String),
 }
 impl std::fmt::Debug for OutputChunk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OutputChunk")
-            .field("stderr", &self.stderr)
-            .field("length", &self.bytes.len())
-            .field("bytes", &"[REDACTED]")
-            .finish()
+        match self {
+            Self::Stdout(bytes) => f
+                .debug_struct("OutputChunk")
+                .field("stream", &"stdout")
+                .field("length", &bytes.len())
+                .field("bytes", &"[REDACTED]")
+                .finish(),
+            Self::Stderr(bytes) => f
+                .debug_struct("OutputChunk")
+                .field("stream", &"stderr")
+                .field("length", &bytes.len())
+                .field("bytes", &"[REDACTED]")
+                .finish(),
+            Self::Diagnostic(payload) => f
+                .debug_struct("OutputChunk")
+                .field("stream", &"diagnostic")
+                .field("length", &payload.len())
+                .field("payload", &"[REDACTED]")
+                .finish(),
+        }
     }
 }
 
@@ -591,7 +648,7 @@ impl ExecutionSetup for TrustedLandlockSetup {
         let outcome = match sandbox {
             SandboxRequest::None => SandboxOutcome::NotRequested,
             SandboxRequest::BestEffort { profile } | SandboxRequest::Required { profile } => {
-                if profile != "workspace_rw" {
+                if profile != WORKSPACE_RW_PROFILE {
                     let reason = "unsupported sandbox profile".to_owned();
                     if matches!(sandbox, SandboxRequest::BestEffort { .. }) {
                         return Ok(SetupOutcome {
@@ -621,35 +678,9 @@ impl ExecutionSetup for TrustedLandlockSetup {
     async fn execution_capabilities(&self) -> Vec<String> {
         let mut capabilities = Vec::new();
         if verify_trusted_helper(&self.helper_path).is_ok() && probe_landlock_ruleset() {
-            capabilities.push("isolation.landlock.workspace-rw.v1".into());
+            capabilities.push(LANDLOCK_WORKSPACE_RW_CAPABILITY.into());
         }
-        let probes = [
-            (
-                "resources.cgroups-v2.memory",
-                ResourceSetupRequest {
-                    memory_bytes: Requirement::BestEffort(32 * 1024 * 1024),
-                    cpu_millis: Requirement::NotRequested,
-                    pids: Requirement::NotRequested,
-                },
-            ),
-            (
-                "resources.cgroups-v2.cpu",
-                ResourceSetupRequest {
-                    memory_bytes: Requirement::NotRequested,
-                    cpu_millis: Requirement::BestEffort(100),
-                    pids: Requirement::NotRequested,
-                },
-            ),
-            (
-                "resources.cgroups-v2.pids",
-                ResourceSetupRequest {
-                    memory_bytes: Requirement::NotRequested,
-                    cpu_millis: Requirement::NotRequested,
-                    pids: Requirement::BestEffort(16),
-                },
-            ),
-        ];
-        for (feature, request) in probes {
+        for (feature, request) in CGROUP_PROBE_TABLE {
             if SystemdCgroupBackend::probe(&request).await.is_ok() {
                 capabilities.push(feature.into());
             }
@@ -665,6 +696,78 @@ impl ExecutionSetup for TrustedLandlockSetup {
 /// Public capability feature name advertised for the closed Landlock
 /// `workspace_rw` profile used by `IsolationRequirement::{BestEffort, Required}`.
 pub const LANDLOCK_WORKSPACE_RW_CAPABILITY: &str = "isolation.landlock.workspace-rw.v1";
+
+/// Public capability feature name advertised when the cgroup v2 memory
+/// controller is enforced.
+///
+/// The value is the frozen public feature name for the memory dimension and
+/// must not change without an ADR: a node advertises it and a server admits
+/// a required memory dimension only when the advertised name matches, so a
+/// renamed byte would turn every memory-limited request into a
+/// capability refusal.
+pub const CGROUPS_V2_MEMORY_CAPABILITY: &str = "resources.cgroups-v2.memory";
+
+/// Public capability feature name advertised when the cgroup v2 CPU
+/// controller is enforced.
+///
+/// The value is the frozen public feature name for the CPU dimension and must
+/// not change without an ADR, for the same reason as
+/// [`CGROUPS_V2_MEMORY_CAPABILITY`].
+pub const CGROUPS_V2_CPU_CAPABILITY: &str = "resources.cgroups-v2.cpu";
+
+/// Public capability feature name advertised when the cgroup v2 pids
+/// controller is enforced.
+///
+/// The value is the frozen public feature name for the pids dimension and must
+/// not change without an ADR, for the same reason as
+/// [`CGROUPS_V2_MEMORY_CAPABILITY`].
+pub const CGROUPS_V2_PIDS_CAPABILITY: &str = "resources.cgroups-v2.pids";
+
+/// The only sandbox profile the protocol can request.
+///
+/// `SandboxRequest::{BestEffort, Required}` carry a profile name, and
+/// `workspace_rw` is the only one the runner will run and the only one the
+/// trusted helper will grant — the helper is a standalone binary with no
+/// workspace-crate dependency, so it keeps its own literal and the test in
+/// `crates/eggwork-sandbox-helper/tests/landlock_runner.rs` pins that literal
+/// to this constant. The value must not change without an ADR: a rename would
+/// make the runner ask for a profile the helper refuses, which fails closed
+/// as "unsupported sandbox profile" rather than silently degrading.
+pub const WORKSPACE_RW_PROFILE: &str = "workspace_rw";
+
+/// The cgroup v2 probes the runner runs before it advertises a resource
+/// feature, paired with the feature name each probe earns.
+///
+/// The table is a `const` so a test can read the names it would advertise
+/// without running the probes: the names here are the exported constants, and
+/// a literal typed into the table would show up as a name that is not one of
+/// them.
+const CGROUP_PROBE_TABLE: [(&str, ResourceSetupRequest); 3] = [
+    (
+        CGROUPS_V2_MEMORY_CAPABILITY,
+        ResourceSetupRequest {
+            memory_bytes: Requirement::BestEffort(32 * 1024 * 1024),
+            cpu_millis: Requirement::NotRequested,
+            pids: Requirement::NotRequested,
+        },
+    ),
+    (
+        CGROUPS_V2_CPU_CAPABILITY,
+        ResourceSetupRequest {
+            memory_bytes: Requirement::NotRequested,
+            cpu_millis: Requirement::BestEffort(100),
+            pids: Requirement::NotRequested,
+        },
+    ),
+    (
+        CGROUPS_V2_PIDS_CAPABILITY,
+        ResourceSetupRequest {
+            memory_bytes: Requirement::NotRequested,
+            cpu_millis: Requirement::NotRequested,
+            pids: Requirement::BestEffort(16),
+        },
+    ),
+];
 
 /// Probe the kernel Landlock ABI V4 with the same set of handles and rules
 /// the trusted helper uses for `workspace_rw`. Returns `true` only if the
@@ -821,6 +924,161 @@ impl ExecutionSetup for NoExecutionSetup {
     }
 }
 
+/// The `requirement` value a degradation diagnostic always carries.
+///
+/// A degradation is by definition a *best-effort* request that was not
+/// honoured: a required request is refused instead, and a refusal is not a
+/// degradation.
+const DIAGNOSTIC_REQUIREMENT_BEST_EFFORT: &str = "best_effort";
+
+/// The degradations the runner has already reported to the caller.
+///
+/// The bookkeeping exists so that one degraded dimension produces exactly one
+/// diagnostic event. A degradation can be discovered more than once — a
+/// sandbox that `prepare` could not apply may also be the sandbox the helper
+/// handshake could not enforce — and the second discovery must refine the
+/// recorded outcome, not duplicate the event.
+#[derive(Debug, Default)]
+struct ReportedDegradations {
+    isolation: bool,
+    resources: Vec<eggwork_core::ResourceDimension>,
+}
+
+/// The best-effort resource dimensions a request asked for.
+///
+/// `Required` dimensions are excluded on purpose. A required dimension that
+/// reached a `NotApplied` outcome would be a failure of the fail-closed rule,
+/// not a degradation, and reporting it as one would turn a refusal into an
+/// advisory. The in-tree setups refuse a required request before they can
+/// produce such an outcome, so this filter never drops a real report.
+fn best_effort_resource_dimensions(
+    request: &ResourceSetupRequest,
+) -> Vec<eggwork_core::ResourceDimension> {
+    let mut dimensions = Vec::new();
+    if matches!(request.memory_bytes, Requirement::BestEffort(_)) {
+        dimensions.push(eggwork_core::ResourceDimension::Memory);
+    }
+    if matches!(request.cpu_millis, Requirement::BestEffort(_)) {
+        dimensions.push(eggwork_core::ResourceDimension::Cpu);
+    }
+    if matches!(request.pids, Requirement::BestEffort(_)) {
+        dimensions.push(eggwork_core::ResourceDimension::Pids);
+    }
+    dimensions
+}
+
+/// The wire name of a resource dimension, as the diagnostic grammar spells it.
+fn resource_dimension_name(dimension: eggwork_core::ResourceDimension) -> &'static str {
+    match dimension {
+        eggwork_core::ResourceDimension::Memory => "memory",
+        eggwork_core::ResourceDimension::Cpu => "cpu",
+        eggwork_core::ResourceDimension::Pids => "pids",
+    }
+}
+
+/// The requested dimensions whose post-mortem counter the helper could not
+/// open.
+///
+/// Only the dimensions the helper actually reported as unobservable are named:
+/// the diagnostic has to say which limit could not be *verified*, not merely
+/// that the resource outcome was downgraded.
+#[cfg(target_os = "linux")]
+fn unobserved_resource_dimensions(
+    request: &ResourceSetupRequest,
+    unobserved: &[eggwork_core::ResourceDimension],
+) -> Vec<eggwork_core::ResourceDimension> {
+    let mut dimensions = Vec::new();
+    if matches!(request.memory_bytes, Requirement::BestEffort(_))
+        && unobserved.contains(&eggwork_core::ResourceDimension::Memory)
+    {
+        dimensions.push(eggwork_core::ResourceDimension::Memory);
+    }
+    if matches!(request.pids, Requirement::BestEffort(_))
+        && unobserved.contains(&eggwork_core::ResourceDimension::Pids)
+    {
+        dimensions.push(eggwork_core::ResourceDimension::Pids);
+    }
+    dimensions
+}
+
+/// Builds the diagnostic payload for a degraded filesystem isolation.
+///
+/// The structured keys come first and the free-form reason last, so a reason
+/// that does not fit absorbs the truncation and the structured keys survive
+/// intact.
+fn isolation_diagnostic(profile: &str, reason: &str) -> Option<String> {
+    let mut payload =
+        eggwork_core::DiagnosticPayload::new(eggwork_core::DIAGNOSTIC_CLASS_ISOLATION_DEGRADED)
+            .ok()?;
+    let _ = payload.set("requirement", DIAGNOSTIC_REQUIREMENT_BEST_EFFORT);
+    let _ = payload.set("profile", profile);
+    let _ = payload.set("reason", reason);
+    Some(payload.build())
+}
+
+/// Builds the diagnostic payload for a degraded resource dimension.
+fn resources_diagnostic(
+    dimension: eggwork_core::ResourceDimension,
+    reason: &str,
+) -> Option<String> {
+    let mut payload =
+        eggwork_core::DiagnosticPayload::new(eggwork_core::DIAGNOSTIC_CLASS_RESOURCES_DEGRADED)
+            .ok()?;
+    let _ = payload.set("requirement", DIAGNOSTIC_REQUIREMENT_BEST_EFFORT);
+    let _ = payload.set("dimension", resource_dimension_name(dimension));
+    let _ = payload.set("reason", reason);
+    Some(payload.build())
+}
+
+/// Sends one diagnostic payload on the runner's output channel.
+///
+/// The channel is the only path from the runner to the caller that preserves
+/// ordering: the server drains it in order, so a payload sent before the
+/// target is spawned is published before anything the target writes.
+async fn send_diagnostic(output_tx: &mpsc::Sender<OutputChunk>, payload: Option<String>) {
+    let Some(payload) = payload else {
+        // The payload could not be built, which can only mean the class is not
+        // in the closed set. There is no grammar-conforming payload to send,
+        // and a malformed one would be worse than none: the degradation stays
+        // recorded in the terminal snapshot.
+        return;
+    };
+    // `send` rather than `try_send`: a dropped diagnostic would silently
+    // reopen the gap this milestone closes, and the channel is bounded, so
+    // awaiting it costs back-pressure and not correctness.
+    let _ = output_tx.send(OutputChunk::Diagnostic(payload)).await;
+}
+
+/// Emits the diagnostic events for the degradations `setup` records.
+///
+/// Only degradations of *best-effort* requests are reported: a required
+/// request that could not be satisfied is refused before the target starts
+/// and is never described as a degradation.
+async fn report_setup_degradations(
+    output_tx: &mpsc::Sender<OutputChunk>,
+    sandbox_request: &SandboxRequest,
+    resource_request: &ResourceSetupRequest,
+    setup: &SetupOutcome,
+    reported: &mut ReportedDegradations,
+) {
+    if !reported.isolation
+        && let SandboxOutcome::NotApplied { reason } = &setup.sandbox
+        && let SandboxRequest::BestEffort { profile } = sandbox_request
+    {
+        reported.isolation = true;
+        send_diagnostic(output_tx, isolation_diagnostic(profile, reason)).await;
+    }
+    if let ResourceSetupOutcome::NotApplied { reason } = &setup.resources {
+        for dimension in best_effort_resource_dimensions(resource_request) {
+            if reported.resources.contains(&dimension) {
+                continue;
+            }
+            reported.resources.push(dimension);
+            send_diagnostic(output_tx, resources_diagnostic(dimension, reason)).await;
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RunnerRequest {
     argv: Vec<String>,
@@ -857,8 +1115,12 @@ impl std::fmt::Debug for RunnerRequest {
 }
 
 impl RunnerRequest {
-    /// Create an embedding request with conservative defaults. [`run`](LocalProcessRunner::run)
-    /// validates every field before setup or child creation.
+    /// Create an embedding request with conservative defaults.
+    ///
+    /// The request is covered by the `eggwork_core` domain contract like every
+    /// other construction path: [`RunnerRequest::contract_error`] reports a
+    /// violation without running anything, and [`run`](LocalProcessRunner::run)
+    /// refuses one before setup and before any child creation.
     pub fn new(argv: Vec<String>, root: impl Into<PathBuf>) -> Self {
         Self {
             argv,
@@ -888,6 +1150,12 @@ impl RunnerRequest {
         self.cwd = cwd;
     }
 
+    /// Replace the request's environment.
+    ///
+    /// The entries are the caller's raw name/value pairs; the environment-entry
+    /// rules themselves are owned by `eggwork_core` and are applied by
+    /// [`RunnerRequest::contract_error`] and by
+    /// [`run`](LocalProcessRunner::run), not restated here.
     pub fn set_environment(&mut self, environment: Vec<(String, String)>) {
         self.environment = environment;
     }
@@ -943,8 +1211,7 @@ impl RunnerRequest {
         root: impl Into<PathBuf>,
         provenance: ExecutionProvenance,
     ) -> Result<Self, RunnerError> {
-        spec.validate()
-            .map_err(|e| RunnerError::InvalidRequest(e.to_string()))?;
+        spec.validate().map_err(RunnerError::InvalidRequest)?;
         let CommandSpec {
             argv,
             cwd,
@@ -959,10 +1226,10 @@ impl RunnerRequest {
         let sandbox = match isolation {
             eggwork_core::IsolationRequirement::None => SandboxRequest::None,
             eggwork_core::IsolationRequirement::BestEffort => SandboxRequest::BestEffort {
-                profile: "workspace_rw".into(),
+                profile: WORKSPACE_RW_PROFILE.into(),
             },
             eggwork_core::IsolationRequirement::Required => SandboxRequest::Required {
-                profile: "workspace_rw".into(),
+                profile: WORKSPACE_RW_PROFILE.into(),
             },
         };
         Ok(Self {
@@ -970,10 +1237,7 @@ impl RunnerRequest {
             root: root.into(),
             cwd,
             environment: environment.into_iter().map(|e| (e.name, e.value)).collect(),
-            stdin: match stdin {
-                CoreStdinPolicy::Null => StdinPolicy::Null,
-                CoreStdinPolicy::Bytes(bytes) => StdinPolicy::Bytes(bytes),
-            },
+            stdin,
             timeout: Duration::from_millis(timeout_millis),
             capture_limit: output.capture_limit_bytes,
             event_chunk_bytes: output.event_chunk_bytes,
@@ -988,48 +1252,106 @@ impl RunnerRequest {
         })
     }
 
-    fn validate(&self) -> Result<PathBuf, RunnerError> {
-        if self.argv.is_empty()
-            || self.argv.len() > eggwork_core::MAX_ARG_COUNT
-            || self
-                .argv
-                .iter()
-                .any(|a| a.is_empty() || a.len() > eggwork_core::MAX_ARG_BYTES || a.contains('\0'))
-        {
-            return Err(RunnerError::InvalidRequest(
-                "argv is empty or contains an empty/NUL entry".into(),
-            ));
-        }
-        if self.environment.len() > MAX_ENV_COUNT
-            || self.environment.iter().any(|(k, v)| {
-                k.is_empty()
-                    || k.len() > MAX_ENV_NAME_BYTES
-                    || v.len() > MAX_ENV_VALUE_BYTES
-                    || k.contains('\0')
-                    || k.contains('=')
-                    || v.contains('\0')
+    /// The first violation of the request contract, if this request has one.
+    ///
+    /// The request contract is the `eggwork_core` domain contract -- the argv,
+    /// environment-entry, output-policy, timeout, stdin and resource rules --
+    /// plus the runner's own stricter argv-entry rule. It is checked here
+    /// without touching the filesystem, so an embedder can ask whether what it
+    /// built is acceptable before it runs anything.
+    ///
+    /// [`LocalProcessRunner::run`] refuses a request that has a violation,
+    /// before setup and before any child exists, with the same error. The
+    /// root-directory and working-directory rules are deliberately not part of
+    /// this answer: they are the runner's own, they need filesystem access, and
+    /// they are enforced at the same point.
+    pub fn contract_error(&self) -> Option<ValidationError> {
+        self.contract_violation()
+    }
+
+    /// The request's environment as core environment entries.
+    ///
+    /// The runner stores raw name/value pairs because that is what the child's
+    /// environment is built from, but the *rules* that govern an entry are
+    /// owned by `eggwork_core`. The entries are handed over as plain values so
+    /// that `eggwork_core` re-validates them rather than trusting them.
+    fn environment_entries(&self) -> Vec<EnvironmentEntry> {
+        self.environment
+            .iter()
+            .map(|(name, value)| EnvironmentEntry {
+                name: name.clone(),
+                value: value.clone(),
             })
-        {
-            return Err(RunnerError::InvalidRequest(
-                "environment violates bounds or syntax".into(),
-            ));
+            .collect()
+    }
+
+    /// The request's output policy as the core output policy.
+    fn output_policy(&self) -> OutputPolicy {
+        OutputPolicy {
+            capture_limit_bytes: self.capture_limit,
+            event_chunk_bytes: self.event_chunk_bytes,
+            overflow: self.overflow.clone(),
         }
-        if self.capture_limit > MAX_CAPTURE_BYTES
-            || self.event_chunk_bytes == 0
-            || self.event_chunk_bytes > MAX_EVENT_CHUNK_BYTES
-        {
-            return Err(RunnerError::InvalidRequest(
-                "output limits are outside supported bounds".into(),
-            ));
+    }
+
+    /// The request's resource requirements as the core resource requirements.
+    fn resource_requirements(&self) -> ResourceRequirements {
+        ResourceRequirements {
+            memory_bytes: self.resources.memory_bytes,
+            cpu_millis: self.resources.cpu_millis,
+            pids: self.resources.pids,
         }
-        if self.timeout.is_zero() || self.timeout > eggwork_core::MAX_TIMEOUT {
-            return Err(RunnerError::InvalidRequest(
-                "timeout must be positive".into(),
-            ));
+    }
+
+    /// The first contract violation in the request, in the canonical order.
+    ///
+    /// The order is the one `eggwork_core::CommandSpec::validate` uses -- argv,
+    /// environment, timeout, stdin, output, resources -- with the runner's own
+    /// argv-entry rule immediately after the argv bounds, so that a request
+    /// built through the builder path and the same request built through
+    /// `from_spec` report the *same* rule for the same input.
+    ///
+    /// Every rule below is owned by `eggwork_core` except the argv-entry rule,
+    /// which is the runner's own and is stricter than the core contract.
+    fn contract_violation(&self) -> Option<ValidationError> {
+        validate_argv(&self.argv)
+            .err()
+            .or_else(|| self.argv_entry_violation())
+            .or_else(|| validate_environment_entries(&self.environment_entries()).err())
+            .or_else(|| validate_timeout(self.timeout).err())
+            .or_else(|| self.stdin.validate().err())
+            .or_else(|| self.output_policy().validate().err())
+            .or_else(|| self.resource_requirements().validate().err())
+    }
+
+    /// The runner's own argv-entry rule.
+    ///
+    /// `eggwork_core` permits an empty argv entry; the runner does not. An
+    /// empty argument is not a protocol problem -- it is a child-process
+    /// construction hazard: the runner hands the argv to the operating system
+    /// as an argument vector, where an empty element is either a silent no-op
+    /// argument or an ambiguity the caller cannot see. The runner is therefore
+    /// deliberately *stricter* than its owner here, and this is the only rule
+    /// it adds on top of the core contract.
+    fn argv_entry_violation(&self) -> Option<ValidationError> {
+        self.argv
+            .iter()
+            .any(|argument| argument.is_empty())
+            .then_some(ValidationError::InvalidSyntax {
+                field: "argv entry",
+            })
+    }
+
+    fn validate(&self) -> Result<PathBuf, RunnerError> {
+        // Every core-owned rule is consumed from `eggwork_core` rather than
+        // restated here, so the runner cannot drift from the contract it
+        // claims to enforce.
+        if let Some(violation) = self.contract_violation() {
+            return Err(RunnerError::InvalidRequest(violation));
         }
-        self.stdin
-            .validate()
-            .map_err(|e| RunnerError::InvalidRequest(e.to_string()))?;
+        // The runner's own contract rules: the root-directory and
+        // working-directory resolution. `eggwork_core` does not own them,
+        // because they are about a filesystem the domain layer never sees.
         let root = self
             .root
             .canonicalize()
@@ -1054,32 +1376,6 @@ impl RunnerRequest {
             root.clone()
         };
         Ok(cwd)
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub enum StdinPolicy {
-    Null,
-    Bytes(Vec<u8>),
-}
-impl std::fmt::Debug for StdinPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Null => f.write_str("Null"),
-            Self::Bytes(bytes) => f
-                .debug_struct("Bytes")
-                .field("length", &bytes.len())
-                .field("value", &"[REDACTED]")
-                .finish(),
-        }
-    }
-}
-impl StdinPolicy {
-    fn validate(&self) -> Result<(), RunnerError> {
-        if matches!(self, Self::Bytes(v) if v.len() > eggwork_core::MAX_STDIN_BYTES) {
-            return Err(RunnerError::InvalidRequest("stdin exceeds limit".into()));
-        }
-        Ok(())
     }
 }
 
@@ -1154,6 +1450,10 @@ impl RunnerResult {
                 .or_else(|| self.cleanup.stdin_error.clone()),
             finalization_failure: None,
             artifact_count: 0,
+            // The runner owns the process, not the capture: the server's
+            // finalization decides the capture disposition and replaces this
+            // placeholder. The placeholder claims nothing.
+            artifact_capture: eggwork_core::ArtifactCaptureDisposition::Unknown,
             sandbox: Some(match &self.setup.sandbox {
                 SandboxOutcome::NotRequested => eggwork_core::SandboxResult::NotRequested,
                 SandboxOutcome::NotApplied { reason } => eggwork_core::SandboxResult::NotApplied {
@@ -1224,8 +1524,14 @@ fn resource_result(
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
+    /// The request violates the `eggwork_core` domain contract.
+    ///
+    /// The payload is the core [`ValidationError`], so the failure stays
+    /// attributable to the rule that produced it: an environment name with
+    /// invalid syntax and a duplicate environment name are two different
+    /// rules, and a caller can tell them apart without parsing a message.
     #[error("invalid execution request: {0}")]
-    InvalidRequest(String),
+    InvalidRequest(ValidationError),
     #[error("execution root is invalid: {0}")]
     InvalidRoot(String),
     #[error("working directory is invalid: {0}")]
@@ -1304,6 +1610,21 @@ impl LocalProcessRunner {
             .setup
             .prepare(&request.sandbox, &request.resources, &request.root)
             .await?;
+        // The degradations `prepare` decided are known before any process
+        // exists, so their diagnostics are emitted here — before the target is
+        // spawned, and therefore before the target can produce any output. A
+        // diagnostic the server derived from the runner's result instead would
+        // necessarily arrive after all target output, which is the gap this
+        // emission point exists to close.
+        let mut reported_degradations = ReportedDegradations::default();
+        report_setup_degradations(
+            &output_tx,
+            &request.sandbox,
+            &request.resources,
+            &setup,
+            &mut reported_degradations,
+        )
+        .await;
         #[cfg(target_os = "linux")]
         let use_helper = ((!matches!(request.sandbox, SandboxRequest::None)
             && matches!(setup.sandbox, SandboxOutcome::Applied { .. }))
@@ -1332,6 +1653,17 @@ impl LocalProcessRunner {
                             reason: error.to_string(),
                         };
                     }
+                    // The helper could not even be launched, so the target is
+                    // about to run without the requested enforcement. The
+                    // diagnostic is emitted here, before the target exists.
+                    report_setup_degradations(
+                        &output_tx,
+                        &request.sandbox,
+                        &request.resources,
+                        &setup,
+                        &mut reported_degradations,
+                    )
+                    .await;
                     None
                 }
                 Err(error) => return Err(error),
@@ -1384,6 +1716,19 @@ impl LocalProcessRunner {
                             reason: "resource helper could not verify the cgroup limits".into(),
                         };
                     }
+                    // The handshake failure is classified and the outcomes are
+                    // rewritten, and only now is the degradation reported: the
+                    // target is about to be re-spawned directly, with no
+                    // Landlock ruleset and no cgroup verification, so the
+                    // caller has to learn that before the target runs.
+                    report_setup_degradations(
+                        &output_tx,
+                        &request.sandbox,
+                        &request.resources,
+                        &setup,
+                        &mut reported_degradations,
+                    )
+                    .await;
                     let direct = direct_command(&request, cwd.clone());
                     let (direct, unit) =
                         wrap_resource_command(direct, &request.resources, &setup.resources)?;
@@ -1412,6 +1757,17 @@ impl LocalProcessRunner {
                             reason: error.to_string(),
                         };
                     }
+                    // Same rule as the `Ok(None)` arm above: the degradation is
+                    // reported after the handshake failure is classified and
+                    // before the target is re-spawned directly.
+                    report_setup_degradations(
+                        &output_tx,
+                        &request.sandbox,
+                        &request.resources,
+                        &setup,
+                        &mut reported_degradations,
+                    )
+                    .await;
                     let direct = direct_command(&request, cwd.clone());
                     let (direct, unit) =
                         wrap_resource_command(direct, &request.resources, &setup.resources)?;
@@ -1450,6 +1806,13 @@ impl LocalProcessRunner {
         let stderr = tree
             .take_stderr()
             .ok_or_else(|| RunnerError::Io("stderr pipe missing".into()))?;
+        // A post-mortem resource observation is only knowable after the target
+        // exited, so the diagnostic that reports it needs a sender of its own:
+        // `output_tx` is moved into the readers below. The clone is dropped
+        // again as soon as the observation has been reported, so the output
+        // channel still closes exactly when the readers finish.
+        #[cfg(target_os = "linux")]
+        let diagnostic_tx = output_tx.clone();
         let stdout_task = spawn_reader(
             stdout,
             false,
@@ -1528,22 +1891,40 @@ impl LocalProcessRunner {
         // post-mortem counter the helper could not open, is not evidence that
         // the limit held. Record `NotApplied` rather than letting it fall
         // through as `Applied`.
-        if matches!(setup.resources, ResourceSetupOutcome::Applied { .. }) {
-            let requested = &request.resources;
-            let unobserved = if matches!(requested.memory_bytes, Requirement::NotRequested) {
-                false
-            } else {
-                resource_unobserved.contains(&eggwork_core::ResourceDimension::Memory)
-            } || if matches!(requested.pids, Requirement::NotRequested) {
-                false
-            } else {
-                resource_unobserved.contains(&eggwork_core::ResourceDimension::Pids)
-            };
-            if unobserved {
-                setup.resources = ResourceSetupOutcome::NotApplied {
-                    reason: "installed resource limits could not be observed after exit".into(),
+        {
+            if matches!(setup.resources, ResourceSetupOutcome::Applied { .. }) {
+                let requested = &request.resources;
+                let unobserved = if matches!(requested.memory_bytes, Requirement::NotRequested) {
+                    false
+                } else {
+                    resource_unobserved.contains(&eggwork_core::ResourceDimension::Memory)
+                } || if matches!(requested.pids, Requirement::NotRequested) {
+                    false
+                } else {
+                    resource_unobserved.contains(&eggwork_core::ResourceDimension::Pids)
                 };
+                if unobserved {
+                    let reason = "installed resource limits could not be observed after exit";
+                    setup.resources = ResourceSetupOutcome::NotApplied {
+                        reason: reason.into(),
+                    };
+                    // This degradation is a post-mortem fact: the helper
+                    // reports the unobservable counter only after the target
+                    // exited, so the diagnostic cannot precede the target's
+                    // output the way a setup-time degradation does. It still
+                    // precedes the terminal event, because the server drains
+                    // the output channel before it publishes the terminal
+                    // state.
+                    for dimension in unobserved_resource_dimensions(requested, &resource_unobserved)
+                    {
+                        send_diagnostic(&diagnostic_tx, resources_diagnostic(dimension, reason))
+                            .await;
+                    }
+                }
             }
+            // The sender is released here, so the output channel keeps closing
+            // exactly when the readers finish.
+            drop(diagnostic_tx);
         }
         #[cfg(target_os = "linux")]
         let resource_cleanup_warning = if let Some(unit) = resource_unit.as_deref() {
@@ -1615,33 +1996,92 @@ impl LocalProcessRunner {
     }
 }
 
-fn denied_environment_key(key: &str) -> bool {
-    let upper = key.to_ascii_uppercase();
-    [
-        "LD_",
-        "DYLD_",
-        "PATH",
-        "IFS",
-        "SHELLOPTS",
-        "CDPATH",
-        "BASH_ENV",
-        "ENV",
-        "PYTHONPATH",
-        "PYTHONHOME",
-        "NODE_OPTIONS",
-        "RUBYOPT",
-        "PERL5OPT",
-        "GIT_ASKPASS",
-        "SSH_ASKPASS",
-        "GIT_CONFIG",
-        "GIT_CONFIG_",
-        "AWS_",
-        "AZURE_",
-        "GOOGLE_",
-        "SSH_AUTH_SOCK",
-    ]
-    .iter()
-    .any(|denied| upper == *denied || upper.starts_with(denied))
+/// True when the node owns `key` on this platform.
+///
+/// The node-owned class is the node's own baseline: the node owns exactly the
+/// keys its baseline sets. On the Unix baseline that is
+/// `environment_policy::RESERVED_KEYS`, which is the shared policy's class.
+/// The Windows baseline is runner-local — its values are read from the parent
+/// process at spawn time, and the sandbox helper is Linux-only so it never
+/// sees a Windows launch — so it is derived from the baseline the runner
+/// actually installs rather than from the shared list.
+///
+/// The rule is deliberately *not* "is this key on the deny-list". A deny-list
+/// entry is a key the caller may not set at all; a node-owned key is one the
+/// node sets itself, and the caller's value for it is discarded in favour of
+/// the node's.
+fn node_owned_key(key: &str, baseline: &[(&'static str, String)]) -> bool {
+    baseline
+        .iter()
+        .any(|(owned, _)| owned.eq_ignore_ascii_case(key))
+}
+
+/// The environment a child process receives, built from the shared policy.
+///
+/// This is the single place the runner builds an environment, and both of the
+/// runner's launch paths use it, so the direct path and the sandbox-helper
+/// path cannot disagree about what a child sees.
+///
+/// Three rules, in the order they are applied:
+///
+/// 1. **The node's baseline wins.** The baseline is installed first and a
+///    caller-supplied value for a node-owned key is discarded. Before this
+///    rule, a caller that set `LANG` produced a launch specification with two
+///    `LANG` entries; the helper refuses a specification with duplicate keys,
+///    and a best-effort request answered that pre-target refusal by
+///    re-spawning the target with no Landlock ruleset at all. The
+///    observable result was a successful, entirely unconfined execution.
+/// 2. **A denied key is dropped.** Silently, and only here: the runner is the
+///    request-normalisation boundary, and a hardened environment has to be a
+///    property of the node rather than something the caller has to get right.
+///    The helper refuses a launch that contains one; the difference is a
+///    deliberate two-layer contract, and only the list is shared.
+/// 3. **Everything else is the caller's**, with a repeated key resolved to
+///    its last value. Collapsing the repeat is what keeps the launch
+///    specification free of duplicate keys, which the helper refuses.
+///
+/// The provenance entries are appended last and are node-owned too: they are
+/// neutral attribution, and a caller cannot forge them.
+fn build_child_environment(request: &RunnerRequest) -> Vec<(String, String)> {
+    let baseline = baseline_child_environment();
+    let mut environment: Vec<(String, String)> = baseline
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), value.clone()))
+        .collect();
+    for (key, value) in &request.environment {
+        if environment_policy::denied_environment_key(key) {
+            continue;
+        }
+        if node_owned_key(key, &baseline) {
+            continue;
+        }
+        match environment.iter_mut().find(|(existing, _)| existing == key) {
+            Some(slot) => slot.1 = value.clone(),
+            None => environment.push((key.clone(), value.clone())),
+        }
+    }
+    if let Some(id) = &request.provenance.execution_id {
+        environment.push(("EGGWORK_EXECUTION_ID".into(), id.as_str().into()));
+    }
+    if let Some(generation) = request.provenance.generation {
+        environment.push((
+            "EGGWORK_EXECUTION_GENERATION".into(),
+            generation.get().to_string(),
+        ));
+    }
+    environment
+}
+
+/// The keys the node's own baseline installs for an execution child.
+///
+/// The list is derived from the baseline the runner actually uses, so it
+/// cannot drift from it: it is the shared policy's Unix class on Unix, and the
+/// runner-local Windows class on Windows.
+pub fn baseline_environment_keys() -> Vec<&'static str> {
+    baseline_child_environment()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect()
 }
 
 fn direct_command(request: &RunnerRequest, cwd: PathBuf) -> Command {
@@ -1654,39 +2094,12 @@ fn direct_command(request: &RunnerRequest, cwd: PathBuf) -> Command {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     command.env_clear();
-    for (key, value) in baseline_child_environment() {
+    for (key, value) in build_child_environment(request) {
         command.env(key, value);
-    }
-    for (key, value) in &request.environment {
-        if !denied_environment_key(key) {
-            command.env(key, value);
-        }
-    }
-    if let Some(id) = &request.provenance.execution_id {
-        command.env("EGGWORK_EXECUTION_ID", id.as_str());
-    }
-    if let Some(generation) = request.provenance.generation {
-        command.env("EGGWORK_EXECUTION_GENERATION", generation.get().to_string());
     }
     command
 }
 
-/// The platform-appropriate minimum environment for an execution child.
-///
-/// This baseline is deliberately platform-shaped. It used to declare a
-/// Unix-only environment unconditionally, including `PATH=/usr/bin:/bin`, so a
-/// Windows child would have been handed a `PATH` that does not exist on
-/// Windows and no `SystemRoot`. That shaping was written against the M004
-/// qualification symptom of `state: Failed`, `failure: Internal`,
-/// `exit_code: null` -- and it could not have fixed Windows qualification,
-/// because at that time no Windows child existed at all: `run` refused with
-/// `UnsupportedPlatform` before spawn and the server mapped that refusal to
-/// `Internal`. Foundation M004 removed the refusal, which makes this shaping
-/// load-bearing instead of merely aspirational.
-///
-/// Unix keeps the narrow, deterministic baseline the existing Linux and macOS
-/// evidence was gathered with. Windows gets the system directories its loader
-/// and `cmd.exe` require, without inheriting the caller's full environment.
 /// What a settled output monitor means for the running child.
 ///
 /// `Some` is a termination reason and ends the wait. `None` means the monitor
@@ -1713,27 +2126,56 @@ fn monitor_termination(overflowed: bool) -> Option<TerminationReason> {
     overflowed.then_some(TerminationReason::OutputLimit)
 }
 
+/// The platform-appropriate minimum environment for an execution child.
+///
+/// The baseline is the node's own: it is installed before any caller-supplied
+/// entry, and a caller-supplied value for a baseline key is discarded in
+/// favour of the node's. See `build_child_environment` for the rules.
+///
+/// The Unix baseline is the shared policy's, and it is read from the generated
+/// policy module rather than written out here, so the runner and the sandbox
+/// helper cannot disagree about it.
+///
+/// The Windows baseline is deliberately runner-local and platform-shaped. It
+/// used to declare a Unix-only environment unconditionally, including
+/// `PATH=/usr/bin:/bin`, so a Windows child would have been handed a `PATH`
+/// that does not exist on Windows and no `SystemRoot`. That shaping was
+/// written against the M004 qualification symptom of `state: Failed`,
+/// `failure: Internal`, `exit_code: null` -- and it could not have fixed
+/// Windows qualification, because at that time no Windows child existed at
+/// all: `run` refused with `UnsupportedPlatform` before spawn and the server
+/// mapped that refusal to `Internal`. Foundation M004 removed the refusal,
+/// which makes this shaping load-bearing instead of merely aspirational.
+///
+/// Windows gets the system directories its loader and `cmd.exe` require,
+/// without inheriting the caller's full environment. The Windows `PATH` is
+/// deliberately *not* the shared policy's `PATH` value: the `PATH` contract is
+/// a Linux/Unix contract, and the sandbox helper never sees a Windows launch.
 fn baseline_child_environment() -> Vec<(&'static str, String)> {
-    let mut baseline: Vec<(&'static str, String)> = vec![
-        ("CI", "1".to_owned()),
-        ("NO_COLOR", "1".to_owned()),
-        ("TERM", "dumb".to_owned()),
-        ("GIT_TERMINAL_PROMPT", "0".to_owned()),
-        ("PAGER", "cat".to_owned()),
-    ];
-    #[cfg(not(windows))]
-    baseline.extend([
-        ("PATH", "/usr/bin:/bin".to_owned()),
-        ("LANG", "C.UTF-8".to_owned()),
-        ("LC_ALL", "C.UTF-8".to_owned()),
-    ]);
-    #[cfg(windows)]
-    {
-        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
-        baseline.push(("SystemRoot", system_root.clone()));
-        baseline.push(("windir", system_root.clone()));
-        baseline.push(("PATH", format!(r"{system_root}\System32;{system_root}")));
-    }
+    platform_baseline()
+}
+
+/// The Unix baseline: the shared policy's, in the policy's order.
+#[cfg(not(windows))]
+fn platform_baseline() -> Vec<(&'static str, String)> {
+    environment_policy::BASELINE
+        .iter()
+        .map(|(key, value)| (*key, (*value).to_owned()))
+        .collect()
+}
+
+/// The Windows baseline: the shared policy's platform-independent part, plus
+/// the system directories the loader and `cmd.exe` need.
+#[cfg(windows)]
+fn platform_baseline() -> Vec<(&'static str, String)> {
+    let mut baseline: Vec<(&'static str, String)> = environment_policy::BASELINE_COMMON
+        .iter()
+        .map(|(key, value)| (*key, (*value).to_owned()))
+        .collect();
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+    baseline.push(("SystemRoot", system_root.clone()));
+    baseline.push(("windir", system_root.clone()));
+    baseline.push(("PATH", format!(r"{system_root}\System32;{system_root}")));
     baseline
 }
 
@@ -1823,6 +2265,7 @@ impl SandboxSession {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
 enum SandboxWaitError {
     BeforeTarget(RunnerError),
     AfterTarget(RunnerError),
@@ -1837,6 +2280,34 @@ impl SandboxWaitError {
     }
 }
 
+/// The runner's reading of the helper's first status byte.
+///
+/// `Ok(false)` means the helper will not report resource counters and the run
+/// continues. `Ok(true)` means the helper applied its mechanics and the second
+/// byte says whether the target started. `Err` is a refusal that happened
+/// before the target existed, and the byte is carried in the message so an
+/// operator can tell an environment-policy refusal (13) apart from the general
+/// specification-validation refusal (12) — the two are different failures and
+/// a single "the helper refused" line cannot distinguish them.
+///
+/// Every refusal, whatever the byte, is a *pre-target* failure: the target did
+/// not exist yet, so nothing ran unconfined by accident. What a caller does
+/// with that refusal is the caller's decision, and the required path fails
+/// closed on it.
+#[cfg(target_os = "linux")]
+fn classify_helper_status(status: u8) -> Result<bool, SandboxWaitError> {
+    match status {
+        0 | 2 | 3 | 30 | 31 => Ok(false),
+        1 => Ok(true),
+        code if code >= 4 => Err(SandboxWaitError::BeforeTarget(RunnerError::Setup(format!(
+            "sandbox helper rejected its launch specification (status {code})"
+        )))),
+        _ => Err(SandboxWaitError::BeforeTarget(RunnerError::Setup(
+            "sandbox status was invalid".into(),
+        ))),
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl SandboxChannel {
     fn new(
@@ -1847,7 +2318,7 @@ impl SandboxChannel {
     ) -> Result<Self, RunnerError> {
         let profile = match &request.sandbox {
             SandboxRequest::BestEffort { profile } | SandboxRequest::Required { profile }
-                if profile == "workspace_rw" =>
+                if profile == WORKSPACE_RW_PROFILE =>
             {
                 Some(profile.clone())
             }
@@ -1868,30 +2339,13 @@ impl SandboxChannel {
         let status_path = directory.path().join("status.sock");
         let listener = UnixListener::bind(&status_path)
             .map_err(|_| RunnerError::Setup("sandbox status channel unavailable".into()))?;
-        let mut environment = vec![
-            ("PATH".into(), "/usr/bin:/bin".into()),
-            ("LANG".into(), "C.UTF-8".into()),
-            ("LC_ALL".into(), "C.UTF-8".into()),
-            ("CI".into(), "1".into()),
-            ("NO_COLOR".into(), "1".into()),
-            ("TERM".into(), "dumb".into()),
-            ("GIT_TERMINAL_PROMPT".into(), "0".into()),
-            ("PAGER".into(), "cat".into()),
-        ];
-        for (key, value) in &request.environment {
-            if !denied_environment_key(key) {
-                environment.push((key.clone(), value.clone()));
-            }
-        }
-        if let Some(id) = &request.provenance.execution_id {
-            environment.push(("EGGWORK_EXECUTION_ID".into(), id.as_str().into()));
-        }
-        if let Some(generation) = request.provenance.generation {
-            environment.push((
-                "EGGWORK_EXECUTION_GENERATION".into(),
-                generation.get().to_string(),
-            ));
-        }
+        // The launch specification's environment is built by the same function
+        // that builds the direct child's environment, so the two paths cannot
+        // disagree about a node-owned key's value. Before that was true, the
+        // direct path applied the caller's `LANG` *after* the node's baseline
+        // while the specification carried both, and the helper refused the
+        // resulting duplicate-key specification.
+        let environment = build_child_environment(request);
         let spec = SandboxLaunchSpec {
             schema_version: 1,
             profile,
@@ -1961,10 +2415,15 @@ impl SandboxChannel {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("LANG", "C.UTF-8")
-            .env("LC_ALL", "C.UTF-8");
+            .env_clear();
+        // The helper's own environment is the node's baseline, from the same
+        // shared policy the target's environment is built from. `env_clear()`
+        // matters here: the helper must not inherit the daemon's `LD_*`,
+        // `GIT_*`, or cloud variables while it is parsing a specification that
+        // a deny-list was supposed to keep clean.
+        for (key, value) in environment_policy::BASELINE {
+            command.env(key, value);
+        }
         command
     }
 
@@ -1988,10 +2447,9 @@ impl SandboxChannel {
                 result
                     .map_err(|_| SandboxWaitError::BeforeTarget(RunnerError::Setup("sandbox status timed out".into())))?
                     .map_err(|_| SandboxWaitError::BeforeTarget(RunnerError::Setup("sandbox status channel failed".into())))?;
-                match status[0] {
-                    0 | 2 | 3 | 30 | 31 => Ok(None),
-                    code if code >= 4 => Err(SandboxWaitError::BeforeTarget(RunnerError::Setup(format!("sandbox helper rejected its launch specification (status {code})")))),
-                    1 => {
+                match classify_helper_status(status[0]) {
+                    Ok(false) => Ok(None),
+                    Ok(true) => {
                         let mut target_spawned = [0u8; 1];
                         tokio::select! {
                             _ = cancellation.cancelled() => return Err(SandboxWaitError::AfterTarget(RunnerError::CancelledBeforeSpawn)),
@@ -2007,7 +2465,7 @@ impl SandboxChannel {
                             _ => Err(SandboxWaitError::AfterTarget(RunnerError::Setup("sandbox status was invalid".into()))),
                         }
                     }
-                    _ => Err(SandboxWaitError::BeforeTarget(RunnerError::Setup("sandbox status was invalid".into()))),
+                    Err(error) => Err(error),
                 }
             }
         }
@@ -2044,13 +2502,12 @@ fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
                 let _ = overflow_tx.send(true);
             }
             for bytes in buffer[..count].chunks(chunk_limit) {
-                if output_tx
-                    .try_send(OutputChunk {
-                        stderr,
-                        bytes: bytes.to_vec(),
-                    })
-                    .is_err()
-                {
+                let chunk = if stderr {
+                    OutputChunk::Stderr(bytes.to_vec())
+                } else {
+                    OutputChunk::Stdout(bytes.to_vec())
+                };
+                if output_tx.try_send(chunk).is_err() {
                     dropped += bytes.len() as u64;
                 }
             }
@@ -2186,7 +2643,11 @@ mod tests {
             )
         } else {
             (
-                vec!["/bin/true".to_owned()],
+                // `/usr/bin/true`, not `/bin/true`: macOS keeps `true` in
+                // `/usr/bin`, and `/bin` holds only the small set of tools
+                // that were always there. A Unix-shaped absolute path is a
+                // macOS-shaped failure.
+                vec!["/usr/bin/true".to_owned()],
                 vec![
                     "/usr/bin/touch".to_owned(),
                     marker.to_str().unwrap().to_owned(),
@@ -2401,9 +2862,18 @@ mod tests {
         let mut cwd = request(temp.path(), &["pwd"]);
         cwd.cwd = Some(RelativePath::new("work").unwrap());
         let result = run(cwd).await.unwrap();
+        // The child reports the *physical* working directory: macOS resolves
+        // `/var` to `/private/var`, so the expectation is canonicalized
+        // rather than compared against the path the temporary directory was
+        // created under.
+        let expected = temp
+            .path()
+            .join("work")
+            .canonicalize()
+            .expect("the confined working directory is canonical");
         assert_eq!(
             String::from_utf8_lossy(&result.stdout.head).trim(),
-            temp.path().join("work").to_string_lossy()
+            expected.to_string_lossy()
         );
 
         let mut overflow = request(
@@ -2528,10 +2998,329 @@ mod tests {
         );
     }
 
+    /// The three cgroup feature names are frozen byte-for-byte.
+    ///
+    /// A node advertises these and a server admits a required resource
+    /// dimension only when the advertised name matches, so a renamed byte
+    /// turns every memory-, CPU- or pids-limited request into a capability
+    /// refusal. The values are asserted here rather than only through the
+    /// constants, so a value change is a test failure even when the constant
+    /// and its consumer are edited together.
+    #[test]
+    fn cgroup_capability_feature_strings_are_frozen() {
+        assert_eq!(CGROUPS_V2_MEMORY_CAPABILITY, "resources.cgroups-v2.memory");
+        assert_eq!(CGROUPS_V2_CPU_CAPABILITY, "resources.cgroups-v2.cpu");
+        assert_eq!(CGROUPS_V2_PIDS_CAPABILITY, "resources.cgroups-v2.pids");
+    }
+
+    /// The sandbox profile name is frozen byte-for-byte.
+    ///
+    /// The helper is a standalone binary with its own literal, so the two
+    /// spellings are pinned together by the helper's test rather than by a
+    /// shared constant. This assertion is the runner's half of that pair.
+    #[test]
+    fn the_workspace_rw_profile_name_is_frozen() {
+        assert_eq!(WORKSPACE_RW_PROFILE, "workspace_rw");
+    }
+
+    /// The advertisement site cannot invent a feature name.
+    ///
+    /// The probe table is the source of every resource feature the runner can
+    /// advertise, and it names them with the exported constants. A literal
+    /// typed back into the table would fail this on any host, because the
+    /// check reads the table rather than a list of names written here.
+    #[test]
+    fn the_probe_table_advertises_exactly_the_exported_constants() {
+        let names: Vec<&str> = CGROUP_PROBE_TABLE
+            .iter()
+            .map(|(feature, _)| *feature)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                CGROUPS_V2_MEMORY_CAPABILITY,
+                CGROUPS_V2_CPU_CAPABILITY,
+                CGROUPS_V2_PIDS_CAPABILITY,
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn no_setup_advertises_empty_dynamic_capabilities() {
         let setup = NoExecutionSetup;
         let runtime = setup.execution_capabilities().await;
         assert!(runtime.is_empty());
+    }
+
+    /// The node-owned class is the node's own baseline.
+    ///
+    /// If the two could drift, the runner would discard a caller's value for a
+    /// key the helper still expects to carry the node's value, and the helper
+    /// would refuse the launch — the same collision that used to cost a
+    /// best-effort execution its confinement.
+    #[test]
+    fn the_node_owned_class_is_the_node_owned_baseline() {
+        let baseline_keys: Vec<&str> = environment_policy::BASELINE
+            .iter()
+            .map(|(key, _)| *key)
+            .collect();
+        assert_eq!(
+            environment_policy::RESERVED_KEYS,
+            baseline_keys.as_slice(),
+            "the node-owned class and the node-owned baseline must be the same set"
+        );
+        for (key, value) in environment_policy::BASELINE {
+            assert_eq!(
+                environment_policy::baseline_value(key),
+                Some(*value),
+                "the baseline value of {key} must be the policy's value"
+            );
+            assert!(
+                environment_policy::is_reserved_key(key),
+                "{key} is in the baseline and must be node-owned"
+            );
+        }
+    }
+
+    /// A caller's value for a node-owned key never reaches the child.
+    ///
+    /// The live defect was that the caller's `LANG` was *appended* to the
+    /// node's baseline, so the child saw the caller's locale and the launch
+    /// specification carried two `LANG` entries.
+    ///
+    /// The node-owned class is the **platform** baseline: the node owns a key
+    /// only where it installs that key. The Unix baseline pins the locale, so
+    /// `LANG` and `LC_ALL` are the node's there; the Windows baseline
+    /// deliberately installs no locale keys, so on Windows they are the
+    /// caller's. The rule under test therefore holds on every platform: for
+    /// every key the node installs *here*, the node's value wins and the key
+    /// appears exactly once.
+    #[test]
+    fn a_caller_supplied_node_owned_key_does_not_replace_the_node_value() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let mut req = request(root.path(), &["/bin/sh", "-c", "true"]);
+        req.environment = vec![
+            ("LANG".into(), "en_US.UTF-8".into()),
+            ("LC_ALL".into(), "en_US.UTF-8".into()),
+            ("CI".into(), "false".into()),
+            ("lang".into(), "de_DE.UTF-8".into()),
+        ];
+        let environment = build_child_environment(&req);
+        let node_owned = baseline_child_environment();
+        for (key, node_value) in &node_owned {
+            let matching: Vec<&String> = environment
+                .iter()
+                .filter(|(name, _)| name == key)
+                .map(|(_, value)| value)
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "{key} must appear exactly once in the child environment"
+            );
+            assert_eq!(matching[0], node_value, "{key} must carry the node's value");
+            // A differently-cased spelling of a node-owned key is the same key,
+            // so the caller's spelling is discarded too.
+            let lower = key.to_ascii_lowercase();
+            if lower != *key {
+                assert!(
+                    !environment.iter().any(|(name, _)| name == &lower),
+                    "{lower} is a differently-cased spelling of the node-owned {key}"
+                );
+            }
+        }
+    }
+
+    /// A denied key is dropped, and only dropped.
+    ///
+    /// The runner is the request-normalisation boundary: it drops the key
+    /// silently and says nothing, because a hardened environment has to be a
+    /// property of the node rather than something the caller has to get right.
+    /// The helper's refusal is a different layer and a different behaviour.
+    #[test]
+    fn a_caller_supplied_denied_key_does_not_reach_the_child() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let mut req = request(root.path(), &["/bin/sh", "-c", "true"]);
+        req.environment = vec![
+            ("LD_PRELOAD".into(), "/tmp/evil.so".into()),
+            ("AWS_SECRET_ACCESS_KEY".into(), "secret".into()),
+            ("PYTHONPATH".into(), "/tmp".into()),
+            ("KEEP_ME".into(), "kept".into()),
+        ];
+        let environment = build_child_environment(&req);
+        for denied in ["LD_PRELOAD", "AWS_SECRET_ACCESS_KEY", "PYTHONPATH"] {
+            assert!(
+                !environment.iter().any(|(name, _)| name == denied),
+                "{denied} must not reach the child"
+            );
+        }
+        assert!(
+            environment
+                .iter()
+                .any(|(name, value)| name == "KEEP_ME" && value == "kept"),
+            "a caller-controlled key must reach the child"
+        );
+    }
+
+    /// A repeated caller key is resolved to its last value.
+    ///
+    /// The launch specification must not carry a duplicate key: the helper
+    /// refuses a specification that does, and a best-effort request answers
+    /// that refusal by re-spawning the target with no Landlock ruleset.
+    #[test]
+    fn a_repeated_caller_key_is_resolved_to_one_entry() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let mut req = request(root.path(), &["/bin/sh", "-c", "true"]);
+        req.environment = vec![
+            ("REPEATED".into(), "first".into()),
+            ("REPEATED".into(), "second".into()),
+        ];
+        let environment = build_child_environment(&req);
+        let matching: Vec<&String> = environment
+            .iter()
+            .filter(|(name, _)| name == "REPEATED")
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(matching, vec!["second"]);
+    }
+
+    /// The launch specification carries exactly one entry per node-owned key,
+    /// with the node's value.
+    ///
+    /// This is the regression for the live defect. The helper refuses a
+    /// specification with duplicate keys, so a specification that carried the
+    /// caller's `LANG` *and* the node's `LANG` was refused with status 12,
+    /// and a best-effort request then ran the target with no Landlock ruleset
+    /// at all.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_launch_specification_carries_one_entry_per_node_owned_key() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let mut req = request(root.path(), &["/bin/sh", "-c", "true"]);
+        req.sandbox = SandboxRequest::BestEffort {
+            profile: "workspace_rw".into(),
+        };
+        req.environment = vec![("LANG".into(), "en_US.UTF-8".into())];
+        let channel = SandboxChannel::new(
+            Path::new("/nonexistent/eggwork-sandbox-helper"),
+            &req,
+            root.path().to_path_buf(),
+            false,
+        )
+        .expect("sandbox channel");
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(channel.spec_path).expect("spec"))
+                .expect("spec json");
+        let environment = spec["environment"]
+            .as_array()
+            .expect("environment array")
+            .iter()
+            .map(|entry| {
+                (
+                    entry[0].as_str().expect("key").to_owned(),
+                    entry[1].as_str().expect("value").to_owned(),
+                )
+            })
+            .collect::<Vec<(String, String)>>();
+        for key in environment_policy::RESERVED_KEYS {
+            let matching: Vec<&String> = environment
+                .iter()
+                .filter(|(name, _)| name == *key)
+                .map(|(_, value)| value)
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "the specification must carry exactly one {key}"
+            );
+            assert_eq!(
+                matching[0],
+                environment_policy::baseline_value(key).expect("baseline value"),
+                "the specification's {key} must carry the node's value"
+            );
+        }
+        assert_eq!(
+            environment_policy::PATH_VALUE,
+            "/usr/bin:/bin",
+            "the `PATH` contract is a Linux/Unix contract"
+        );
+        assert!(
+            environment
+                .iter()
+                .any(|(name, value)| name == "PATH" && value == environment_policy::PATH_VALUE),
+            "the specification's PATH must carry the contract value"
+        );
+    }
+
+    /// The direct path and the launch specification agree.
+    ///
+    /// They used to disagree: the direct path applied the caller's `LANG`
+    /// after the node's baseline, so the child saw the caller's locale, while
+    /// the specification carried both entries and was refused.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_direct_path_and_the_launch_specification_agree() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let mut req = request(root.path(), &["/bin/sh", "-c", "true"]);
+        req.sandbox = SandboxRequest::BestEffort {
+            profile: "workspace_rw".into(),
+        };
+        req.environment = vec![
+            ("LANG".into(), "en_US.UTF-8".into()),
+            ("CI".into(), "false".into()),
+            ("CALLER_KEY".into(), "caller".into()),
+        ];
+        let direct = build_child_environment(&req);
+        let channel = SandboxChannel::new(
+            Path::new("/nonexistent/eggwork-sandbox-helper"),
+            &req,
+            root.path().to_path_buf(),
+            false,
+        )
+        .expect("sandbox channel");
+        let spec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(channel.spec_path).expect("spec"))
+                .expect("spec json");
+        let specified = spec["environment"]
+            .as_array()
+            .expect("environment array")
+            .iter()
+            .map(|entry| {
+                (
+                    entry[0].as_str().expect("key").to_owned(),
+                    entry[1].as_str().expect("value").to_owned(),
+                )
+            })
+            .collect::<Vec<(String, String)>>();
+        assert_eq!(direct, specified);
+    }
+
+    /// The environment-policy refusal is its own status, and the runner
+    /// treats it as a failure that happened before the target existed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_helper_status_bytes_classify_a_refusal_before_the_target() {
+        for (byte, expected) in [
+            (0u8, false),
+            (2, false),
+            (3, false),
+            (30, false),
+            (31, false),
+        ] {
+            assert!(
+                matches!(classify_helper_status(byte), Ok(value) if value == expected),
+                "status {byte} must not be a refusal"
+            );
+        }
+        assert!(matches!(classify_helper_status(1), Ok(true)));
+        for code in [12u8, 13] {
+            match classify_helper_status(code) {
+                Err(SandboxWaitError::BeforeTarget(RunnerError::Setup(message))) => assert!(
+                    message.contains(&format!("status {code}")),
+                    "the refusal must name its status byte: {message}"
+                ),
+                _ => panic!("status {code} must be a pre-target refusal"),
+            }
+        }
     }
 }

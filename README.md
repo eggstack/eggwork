@@ -128,10 +128,21 @@ filesystem or resource isolation: a `Required` isolation or resource request is
 refused before the target starts, and a best-effort request is reported as
 `NotApplied` rather than enforced.
 
-**Windows service management is unsupported and fails closed** — `eggworkd` has
-no service-control dispatcher, so a registered service can never reach
-`Running`. Every mutating `service` verb is refused before any mutation; Windows
-binary installation and daemon runtime are unaffected.
+**Windows refuses declared artifacts; it does not capture them.** A Windows
+node cannot open a file beneath the workspace root without traversing a
+symlink, so it refuses a declared output instead of capturing it. The node does
+not advertise the `artifact.declared.v1` capability, and an execution that
+declares outputs ends in a failed state with a `failed` capture disposition and
+a diagnostic event — never a successful execution whose declared outputs were
+silently dropped.
+
+**Windows hosts a real service.** `eggworkd service-host --config <path>` is the
+Windows service entry: it joins the service control manager, reports
+`START_PENDING` while the node comes up, claims `RUNNING` only once the node is
+ready, and converges the active executions on `STOP` before it reports `STOPPED`.
+Eggup still owns registration and install/start/stop/uninstall — Eggwork hosts
+the process, it does not manage the service. The lifecycle proof is a
+source-built hosted run; no published release carries it yet.
 
 ## Design and contribution
 

@@ -5,9 +5,9 @@ description: Run the mandatory pre-submit verification gate for eggwork before a
 
 # Pre-submit gate
 
-Run the full gate before every commit. Six of the seven commands are cheap; the
-one that costs real time is the workspace test suite, so start it first and read
-results while it runs.
+Run the full gate before every commit. All but two of the commands are cheap;
+the ones that cost real time are the workspace test suite and the two
+documentation gates, so start them first and read results while they run.
 
 ```bash
 cargo test --locked --workspace --all-targets          # slow — start first
@@ -17,6 +17,9 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo check --workspace
 python3 -m unittest discover --start-directory tests/release --top-level-directory tests/release
+python3 scripts/check_doc_citations.py
+python3 scripts/check_doc_citations.py --prove-negative-exit
+python3 scripts/check_quickstart_sync.py
 git diff --check
 ```
 
@@ -48,7 +51,10 @@ tag. See the `cut-a-release` skill.
 | `--prove-negative-exit` | Proves the scanner *detects* a synthetic forbidden spawn | **Not** a second full guard pass: it returns before `scan_sources()`/`check_dependencies()` |
 | `cargo fmt --check` | Formatting drift (no `rustfmt.toml`, so default rustfmt) | — |
 | `cargo clippy … -D warnings` | Lints; `unsafe_code = "deny"` and `clippy::all = "warn"` are workspace-level | — |
-| `unittest discover` | The 52 Python harness tests backing `qualify_release.py`, `release_candidate_probe.py`, `verify_windows_reproducibility.py` | The Rust side |
+| `unittest discover` | The Python harness tests backing `qualify_release.py`, `release_candidate_probe.py`, `verify_windows_reproducibility.py`, and the two documentation gates | The Rust side |
+| `check_doc_citations.py` | A citation under `architecture/` or `docs/` that names a line number, a path that does not exist, a symbol that is not in the named file, or an ambiguous in-file symbol | Whether the cited symbol is the one the sentence *means* — that part is the design record's own re-verification |
+| `check_doc_citations.py --prove-negative-exit` | Proves the citation gate *rejects* a deliberately wrong citation and accepts a correct one | A second full pass over the tree |
+| `check_quickstart_sync.py` | `docs/quickstart.md` drifting from `scripts/quickstart.sh`, and the document's shown `doctor` output drifting from the node's real report | Whether the quickstart's steps are the *right* steps |
 | `git diff --check` | Whitespace errors and conflict markers | — |
 
 ## Two limits worth knowing before you trust a green gate

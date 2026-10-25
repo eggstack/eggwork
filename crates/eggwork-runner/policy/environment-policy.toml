@@ -1,0 +1,153 @@
+# The node's environment policy — the single owner of the sandbox
+# environment contract.
+#
+# `eggwork-runner` and `eggwork-sandbox-helper` both enforce this policy, and
+# the helper is a standalone binary that may not depend on any workspace crate.
+# The duplication that forced the helper to keep its own copy is what let a
+# one-sided edit change what was enforced without failing anything, and it is
+# also what let a caller-supplied `LANG` collide with the node's own baseline
+# and cost a best-effort execution its confinement.
+#
+# So the policy is authored here, once, and
+# `scripts/generate_environment_policy.py` writes a generated copy into each
+# crate:
+#
+#   crates/eggwork-runner/src/environment_policy.rs
+#   crates/eggwork-sandbox-helper/src/environment_policy.rs
+#
+# The generated copies are checked in, so no build needs the generator, no
+# crate reads a file outside its own directory, and no dependency edge is
+# created. A parity test pins the two copies together, so a one-sided edit
+# fails the build instead of silently changing what is enforced.
+#
+# A hand edit of a generated copy is a contract change, not a local fix.
+
+schema_version = 1
+
+# The rule used to match an environment key against the denied list and against
+# the node-owned class:
+#
+#   upper = key.to_ascii_uppercase()
+#   matches(entry) := upper == entry || upper.starts_with(entry)
+#
+# It is case-insensitive because the dangerous knobs are dangerous whatever
+# their case, and it is prefix-based so one entry covers a whole family
+# (`AWS_*`, `GIT_CONFIG_*`). Two properties of the rule are worth recording
+# because a parity fix must preserve them: `GIT_CONFIG_` is redundant, because
+# the `GIT_CONFIG` prefix already covers `GIT_CONFIG_GLOBAL` and its
+# relatives; and because the match is prefix-based, `PATH` denies *any* key
+# beginning with `PATH`, not only `PATH` itself.
+[match]
+rule = "ascii-uppercase-exact-or-prefix"
+
+# The keys a caller may not set.
+#
+# The runner *drops* one of these silently: it is the request-normalisation
+# boundary, and a hardened environment has to be a property of the node rather
+# than something the caller has to get right. The helper *refuses the whole
+# launch* when one of these is present: it is the enforcement point, and a
+# denied key reaching it means the node's own filtering did not happen, which
+# is a defect in the node rather than a caller error. The two behaviours are a
+# deliberate two-layer contract; only the list is duplicated, never the
+# behaviour.
+#
+# The entry set is carried over unchanged from the reviewed baseline. Adding or
+# removing an entry is a policy decision with its own security review, and it
+# is not this milestone's business.
+[denied]
+keys = [
+    "LD_",
+    "DYLD_",
+    "PATH",
+    "IFS",
+    "SHELLOPTS",
+    "CDPATH",
+    "BASH_ENV",
+    "ENV",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "NODE_OPTIONS",
+    "RUBYOPT",
+    "PERL5OPT",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "GIT_CONFIG",
+    "GIT_CONFIG_",
+    "AWS_",
+    "AZURE_",
+    "GOOGLE_",
+    "SSH_AUTH_SOCK",
+]
+
+# The node-owned baseline.
+#
+# `unix` is the Unix/Linux baseline: the keys the node installs for an
+# execution child, and the values it installs them with, in the order it
+# installs them. This is the baseline the helper enforces and the Linux runner
+# installs.
+#
+# The Windows baseline is deliberately *not* here. Its values are read from the
+# parent process at spawn time (`SystemRoot`/`windir`, and a `PATH` built from
+# them), and the sandbox helper is Linux-only so it never sees a Windows
+# launch. That branch is runner-local; see `baseline_child_environment` in
+# `crates/eggwork-runner/src/lib.rs`. `windows_common` names only the keys the
+# Windows baseline shares with the Unix one — their values are identical — so
+# that the runner's local branch does not have to re-list them.
+[baseline.unix]
+PATH = "/usr/bin:/bin"
+LANG = "C.UTF-8"
+LC_ALL = "C.UTF-8"
+CI = "1"
+NO_COLOR = "1"
+TERM = "dumb"
+GIT_TERMINAL_PROMPT = "0"
+PAGER = "cat"
+
+[baseline.windows_common]
+keys = [
+    "CI",
+    "NO_COLOR",
+    "TERM",
+    "GIT_TERMINAL_PROMPT",
+    "PAGER",
+]
+
+# The node-owned (reserved) keys on the Unix baseline.
+#
+# A caller-supplied value for one of these is discarded in favour of the
+# node's value, so the node's baseline is what reaches the child and the
+# launch specification can never carry a duplicate of a baseline key. This is
+# the rule that closes the collision hole: before it, a caller that set `LANG`
+# produced a specification with two `LANG` entries, the helper refused that
+# specification, and a best-effort request answered the refusal by running the
+# target with no Landlock ruleset at all.
+#
+# The class is the node-owned baseline, and the baseline is platform-shaped: on
+# the Windows baseline the node owns `SystemRoot`, `windir` and `PATH` instead
+# of the Unix locale keys.
+[reserved]
+keys = [
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "CI",
+    "NO_COLOR",
+    "TERM",
+    "GIT_TERMINAL_PROMPT",
+    "PAGER",
+]
+
+# The `PATH` value contract.
+#
+# A `PATH` that points outside `/usr/bin:/bin` widens what a confined target
+# can execute, and the helper's Landlock ruleset does not restrict `execve` by
+# path. The rule is enforced on both sides: the helper refuses a launch whose
+# `PATH` differs, and the runner guarantees the value in the child environment
+# and in the launch specification.
+#
+# The scope is Linux/Unix. The Windows baseline is explicitly outside this
+# contract — its `PATH` is `%SystemRoot%\System32;%SystemRoot%` — so a future
+# reader must not "fix" the Windows `PATH` to the Unix value.
+[path_contract]
+value = "/usr/bin:/bin"
+scope = "linux-unix"

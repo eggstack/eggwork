@@ -2,11 +2,13 @@
 
 use crate::{
     Authorizer, FingerprintPrincipalResolver, NodeConfig, NodeGcReport, NodePrincipal, NodeServer,
-    Operation, artifact::ArtifactStore, blob::BlobStore, telemetry::HostTelemetryConfig,
-    workspace::WorkspaceManager,
+    Operation, OperationRequest, ResourceId, ResourceKind, artifact::ArtifactStore,
+    blob::BlobStore, telemetry::HostTelemetryConfig, workspace::WorkspaceManager,
 };
 use eggserve_core::tls::TlsServerConfig;
-use eggwork_core::{ExecutionGeneration, ExecutionId, NodeId, PrincipalId};
+use eggwork_core::{
+    ArtifactId, BlobDigest, ExecutionGeneration, ExecutionId, NodeId, PrincipalId, WorkspaceId,
+};
 use rusqlite::OptionalExtension;
 use rustls::pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
@@ -24,33 +26,235 @@ use thiserror::Error;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_GC_BATCH: usize = 1024;
 const MAX_EXECUTION_PAGE: usize = 200;
-const METRIC_NAMES: &[&str] = &[
-    "executions_accepted",
-    "rejected_route",
-    "rejected_unauthenticated",
-    "rejected_unauthorized",
-    "rejected_invalid",
-    "rejected_draining",
-    "rejected_capability",
-    "rejected_busy",
-    "rejected_storage",
-    "event_history_resync",
-    "blob_upload_bytes",
-    "blob_download_bytes",
-    "stdout_bytes",
-    "stderr_bytes",
-    "terminal_succeeded",
-    "terminal_failed",
-    "terminal_cancelled",
-    "terminal_timed_out",
-    "terminal_interrupted",
-    "cleanup_failures",
-];
+/// The maximum number of resource scopes one grant may carry.
+///
+/// A scope is a small, hand-written narrowing of an operation the principal
+/// already holds, not a policy language. The cap bounds the configuration's
+/// size and the work the authorizer does per request.
+const MAX_RESOURCE_SCOPES_PER_GRANT: usize = 64;
+/// The maximum number of resource scopes one node's grant set may carry.
+const MAX_RESOURCE_SCOPES_TOTAL: usize = 4096;
+
+/// Declare the configuration rules the node can report a violation of.
+///
+/// The identifier is stable and greppable: an operator's runbook can name it,
+/// and every surface that reports a configuration fault — `config print`,
+/// `config validate`, `doctor`, and the daemon's startup failure — reports
+/// the same identifier for the same fault.
+macro_rules! config_rules {
+    ($($variant:ident => $id:literal, $action:literal;)*) => {
+        /// One rule a configuration can violate.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum ConfigRule {
+            $($variant),*
+        }
+
+        impl ConfigRule {
+            /// Every rule, in a stable order.
+            pub const ALL: &'static [ConfigRule] = &[$(ConfigRule::$variant),*];
+
+            /// The stable identifier of the rule.
+            pub const fn id(self) -> &'static str {
+                match self {
+                    $(ConfigRule::$variant => $id),*
+                }
+            }
+
+            /// What the operator should do about it, in one sentence.
+            pub const fn action(self) -> &'static str {
+                match self {
+                    $(ConfigRule::$variant => $action),*
+                }
+            }
+        }
+    };
+}
+
+config_rules! {
+    // The configuration file itself.
+    ConfigFileUnreadable => "config_file_unreadable", "make the configuration file readable by the node's user";
+    ConfigFileNotARegularFile => "config_file_not_a_regular_file", "point the configuration at a regular file, not a directory or a symbolic link";
+    ConfigFileTooLarge => "config_file_too_large", "reduce the configuration file to at most 1 MiB";
+    ConfigFileWrongOwner => "config_file_wrong_owner", "make the configuration file owned by the node's user";
+    ConfigFileWorldWritable => "config_file_world_writable", "remove group- and world-write permission from the configuration file";
+    ConfigFileMalformed => "config_file_malformed", "write the configuration file as a single JSON object";
+    ConfigFieldInvalid => "config_field_invalid", "correct the field the node refused, or remove the field the node does not know";
+
+    // The configuration's own fields.
+    ConfigSchemaVersionUnsupported => "config_schema_version_unsupported", "set schema_version to the version this node implements";
+    ConfigNodeIdInvalid => "config_node_id_invalid", "write a node_id this node accepts as an identifier";
+    ConfigBindAddressInvalid => "config_bind_address_invalid", "write bind as an IP address and a port, for example 127.0.0.1:8443";
+    ConfigMaxActiveExecutionsOutOfRange => "config_max_active_executions_out_of_range", "set max_active_executions between 1 and 65536";
+    ConfigLeaseTtlOutOfRange => "config_lease_ttl_out_of_range", "set lease_ttl_seconds between 1 and 86400";
+    ConfigBlobQuotaInvalid => "config_blob_quota_invalid", "set blob_quota_bytes to a non-zero byte count";
+    ConfigWorkspaceQuotaInvalid => "config_workspace_quota_invalid", "set workspace_quota_bytes to a non-zero byte count";
+    ConfigClientGrantCountOutOfRange => "config_client_grant_count_out_of_range", "list between 1 and 1024 client grants";
+    ConfigPrincipalIdInvalid => "config_principal_id_invalid", "write a principal_id this node accepts as an identifier";
+    ConfigClientFingerprintInvalid => "config_client_fingerprint_invalid", "write the client's certificate fingerprint as 64 hexadecimal characters";
+    ConfigClientFingerprintDuplicate => "config_client_fingerprint_duplicate", "give every client grant its own certificate fingerprint";
+    ConfigClientOperationsEmpty => "config_client_operations_empty", "list at least one operation for every client grant";
+    ConfigClientOperationUnknown => "config_client_operation_unknown", "list only the operations this node implements";
+
+    // Resource scopes.
+    ConfigResourceScopeCountOutOfRange => "config_resource_scope_count_out_of_range", "narrow each client grant to at most 64 resource scopes, and the node to at most 4096";
+    ConfigResourceScopeOperationUnknown => "config_resource_scope_operation_unknown", "narrow only the operations this node implements";
+    ConfigResourceScopeKindUnknown => "config_resource_scope_kind_unknown", "use a resource kind of execution, blob, workspace, or artifact";
+    ConfigResourceScopeNotHeld => "config_resource_scope_not_held", "drop the scope, or grant the operation the scope names";
+    ConfigResourceScopeKindNotApplicable => "config_resource_scope_kind_not_applicable", "drop the scope, or narrow an operation that names that resource kind";
+    ConfigResourceScopeIdentifierInvalid => "config_resource_scope_identifier_invalid", "write the scope's resource identifier in the form its resource kind names";
+    ConfigResourceScopeDuplicate => "config_resource_scope_duplicate", "list every resource scope once";
+
+    // The TLS material.
+    TlsCertificateUnreadable => "tls_certificate_unreadable", "make the certificate file readable by the node's user";
+    TlsCertificateNotARegularFile => "tls_certificate_not_a_regular_file", "point the certificate path at a regular file, not a directory or a symbolic link";
+    TlsCertificateWrongOwner => "tls_certificate_wrong_owner", "make the certificate file owned by the node's user";
+    TlsCertificateWorldWritable => "tls_certificate_world_writable", "remove group- and world-write permission from the certificate file";
+    TlsCertificateMalformed => "tls_certificate_malformed", "write the certificate file as PEM certificates this node can parse";
+    TlsPrivateKeyUnreadable => "tls_private_key_unreadable", "make the private key readable by the node's user";
+    TlsPrivateKeyNotARegularFile => "tls_private_key_not_a_regular_file", "point the private key at a regular file, not a directory or a symbolic link";
+    TlsPrivateKeyWrongOwner => "tls_private_key_wrong_owner", "make the private key owned by the node's user";
+    TlsPrivateKeyWorldWritable => "tls_private_key_world_writable", "remove group- and world-write permission from the private key";
+    TlsPrivateKeyReadableByOthers => "tls_private_key_readable_by_others", "set the private key to mode 0600";
+    TlsPrivateKeyNotWritable => "tls_private_key_not_writable", "give the node's user write permission on the private key";
+    TlsPrivateKeyMalformed => "tls_private_key_malformed", "write the private key as a PEM private key this node can parse";
+    TlsIdentityInvalid => "tls_identity_invalid", "write a certificate chain and a private key that form one identity";
+    TlsClientCaInvalid => "tls_client_ca_invalid", "write a client CA bundle this node can use to verify client certificates";
+
+    // The node's state directories.
+    StateRootNotADirectory => "state_root_not_a_directory", "create the directory and make it owned by the node's user";
+    StateRootSymlinked => "state_root_symlinked", "point the path at the directory itself, not a symbolic link";
+    StateRootWrongOwner => "state_root_wrong_owner", "make the directory owned by the node's user";
+    StateRootNotOwnerOnly => "state_root_not_owner_only", "set the directory to mode 0700";
+    StateRootsOverlap => "state_roots_overlap", "point each root at a directory of its own";
+    DatabaseDirectoryWrongOwner => "database_directory_wrong_owner", "make the directory that holds the execution database owned by the node's user";
+    DatabaseDirectoryNotOwnerOnly => "database_directory_not_owner_only", "set the directory that holds the execution database to mode 0700";
+    DatabaseFileNotARegularFile => "database_file_not_a_regular_file", "point the execution database at a regular file, not a directory or a symbolic link";
+    DatabaseFileWrongOwner => "database_file_wrong_owner", "make the execution database owned by the node's user";
+    DatabaseFileNotWritable => "database_file_not_writable", "give the node's user write permission on the execution database";
+
+    // The sandbox helper.
+    SandboxHelperUnavailable => "sandbox_helper_unavailable", "install the sandbox helper at the configured path";
+    SandboxHelperNotTrusted => "sandbox_helper_not_trusted", "make the sandbox helper a regular file owned by the node's user, executable, and not group- or world-writable";
+    SandboxHelperLocationInvalid => "sandbox_helper_location_invalid", "install the sandbox helper in a directory this node can resolve";
+    SandboxHelperDirectoryNotTrusted => "sandbox_helper_directory_not_trusted", "make the sandbox helper's directory owned by the node's user and not group- or world-writable";
+    SandboxHelperAncestorNotTrusted => "sandbox_helper_ancestor_not_trusted", "remove group- and world-write permission from the sandbox helper's ancestor directories";
+    SandboxHelperUnsupportedPlatform => "sandbox_helper_unsupported_platform", "run the node on a platform that supports the trusted Landlock helper";
+
+    // Everything else.
+    HostTelemetryEndpointInvalid => "host_telemetry_endpoint_invalid", "point host telemetry at the provider's loopback status endpoint";
+    ConfigSerializationFailed => "config_serialization_failed", "report this to the node's maintainers: the configuration could not be rendered";
+    NodeStartFailed => "node_start_failed", "run eggworkd doctor for the check that refused the node";
+}
+
+/// The item a configuration fault is about.
+///
+/// A path or a value is named as it is when it is not itself secret-bearing.
+/// A secret-bearing item is named by its role alone: naming the path of a
+/// private key, the fingerprint of a certificate, or the identifier a
+/// resource scope confines a grant to is exactly the leak the redaction rule
+/// exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigItem {
+    /// A filesystem path that is not itself secret-bearing.
+    Path(PathBuf),
+    /// A configuration value that is not itself secret-bearing.
+    Value(String),
+    /// The role of a secret-bearing item, optionally qualified by a
+    /// non-secret qualifier that says *which* item failed.
+    Role {
+        role: &'static str,
+        qualifier: Option<String>,
+    },
+}
+
+impl ConfigItem {
+    /// A filesystem path item.
+    pub fn path(path: impl Into<PathBuf>) -> Self {
+        ConfigItem::Path(path.into())
+    }
+
+    /// A configuration value item.
+    pub fn value(value: impl Into<String>) -> Self {
+        ConfigItem::Value(value.into())
+    }
+
+    /// A secret-bearing item, named by its role alone.
+    pub fn role(role: &'static str) -> Self {
+        ConfigItem::Role {
+            role,
+            qualifier: None,
+        }
+    }
+
+    /// A secret-bearing item, named by its role and a non-secret qualifier.
+    pub fn qualified_role(role: &'static str, qualifier: impl Into<String>) -> Self {
+        ConfigItem::Role {
+            role,
+            qualifier: Some(qualifier.into()),
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigItem::Path(path) => write!(f, "{}", path.display()),
+            ConfigItem::Value(value) => write!(f, "{value}"),
+            ConfigItem::Role {
+                role,
+                qualifier: None,
+            } => write!(f, "{role}"),
+            ConfigItem::Role {
+                role,
+                qualifier: Some(qualifier),
+            } => write!(f, "{role} ({qualifier})"),
+        }
+    }
+}
+
+/// A configuration fault: the rule that was violated, and the item that
+/// violated it.
+///
+/// The fault carries no underlying error text and no secret-bearing value: an
+/// `std::io::Error` or a `serde_json` message is classified into a rule and
+/// then discarded, a private key is named by its role and never by its path,
+/// and a certificate is never named by its fingerprint or its subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigFault {
+    /// The rule the configuration violated.
+    pub rule: ConfigRule,
+    /// The item that violated it.
+    pub item: ConfigItem,
+}
+
+impl ConfigFault {
+    /// A fault of one rule, about one item.
+    pub fn new(rule: ConfigRule, item: ConfigItem) -> Self {
+        Self { rule, item }
+    }
+}
+
+impl std::fmt::Display for ConfigFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{}] {}: {}",
+            self.rule.id(),
+            self.item,
+            self.rule.action()
+        )
+    }
+}
+
+/// Build a configuration fault.
+fn fault(rule: ConfigRule, item: ConfigItem) -> OperationsError {
+    OperationsError::Config(ConfigFault::new(rule, item))
+}
 
 #[derive(Debug, Error)]
 pub enum OperationsError {
-    #[error("operator configuration is invalid")]
-    Config,
+    #[error("{0}")]
+    Config(ConfigFault),
     #[error("operator configuration could not be read")]
     Io(#[from] std::io::Error),
     #[error("operator data could not be read")]
@@ -109,7 +313,14 @@ impl HostTelemetrySettings {
             self.refresh_interval_seconds,
             self.freshness_seconds,
         )
-        .map_err(|_| OperationsError::Config)
+        .map_err(|_| {
+            // The endpoint is named by its role and never by its value: a
+            // diagnostic line must not carry a provider address into a log.
+            fault(
+                ConfigRule::HostTelemetryEndpointInvalid,
+                ConfigItem::role("the host-telemetry endpoint"),
+            )
+        })
     }
 }
 
@@ -121,6 +332,26 @@ pub struct TlsFiles {
     pub client_ca: PathBuf,
 }
 
+/// A resource-scoped narrowing of one operation a principal already holds.
+///
+/// A scope is a name, a kind, and an identifier — nothing more. It cannot
+/// grant an operation the grant does not hold, and it cannot widen a grant:
+/// the store's `principal_id` fences stay authoritative for ownership, so a
+/// scope only ever removes access.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceScope {
+    /// The operation this scope narrows. Must be an operation the same grant
+    /// already holds.
+    pub operation: String,
+    /// The resource kind this scope names: `execution`, `blob`, `workspace`,
+    /// or `artifact`.
+    pub resource_kind: String,
+    /// The string form of the resource identifier, parsed back into the typed
+    /// variant its kind names.
+    pub resource_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientGrant {
@@ -128,6 +359,18 @@ pub struct ClientGrant {
     /// Lowercase hex SHA-256 digest of the verified leaf certificate DER.
     pub certificate_sha256: String,
     pub operations: Vec<String>,
+    /// Optional resource-scoped narrowing of the operations above.
+    ///
+    /// Absent or empty means the grant is exactly as broad as its operation
+    /// list, which is the meaning every configuration written before
+    /// resource scopes existed has. A scope narrows one operation and one
+    /// resource kind; it never grants an operation the grant does not hold.
+    ///
+    /// `deny_unknown_fields` on this struct is deliberate: an older node
+    /// reading a configuration that carries a scope refuses to start rather
+    /// than silently ignoring the narrowing the operator wrote.
+    #[serde(default)]
+    pub resource_scopes: Vec<ResourceScope>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,6 +391,18 @@ impl DoctorReport {
         self.checks
             .iter()
             .any(|check| check.name == "configuration" && check.ok)
+    }
+
+    /// The configuration check's detail — the rule, the item, and the action
+    /// when the configuration is invalid.
+    ///
+    /// `status` reports it so that a refused `status` says the same thing the
+    /// other surfaces say, rather than a bare verdict.
+    pub fn configuration_detail(&self) -> Option<&str> {
+        self.checks
+            .iter()
+            .find(|check| check.name == "configuration")
+            .map(|check| check.detail.as_str())
     }
 }
 
@@ -179,7 +434,14 @@ pub struct ExecutionPage {
     pub limit: usize,
     pub offset: usize,
     pub total: usize,
-    pub active_executions: usize,
+    /// How many executions are in a non-terminal state.
+    ///
+    /// This is the count of *durable rows* in a non-terminal state, not the
+    /// number of execution permits the running node holds. The two are
+    /// different facts: an execution whose process died keeps its row until
+    /// recovery, and an idempotent re-request releases its permit while the
+    /// original execution still holds one. The name says which one this is.
+    pub non_terminal_executions: usize,
     pub states: BTreeMap<&'static str, usize>,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
@@ -197,20 +459,47 @@ pub struct ResourceInspection {
 
 impl OperatorConfig {
     pub fn load(path: &Path) -> Result<Self, OperationsError> {
-        let metadata = fs::symlink_metadata(path)?;
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.len() > MAX_CONFIG_BYTES
-            || config_writable_by_others(&metadata)
-        {
-            return Err(OperationsError::Config);
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| fault(ConfigRule::ConfigFileUnreadable, ConfigItem::path(path)))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(fault(
+                ConfigRule::ConfigFileNotARegularFile,
+                ConfigItem::path(path),
+            ));
+        }
+        if metadata.len() > MAX_CONFIG_BYTES {
+            return Err(fault(
+                ConfigRule::ConfigFileTooLarge,
+                ConfigItem::path(path),
+            ));
+        }
+        if config_wrong_owner(&metadata) {
+            return Err(fault(
+                ConfigRule::ConfigFileWrongOwner,
+                ConfigItem::path(path),
+            ));
+        }
+        if config_writable_by_others(&metadata) {
+            return Err(fault(
+                ConfigRule::ConfigFileWorldWritable,
+                ConfigItem::path(path),
+            ));
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        File::open(path)?
-            .take(MAX_CONFIG_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        let mut config: Self =
-            serde_json::from_slice(&bytes).map_err(|_| OperationsError::Config)?;
+        File::open(path)
+            .and_then(|file| file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes))
+            .map_err(|_| fault(ConfigRule::ConfigFileUnreadable, ConfigItem::path(path)))?;
+        let mut config: Self = serde_json::from_slice(&bytes).map_err(|error| {
+            // The parser's own message names the offending field and
+            // sometimes echoes a value, so it is classified and dropped. The
+            // rule says which kind of fault it is; the item says which file.
+            let rule = if error.is_syntax() || error.is_eof() {
+                ConfigRule::ConfigFileMalformed
+            } else {
+                ConfigRule::ConfigFieldInvalid
+            };
+            fault(rule, ConfigItem::path(path))
+        })?;
         let base = path.parent().unwrap_or_else(|| Path::new("."));
         config.resolve_paths(base);
         Ok(config)
@@ -238,36 +527,177 @@ impl OperatorConfig {
     }
 
     pub fn validate(&self) -> Result<(), OperationsError> {
-        if self.schema_version != 1
-            || NodeId::new(self.node_id.clone()).is_err()
-            || self.bind.parse::<SocketAddr>().is_err()
-            || self.max_active_executions == 0
-            || self.max_active_executions > 65_536
-            || self.lease_ttl_seconds == 0
-            || self.lease_ttl_seconds > 86_400
-            || self.blob_quota_bytes == 0
-            || self.workspace_quota_bytes == 0
-            || self.clients.is_empty()
-            || self.clients.len() > 1024
-        {
-            return Err(OperationsError::Config);
+        if self.schema_version != 1 {
+            return Err(fault(
+                ConfigRule::ConfigSchemaVersionUnsupported,
+                ConfigItem::value(self.schema_version.to_string()),
+            ));
+        }
+        if NodeId::new(self.node_id.clone()).is_err() {
+            return Err(fault(
+                ConfigRule::ConfigNodeIdInvalid,
+                ConfigItem::value(self.node_id.clone()),
+            ));
+        }
+        if self.bind.parse::<SocketAddr>().is_err() {
+            return Err(fault(
+                ConfigRule::ConfigBindAddressInvalid,
+                ConfigItem::value(self.bind.clone()),
+            ));
+        }
+        if self.max_active_executions == 0 || self.max_active_executions > 65_536 {
+            return Err(fault(
+                ConfigRule::ConfigMaxActiveExecutionsOutOfRange,
+                ConfigItem::value(self.max_active_executions.to_string()),
+            ));
+        }
+        if self.lease_ttl_seconds == 0 || self.lease_ttl_seconds > 86_400 {
+            return Err(fault(
+                ConfigRule::ConfigLeaseTtlOutOfRange,
+                ConfigItem::value(self.lease_ttl_seconds.to_string()),
+            ));
+        }
+        if self.blob_quota_bytes == 0 {
+            return Err(fault(
+                ConfigRule::ConfigBlobQuotaInvalid,
+                ConfigItem::value(self.blob_quota_bytes.to_string()),
+            ));
+        }
+        if self.workspace_quota_bytes == 0 {
+            return Err(fault(
+                ConfigRule::ConfigWorkspaceQuotaInvalid,
+                ConfigItem::value(self.workspace_quota_bytes.to_string()),
+            ));
+        }
+        if self.clients.is_empty() || self.clients.len() > 1024 {
+            return Err(fault(
+                ConfigRule::ConfigClientGrantCountOutOfRange,
+                ConfigItem::value(self.clients.len().to_string()),
+            ));
         }
         let mut fingerprints = HashSet::new();
+        let mut total_scopes = 0usize;
         for grant in &self.clients {
-            if PrincipalId::new(grant.principal_id.clone()).is_err()
-                || grant.certificate_sha256.len() != 64
+            if PrincipalId::new(grant.principal_id.clone()).is_err() {
+                return Err(fault(
+                    ConfigRule::ConfigPrincipalIdInvalid,
+                    ConfigItem::value(grant.principal_id.clone()),
+                ));
+            }
+            // The fingerprint is secret-bearing: the message names the role and
+            // the principal, never the value.
+            if grant.certificate_sha256.len() != 64
                 || !grant
                     .certificate_sha256
                     .bytes()
                     .all(|c| c.is_ascii_hexdigit())
-                || !fingerprints.insert(grant.certificate_sha256.to_ascii_lowercase())
-                || grant.operations.is_empty()
-                || grant
-                    .operations
-                    .iter()
-                    .any(|name| operation(name).is_none())
             {
-                return Err(OperationsError::Config);
+                return Err(fault(
+                    ConfigRule::ConfigClientFingerprintInvalid,
+                    ConfigItem::qualified_role(
+                        "the client certificate fingerprint",
+                        grant.principal_id.clone(),
+                    ),
+                ));
+            }
+            if !fingerprints.insert(grant.certificate_sha256.to_ascii_lowercase()) {
+                return Err(fault(
+                    ConfigRule::ConfigClientFingerprintDuplicate,
+                    ConfigItem::qualified_role(
+                        "the client certificate fingerprint",
+                        grant.principal_id.clone(),
+                    ),
+                ));
+            }
+            if grant.operations.is_empty() {
+                return Err(fault(
+                    ConfigRule::ConfigClientOperationsEmpty,
+                    ConfigItem::qualified_role(
+                        "the client grant's operation list",
+                        grant.principal_id.clone(),
+                    ),
+                ));
+            }
+            for name in &grant.operations {
+                if operation(name).is_none() {
+                    return Err(fault(
+                        ConfigRule::ConfigClientOperationUnknown,
+                        ConfigItem::value(name.clone()),
+                    ));
+                }
+            }
+            total_scopes += grant.resource_scopes.len();
+            if total_scopes > MAX_RESOURCE_SCOPES_TOTAL
+                || grant.resource_scopes.len() > MAX_RESOURCE_SCOPES_PER_GRANT
+            {
+                return Err(fault(
+                    ConfigRule::ConfigResourceScopeCountOutOfRange,
+                    ConfigItem::qualified_role(
+                        "the client grant's resource scopes",
+                        grant.principal_id.clone(),
+                    ),
+                ));
+            }
+            // A scope narrows an operation the grant already holds, so the
+            // grant's own operation list is the reference a scope is checked
+            // against. Every name in that list already resolved above.
+            let held: HashSet<Operation> = grant
+                .operations
+                .iter()
+                .filter_map(|name| operation(name))
+                .collect();
+            let mut seen: HashSet<(Operation, ResourceKind, ResourceId)> = HashSet::new();
+            for scope in &grant.resource_scopes {
+                let Some(narrowed) = operation(&scope.operation) else {
+                    return Err(fault(
+                        ConfigRule::ConfigResourceScopeOperationUnknown,
+                        ConfigItem::value(scope.operation.clone()),
+                    ));
+                };
+                let Some(kind) = resource_kind(&scope.resource_kind) else {
+                    return Err(fault(
+                        ConfigRule::ConfigResourceScopeKindUnknown,
+                        ConfigItem::value(scope.resource_kind.clone()),
+                    ));
+                };
+                // A scope for an operation the grant does not hold would be a
+                // grant written in the wrong place; a scope for a kind that
+                // operation never names could never be consulted and would
+                // narrow nothing while the operator believed it did. Both are
+                // configuration errors, not silently ignored entries.
+                if !held.contains(&narrowed) {
+                    return Err(fault(
+                        ConfigRule::ConfigResourceScopeNotHeld,
+                        ConfigItem::value(scope.operation.clone()),
+                    ));
+                }
+                if !narrowed.resource_kinds().contains(&kind) {
+                    return Err(fault(
+                        ConfigRule::ConfigResourceScopeKindNotApplicable,
+                        ConfigItem::value(scope.resource_kind.clone()),
+                    ));
+                }
+                // The identifier names the exact resource the grant was
+                // confined to — the same class of value as the certificate
+                // fingerprint — so the message names the role, not the value.
+                let Some(identifier) = parse_resource_id(kind, &scope.resource_id) else {
+                    return Err(fault(
+                        ConfigRule::ConfigResourceScopeIdentifierInvalid,
+                        ConfigItem::qualified_role(
+                            "the resource scope's identifier",
+                            grant.principal_id.clone(),
+                        ),
+                    ));
+                };
+                if !seen.insert((narrowed, kind, identifier)) {
+                    return Err(fault(
+                        ConfigRule::ConfigResourceScopeDuplicate,
+                        ConfigItem::qualified_role(
+                            "the resource scope",
+                            grant.principal_id.clone(),
+                        ),
+                    ));
+                }
             }
         }
         let _ = self.tls_config()?;
@@ -279,10 +709,7 @@ impl OperatorConfig {
             settings.config()?;
         }
         for path in [&self.execution_root, &self.blob_root, &self.workspace_root] {
-            let meta = fs::symlink_metadata(path).map_err(|_| OperationsError::Config)?;
-            if !meta.is_dir() || meta.file_type().is_symlink() || !trusted_directory(&meta) {
-                return Err(OperationsError::Config);
-            }
+            self.check_state_root(path)?;
         }
         // These roots must not overlap, and they must not contain one another.
         // `WorkspaceManager::reconcile` deletes every directory under
@@ -295,26 +722,101 @@ impl OperatorConfig {
         for (index, path) in roots.iter().enumerate() {
             for other in &roots[index + 1..] {
                 if path == other || path.starts_with(other) || other.starts_with(path) {
-                    return Err(OperationsError::Config);
+                    return Err(fault(
+                        ConfigRule::StateRootsOverlap,
+                        ConfigItem::path(*path),
+                    ));
                 }
             }
         }
-        for path in [&self.database_path] {
-            if let Some(parent) = path.parent()
-                && (!parent.is_dir()
-                    || fs::symlink_metadata(parent).is_ok_and(|meta| {
-                        meta.file_type().is_symlink() || !trusted_directory(&meta)
-                    }))
-            {
-                return Err(OperationsError::Config);
+        if let Some(parent) = self.database_path.parent() {
+            self.check_database_directory(parent)?;
+        }
+        if let Ok(metadata) = fs::symlink_metadata(&self.database_path) {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(fault(
+                    ConfigRule::DatabaseFileNotARegularFile,
+                    ConfigItem::path(&self.database_path),
+                ));
+            }
+            if !owned_by_euid(&metadata) {
+                return Err(fault(
+                    ConfigRule::DatabaseFileWrongOwner,
+                    ConfigItem::path(&self.database_path),
+                ));
+            }
+            if !owner_writable(&metadata) {
+                return Err(fault(
+                    ConfigRule::DatabaseFileNotWritable,
+                    ConfigItem::path(&self.database_path),
+                ));
             }
         }
-        if let Ok(metadata) = fs::symlink_metadata(&self.database_path)
-            && (!metadata.is_file()
-                || metadata.file_type().is_symlink()
-                || !owned_writable_file(&metadata))
-        {
-            return Err(OperationsError::Config);
+        Ok(())
+    }
+
+    /// Check one of the node's state roots.
+    ///
+    /// A state root holds every execution's output, every blob, and every
+    /// workspace, so it must be a real directory — not a symbolic link — owned
+    /// by the node's user and readable by nobody else.
+    fn check_state_root(&self, path: &Path) -> Result<(), OperationsError> {
+        let meta = fs::symlink_metadata(path)
+            .map_err(|_| fault(ConfigRule::StateRootNotADirectory, ConfigItem::path(path)))?;
+        if meta.file_type().is_symlink() {
+            return Err(fault(
+                ConfigRule::StateRootSymlinked,
+                ConfigItem::path(path),
+            ));
+        }
+        if !meta.is_dir() {
+            return Err(fault(
+                ConfigRule::StateRootNotADirectory,
+                ConfigItem::path(path),
+            ));
+        }
+        if !state_root_owned(&meta) {
+            return Err(fault(
+                ConfigRule::StateRootWrongOwner,
+                ConfigItem::path(path),
+            ));
+        }
+        if !state_root_owner_only(&meta) {
+            return Err(fault(
+                ConfigRule::StateRootNotOwnerOnly,
+                ConfigItem::path(path),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check the directory that holds the execution database.
+    fn check_database_directory(&self, parent: &Path) -> Result<(), OperationsError> {
+        if !parent.is_dir() {
+            return Err(fault(
+                ConfigRule::StateRootNotADirectory,
+                ConfigItem::path(parent),
+            ));
+        }
+        let meta = fs::symlink_metadata(parent)
+            .map_err(|_| fault(ConfigRule::StateRootNotADirectory, ConfigItem::path(parent)))?;
+        if meta.file_type().is_symlink() {
+            return Err(fault(
+                ConfigRule::StateRootSymlinked,
+                ConfigItem::path(parent),
+            ));
+        }
+        if !state_root_owned(&meta) {
+            return Err(fault(
+                ConfigRule::DatabaseDirectoryWrongOwner,
+                ConfigItem::path(parent),
+            ));
+        }
+        if !state_root_owner_only(&meta) {
+            return Err(fault(
+                ConfigRule::DatabaseDirectoryNotOwnerOnly,
+                ConfigItem::path(parent),
+            ));
         }
         Ok(())
     }
@@ -324,19 +826,49 @@ impl OperatorConfig {
         let roots = read_certificates(&self.tls.client_ca)?;
         let key_file = trusted_private_key(&self.tls.private_key)?;
         let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-            .map_err(|_| OperationsError::Config)?
-            .ok_or(OperationsError::Config)?;
+            .map_err(|_| {
+                fault(
+                    ConfigRule::TlsPrivateKeyMalformed,
+                    ConfigItem::role("the private key"),
+                )
+            })?
+            .ok_or_else(|| {
+                fault(
+                    ConfigRule::TlsPrivateKeyMalformed,
+                    ConfigItem::role("the private key"),
+                )
+            })?;
         TlsServerConfig::builder()
             .single_identity(certs, key)
-            .map_err(|_| OperationsError::Config)?
+            .map_err(|_| {
+                fault(
+                    ConfigRule::TlsIdentityInvalid,
+                    ConfigItem::role("the TLS identity"),
+                )
+            })?
             .client_auth_required(roots)
-            .map_err(|_| OperationsError::Config)?
+            .map_err(|_| {
+                fault(
+                    ConfigRule::TlsClientCaInvalid,
+                    ConfigItem::path(&self.tls.client_ca),
+                )
+            })?
             .build()
-            .map_err(|_| OperationsError::Config)
+            .map_err(|_| {
+                fault(
+                    ConfigRule::TlsIdentityInvalid,
+                    ConfigItem::role("the TLS identity"),
+                )
+            })
     }
 
     pub fn redacted_json(&self) -> Result<String, OperationsError> {
-        let mut value = serde_json::to_value(self).map_err(|_| OperationsError::Config)?;
+        let mut value = serde_json::to_value(self).map_err(|_| {
+            fault(
+                ConfigRule::ConfigSerializationFailed,
+                ConfigItem::role("the configuration"),
+            )
+        })?;
         if let Some(tls) = value
             .get_mut("tls")
             .and_then(serde_json::Value::as_object_mut)
@@ -350,16 +882,46 @@ impl OperatorConfig {
             for client in clients {
                 if let Some(object) = client.as_object_mut() {
                     object.insert("certificate_sha256".into(), "[REDACTED]".into());
+                    // The scope's identifier names the exact resource the
+                    // operator confined the grant to — the same class of
+                    // value as the certificate fingerprint. The operation and
+                    // kind stay visible, because the shape of the narrowing
+                    // is what an operator reads; the identifier does not.
+                    if let Some(scopes) = object
+                        .get_mut("resource_scopes")
+                        .and_then(serde_json::Value::as_array_mut)
+                    {
+                        for scope in scopes {
+                            if let Some(scope_object) = scope.as_object_mut() {
+                                scope_object.insert("resource_id".into(), "[REDACTED]".into());
+                            }
+                        }
+                    }
                 }
             }
         }
-        serde_json::to_string_pretty(&value).map_err(|_| OperationsError::Config)
+        serde_json::to_string_pretty(&value).map_err(|_| {
+            fault(
+                ConfigRule::ConfigSerializationFailed,
+                ConfigItem::role("the configuration"),
+            )
+        })
     }
 
     pub fn node_config(&self) -> Result<NodeConfig, OperationsError> {
         Ok(NodeConfig {
-            node_id: NodeId::new(self.node_id.clone()).map_err(|_| OperationsError::Config)?,
-            bind: self.bind.parse().map_err(|_| OperationsError::Config)?,
+            node_id: NodeId::new(self.node_id.clone()).map_err(|_| {
+                fault(
+                    ConfigRule::ConfigNodeIdInvalid,
+                    ConfigItem::value(self.node_id.clone()),
+                )
+            })?,
+            bind: self.bind.parse().map_err(|_| {
+                fault(
+                    ConfigRule::ConfigBindAddressInvalid,
+                    ConfigItem::value(self.bind.clone()),
+                )
+            })?,
             execution_root: self.execution_root.clone(),
             database_path: self.database_path.clone(),
             blob_root: self.blob_root.clone(),
@@ -381,37 +943,172 @@ impl OperatorConfig {
         &self,
     ) -> Result<(FingerprintPrincipalResolver, GrantAuthorizer), OperationsError> {
         let mut identities = Vec::with_capacity(self.clients.len());
-        let mut grants = HashMap::new();
+        let mut grants: HashMap<PrincipalId, PrincipalGrant> = HashMap::new();
         for client in &self.clients {
-            let id = PrincipalId::new(client.principal_id.clone())
-                .map_err(|_| OperationsError::Config)?;
+            let id = PrincipalId::new(client.principal_id.clone()).map_err(|_| {
+                fault(
+                    ConfigRule::ConfigPrincipalIdInvalid,
+                    ConfigItem::value(client.principal_id.clone()),
+                )
+            })?;
             identities.push((client.certificate_sha256.to_ascii_lowercase(), id.clone()));
             let allowed = client
                 .operations
                 .iter()
                 .filter_map(|name| operation(name))
                 .collect();
-            grants.insert(id, allowed);
+            let mut scopes: HashMap<(Operation, ResourceKind), HashSet<ResourceId>> =
+                HashMap::new();
+            for scope in &client.resource_scopes {
+                // Parsing is strict here even though `validate` already
+                // refused the same shapes: `principals` is what the daemon
+                // calls, and a node that could not build its grant table must
+                // refuse to start rather than start with a permissive one.
+                let narrowed = operation(&scope.operation).ok_or_else(|| {
+                    fault(
+                        ConfigRule::ConfigResourceScopeOperationUnknown,
+                        ConfigItem::value(scope.operation.clone()),
+                    )
+                })?;
+                let kind = resource_kind(&scope.resource_kind).ok_or_else(|| {
+                    fault(
+                        ConfigRule::ConfigResourceScopeKindUnknown,
+                        ConfigItem::value(scope.resource_kind.clone()),
+                    )
+                })?;
+                let identifier = parse_resource_id(kind, &scope.resource_id).ok_or_else(|| {
+                    fault(
+                        ConfigRule::ConfigResourceScopeIdentifierInvalid,
+                        ConfigItem::qualified_role(
+                            "the resource scope's identifier",
+                            client.principal_id.clone(),
+                        ),
+                    )
+                })?;
+                scopes
+                    .entry((narrowed, kind))
+                    .or_default()
+                    .insert(identifier);
+            }
+            grants.insert(
+                id,
+                PrincipalGrant {
+                    operations: allowed,
+                    scopes,
+                },
+            );
         }
         Ok((
             FingerprintPrincipalResolver::new(identities),
-            GrantAuthorizer(grants),
+            GrantAuthorizer { grants },
         ))
     }
 
     pub fn drain_path(&self) -> PathBuf {
         self.database_path.with_extension("drain")
     }
+
+    /// Where the node publishes its live execution-permit count.
+    ///
+    /// The count is a fact of the *running* node: it is how many execution
+    /// permits the admission semaphore currently holds. The store cannot
+    /// re-derive it — an execution that crashed keeps a non-terminal row long
+    /// after its permit was released — so the node publishes the number beside
+    /// the execution database and the operator surface reads it from there.
+    pub fn permit_report_path(&self) -> PathBuf {
+        self.database_path.with_extension("permits")
+    }
 }
 
-pub struct GrantAuthorizer(HashMap<PrincipalId, HashSet<Operation>>);
+/// One principal's grant: the operations it holds, and the resource scopes
+/// that narrow them.
+///
+/// The scope table is keyed by `(operation, resource kind)` and holds typed
+/// identifiers, so a scope for `Blob` can never be compared against an
+/// `Execution` even if the configuration tried.
+struct PrincipalGrant {
+    operations: HashSet<Operation>,
+    scopes: HashMap<(Operation, ResourceKind), HashSet<ResourceId>>,
+}
+
+/// The per-principal grant table the node authorizes against.
+///
+/// The grant table is derived entirely from the operator configuration: the
+/// decision it makes is a lookup, never a store round trip, so authorization
+/// keeps the in-memory shape it has always had and never acquires a lock or
+/// an ordering dependency it did not have before.
+pub struct GrantAuthorizer {
+    grants: HashMap<PrincipalId, PrincipalGrant>,
+}
 
 impl Authorizer for GrantAuthorizer {
     fn authorize(&self, principal: &NodePrincipal, operation: Operation) -> bool {
-        self.0
+        self.grants
             .get(&principal.id)
-            .is_some_and(|allowed| allowed.contains(&operation))
+            .is_some_and(|grant| grant.operations.contains(&operation))
     }
+
+    /// The resource-scoped decision.
+    ///
+    /// The rule, in order:
+    ///
+    /// 1. the operation grant must be present — a scope never grants an
+    ///    operation the principal does not hold;
+    /// 2. a request that carries no resource falls back to the operation-level
+    ///    grant, exactly as before resource scopes existed;
+    /// 3. when a scope is configured for that operation *and* that resource
+    ///    kind, the resource must be inside it;
+    /// 4. otherwise the operation-level grant stands.
+    ///
+    /// Rule 3 is per `(operation, kind)`: scoping `Execute` against
+    /// `Execution` does not scope `Execute` against `Workspace`. An operator
+    /// who wants both constrained writes a scope for each.
+    ///
+    /// This decision can only narrow. It never asks who owns the resource, so
+    /// the store's `principal_id` fences remain the authority on ownership: a
+    /// scope that names another principal's resource lets the request reach
+    /// the store, and the store refuses it there.
+    fn authorize_request(&self, principal: &NodePrincipal, request: &OperationRequest) -> bool {
+        if !self.authorize(principal, request.operation) {
+            return false;
+        }
+        let Some(resource) = request.resource.as_ref() else {
+            return true;
+        };
+        let Some(grant) = self.grants.get(&principal.id) else {
+            return false;
+        };
+        match grant.scopes.get(&(request.operation, resource.kind())) {
+            Some(allowed) => allowed.contains(resource),
+            None => true,
+        }
+    }
+}
+
+/// The resource kinds a scope may name.
+fn resource_kind(name: &str) -> Option<ResourceKind> {
+    Some(match name {
+        "execution" => ResourceKind::Execution,
+        "blob" => ResourceKind::Blob,
+        "workspace" => ResourceKind::Workspace,
+        "artifact" => ResourceKind::Artifact,
+        _ => return None,
+    })
+}
+
+/// Parse a scope's identifier into the typed variant its kind names.
+///
+/// The identifier is the string form of the corresponding `ResourceId`
+/// variant, and it is parsed back through the same constructors the request
+/// path uses, so a configuration cannot name a resource the request path
+/// would refuse to resolve.
+fn parse_resource_id(kind: ResourceKind, value: &str) -> Option<ResourceId> {
+    Some(match kind {
+        ResourceKind::Execution => ResourceId::Execution(ExecutionId::new(value.to_owned()).ok()?),
+        ResourceKind::Blob => ResourceId::Blob(BlobDigest::parse(value.to_owned()).ok()?),
+        ResourceKind::Workspace => ResourceId::Workspace(WorkspaceId::new(value.to_owned()).ok()?),
+        ResourceKind::Artifact => ResourceId::Artifact(ArtifactId::new(value.to_owned()).ok()?),
+    })
 }
 
 fn operation(name: &str) -> Option<Operation> {
@@ -433,26 +1130,54 @@ fn operation(name: &str) -> Option<Operation> {
 }
 
 fn read_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, OperationsError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || config_writable_by_others(&metadata)
-    {
-        return Err(OperationsError::Config);
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| fault(ConfigRule::TlsCertificateUnreadable, ConfigItem::path(path)))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(fault(
+            ConfigRule::TlsCertificateNotARegularFile,
+            ConfigItem::path(path),
+        ));
     }
-    let file = File::open(path)?;
+    if config_wrong_owner(&metadata) {
+        return Err(fault(
+            ConfigRule::TlsCertificateWrongOwner,
+            ConfigItem::path(path),
+        ));
+    }
+    if config_writable_by_others(&metadata) {
+        return Err(fault(
+            ConfigRule::TlsCertificateWorldWritable,
+            ConfigItem::path(path),
+        ));
+    }
+    let file = File::open(path)
+        .map_err(|_| fault(ConfigRule::TlsCertificateUnreadable, ConfigItem::path(path)))?;
     let certs = rustls_pemfile::certs(&mut BufReader::new(file))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| OperationsError::Config)?;
+        .map_err(|_| fault(ConfigRule::TlsCertificateMalformed, ConfigItem::path(path)))?;
     if certs.is_empty() {
-        return Err(OperationsError::Config);
+        return Err(fault(
+            ConfigRule::TlsCertificateMalformed,
+            ConfigItem::path(path),
+        ));
     }
     Ok(certs)
 }
 
 #[cfg(unix)]
-fn trusted_directory(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+fn state_root_owned(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.uid() == rustix::process::geteuid().as_raw()
+}
+
+#[cfg(not(unix))]
+fn state_root_owned(_: &fs::Metadata) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn state_root_owner_only(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
     // Exactly `0700`, not "the owner has `rwx`". `mode & 0o700 == 0o700` also
     // accepts `0750` and `0755`, and this predicate gates `execution_root`,
     // `blob_root`, `workspace_root` and the database parent — the directories
@@ -463,33 +1188,82 @@ fn trusted_directory(metadata: &fs::Metadata) -> bool {
     // The `0o022` clause is kept explicit: it is the property that actually
     // mattered, and stating it documents why `0o700` alone is insufficient.
     let mode = metadata.permissions().mode();
-    metadata.uid() == rustix::process::geteuid().as_raw()
-        && mode & 0o777 == 0o700
-        && mode & 0o022 == 0
+    mode & 0o777 == 0o700 && mode & 0o022 == 0
 }
 
 #[cfg(not(unix))]
-fn trusted_directory(_: &fs::Metadata) -> bool {
+fn state_root_owner_only(_: &fs::Metadata) -> bool {
     true
 }
 
 fn trusted_private_key(path: &Path) -> Result<File, OperationsError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file()
-        || config_writable_by_others(&metadata)
-        || !owned_writable_file(&metadata)
-        || private_key_readable_by_others(&metadata)
-    {
-        return Err(OperationsError::Config);
+    // The private key is secret-bearing: every fault about it names the role
+    // and never the path, so a diagnostic line cannot disclose where the key
+    // lives.
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        fault(
+            ConfigRule::TlsPrivateKeyUnreadable,
+            ConfigItem::role("the private key"),
+        )
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(fault(
+            ConfigRule::TlsPrivateKeyNotARegularFile,
+            ConfigItem::role("the private key"),
+        ));
     }
-    Ok(File::open(path)?)
+    if !owned_by_euid(&metadata) {
+        return Err(fault(
+            ConfigRule::TlsPrivateKeyWrongOwner,
+            ConfigItem::role("the private key"),
+        ));
+    }
+    if config_writable_by_others(&metadata) {
+        return Err(fault(
+            ConfigRule::TlsPrivateKeyWorldWritable,
+            ConfigItem::role("the private key"),
+        ));
+    }
+    if private_key_readable_by_others(&metadata) {
+        return Err(fault(
+            ConfigRule::TlsPrivateKeyReadableByOthers,
+            ConfigItem::role("the private key"),
+        ));
+    }
+    if !owner_writable(&metadata) {
+        return Err(fault(
+            ConfigRule::TlsPrivateKeyNotWritable,
+            ConfigItem::role("the private key"),
+        ));
+    }
+    File::open(path).map_err(|_| {
+        fault(
+            ConfigRule::TlsPrivateKeyUnreadable,
+            ConfigItem::role("the private key"),
+        )
+    })
+}
+
+/// Whether the file is owned by a user other than the node's user or root.
+///
+/// The owner check and the permission check are separate predicates because
+/// they are separate rules: an operator who fixed the mode of a file owned by
+/// somebody else has not finished the job.
+#[cfg(unix)]
+fn config_wrong_owner(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    !matches!(metadata.uid(), 0) && metadata.uid() != rustix::process::geteuid().as_raw()
+}
+
+#[cfg(not(unix))]
+fn config_wrong_owner(_: &fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(unix)]
 fn config_writable_by_others(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    (!matches!(metadata.uid(), 0) && metadata.uid() != rustix::process::geteuid().as_raw())
-        || metadata.permissions().mode() & 0o022 != 0
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o022 != 0
 }
 
 #[cfg(not(unix))]
@@ -498,14 +1272,24 @@ fn config_writable_by_others(_: &fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
-fn owned_writable_file(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+fn owned_by_euid(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
     metadata.uid() == rustix::process::geteuid().as_raw()
-        && metadata.permissions().mode() & 0o200 != 0
 }
 
 #[cfg(not(unix))]
-fn owned_writable_file(_: &fs::Metadata) -> bool {
+fn owned_by_euid(_: &fs::Metadata) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn owner_writable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o200 != 0
+}
+
+#[cfg(not(unix))]
+fn owner_writable(_: &fs::Metadata) -> bool {
     true
 }
 
@@ -522,16 +1306,18 @@ fn private_key_readable_by_others(_: &fs::Metadata) -> bool {
 
 pub async fn doctor(config: &OperatorConfig) -> DoctorReport {
     let mut checks = Vec::new();
-    let config_ok = config.validate().is_ok();
+    // The configuration check reports the *rule* the configuration violated,
+    // not a verdict. `config print`, `config validate`, and the daemon's
+    // startup failure report the same rule for the same fault, so an
+    // operator who reads one of them has read all of them.
+    let configuration_fault = config.validate().err();
     checks.push(DoctorCheck {
         name: "configuration",
-        ok: config_ok,
-        detail: if config_ok {
-            "configuration and TLS policy are valid"
-        } else {
-            "configuration or TLS material is invalid"
-        }
-        .into(),
+        ok: configuration_fault.is_none(),
+        detail: match &configuration_fault {
+            None => "configuration and TLS policy are valid".into(),
+            Some(error) => error.to_string(),
+        },
     });
     // The provider is *not* contacted here. `doctor` is an offline diagnostic:
     // a node whose telemetry provider happens to be down is still a healthy
@@ -557,11 +1343,12 @@ pub async fn doctor(config: &OperatorConfig) -> DoctorReport {
     // verification exists to close. `doctor` is a one-shot operator diagnostic,
     // so the duplicated ancestor walk and file digest cost microseconds and are
     // not worth a cross-crate trust cache.
-    let helper_ok = config
-        .sandbox_helper
+    let helper = config.sandbox_helper.as_deref();
+    let helper_verdict = helper.map(trusted_helper);
+    let helper_ok = helper_verdict
         .as_ref()
-        .is_none_or(|helper| trusted_helper(helper));
-    let capabilities = if let Some(helper) = config.sandbox_helper.as_ref().filter(|_| helper_ok) {
+        .is_none_or(|verdict| verdict.is_ok());
+    let capabilities = if let Some(helper) = helper.filter(|_| helper_ok) {
         let runner = eggwork_runner::LocalProcessRunner::new(
             eggwork_runner::TrustedLandlockSetup::new(helper),
         );
@@ -572,14 +1359,21 @@ pub async fn doctor(config: &OperatorConfig) -> DoctorReport {
     checks.push(DoctorCheck {
         name: "sandbox-resource-backend",
         ok: helper_ok,
-        detail: if config.sandbox_helper.is_none() {
-            "no trusted sandbox helper configured; required isolation fails closed and resource limits are not advertised".into()
-        } else if !helper_ok {
-            "configured sandbox helper is missing or fails installation ownership checks".into()
-        } else if capabilities.is_empty() {
-            "trusted helper configured; no execution capability passed runtime probes".into()
-        } else {
-            format!("runtime-probed capabilities: {}", capabilities.join(", "))
+        detail: match &helper_verdict {
+            None => {
+                "no trusted sandbox helper configured; required isolation fails closed and resource limits are not advertised"
+                    .into()
+            }
+            Some(Err(rule)) => {
+                fault(*rule, ConfigItem::path(helper.unwrap_or(Path::new("")))).to_string()
+            }
+            Some(Ok(())) => {
+                if capabilities.is_empty() {
+                    "trusted helper configured; no execution capability passed runtime probes".into()
+                } else {
+                    format!("runtime-probed capabilities: {}", capabilities.join(", "))
+                }
+            }
         },
     });
     let bind: Result<SocketAddr, _> = config.bind.parse();
@@ -636,8 +1430,25 @@ pub async fn doctor(config: &OperatorConfig) -> DoctorReport {
 /// unprivileged user-scope installation into a node that can never advertise
 /// required filesystem isolation, and makes `doctor` contradict the enforcement
 /// path it is meant to describe.
-fn trusted_helper(path: &Path) -> bool {
-    eggwork_runner::verify_trusted_helper(path).is_ok()
+///
+/// The runner says *which* trust check failed in a fixed phrase. The phrase is
+/// classified into this crate's own rule and then discarded: the operator sees
+/// a greppable rule identifier, never the runner's wording, and a wording the
+/// runner later changes degrades to the general "not trusted" rule rather than
+/// to a wrong one.
+fn trusted_helper(path: &Path) -> Result<(), ConfigRule> {
+    eggwork_runner::verify_trusted_helper(path).map_err(|reason| match reason.as_str() {
+        "sandbox helper is unavailable" => ConfigRule::SandboxHelperUnavailable,
+        "sandbox helper location is invalid" => ConfigRule::SandboxHelperLocationInvalid,
+        "sandbox helper directory trust check failed" => {
+            ConfigRule::SandboxHelperDirectoryNotTrusted
+        }
+        "sandbox helper ancestor trust check failed" => ConfigRule::SandboxHelperAncestorNotTrusted,
+        "trusted Landlock is unsupported on this platform" => {
+            ConfigRule::SandboxHelperUnsupportedPlatform
+        }
+        _ => ConfigRule::SandboxHelperNotTrusted,
+    })
 }
 
 pub fn set_persistent_drain(path: &Path, draining: bool) -> Result<(), OperationsError> {
@@ -679,6 +1490,65 @@ pub fn is_persistently_draining(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
+/// Publish the node's live execution-permit count for the operator surface.
+///
+/// The count is written beside the execution database, in the same owner-only
+/// state directory, and is replaced atomically so a reader never sees a
+/// half-written number.
+pub fn publish_permit_count(path: &Path, held: u32) -> Result<(), OperationsError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension(format!("permits.{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
+    file.write_all(held.to_string().as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&temp, path)?;
+    Ok(())
+}
+
+/// Remove the published permit count, so a stopped node leaves no number
+/// behind.
+pub fn clear_permit_count(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
+/// Read the permit count the node published, if it published one.
+pub fn read_permit_count(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse::<u32>().ok()
+}
+
+/// Whether the configured bind address is currently accepting connections.
+///
+/// The probe is a bare TCP connect: it sends no request, so it cannot be
+/// mistaken for an execution, and it fails for a node that is not running.
+pub fn node_is_listening(config: &OperatorConfig) -> bool {
+    config.bind.parse::<SocketAddr>().is_ok_and(|addr| {
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_ok()
+    })
+}
+
+/// The live permit count the running node published, if the node is running.
+///
+/// The published number describes the permits the node held when it wrote it.
+/// A node that has stopped leaves the file behind, so the count is reported
+/// only when the node's bind address is still accepting connections. A node
+/// that is not running has no live permit count, and the operator surface says
+/// so rather than reporting a number that describes a node that is gone.
+pub fn observed_permit_count(config: &OperatorConfig) -> Option<u32> {
+    if !node_is_listening(config) {
+        return None;
+    }
+    read_permit_count(&config.permit_report_path())
+}
+
 pub async fn execution_page(
     config: &OperatorConfig,
     limit: usize,
@@ -689,17 +1559,9 @@ pub async fn execution_page(
     require_regular_file(&config.database_path)?;
     let mut executions = load_snapshots(config)?;
     let total = executions.len();
-    let active_executions = executions
+    let non_terminal_executions = executions
         .iter()
-        .filter(|snapshot| {
-            matches!(
-                snapshot.state,
-                eggwork_core::ExecutionState::Accepted
-                    | eggwork_core::ExecutionState::Preparing
-                    | eggwork_core::ExecutionState::Running
-                    | eggwork_core::ExecutionState::Cancelling
-            )
-        })
+        .filter(|snapshot| snapshot.state.is_non_terminal())
         .count();
     let mut states = BTreeMap::new();
     let mut stdout_bytes = 0u64;
@@ -724,7 +1586,7 @@ pub async fn execution_page(
         limit,
         offset,
         total,
-        active_executions,
+        non_terminal_executions,
         states,
         stdout_bytes,
         stderr_bytes,
@@ -755,16 +1617,21 @@ pub fn active_execution_count(config: &OperatorConfig) -> usize {
 /// connection and `serde_json`-decoded up to 2048 durable snapshots on every
 /// poll — thousands of connections and millions of decodes over one update —
 /// only to filter four state values that `executions.state` already stores as a
-/// real column. The literals below are the `store::state_name` spellings, which
-/// are PascalCase, not the snake_case used by `state_label` for display.
+/// real column. The names bound below are the core-owned wire spellings of the
+/// shared non-terminal classification, not the snake_case used by `state_label`
+/// for display, and they are bound as parameters so the runtime-assembled list
+/// never becomes SQL text.
 fn count_active_executions(config: &OperatorConfig) -> Result<usize, OperationsError> {
     require_regular_file(&config.database_path)?;
     let db = read_only_database(&config.database_path)?;
+    let states = crate::store::non_terminal_state_names();
+    let placeholders = std::iter::repeat_n("?", states.len())
+        .collect::<Vec<_>>()
+        .join(",");
     let count: i64 = db
         .query_row(
-            "SELECT COUNT(*) FROM executions
-             WHERE state IN ('Accepted','Preparing','Running','Cancelling')",
-            [],
+            &format!("SELECT COUNT(*) FROM executions WHERE state IN ({placeholders})"),
+            rusqlite::params_from_iter(states.iter()),
             |row| row.get(0),
         )
         .map_err(|_| OperationsError::Data)?;
@@ -832,6 +1699,15 @@ fn load_snapshots(
     Ok(snapshots)
 }
 
+/// The operator-facing label for an execution state.
+///
+/// This is a *display* projection, not a protocol fact. The protocol spelling
+/// is `eggwork_core::ExecutionState::wire_name`, and the terminal
+/// classification is `eggwork_core::ExecutionState::is_terminal`; this map
+/// deliberately stays in the operator crate because snake_case is an
+/// operator-facing convention rather than something the protocol-neutral core
+/// should carry. The match is exhaustive with no wildcard arm, so a new state
+/// variant has to be given a label here instead of falling back to a default.
 fn state_label(state: &eggwork_core::ExecutionState) -> &'static str {
     use eggwork_core::ExecutionState::*;
     match state {
@@ -888,7 +1764,7 @@ fn file_family_bytes(path: &Path) -> u64 {
 }
 
 pub fn storage_summary(config: &OperatorConfig) -> Result<StorageSummary, OperationsError> {
-    let artifact_db = config.database_path.with_extension("artifacts.sqlite");
+    let artifact_db = crate::artifact::metadata_path(&config.database_path);
     Ok(StorageSummary {
         execution_bytes: file_family_bytes(&config.database_path),
         blob_bytes: tree_bytes(&config.blob_root)?,
@@ -900,10 +1776,18 @@ pub fn storage_summary(config: &OperatorConfig) -> Result<StorageSummary, Operat
     })
 }
 
+/// The counters the node holds, as the operator surface reports them.
+///
+/// Every metric the node can increment is present, with `0` when the node has
+/// never incremented it, and every row the node's metrics table holds is
+/// reported under its own name. A name this build does not know — a row
+/// written by another version of the node — is reported as it stands rather
+/// than dropped: a counter that vanishes from the report is a counter an
+/// operator cannot see.
 pub fn metrics_snapshot(config: &OperatorConfig) -> Result<OperatorMetrics, OperationsError> {
-    let mut counters = METRIC_NAMES
+    let mut counters = crate::Metric::ALL
         .iter()
-        .map(|name| ((*name).to_owned(), 0))
+        .map(|metric| ((*metric).name().to_owned(), 0u64))
         .collect::<BTreeMap<_, _>>();
     match fs::symlink_metadata(&config.database_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -925,9 +1809,7 @@ pub fn metrics_snapshot(config: &OperatorConfig) -> Result<OperatorMetrics, Oper
         .map_err(|_| OperationsError::Data)?;
     for row in rows {
         let (name, value) = row.map_err(|_| OperationsError::Data)?;
-        if let Some(counter) = counters.get_mut(&name) {
-            *counter = value.max(0) as u64;
-        }
+        counters.insert(name, value.max(0) as u64);
     }
     Ok(OperatorMetrics { counters })
 }
@@ -946,7 +1828,7 @@ pub async fn collect_garbage(
         .map_err(|_| OperationsError::Data)?;
     let blobs = BlobStore::open(&config.blob_root, config.blob_quota_bytes)
         .map_err(|_| OperationsError::Data)?;
-    let artifacts = ArtifactStore::open(config.database_path.with_extension("artifacts.sqlite"))
+    let artifacts = ArtifactStore::open(crate::artifact::metadata_path(&config.database_path))
         .map_err(|_| OperationsError::Data)?;
     let now = crate::artifact::now_unix_ms();
     let (workspace_candidates, workspace_logical_bytes, workspaces_deleted) = workspaces
@@ -1030,64 +1912,46 @@ fn read_only_database(path: &Path) -> Result<rusqlite::Connection, OperationsErr
 }
 
 fn dry_run_gc(config: &OperatorConfig, limit: usize) -> Result<NodeGcReport, OperationsError> {
-    let now = crate::artifact::now_unix_ms() as i64;
-    let workspace_db = read_only_database(&config.workspace_root.join("metadata.sqlite"))?;
-    let (workspace_candidates, workspace_logical_bytes): (i64, i64) = workspace_db
-        .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(logical_bytes),0) FROM
-             (SELECT logical_bytes FROM workspaces WHERE expires_unix_ms IS NOT NULL
-              AND expires_unix_ms <= ?1 ORDER BY expires_unix_ms LIMIT ?2)",
-            rusqlite::params![now, limit as i64],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|_| OperationsError::Data)?;
-    // Older stores predate the retained-manifest cache; report zero instead
-    // of failing the whole preview.
-    let manifest_candidates: i64 = workspace_db
-        .query_row(
-            "SELECT COUNT(*) FROM (SELECT manifest_digest FROM retained_manifests
-             WHERE expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?1
-             ORDER BY expires_unix_ms LIMIT ?2)",
-            rusqlite::params![now, limit as i64],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let artifact_db = read_only_database(&config.database_path.with_extension("artifacts.sqlite"))?;
-    let artifact_candidates: i64 = artifact_db
-        .query_row(
-            "SELECT COUNT(*) FROM (SELECT artifact_id FROM artifacts
-             WHERE expires_unix_ms <= ?1 ORDER BY expires_unix_ms LIMIT ?2)",
-            rusqlite::params![now, limit as i64],
-            |row| row.get(0),
-        )
-        .map_err(|_| OperationsError::Data)?;
-    let blob_db = read_only_database(&config.blob_root.join("metadata.sqlite"))?;
-    let expired_blob_references: i64 = blob_db
-        .query_row(
-            "SELECT COUNT(*) FROM blob_references WHERE expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?1",
-            [now],
-            |row| row.get(0),
-        )
-        .map_err(|_| OperationsError::Data)?;
-    let (blob_candidates, blob_candidate_bytes): (i64, i64) = blob_db
-        .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM
-             (SELECT size_bytes FROM blobs WHERE reference_count = 0 ORDER BY last_used_unix_ms LIMIT ?1)",
-            [limit as i64],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+    // The preview owns no candidate predicate of its own. It asks each owner
+    // module for the set the collector would act on, and the owner evaluates
+    // the same statement the collector evaluates - so the preview and the
+    // apply pass cannot answer different questions.
+    //
+    // The owner entry points open the store's metadata database read-only.
+    // They do not open the store: `BlobStore::open`, `WorkspaceManager::open`
+    // and `ArtifactStore::open` all create and reconcile, and a preview that
+    // created the store it reports on would not be a preview.
+    let now = crate::artifact::now_unix_ms();
+    let workspaces = crate::workspace::preview_gc(
+        &crate::workspace::metadata_path(&config.workspace_root),
+        now,
+        limit,
+    )
+    .map_err(|_| OperationsError::Data)?;
+    let artifacts = crate::artifact::preview_gc(
+        &crate::artifact::metadata_path(&config.database_path),
+        now,
+        limit,
+    )
+    .map_err(|_| OperationsError::Data)?;
+    let blobs = crate::blob::preview_gc(&crate::blob::metadata_path(&config.blob_root), now, limit)
         .map_err(|_| OperationsError::Data)?;
     Ok(NodeGcReport {
-        workspace_candidates: workspace_candidates.max(0) as u64,
-        workspace_logical_bytes: workspace_logical_bytes.max(0) as u64,
+        workspace_candidates: workspaces.workspaces.len() as u64,
+        workspace_logical_bytes: workspaces.workspaces.iter().fold(0u64, |sum, candidate| {
+            sum.saturating_add(candidate.logical_bytes)
+        }),
         workspaces_deleted: 0,
-        manifest_candidates: manifest_candidates.max(0) as u64,
+        manifest_candidates: workspaces.manifests.len() as u64,
         manifests_deleted: 0,
-        artifact_candidates: artifact_candidates.max(0) as u64,
+        artifact_candidates: artifacts.artifacts.len() as u64,
         artifacts_deleted: 0,
-        expired_blob_references: expired_blob_references.max(0) as u64,
-        blob_candidates: blob_candidates.max(0) as u64,
-        blob_candidate_bytes: blob_candidate_bytes.max(0) as u64,
+        expired_blob_references: blobs.expired_references,
+        blob_candidates: blobs.candidates.len() as u64,
+        blob_candidate_bytes: blobs
+            .candidates
+            .iter()
+            .fold(0u64, |sum, (_, size)| sum.saturating_add(*size)),
         blobs_deleted: 0,
         blob_bytes_deleted: 0,
         dry_run: true,
@@ -1100,17 +1964,21 @@ pub fn inspect_blob(
 ) -> Result<ResourceInspection, OperationsError> {
     let digest = eggwork_core::BlobDigest::parse(digest.to_owned())
         .map_err(|_| OperationsError::NotFound)?;
-    let shard = config.blob_root.join(&digest.as_str()[..2]);
+    // The shard directory and the object path come from the store's own path
+    // ownership. The inspection verb runs against an offline store, so it
+    // must not need a store instance - and a store instance would mean the
+    // creating, reconciling open that `BlobStore::open` performs.
+    let shard = crate::blob::shard_path(&config.blob_root, &digest);
     let shard_meta = fs::symlink_metadata(&shard).map_err(|_| OperationsError::NotFound)?;
     if !shard_meta.is_dir() || shard_meta.file_type().is_symlink() {
         return Err(OperationsError::NotFound);
     }
-    let path = shard.join(digest.as_str());
+    let path = crate::blob::object_path(&config.blob_root, &digest);
     let metadata = fs::symlink_metadata(&path).map_err(|_| OperationsError::NotFound)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(OperationsError::NotFound);
     }
-    let db = read_only_database(&config.blob_root.join("metadata.sqlite"))?;
+    let db = read_only_database(&crate::blob::metadata_path(&config.blob_root))?;
     let size_recorded: Option<(i64, i64)> = db
         .query_row(
             "SELECT size_bytes,reference_count FROM blobs WHERE digest=?1",
@@ -1136,7 +2004,7 @@ pub fn inspect_workspace(
 ) -> Result<ResourceInspection, OperationsError> {
     let id =
         eggwork_core::WorkspaceId::new(id.to_owned()).map_err(|_| OperationsError::NotFound)?;
-    let db = read_only_database(&config.workspace_root.join("metadata.sqlite"))?;
+    let db = read_only_database(&crate::workspace::metadata_path(&config.workspace_root))?;
     let row: Option<(String, i64, String, Option<i64>)> = db.query_row("SELECT state, logical_bytes, manifest_digest, expires_unix_ms FROM workspaces WHERE workspace_id=?1", [id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|_| OperationsError::Data)?;
     let (state, logical, digest, expires) = row.ok_or(OperationsError::NotFound)?;
     Ok(ResourceInspection {
@@ -1151,7 +2019,7 @@ pub fn inspect_artifact(
     id: &str,
 ) -> Result<ResourceInspection, OperationsError> {
     let id = eggwork_core::ArtifactId::new(id.to_owned()).map_err(|_| OperationsError::NotFound)?;
-    let db = read_only_database(&config.database_path.with_extension("artifacts.sqlite"))?;
+    let db = read_only_database(&crate::artifact::metadata_path(&config.database_path))?;
     let row: Option<Vec<u8>> = db
         .query_row(
             "SELECT record_json FROM artifacts WHERE artifact_id=?1",
@@ -1190,7 +2058,13 @@ pub async fn start_server(config: &OperatorConfig) -> Result<NodeServer, Operati
         Arc::new(authorizer),
     )
     .await
-    .map_err(|_| OperationsError::Config)
+    .map_err(|_| {
+        // The node's own start error carries a reason string that may name a
+        // path; it is classified and dropped. `config validate` has already
+        // reported the specific rule for a configuration that is wrong, so
+        // this rule says only that the node refused to start.
+        fault(ConfigRule::NodeStartFailed, ConfigItem::role("the node"))
+    })
 }
 
 #[cfg(test)]
@@ -1221,6 +2095,7 @@ mod tests {
                 principal_id: "controller".into(),
                 certificate_sha256: "ab".repeat(32),
                 operations: vec!["status".into()],
+                resource_scopes: Vec::new(),
             }],
             host_telemetry: None,
         }
@@ -1233,6 +2108,192 @@ mod tests {
         assert!(!encoded.contains("super-secret-key.pem"));
         assert!(!encoded.contains(&"ab".repeat(32)));
         assert!(encoded.contains("[REDACTED]"));
+    }
+
+    /// The printed configuration must not carry the resource a scope names,
+    /// the same way it does not carry the private key path or the certificate
+    /// fingerprint. The shape of the narrowing stays readable: the operator
+    /// reads which operation and which kind were confined.
+    #[test]
+    fn the_printed_configuration_redacts_resource_scope_identifiers() {
+        let temp = TempDir::new().unwrap();
+        let mut config = config(temp.path());
+        config.clients[0].operations = vec!["blob-read".into()];
+        config.clients[0].resource_scopes = vec![ResourceScope {
+            operation: "blob-read".into(),
+            resource_kind: "blob".into(),
+            resource_id: "cd".repeat(32),
+        }];
+        let encoded = config.redacted_json().unwrap();
+        assert!(!encoded.contains(&"cd".repeat(32)));
+        assert!(!encoded.contains("super-secret-key.pem"));
+        assert!(!encoded.contains(&"ab".repeat(32)));
+        assert!(encoded.contains("[REDACTED]"));
+        assert!(encoded.contains("blob-read"));
+        assert!(encoded.contains("blob"));
+    }
+
+    /// A scope that narrows an operation the grant already holds is accepted.
+    #[test]
+    fn a_resource_scope_that_narrows_a_held_operation_is_accepted() {
+        let temp = TempDir::new().unwrap();
+        let mut config = installed_config(temp.path());
+        config.clients[0].operations = vec!["blob-read".into()];
+        config.clients[0].resource_scopes = vec![ResourceScope {
+            operation: "blob-read".into(),
+            resource_kind: "blob".into(),
+            resource_id: "a".repeat(64),
+        }];
+        assert!(config.validate().is_ok());
+    }
+
+    /// Every malformed scope is a configuration error. The node refuses to
+    /// start rather than degrade to a decision that ignores the scope.
+    #[test]
+    fn a_malformed_resource_scope_is_refused_by_the_configuration() {
+        let cases: Vec<(&str, ResourceScope)> = vec![
+            (
+                "an unknown operation name",
+                ResourceScope {
+                    operation: "blob-readd".into(),
+                    resource_kind: "blob".into(),
+                    resource_id: "a".repeat(64),
+                },
+            ),
+            (
+                "an unknown resource kind",
+                ResourceScope {
+                    operation: "blob-read".into(),
+                    resource_kind: "blobs".into(),
+                    resource_id: "a".repeat(64),
+                },
+            ),
+            (
+                "a malformed identifier",
+                ResourceScope {
+                    operation: "blob-read".into(),
+                    resource_kind: "blob".into(),
+                    resource_id: "not-a-digest".into(),
+                },
+            ),
+            (
+                "a scope for an operation the grant does not hold",
+                ResourceScope {
+                    operation: "blob-write".into(),
+                    resource_kind: "blob".into(),
+                    resource_id: "a".repeat(64),
+                },
+            ),
+            (
+                "a scope for a kind the operation never names",
+                ResourceScope {
+                    operation: "blob-read".into(),
+                    resource_kind: "execution".into(),
+                    resource_id: "exec-1".into(),
+                },
+            ),
+            (
+                "a scope for an operation that names no resource at all",
+                ResourceScope {
+                    operation: "status".into(),
+                    resource_kind: "execution".into(),
+                    resource_id: "exec-1".into(),
+                },
+            ),
+        ];
+        for (label, scope) in cases {
+            let temp = TempDir::new().unwrap();
+            let mut config = installed_config(temp.path());
+            config.clients[0].operations = vec!["blob-read".into(), "status".into()];
+            config.clients[0].resource_scopes = vec![scope];
+            assert!(config.validate().is_err(), "{label} must be refused");
+        }
+    }
+
+    /// The same scope twice is a duplicate, not a redundancy to be tolerated.
+    #[test]
+    fn a_duplicate_resource_scope_is_refused_by_the_configuration() {
+        let temp = TempDir::new().unwrap();
+        let mut config = installed_config(temp.path());
+        config.clients[0].operations = vec!["blob-read".into()];
+        config.clients[0].resource_scopes = vec![
+            ResourceScope {
+                operation: "blob-read".into(),
+                resource_kind: "blob".into(),
+                resource_id: "a".repeat(64),
+            },
+            ResourceScope {
+                operation: "blob-read".into(),
+                resource_kind: "blob".into(),
+                resource_id: "a".repeat(64),
+            },
+        ];
+        assert!(config.validate().is_err());
+    }
+
+    /// One grant cannot carry more scopes than the per-grant cap.
+    #[test]
+    fn too_many_resource_scopes_in_one_grant_are_refused() {
+        let temp = TempDir::new().unwrap();
+        let mut config = installed_config(temp.path());
+        config.clients[0].operations = vec!["blob-read".into()];
+        config.clients[0].resource_scopes = (0..=MAX_RESOURCE_SCOPES_PER_GRANT)
+            .map(|index| ResourceScope {
+                operation: "blob-read".into(),
+                resource_kind: "blob".into(),
+                resource_id: format!("{index:064x}"),
+            })
+            .collect();
+        assert!(config.validate().is_err());
+    }
+
+    /// The node's grant set cannot carry more scopes than the per-node cap,
+    /// even when every individual grant is within its own cap.
+    #[test]
+    fn too_many_resource_scopes_across_the_node_are_refused() {
+        let temp = TempDir::new().unwrap();
+        let mut config = installed_config(temp.path());
+        let base = config.clients.remove(0);
+        let grants = MAX_RESOURCE_SCOPES_TOTAL / MAX_RESOURCE_SCOPES_PER_GRANT + 1;
+        for grant in 0..grants {
+            let mut client = base.clone();
+            client.principal_id = format!("controller-{grant:02}");
+            client.certificate_sha256 = format!("{grant:064x}");
+            client.operations = vec!["blob-read".into()];
+            client.resource_scopes = (0..MAX_RESOURCE_SCOPES_PER_GRANT)
+                .map(|index| ResourceScope {
+                    operation: "blob-read".into(),
+                    resource_kind: "blob".into(),
+                    resource_id: format!("{:064x}", (grant as u64) * 1_000 + index as u64),
+                })
+                .collect();
+            config.clients.push(client);
+        }
+        assert!(config.validate().is_err());
+    }
+
+    /// A configuration written before resource scopes existed still validates.
+    #[test]
+    fn a_configuration_written_before_resource_scopes_still_validates() {
+        let temp = TempDir::new().unwrap();
+        let config = installed_config(temp.path());
+        assert!(config.clients[0].resource_scopes.is_empty());
+        assert!(config.validate().is_ok());
+    }
+
+    /// The grant table the daemon builds refuses a scope it cannot parse,
+    /// even if `validate` was never called on the way to it.
+    #[test]
+    fn the_grant_table_refuses_a_scope_it_cannot_parse() {
+        let temp = TempDir::new().unwrap();
+        let mut config = installed_config(temp.path());
+        config.clients[0].operations = vec!["blob-read".into()];
+        config.clients[0].resource_scopes = vec![ResourceScope {
+            operation: "blob-read".into(),
+            resource_kind: "blob".into(),
+            resource_id: "not-a-digest".into(),
+        }];
+        assert!(config.principals().is_err());
     }
 
     /// A configuration document in the shape the loader accepts.
@@ -1420,6 +2481,65 @@ mod tests {
         assert_eq!(tree_bytes(&root).unwrap(), 0);
     }
 
+    /// The active-execution count selects exactly the non-terminal states.
+    ///
+    /// The list behind the drain and quiescence query is derived from the shared
+    /// classification at runtime and bound as SQL parameters, so this test reads
+    /// the same four names the drain path counts: `Accepted`, `Preparing`,
+    /// `Running` and `Cancelling`. A fifth name, or a missing one, changes the
+    /// count and fails here.
+    #[test]
+    fn the_active_execution_count_selects_exactly_the_non_terminal_states() {
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        fs::create_dir_all(config.database_path.parent().unwrap()).unwrap();
+        let db = rusqlite::Connection::open(&config.database_path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE executions(
+                 execution_id TEXT,
+                 generation INTEGER,
+                 state TEXT,
+                 snapshot_json BLOB
+             );",
+        )
+        .unwrap();
+        for state in eggwork_core::ALL_EXECUTION_STATES {
+            db.execute(
+                "INSERT INTO executions VALUES (?1,1,?2,NULL)",
+                rusqlite::params![format!("exec-{}", state.wire_name()), state.wire_name()],
+            )
+            .unwrap();
+        }
+        drop(db);
+
+        assert_eq!(
+            count_active_executions(&config).unwrap(),
+            4,
+            "exactly Accepted, Preparing, Running and Cancelling must be counted as active"
+        );
+        let names: Vec<&str> = crate::store::non_terminal_state_names();
+        assert_eq!(names, ["Accepted", "Preparing", "Running", "Cancelling"]);
+    }
+
+    /// The operator-facing state labels are unchanged.
+    ///
+    /// These labels are a display projection, not a protocol fact, and the
+    /// snake_case they use is what an operator sees. The test pins all nine so a
+    /// rename of a label is a deliberate change rather than an accident.
+    #[test]
+    fn the_operator_state_labels_are_unchanged() {
+        use eggwork_core::ExecutionState::*;
+        assert_eq!(state_label(&Accepted), "accepted");
+        assert_eq!(state_label(&Preparing), "preparing");
+        assert_eq!(state_label(&Running), "running");
+        assert_eq!(state_label(&Cancelling), "cancelling");
+        assert_eq!(state_label(&Succeeded), "succeeded");
+        assert_eq!(state_label(&Failed), "failed");
+        assert_eq!(state_label(&Cancelled), "cancelled");
+        assert_eq!(state_label(&TimedOut), "timed_out");
+        assert_eq!(state_label(&Interrupted), "interrupted");
+    }
+
     #[tokio::test]
     async fn execution_listing_is_bounded_and_paginates_over_durable_records() {
         let temp = TempDir::new().unwrap();
@@ -1433,7 +2553,7 @@ mod tests {
         for index in 0..3u64 {
             let id = ExecutionId::new(format!("exec-{index}")).unwrap();
             let snapshot = eggwork_core::ExecutionSnapshot {
-                schema_version: 1,
+                schema_version: eggwork_core::API_SCHEMA_VERSION,
                 execution_id: id.clone(),
                 generation: ExecutionGeneration::new(1).unwrap(),
                 state: if index == 1 {
@@ -1452,7 +2572,7 @@ mod tests {
         drop(db);
         let first = execution_page(&config, 1, 0).await.unwrap();
         assert_eq!(first.total, 3);
-        assert_eq!(first.active_executions, 1);
+        assert_eq!(first.non_terminal_executions, 1);
         assert_eq!(first.executions[0].execution_id.as_str(), "exec-0");
         assert_eq!(first.next_offset, Some(1));
         let next = execution_page(&config, 1, first.next_offset.unwrap())
@@ -1462,51 +2582,453 @@ mod tests {
         assert_eq!(next.next_offset, Some(2));
     }
 
+    /// The three data-plane stores, built through their owner modules.
+    ///
+    /// The fixture this replaces hand-built a `blobs` table whose columns were
+    /// `(reference_count, size_bytes, last_used_unix_ms)`, with no `digest`
+    /// column at all. It was a database shaped to the hand-copied predicate,
+    /// and the canonical statement could not even be evaluated against it.
+    fn real_stores(config: &OperatorConfig) -> (BlobStore, WorkspaceManager, ArtifactStore) {
+        (
+            BlobStore::open(&config.blob_root, config.blob_quota_bytes).unwrap(),
+            WorkspaceManager::open(&config.workspace_root, config.workspace_quota_bytes).unwrap(),
+            ArtifactStore::open(crate::artifact::metadata_path(&config.database_path)).unwrap(),
+        )
+    }
+
+    async fn seed_blob(blobs: &BlobStore, bytes: &'static [u8]) -> eggwork_core::BlobDigest {
+        let digest = eggwork_core::BlobDigest::from_bytes(bytes);
+        blobs
+            .put_stream(
+                digest.clone(),
+                bytes.len() as u64,
+                futures_util::stream::iter([Ok::<_, ()>(bytes::Bytes::from_static(bytes))]),
+            )
+            .await
+            .unwrap();
+        digest
+    }
+
+    /// The blob states the two candidate predicates can disagree about.
+    struct BlobStates {
+        /// A live reference row: never a candidate.
+        live: eggwork_core::BlobDigest,
+        /// Only an expired reference row: a candidate once that row is gone.
+        /// Absent when the fixture seeds no expired reference at all.
+        expired: Option<eggwork_core::BlobDigest>,
+        /// No reference rows at all: always a candidate.
+        unreferenced: Vec<eggwork_core::BlobDigest>,
+        /// A live reference row whose counter says zero.
+        ///
+        /// Two of them, so that the two candidate predicates disagree on the
+        /// *count* and not only on the membership: a counter-based predicate
+        /// would report one blob too many, which a count comparison can see.
+        counter_low: Vec<eggwork_core::BlobDigest>,
+        /// No reference rows whose counter says one.
+        counter_high: eggwork_core::BlobDigest,
+    }
+
+    /// Seed the blob states and drift the trigger-maintained counter against
+    /// the reference rows of two of them.
+    ///
+    /// `blobs.reference_count` is a denormalization written only by the
+    /// `blob_reference_insert` / `blob_reference_delete` triggers. Drifting it
+    /// here does not fabricate a reference row: it reproduces the condition
+    /// under which a counter-based predicate and a reference-row predicate
+    /// answer different questions, which is the whole point of the
+    /// divergence this milestone removes.
+    async fn seed_blob_states(
+        config: &OperatorConfig,
+        blobs: &BlobStore,
+        with_expired_reference: bool,
+    ) -> BlobStates {
+        let states = BlobStates {
+            live: seed_blob(blobs, b"live").await,
+            expired: if with_expired_reference {
+                Some(seed_blob(blobs, b"expired").await)
+            } else {
+                None
+            },
+            unreferenced: vec![
+                seed_blob(blobs, b"unreferenced-a").await,
+                seed_blob(blobs, b"unreferenced-b").await,
+                seed_blob(blobs, b"unreferenced-c").await,
+            ],
+            counter_low: vec![
+                seed_blob(blobs, b"counter-low-a").await,
+                seed_blob(blobs, b"counter-low-b").await,
+            ],
+            counter_high: seed_blob(blobs, b"counter-high").await,
+        };
+        blobs
+            .retain(
+                "workspace",
+                "ws-live",
+                std::slice::from_ref(&states.live),
+                None,
+            )
+            .unwrap();
+        blobs
+            .retain("workspace", "ws-counter", &states.counter_low, None)
+            .unwrap();
+        if let Some(expired) = states.expired.clone() {
+            blobs
+                .retain("workspace", "ws-expired", &[expired], Some(1))
+                .unwrap();
+        }
+        let connection =
+            rusqlite::Connection::open(crate::blob::metadata_path(&config.blob_root)).unwrap();
+        for digest in &states.counter_low {
+            connection
+                .execute(
+                    "UPDATE blobs SET reference_count = 0 WHERE digest = ?1",
+                    [digest.as_str()],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "UPDATE blobs SET reference_count = 1 WHERE digest = ?1",
+                [states.counter_high.as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        states
+    }
+
+    /// Seed expired workspaces and artifacts so the preview's workspace and
+    /// artifact figures are exercised against real tables.
+    ///
+    /// The workspace rows need a storage directory that exists, because the
+    /// manager's reconciliation drops rows whose tree is gone.
+    fn seed_expired_workspaces(config: &OperatorConfig, count: usize) {
+        let connection =
+            rusqlite::Connection::open(crate::workspace::metadata_path(&config.workspace_root))
+                .unwrap();
+        for index in 0..count {
+            let storage_key = format!("workspace-{}", uuid::Uuid::new_v4());
+            fs::create_dir_all(config.workspace_root.join(&storage_key)).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO workspaces(workspace_id, execution_id, generation, principal_id,
+                       manifest_digest, storage_key, logical_bytes, state, created_unix_ms,
+                       expires_unix_ms)
+                     VALUES (?1, 'exec-expired', 1, 'principal-a', 'digest', ?2, 99, 'Ready', 0, 1)",
+                    rusqlite::params![
+                        format!("workspace-expired-{index}"),
+                        storage_key
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+    }
+
+    fn seed_expired_artifacts(config: &OperatorConfig, count: usize) {
+        let connection =
+            rusqlite::Connection::open(crate::artifact::metadata_path(&config.database_path))
+                .unwrap();
+        for index in 0..count {
+            connection
+                .execute(
+                    "INSERT INTO artifacts(artifact_id, execution_id, generation, principal_id,
+                       record_json, created_unix_ms, expires_unix_ms)
+                     VALUES (?1, 'exec-expired', 1, 'principal-a', ?2, 0, 1)",
+                    rusqlite::params![
+                        format!("artifact-expired-{index}"),
+                        format!("{{\"n\":{index}}}").into_bytes()
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+    }
+
+    /// The candidates the store's own canonical statement selects.
+    fn owner_preview(config: &OperatorConfig, now: u64, limit: usize) -> crate::blob::GcPreview {
+        crate::blob::preview_gc(&crate::blob::metadata_path(&config.blob_root), now, limit).unwrap()
+    }
+
+    /// The digests the store's own candidate statement selects.
+    fn owner_candidates(config: &OperatorConfig, now: u64, limit: usize) -> Vec<String> {
+        owner_preview(config, now, limit)
+            .candidates
+            .into_iter()
+            .map(|(digest, _)| digest)
+            .collect()
+    }
+
+    /// Every seeded digest, in a stable order.
+    fn all_seeded(states: &BlobStates) -> Vec<eggwork_core::BlobDigest> {
+        let mut all = vec![states.live.clone(), states.counter_high.clone()];
+        all.extend(states.counter_low.iter().cloned());
+        all.extend(states.expired.clone());
+        all.extend(states.unreferenced.iter().cloned());
+        all
+    }
+
+    /// The digests whose object file the collector removed.
+    fn removed_objects(config: &OperatorConfig, states: &BlobStates) -> Vec<String> {
+        all_seeded(states)
+            .into_iter()
+            .filter(|digest| !crate::blob::object_path(&config.blob_root, digest).exists())
+            .map(|digest| digest.as_str().to_owned())
+            .collect()
+    }
+
     #[tokio::test]
     async fn garbage_collection_preview_reads_only_and_reports_bounds() {
         let temp = TempDir::new().unwrap();
         let config = config(temp.path());
-        fs::create_dir_all(&config.workspace_root).unwrap();
-        fs::create_dir_all(&config.blob_root).unwrap();
         fs::create_dir_all(config.database_path.parent().unwrap()).unwrap();
-        let workspace_db =
-            rusqlite::Connection::open(config.workspace_root.join("metadata.sqlite")).unwrap();
-        workspace_db.execute_batch("CREATE TABLE workspaces(workspace_id TEXT,logical_bytes INTEGER,expires_unix_ms INTEGER);").unwrap();
-        workspace_db
-            .execute("INSERT INTO workspaces VALUES ('workspace-1',99,0)", [])
-            .unwrap();
-        drop(workspace_db);
-        let artifact_db =
-            rusqlite::Connection::open(config.database_path.with_extension("artifacts.sqlite"))
-                .unwrap();
-        artifact_db
-            .execute_batch("CREATE TABLE artifacts(artifact_id TEXT,expires_unix_ms INTEGER);")
-            .unwrap();
-        artifact_db
-            .execute("INSERT INTO artifacts VALUES ('artifact-1',0)", [])
-            .unwrap();
-        drop(artifact_db);
-        let blob_db = rusqlite::Connection::open(config.blob_root.join("metadata.sqlite")).unwrap();
-        blob_db.execute_batch("CREATE TABLE blob_references(expires_unix_ms INTEGER); CREATE TABLE blobs(reference_count INTEGER,size_bytes INTEGER,last_used_unix_ms INTEGER);").unwrap();
-        blob_db
-            .execute("INSERT INTO blob_references VALUES (0)", [])
-            .unwrap();
-        blob_db
-            .execute("INSERT INTO blobs VALUES (0,123,0)", [])
-            .unwrap();
-        drop(blob_db);
+        let (blobs, workspaces, artifacts) = real_stores(&config);
+        seed_blob_states(&config, &blobs, true).await;
+        seed_expired_workspaces(&config, 2);
+        seed_expired_artifacts(&config, 2);
+        // Close the stores so the preview reads a cleanly checkpointed
+        // database rather than a live write-ahead log.
+        drop(artifacts);
+        drop(workspaces);
+        drop(blobs);
         let in_flight_upload = config.blob_root.join(".part-live-upload");
         fs::write(&in_flight_upload, b"partial upload").unwrap();
 
-        let report = collect_garbage(&config, true, 1).await.unwrap();
-        assert_eq!(report.workspace_candidates, 1);
-        assert_eq!(report.workspace_logical_bytes, 99);
-        assert_eq!(report.artifact_candidates, 1);
-        assert_eq!(report.expired_blob_references, 1);
-        assert_eq!(report.blob_candidates, 1);
-        assert!(report.dry_run);
+        // The bound is honoured: the preview reports a bounded sample of the
+        // eligible entries, not a census.
+        let bounded = collect_garbage(&config, true, 1).await.unwrap();
+        assert_eq!(bounded.workspace_candidates, 1);
+        assert_eq!(bounded.artifact_candidates, 1);
+        assert_eq!(bounded.blob_candidates, 1);
+        assert!(bounded.dry_run);
+        assert_eq!(bounded.workspaces_deleted, 0);
+        assert_eq!(bounded.artifacts_deleted, 0);
+        assert_eq!(bounded.blobs_deleted, 0);
+        // A preview reads; it does not sweep. The in-flight upload survives.
         assert!(in_flight_upload.exists());
         assert_eq!(fs::read(&in_flight_upload).unwrap(), b"partial upload");
+
+        // The unbounded figures of the same store.
+        let full = collect_garbage(&config, true, 8).await.unwrap();
+        assert_eq!(full.workspace_candidates, 2);
+        assert_eq!(full.workspace_logical_bytes, 198);
+        assert_eq!(full.artifact_candidates, 2);
+        assert_eq!(full.expired_blob_references, 1);
+        assert_eq!(full.blob_candidates, 4);
+        assert!(full.dry_run);
+        assert!(in_flight_upload.exists());
+        assert_eq!(fs::read(&in_flight_upload).unwrap(), b"partial upload");
+    }
+
+    #[tokio::test]
+    async fn gc_preview_uses_the_stores_own_blob_predicate_not_the_reference_count_counter() {
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        fs::create_dir_all(config.database_path.parent().unwrap()).unwrap();
+        let (blobs, workspaces, artifacts) = real_stores(&config);
+        let states = seed_blob_states(&config, &blobs, true).await;
+        drop(artifacts);
+        drop(workspaces);
+        drop(blobs);
+
+        let report = collect_garbage(&config, true, 8).await.unwrap();
+        let owner = owner_preview(&config, crate::artifact::now_unix_ms(), 8);
+        let candidates: Vec<String> = owner
+            .candidates
+            .iter()
+            .map(|(digest, _)| digest.clone())
+            .collect();
+
+        // The operator's preview reports exactly the owner's candidate set -
+        // the same count and the same bytes. A counter-based predicate would
+        // report two blobs too many here, because it counts the drifted
+        // blobs whose counter says zero and misses the one whose counter
+        // says one.
+        assert_eq!(report.blob_candidates as usize, owner.candidates.len());
+        assert_eq!(report.blob_candidates, 4);
+        assert_eq!(
+            report.blob_candidate_bytes,
+            owner
+                .candidates
+                .iter()
+                .fold(0u64, |sum, (_, size)| sum.saturating_add(*size))
+        );
+
+        // The reference-row predicate, not the counter: a blob whose counter
+        // says zero but which still has a live reference row is not a
+        // candidate, and a blob whose counter says one but which has no
+        // reference rows is. A counter-based predicate answers exactly the
+        // opposite for both, which is the divergence this test rules out.
+        for digest in &states.counter_low {
+            assert!(
+                !candidates.contains(&digest.as_str().to_owned()),
+                "a blob with a live reference row is never a candidate"
+            );
+        }
+        assert!(
+            candidates.contains(&states.counter_high.as_str().to_owned()),
+            "a blob with no reference rows is a candidate whatever the counter says"
+        );
+        assert!(!candidates.contains(&states.live.as_str().to_owned()));
+        assert!(!candidates.contains(&states.expired.as_ref().unwrap().as_str().to_owned()));
+        for digest in &states.unreferenced {
+            assert!(candidates.contains(&digest.as_str().to_owned()));
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_preview_candidates_are_a_subset_of_what_the_apply_pass_removes() {
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        fs::create_dir_all(config.database_path.parent().unwrap()).unwrap();
+        let (blobs, workspaces, artifacts) = real_stores(&config);
+        let states = seed_blob_states(&config, &blobs, true).await;
+        drop(artifacts);
+        drop(workspaces);
+        drop(blobs);
+
+        let preview = owner_candidates(&config, crate::artifact::now_unix_ms(), 8);
+        assert_eq!(preview.len(), 4);
+
+        let applied = collect_garbage(&config, false, 8).await.unwrap();
+        assert!(!applied.dry_run);
+        let removed = removed_objects(&config, &states);
+
+        // The preview's set is a subset of what the apply pass removes.
+        for digest in &preview {
+            assert!(
+                removed.contains(digest),
+                "the preview reported {digest}, which the apply pass did not remove"
+            );
+        }
+        // The apply pass removes strictly more here, and only for the
+        // documented reason: it selects after the expired reference rows are
+        // deleted, so a blob that has just become unreferenced is collectable
+        // in the same pass.
+        assert_eq!(removed.len(), 5);
+        assert!(removed.contains(&states.expired.as_ref().unwrap().as_str().to_owned()));
+        assert!(!removed.contains(&states.live.as_str().to_owned()));
+        for digest in &states.counter_low {
+            assert!(!removed.contains(&digest.as_str().to_owned()));
+        }
+        assert!(!removed.contains(&states.live.as_str().to_owned()));
+    }
+
+    #[tokio::test]
+    async fn gc_preview_and_apply_agree_when_the_store_has_no_expired_references() {
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        fs::create_dir_all(config.database_path.parent().unwrap()).unwrap();
+        let (blobs, workspaces, artifacts) = real_stores(&config);
+        let states = seed_blob_states(&config, &blobs, false).await;
+        drop(artifacts);
+        drop(workspaces);
+        drop(blobs);
+
+        let preview = owner_candidates(&config, crate::artifact::now_unix_ms(), 8);
+        assert_eq!(preview.len(), 4);
+
+        let applied = collect_garbage(&config, false, 8).await.unwrap();
+        assert_eq!(applied.blob_candidates, 4);
+
+        let removed = removed_objects(&config, &states);
+
+        // With no expired references the two passes select at the same point
+        // in the transaction, so the sets are equal.
+        let mut preview_sorted = preview.clone();
+        preview_sorted.sort();
+        let mut removed_sorted = removed.clone();
+        removed_sorted.sort();
+        assert_eq!(preview_sorted, removed_sorted);
+    }
+
+    #[tokio::test]
+    async fn gc_preview_does_not_create_a_store_that_does_not_exist() {
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        assert!(!config.blob_root.exists());
+        assert!(!config.workspace_root.exists());
+        assert!(!config.database_path.exists());
+        assert!(!config.database_path.parent().unwrap().exists());
+
+        // The preview cannot evaluate a store that is not there, so it fails
+        // with a typed error rather than reporting zero candidates - and it
+        // fails without bringing the store into being.
+        assert!(collect_garbage(&config, true, 1).await.is_err());
+        assert!(!config.blob_root.exists());
+        assert!(!config.workspace_root.exists());
+        assert!(!config.database_path.exists());
+        assert!(!config.database_path.parent().unwrap().exists());
+
+        // The assertion has teeth: the creating, reconciling open the
+        // preview must not use does bring the store into being.
+        BlobStore::open(&config.blob_root, config.blob_quota_bytes).unwrap();
+        assert!(config.blob_root.exists());
+        assert!(crate::blob::metadata_path(&config.blob_root).exists());
+    }
+
+    #[tokio::test]
+    async fn inspect_blob_resolves_the_object_through_the_store_path_ownership() {
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        let blobs = BlobStore::open(&config.blob_root, config.blob_quota_bytes).unwrap();
+        let digest = seed_blob(&blobs, b"inspectable").await;
+
+        let inspection = inspect_blob(&config, digest.as_str()).unwrap();
+        assert_eq!(inspection.kind, "blob");
+        assert_eq!(inspection.id, digest.as_str());
+        assert_eq!(inspection.metadata["size_bytes"], 11u64);
+
+        // A recorded size that disagrees with the file's actual length is a
+        // data error, not a successful inspection.
+        let connection =
+            rusqlite::Connection::open(crate::blob::metadata_path(&config.blob_root)).unwrap();
+        connection
+            .execute(
+                "UPDATE blobs SET size_bytes = 3 WHERE digest = ?1",
+                [digest.as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            inspect_blob(&config, digest.as_str()),
+            Err(OperationsError::Data)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inspect_blob_refuses_a_symlinked_shard_or_object() {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().unwrap();
+        let config = config(temp.path());
+        let blobs = BlobStore::open(&config.blob_root, config.blob_quota_bytes).unwrap();
+        let digest = seed_blob(&blobs, b"inspectable").await;
+        let shard = crate::blob::shard_path(&config.blob_root, &digest);
+        let object = crate::blob::object_path(&config.blob_root, &digest);
+
+        // A symlinked object file is refused.
+        let bytes = fs::read(&object).unwrap();
+        let outside = temp.path().join("outside-object");
+        fs::write(&outside, &bytes).unwrap();
+        fs::remove_file(&object).unwrap();
+        symlink(&outside, &object).unwrap();
+        assert!(matches!(
+            inspect_blob(&config, digest.as_str()),
+            Err(OperationsError::NotFound)
+        ));
+
+        // A symlinked shard directory is refused.
+        fs::remove_file(&object).unwrap();
+        fs::write(&object, &bytes).unwrap();
+        let outside_shard = temp.path().join("outside-shard");
+        fs::create_dir_all(&outside_shard).unwrap();
+        fs::write(outside_shard.join(digest.as_str()), &bytes).unwrap();
+        fs::remove_dir_all(&shard).unwrap();
+        symlink(&outside_shard, &shard).unwrap();
+        assert!(matches!(
+            inspect_blob(&config, digest.as_str()),
+            Err(OperationsError::NotFound)
+        ));
     }
 
     #[tokio::test]
@@ -1518,8 +3040,17 @@ mod tests {
         assert!(collect_garbage(&config, false, 1).await.is_err());
     }
 
+    /// The report carries every metric the node can increment, and a row the
+    /// report does not recognise is reported under its own name rather than
+    /// dropped.
+    ///
+    /// The old report seeded its map from a hand-maintained list and copied a
+    /// stored value only when the name was already in the map, so a counter the
+    /// server incremented but the list did not name — five of them — was
+    /// invisible to the operator. The vocabulary now lives with the producers,
+    /// so the report cannot fall behind them.
     #[test]
-    fn metrics_report_uses_a_fixed_bounded_counter_set() {
+    fn metrics_report_carries_every_metric_the_node_can_increment() {
         let temp = TempDir::new().unwrap();
         let config = config(temp.path());
         fs::create_dir_all(config.database_path.parent().unwrap()).unwrap();
@@ -1539,8 +3070,26 @@ mod tests {
         drop(db);
         let metrics = metrics_snapshot(&config).unwrap();
         assert_eq!(metrics.counters.get("executions_accepted"), Some(&7));
-        assert!(!metrics.counters.contains_key("untrusted_raw_execution_id"));
-        assert_eq!(metrics.counters.len(), METRIC_NAMES.len());
+        // A name this build does not know is still reported: a counter that
+        // vanishes from the report is a counter an operator cannot see.
+        assert_eq!(
+            metrics.counters.get("untrusted_raw_execution_id"),
+            Some(&99)
+        );
+        // Every metric the node can increment is reported, whether or not it
+        // has ever been incremented.
+        for metric in crate::Metric::ALL {
+            assert!(
+                metrics.counters.contains_key(metric.name()),
+                "{} is incremented by the node but missing from the report",
+                metric.name()
+            );
+        }
+        assert_eq!(
+            metrics.counters.len(),
+            crate::Metric::ALL.len() + 1,
+            "the report is the vocabulary plus the one row it does not know"
+        );
     }
 
     #[tokio::test]
@@ -1567,14 +3116,16 @@ mod tests {
             fs::set_permissions(&directory, fs::Permissions::from_mode(mode)).unwrap();
             fs::symlink_metadata(&directory).unwrap()
         };
-        assert!(trusted_directory(&metadata(0o700)));
+        assert!(state_root_owned(&metadata(0o700)));
+        assert!(state_root_owner_only(&metadata(0o700)));
         // The published rule is owner-only `0700`. `0750`/`0755` leave the whole
         // execution output, workspace and blob surface readable by other local
         // users while the configuration still validates.
-        assert!(!trusted_directory(&metadata(0o750)));
-        assert!(!trusted_directory(&metadata(0o755)));
-        assert!(!trusted_directory(&metadata(0o500)));
-        assert!(!trusted_directory(&metadata(0o707)));
+        assert!(state_root_owned(&metadata(0o750)));
+        assert!(!state_root_owner_only(&metadata(0o750)));
+        assert!(!state_root_owner_only(&metadata(0o755)));
+        assert!(!state_root_owner_only(&metadata(0o500)));
+        assert!(!state_root_owner_only(&metadata(0o707)));
     }
 
     #[test]
