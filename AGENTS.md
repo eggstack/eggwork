@@ -65,10 +65,10 @@ Quickstart commands in `docs/` are **executed and verified**, not illustrative:
 agreement. The config loader's strictness (owner-only state directories `0700`,
 private key `0600`, nothing group/world writable, and a sandbox helper outside
 world-writable ancestors) is undocumented anywhere else — since the M008a
-corrective it produces a **named, greppable rule id** and the offending item
-rather than a single unhelpful string, so a configuration fault now says which
-rule was violated and what to do. If a configuration fault still surfaces
-without a rule id, check permissions first.
+corrective it is reported as a stable rule identifier, the offending file or
+path, and the corrective action, and a secret-bearing item is named by its
+role, never by its path. If a configuration fault still surfaces without a rule
+id, check permissions first.
 
 ## Architecture index
 
