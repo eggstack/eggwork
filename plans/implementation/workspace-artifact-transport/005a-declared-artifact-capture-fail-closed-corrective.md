@@ -1,6 +1,6 @@
 # Workspace and Artifact Transport M005a — Declared-artifact capture fails closed
 
-Status: proposed
+Status: conditionally closed
 
 Class: invariant
 

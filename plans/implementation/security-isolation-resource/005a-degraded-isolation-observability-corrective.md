@@ -1,6 +1,6 @@
 # Security M005a — Degraded isolation observability corrective
 
-Status: proposed
+Status: conditionally closed
 
 Closure record: `plans/closure/security-isolation-resource/005a-status.md`
 

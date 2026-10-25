@@ -1,5 +1,7 @@
 # Workspace and Artifact Transport M005b Closure — GC Preview and Store Ownership Corrective
 
+Status: closed — implementation commit `63699df`
+
 Source plan: `plans/implementation/workspace-artifact-transport/005b-gc-preview-and-store-ownership-corrective.md`
 Corrective addendum: `plans/subsystems/workspace-artifact-transport-data-plane-corrective-addendum.md`
 Subsystem roadmap: `plans/subsystems/workspace-artifact-transport-roadmap.md`

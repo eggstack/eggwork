@@ -1,6 +1,6 @@
 # Security M005b — Sandbox-helper environment parity corrective
 
-Status: implemented — closure record written, implementation commit pending
+Status: closed — implementation commit `63699df`
 
 Source implementation plan:
 `plans/implementation/security-isolation-resource/005b-sandbox-helper-environment-parity-corrective.md`

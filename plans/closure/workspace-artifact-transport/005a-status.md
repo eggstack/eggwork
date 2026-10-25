@@ -1,5 +1,7 @@
 # Workspace and Artifact Transport M005a Closure — Declared-artifact capture fail-closed corrective
 
+Status: conditionally closed — implementation commit `4258964`; the outstanding evidence item is the execution of the new portable test target on a non-unix host and of the hosted Windows qualification, both of which the plan requires and this host cannot provide
+
 - Milestone: **M005a — Declared-artifact capture fail-closed corrective**
 - Corrective addendum: `plans/subsystems/workspace-artifact-transport-data-plane-corrective-addendum.md` (wins over the plan where they disagree)
 - Implementation plan: `plans/implementation/workspace-artifact-transport/005a-declared-artifact-capture-fail-closed-corrective.md`
@@ -410,6 +412,24 @@ one-line placeholder (see *Deviations from the plan*).
    to the subject's receipt path, because the execution qualification writes to that
    path and two suites writing one file would leave whichever ran last as the only
    evidence.
+
+## Outstanding evidence item (why this is conditionally closed)
+
+The implementation is complete and every acceptance criterion's code and wiring
+half is met on the Linux host, but two criteria require evidence this host
+cannot produce:
+
+- acceptance criterion 7 requires that the new portable test target
+  "compiles and passes on a non-unix host", and it is wired into the
+  `windows-runner` CI job;
+- acceptance criterion 8 requires that the Windows hosted qualification
+  declares an output and asserts the truthful terminal disposition.
+
+The step and the wiring both exist; neither has executed, because this host is
+Linux x86_64 and the hosted qualification is tag-gated. The milestone stays
+**conditionally closed** until the `windows-runner` job and the hosted
+qualification have run. The claim that is *not* made is that Windows has been
+qualified.
 
 ## Unresolved findings by severity
 

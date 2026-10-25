@@ -1,6 +1,6 @@
 # Security M005b — Sandbox-helper environment parity corrective
 
-Status: proposed
+Status: closed
 
 Closure record: `plans/closure/security-isolation-resource/005b-status.md`
 

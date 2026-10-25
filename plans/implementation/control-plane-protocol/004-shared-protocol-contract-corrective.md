@@ -1,8 +1,10 @@
 # Control Plane M004 — Shared Protocol Contract Ownership
 
-Status: proposed
+Status: closed
 
 Class: invariant
+
+Closure record: `plans/closure/control-plane-protocol/004-status.md`
 
 Source roadmap:
 

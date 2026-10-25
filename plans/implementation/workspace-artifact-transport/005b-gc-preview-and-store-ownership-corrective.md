@@ -1,6 +1,6 @@
 # Workspace and Artifact Transport M005b — GC preview/apply parity and store-owned formats
 
-Status: proposed
+Status: closed
 
 Class: invariant
 

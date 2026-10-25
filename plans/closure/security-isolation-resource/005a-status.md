@@ -1,6 +1,6 @@
 # Security M005a — Degraded-isolation observability corrective
 
-Status: implemented — closure record written, implementation commit pending
+Status: conditionally closed — implementation commit `6f41957`; the outstanding evidence item is the Windows and macOS exercise of the runner's `OutputChunk` shape change, which the plan requires and this host cannot provide
 
 Source implementation plan:
 `plans/implementation/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`
@@ -453,3 +453,20 @@ separate, still-open item that this milestone neither closes nor worsens.
 - `plans/implementation/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`:
   **not edited** — the plan is not in this milestone's ownership and is left
   as the authoritative statement of what was asked.
+
+## Outstanding evidence item (why this is conditionally closed)
+
+The implementation is complete and every acceptance criterion is met on the
+Linux host, but one criterion requires evidence this host cannot produce:
+
+- the plan requires that a change to the runner's public `OutputChunk` type
+  "must also be exercised on the Windows and macOS targets the release matrix
+  builds, because the runner has platform-specific spawn paths and the
+  diagnostic sits in front of all of them."
+
+`OutputChunk` did change shape (struct to enum, carrying a `Diagnostic`
+variant), so that requirement applies. Only Linux x86_64 was exercised here.
+Nothing about the implementation is unfinished; what is missing is a run on
+two platforms, and the milestone stays **conditionally closed** until the
+`windows-runner` CI job and the macOS release job have run. The claim that is
+*not* made is that any platform has been qualified.

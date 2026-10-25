@@ -1,6 +1,6 @@
 # Workspace and Artifact Transport Roadmap
 
-Status: active roadmap; M001-M004 closed; M005a data-plane corrective implemented; M005b data-plane corrective implemented
+Status: active roadmap; M001-M004 closed; M005a data-plane corrective conditionally closed; M005b data-plane corrective closed
 
 Canonical authority:
 
@@ -136,7 +136,7 @@ Exit conditions:
 
 Class: invariant
 
-Status: implemented
+Status: conditionally closed — implementation commit `4258964`; the outstanding evidence item is the execution of the portable test target on a non-unix host and of the hosted Windows qualification
 
 Corrective addendum:
 
@@ -175,7 +175,7 @@ Implemented:
 
 Class: invariant
 
-Status: implemented
+Status: closed — implementation commit `63699df`
 
 Corrective addendum:
 
