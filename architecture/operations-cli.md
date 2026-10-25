@@ -221,7 +221,8 @@ removes both from the argument vector. The remaining vector keeps the subcommand
 | `config validate` | `--config` | `{"valid": bool, "doctor": DoctorReport}`; exit 2 when `valid` is false |
 | `config print` | `--config` | The redacted configuration document, pretty-printed |
 | `doctor` | `--config` | `DoctorReport`; exit 2 when `report.ready` is false |
-| `run` | `--config` | `{"ready": true, "node_id": ..., "local_addr": ...}`, then blocks on `ctrl_c` and shuts the server down |
+| `run` | `--config` | `{"ready": true, "node_id": ..., "local_addr": ...}`, then blocks on `ctrl_c` and converges the node: admission stops, the active executions are cancelled and waited for, and the listener closes |
+| `service-host` | `--config <absolute-path>` | Windows only: joins the service control manager and hosts the service until it stops. It is the manager's entry rather than an operator verb, and it is refused on every other platform |
 | `status` | `--config` | `schema_version`, `node_id`, `draining`, `execution_permits_held`, `non_terminal_executions`, `max_active_executions`, `execution_records`, `execution_states`, `stdout_bytes`, `stderr_bytes`, `cleanup_failures`, `metrics`, `doctor` |
 | `metrics` | `--config` | `OperatorMetrics` — the node's counters |
 | `drain` | `--config` | `{"draining": true, "persistent": true}` |
@@ -245,7 +246,20 @@ closing clause — "service backends require explicit systemd, launchd, or Windo
 policy" — is *not* a flag. There is no `--backend`, `--platform`, or `--policy` switch
 anywhere in the file: the backend is chosen by compile-time `cfg!` inside
 `product_service_manager` and named by `service_backend()`. The same usage line does say
-"deployment apply accepts local `--daemon`/`--helper` candidates", which is accurate.
+"deployment apply accepts local `--daemon`/`--helper` candidates", which is accurate, and
+its second closing clause — "service-host is the Windows service control manager entry and
+takes --config <absolute-path>" — names a *mode*, not a flag.
+
+**The usage string's verb list is not the process-mode list.** `usage()` names
+`service-host` among the verbs, but the daemon's *mode* is chosen before any of that
+parsing happens: `mode_for` reads argv[0], and only the literal `service-host` selects the
+dispatcher path. Everything else — `run` included — is the ordinary CLI. The mode is never
+inferred from the parent process, the session, the environment, or a dispatcher error, and
+on a non-Windows target the `service-host` mode is refused before it can do anything.
+`main()` makes that choice *before* an async runtime exists, because the dispatcher owns
+the calling thread until the service exits and must not be parked inside a runtime that
+the dispatcher thread is not part of; the ordinary CLI builds its multi-threaded runtime in
+`cli_entry`, and the service-hosted path enters its own runtime on the service thread.
 
 **Corrections to a naive reading of the command list.** `config print` is fully
 implemented and appears in `usage()`, even though it is easy to overlook next to
@@ -637,33 +651,77 @@ Backend selection is **explicit and compile-time**, in `product_service_manager`
   derived from its `file_name()`); `--scope` defaults to `system` and goes through
   `deployment::parse_systemd_scope`; `--enable` and `--no-reload` (reload defaults to on)
   are presence flags; timeout 60 s.
-- Windows: refused, before any mutation.
+- Windows: no required flag. `--windows-start-type` is optional and bounded
+  (`automatic`, `manual`, `disabled`) and goes through
+  `deployment::parse_windows_start_type`, which defaults it to `manual` so an
+  installed service does not start on boot behind the operator's back; timeout 60 s.
 - Anything else: "service management is unsupported on this platform".
 
 `service_backend()` names the backend purely for the report: `systemd`, `launchd`,
-`windows-scm-unsupported`, or `unsupported`.
+`windows-scm`, or `unsupported`.
 
-**Adapter availability is never a platform support claim.** The typed adapter and the
-typed policy are retained on every platform — the Windows path is compiled, it simply
-refuses. What may be claimed supported is only where the native manager was actually
-mutated on a real host. The in-file comment states the rule: Linux systemd is the
-qualified path; "other platforms receive a structured diagnostic instead of a parallel
-manager implementation."
+**Adapter availability is never a platform support claim, and the claim now has two
+halves.** The typed adapter and the typed policy are retained on every platform. What
+may be claimed supported is only where the native manager was actually mutated on a real
+host — and *which* host matters, because a source-built hosted lifecycle and an installed
+release lifecycle are different proofs of different things. Windows has the first: the
+hosted `windows-service-host` job registers, starts, stops, restarts, and uninstalls a
+real SCM registration against a source-built daemon. It does not have the second, because
+no published release carries both the M004 and the M007 work, so the exact-release Windows
+service receipt does not exist.
 
-**The Windows fail-closed refusal, and its ordering.** The source records the reason
-precisely: hosted M004 qualification created the `eggwork-node` SCM registration and then
-failed to start it with Windows error 1053, "the service did not respond to the start
-request in a timely fashion." The cause is structural — `eggworkd` has no service-control
-dispatcher, so the process the SCM launches never connects back to the manager. Because
-the adapter *can* register the service, leaving the mutating path enabled would be
-actively misleading: it would perform a real, partly successful, ultimately useless
-mutation. Registering the daemon as a Windows service host is a product capability, not
-a qualification fix, so it is a separate milestone. Until then every *mutating* `service`
-verb on Windows returns a fixed refusal literal **before** any manager exists.
+**The Windows refusal, why it existed, and what replaced it.** The refusal existed for a
+recorded reason: hosted M004 qualification created the `eggwork-node` SCM registration and
+then failed to start it with Windows error 1053, "the service did not respond to the start
+request in a timely fashion." The cause was structural — that candidate's `eggworkd` had
+no service-control dispatcher, so the process the SCM launched never connected back to the
+manager. Because the adapter *can* register the service, leaving the mutating path enabled
+would have been actively misleading: it would perform a real, partly successful, ultimately
+useless mutation. Registering the daemon as a Windows service host is a product capability,
+not a qualification fix, so it was a separate milestone, and the interim refusal was a
+deliberate refusal rather than a missing feature.
+
+That milestone is what the service host is. `product_service_manager`'s `#[cfg(windows)]`
+arm now builds `deployment::windows_scm_manager` instead of returning a refusal, so every
+mutating `service` verb on Windows reaches Eggup's SCM adapter — and therefore the
+ownership proof — exactly like every other platform. `service_backend()` names the backend
+`windows-scm`. `product_service_manager` is also called by `deployment apply`, so an
+apply on Windows now reaches the same adapter rather than failing at the refusal.
 `deployment status` still reports host facts, and binary installation plus daemon runtime
-remain qualified. `product_service_manager` is also called by `deployment apply`, so an
-apply on Windows fails at the same point. Transaction mechanics are in
+remain qualified. Transaction mechanics are in
 [deployment-lifecycle.md](deployment-lifecycle.md).
+
+### The `service-host` mode
+
+`service-host` is a *process mode*, not an operator verb, and it is the only place in the
+workspace that talks to the Windows service control manager. The module that does it —
+`crates/eggwork-server/src/service_host/windows.rs` — registers a control handler whose
+closure does only two things: latch a stop request, and answer an interrogate. It
+performs no network, database, sleep, wait, runner cleanup, or service-manager
+operation, because a control handler that blocked would stall the manager's own thread
+and turn a stop into a failed stop.
+
+The wrapper it uses is pinned exactly and is a Windows-target-only dependency, and
+nothing in it needs `unsafe`: the service entry is a plain `extern "system" fn`, so the
+workspace's `unsafe_code = "deny"` is unchanged by the host.
+
+The state machine beside it — `crates/eggwork-server/src/service_host.rs` — is
+platform-neutral and owns which state comes next: `StartPending`, `Running`, `StopPending`,
+`Stopped`, with `Normal`, `StartFailed`, and `ConvergeFailed` as the exits. The current
+state and the stop latch live in **one** atomic byte, so claiming `RUNNING` and a stop
+arriving cannot interleave; the notification channel is only the wake-up, and the byte is
+the truth. A stop that arrives during startup is therefore latched rather than lost, and
+the node converges without ever having claimed to be running.
+
+**One lifecycle, two callers.** `crates/eggwork-server/src/service_host.rs::serve_until_stopped`
+is used by *both* the foreground `run` verb and the service-hosted path: it starts the
+node, reports a readiness edge, awaits a stop signal, stops admission, cancels and
+converges the active executions, shuts the listener down, and **waits** for the listener
+and the executions. Foreground `run` used to call `shutdown()` without `wait()`, so a
+foreground stop could return while an execution was still converging. That asymmetry is
+gone, and the convergence is an in-memory drain only: it never writes the persistent drain
+marker, an existing marker is preserved and still honoured at startup, and service mode
+never undrains.
 
 ## `deployment apply` CLI surface
 
@@ -736,7 +794,7 @@ be able to tell them apart from the JSON alone, since the exit code is 2 in ever
 | `gc --apply` cannot race a running node | `acquire_maintenance_lock` `try_lock_exclusive` | `applying_gc_refuses_to_race_a_running_node` |
 | The drain marker survives a process restart and `undrain` removes it | `set_persistent_drain` temp+rename+fsync; `NotFound` tolerated on removal | `drain_state_survives_process_restart_and_undrain_removes_marker` |
 | Quiescence fails closed on unreadable state | `active_execution_count` returning `usize::MAX` | No test in this file; exercised by [release-qualification.md](release-qualification.md) |
-| Windows service verbs mutate nothing | `#[cfg(windows)]` early return in `product_service_manager` | No test in this file; the comment records the M004 1053 evidence |
+| Windows service verbs mutate only through Eggup's SCM adapter, and only a registration Eggwork owns | `deployment::windows_scm_manager` behind `product_service_manager`; Eggup's ownership comparison over the exact executable, the config, and the critical argv | `crates/eggwork-server/tests/windows_service_contract.rs` (`a_different_executable_is_not_owned`, `a_different_config_is_not_owned`, `a_different_critical_argv_is_not_owned`); the hosted `windows-service-host` job mutates a real registration |
 | Persistent drain stays set after a release, including success | `"drain_remains_active": true` in the apply report | `scripts/qualify_release.py` (`drain-visible-in-status`, `drain-cleared-explicitly`) |
 
 ## Test coverage
@@ -771,12 +829,18 @@ that a scope narrows, that it never grants, that it is per `(operation, kind)`, 
 request without a resource falls back to the operation grant, and that an older node
 refuses a configuration carrying a scope.
 
-**`crates/eggwork-server/src/bin/eggworkd.rs` has no `#[cfg(test)]` module at all.** Every CLI concern is therefore
-untested at the unit level: argv parsing and the `--config` splice, `parse_option`
-coercion, `service_command`'s fail-closed `--service-config`, the platform policy flag
-sets, `parse_sha256`, the `deployment apply` all-or-nothing digest rule, and the exit-code
-discipline. That is the single largest coverage gap in this component, and it is why the
-release harness matters so much.
+**`crates/eggwork-server/src/bin/eggworkd.rs` has a `#[cfg(test)]` module, and it covers the service-host
+lifecycle and nothing else.** Seven tests live there — explicit mode selection, the
+running claim needing the ready edge, the latched stop, idempotent repeated stops, the
+non-blocking control callback, `STOPPED` only after the convergence edge, and a failed
+start that never claimed to be running. They live in the binary target on purpose: the
+server's *unit* tests are `/bin/sh`-shaped and do not compile for Windows, so the binary
+target is what makes the service host's lifecycle reachable from a hosted Windows runner
+at all. Every other CLI concern is still untested at the unit level: argv parsing and the
+`--config` splice, `parse_option` coercion, `service_command`'s fail-closed
+`--service-config`, the platform policy flag sets, `parse_sha256`, the `deployment apply`
+all-or-nothing digest rule, and the exit-code discipline. That remains the single largest
+coverage gap in this component, and it is why the release harness matters so much.
 
 `scripts/qualify_release.py` drives the *installed* binary through operator commands
 (per its own module docstring). At grep level it invokes `version` (both for the
@@ -791,13 +855,27 @@ both a nonzero return code and that `draining` is present in the output. I read 
 harness only by targeted grep, so the list above is grep-verified but not
 exhaustively so.
 
+`crates/eggwork-server/tests/windows_service_contract.rs` and
+`crates/eggwork-server/tests/windows_service_lifecycle.rs` are two Windows-only targets, and
+they are two different kinds of evidence. The contract one mutates nothing: it asserts the
+service identity — the `service-host` argv, the exact executable and config, and the
+ownership comparison, where a different executable, a different config, or a different
+critical argv is `Foreign` rather than `Owned` — and it constructs the manager without ever
+running it against a real registration. The lifecycle one is `#[ignore]`d and does the
+opposite: it mutates a real service control manager registration — install, start, an
+authenticated request while the manager says Running, stop with an active execution, start
+again, restart, uninstall, a foreign same-name registration that Eggwork never touches,
+and a node whose configuration cannot be loaded never reporting Running. The hosted
+`windows-service-host` CI job runs it.
+
 **Honest gaps.** The `GrantAuthorizer` decision is covered by
 `crates/eggwork-server/tests/resource_scoped_authorization.rs` and by the server's own end-to-end test, but the
 *in-file* `operations.rs` module has no test that calls the authorizer directly; no test for
 `active_execution_count`'s fail-closed branches; no test for `storage_summary`'s WAL/shm
 accounting; no test for the three `inspect_*` functions or the blob size cross-check; no
-test for `start_server`; and no test at all in the binary. The macOS launchd flag matrix
-and the Windows refusal are, by their nature, only exercisable on those hosts.
+test for `start_server`; and, apart from the service-host lifecycle, no test at all in the
+binary. The macOS launchd flag matrix and the Windows service lifecycle are, by their
+nature, only exercisable on those hosts.
 
 ## Review focus
 
@@ -831,12 +909,18 @@ and the Windows refusal are, by their nature, only exercisable on those hosts.
 - **`--force` bypasses quiescence** while `drain_remains_active` is still reported `true`.
   The report therefore does not by itself distinguish a quiesced release from a forced
   one; a reader could conclude more than the JSON supports.
-- **The Windows refusal ordering must stay ahead of manager construction,** and the
-  `#[cfg]`-gated `option_value` (Linux, macOS, Windows only) deserves the same scrutiny: the
-  safety argument depends on the `#[cfg(windows)]` block returning before any mutation is
-  possible at *both* call sites — `service` and `deployment apply` — and the
-  "unsupported platform" branch is unreachable from `deployment apply` on any other
-  target. Re-check both on any refactor.
+- **The Windows branch of `product_service_manager` is a real mutation now, so the old
+  ordering argument no longer covers it.** The `#[cfg(windows)]` block builds
+  `deployment::windows_scm_manager`, and the adapter performs the registration — which
+  replaces the previous safety argument that the Windows block returned before any
+  mutation was possible. Three things deserve the scrutiny that argument used to get:
+  that the adapter is the *only* thing that mutates the manager, that Eggup's ownership
+  comparison is the only thing standing between this node and someone else's
+  registration, and that `deployment apply` reaches the same branch and cannot skip the
+  ownership check. The `#[cfg]`-gated `option_value` (Linux, macOS, Windows only) wants
+  the same attention at both call sites — `service` and `deployment apply` — and the
+  "unsupported platform" branch still cannot be reached from `deployment apply` on
+  Linux, macOS, or Windows. Re-check all of this on any refactor.
 - **Redaction covers three fields.** `tls.private_key`, `clients[].certificate_sha256`, and
   `clients[].resource_scopes[].resource_id` are printed as `[REDACTED]`, while
   `tls.certificate_chain`, `tls.client_ca`, and `clients[].principal_id` are printed in the

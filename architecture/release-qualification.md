@@ -973,6 +973,22 @@ the `windows-platform-disposition` gate. A second real bug in the same area: the
 Windows disposition step was inheriting the daemon's exit code (`32e4559`), which
 would have silently turned a recorded disposition into a job failure.
 
+**What changed afterwards.** Operations M007 implemented the service host
+(`plans/closure/operations-distribution/007-status.md`): `eggworkd` now joins the
+dispatcher, the mutating Windows `service` verbs go live through Eggup's typed
+adapter, and the refusal is gone. The receipt above still describes the
+candidates it was taken from, and the `windows-platform-disposition` gate still
+holds those candidates to it — a candidate's bytes are what the gate reads.
+
+The **release-scoped** consequence is that the gate's second observation ("`main`
+fails closed before mutating") is no longer true of `main`. The
+`windows-installed-execution` job therefore still asserts the refusal *for the
+candidate it stages*, which is correct for every candidate published so far, and
+it must be re-pointed at the real-service disposition as soon as a release
+carrying the service host is qualified. That re-pointing is Operations M004's
+outstanding item, not M007's: M007 owns the capability, and M004 owns the
+release lineage that turns it into an installed-release receipt.
+
 ### A Windows-shaped run failure attributed to the wrong cause
 
 `v0.1.2` reproduced the same `Internal`/`null` shape and was attributed to a
@@ -1203,10 +1219,16 @@ property of the *product* rather than of the test harness:
 - **The PDB tradeoff is a real, accepted cost.** Release Windows binaries have no
   symbols. Is local-rebuild-from-the-same-revision triage actually practical — do
   the pinned toolchain and build flags reproduce what a triager needs?
-- **The 1053 disposition is time-sensitive.** Every mutating Windows `service`
-  verb is refused, but `deployment::windows_scm_manager` is retained
-  `#[allow(dead_code)]` for a future milestone. Does anything prevent that code
-  from quietly becoming reachable again?
+- **The 1053 disposition is time-sensitive, and its time has come.** The refusal
+  existed because the daemon had no service-control dispatcher. M007 gave it one,
+  so the mutating Windows `service` verbs are live again and
+  `deployment::windows_scm_manager` is no longer `#[allow(dead_code)]`. The
+  remaining question is the one the gate still asks: which *candidate's bytes*
+  does the qualification read? For every candidate published so far the answer
+  is "one that predates the host", so the refusal observation is still the
+  correct one — but the gate's second observation about `main` is now stale, and
+  the job has to be re-pointed at the real-service disposition for the first
+  candidate that carries the host.
 - **The fifth authority.** Is anything in the producer configuration trying to
   override `.cargo/config.toml`, and would a future `pack.toml` change (say,
   adopting CargoZigbuild) silently interact with the MSVC flags?

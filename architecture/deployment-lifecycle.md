@@ -576,7 +576,7 @@ to be stated explicitly rather than left as 'untested'." See
 [release-qualification.md](release-qualification.md) and
 [ci-guardrails.md](ci-guardrails.md).
 
-## Windows: unsupported and fail-closed
+## Windows: the daemon hosts the service
 
 This is the most carefully hedged part of the module, so the hedging matters.
 
@@ -592,52 +592,62 @@ DISPOSITION: unsupported (registers, then cannot reach Running; no service host)
 ```
 
 **Why.** Windows error 1053 is "the service did not respond to the start request
-in a timely fashion." The cause is structural, confirmed by inspection rather than
-inferred: `eggworkd` implements **no service-control dispatcher**. The workspace
+in a timely fashion." The cause was structural, confirmed by inspection rather than
+inferred: `eggworkd` implemented **no service-control dispatcher**. The workspace
 grep found no `windows_service::service_dispatcher` or equivalent in `crates/`;
-`windows-service` enters the dependency graph only as a transitive dependency of
-`eggup-service`'s manager side. The process the SCM launches therefore never
-connects back to the manager, and the registration can never reach `Running`. The
+`windows-service` entered the dependency graph only as a transitive dependency of
+`eggup-service`'s manager side. The process the SCM launched therefore never
+connected back to the manager, and the registration could never reach `Running`. The
 adapter registering the service *successfully* is what made this look like
-flakiness. It is not: registering an external process would produce a working
+flakiness. It was not: registering an external process would produce a working
 installation with **no service behind it**, which is worse than an honest refusal.
 
-**Current behavior.** Every **mutating** `service` verb on Windows is refused
-before any mutation. In `crates/eggwork-server/src/bin/eggworkd.rs::product_service_manager` the
-`#[cfg(windows)]` arm returns an `Err` naming the reason; `crates/eggwork-server/src/bin/eggworkd.rs::service_mutation` calls it *before* `apply_service_operation`, so the refusal
-precedes the mutation. `crates/eggwork-server/src/bin/eggworkd.rs::service_backend` still returns
-`"windows-scm-unsupported"` for diagnostics, and `deployment status` still reports
-host facts.
+That receipt is a statement about the candidate it was taken from, and it stays as
+it was observed.
 
-**What remains supported.** Windows binary installation and daemon runtime are
-qualified **independently** of service management. The `deployment status` path,
-the install unit, the digest-proof mechanism, the drain decision, and the health
-check all remain live; the helper is simply not part of the Windows install unit.
-Making the daemon a Windows service host is a **product capability, not a
-qualification fix**, tracked as M007
-(`plans/implementation/operations-distribution/007-windows-service-host.md`,
-recorded ready in `plans/registry.md`). That row adds a standing constraint: the
-interim refusal "must stay until a release containing a real host has hosted
-Windows evidence."
+**Current behavior.** `eggworkd` is a Windows service host.
+`crates/eggwork-server/src/bin/eggworkd.rs::mode_for` selects the
+`service-host` mode from argv before any runtime exists, and
+`crates/eggwork-server/src/service_host/windows.rs::entry` hands the process to
+the dispatcher. The daemon reports `START_PENDING` before startup work,
+`RUNNING` only after the node is ready, `STOP_PENDING` while it converges, and
+`STOPPED` at the end; a bounded checkpoint heartbeat advances while a transition
+is pending, so a slow start no longer looks like a hung service. `STOP` and
+`SHUTDOWN` are idempotent, and a stop that arrives during startup is latched and
+produces no `RUNNING` claim.
 
-**What is retained.** `crates/eggwork-server/src/deployment.rs::windows_scm_manager` is `#[cfg(windows)]`
-and `#[allow(dead_code)]`. It constructs the fixed Eggwork SCM product policy:
+Every **mutating** `service` verb on Windows goes through
+`crates/eggwork-server/src/deployment.rs::windows_scm_manager`, which builds
+Eggup's typed `WindowsScmManager`. Eggup remains the only service-manager
+owner: the daemon hosts the service process, and it never registers, starts,
+stops, or removes a service itself.
+`crates/eggwork-server/src/deployment.rs::parse_windows_start_type` bounds the
+registration policy to three values with `manual` as the default, and
+`crates/eggwork-server/src/bin/eggworkd.rs::service_backend` names the backend
+`windows-scm`.
+
+**What remains supported.** Windows binary installation and daemon runtime were
+qualified **independently** of service management, and they still are. The
+`deployment status` path, the install unit, the digest-proof mechanism, the
+drain decision, and the health check all remain live; the helper is simply not
+part of the Windows install unit.
+
+**What is retained.** `crates/eggwork-server/src/deployment.rs::windows_scm_manager`
+is `#[cfg(windows)]` and constructs the fixed Eggwork SCM product policy:
 `WindowsScmInstall::new(SERVICE_ID, "Eggwork Node Daemon", start_type,
 WindowsErrorControl::Normal, None).with_transition_timeout(timeout)`, wrapped in
-`WindowsScmManager`. No custom account, dependencies, or elevation. Its doc comment
-says it is "the recorded SCM *policy*, retained for review and for a future
-service-host milestone. The operator surface does not expose it."
+`WindowsScmManager`. No custom account, dependencies, or elevation. The adapter
+is no longer retained for a future milestone; it is the live path.
 
-**"Not yet a service host" versus "not supported at all."** The distinction is
-deliberate. Windows service *management* is unsupported today — every mutating
-verb fails closed by design. The *capability* of running `eggworkd` as a Windows
-service host is not supported **yet**: unimplemented, not impossible, with a
-milestone for it. The qualification workflow's `windows-platform-disposition` job
-fails if either the candidate's registers-and-fails-1053 observation or the
-refused `main` changes.
-
-Minor honest note: the refusal message in `eggworkd.rs` contains runs of internal
-spaces (a wrapped-literal artifact). Cosmetic, not semantic.
+**"A service host" versus "a qualified release."** The distinction is
+deliberate. The *capability* is implemented and exercised on a hosted Windows
+runner from a source build
+(`plans/closure/operations-distribution/007-status.md`). The *installed-release*
+receipt does not exist yet: no immutable release contains both Foundation M004 and
+M007, so the qualification workflow's `windows-installed-execution` job still
+asserts the historical refusal for the candidate it stages. The disposition is
+therefore **release-scoped**, and re-pointing that job at the real-service
+disposition is Operations M004's outstanding item, not this milestone's.
 
 ## `DeploymentError` model
 
@@ -906,10 +916,13 @@ verified intact afterwards. "No platform passed by bypassing an ownership check.
   and `../plans/implementation/operations-distribution/002a-eggup-deployment-and-service-integration-corrective.md`
   — the plan and corrective that landed this module.
 - `../plans/implementation/operations-distribution/007-windows-service-host.md` —
-  the separate milestone that would lift the Windows refusal.
+  the milestone that lifted the Windows refusal by making the daemon a service
+  host.
 - `../plans/closure/operations-distribution/` — recorded closure status per
-  milestone; `004-status.md` §9 is the Windows 1053 citation of record.
-- `../plans/registry.md` — M007 registry row stating that the Windows refusal must
-  stay until a release with a real service host has hosted Windows evidence.
+  milestone; `004-status.md` §9 is the Windows 1053 citation of record, and
+  `007-status.md` is the service host's own record.
+- `../plans/registry.md` — the M007 registry row, which states the standing
+  constraint that the *installed-release* receipt is still M004's, because no
+  immutable release carries a real service host yet.
 - `../release/eggpack/` — the producer contract these parity tests keep in
   agreement.

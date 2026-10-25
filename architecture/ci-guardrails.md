@@ -19,11 +19,11 @@ Every invariant in [overview.md](overview.md) is stated as a rule that *is enfor
 | **1. Process ownership is singular.** Only `eggwork-runner` creates OS children; `eggwork-sandbox-helper` may create the target to apply sandbox mechanics. Server, client, and core must not. | `scripts/check_execution_ownership.py` — `scan_sources()` over `crates/*/src/**/*.rs` against the `APPROVED_PROCESS_OWNERS` allowlist, run as the `rust` job step "execution ownership guard" | Nonzero exit; CI red. Prints `process creation outside approved owners (<matched patterns>)` per offending file. |
 | **1b. The ownership guard itself still fails when it should.** | `--prove-negative-exit` step, plus the in-process `self_test()` that runs on *every* invocation | A scanner regression (a dropped spawn pattern) makes the proof step exit 1 with `scanner regression — synthetic forbidden spawn was not detected`. |
 | **1c. Crate dependency direction.** `eggwork-server` owns no process machinery and must route through `eggwork-runner`. | `check_execution_ownership.py::check_dependencies()` over `cargo metadata --no-deps --format-version 1` | Nonzero exit naming the offending crate, e.g. `eggwork-core must not depend on eggwork-client`, `eggwork-server enables Tokio process creation; use eggwork-runner`, or `eggwork-server must depend on the canonical eggwork-runner`. |
-| **2. No direct service-manager invocation** (`systemctl`, `launchctl`, SCM, `crontab`). | Not machine-checked by a dedicated guard. The one hand-written enforcement is `operational-qualification.yml`'s `windows-installed-execution` job, which fails hard if the Windows service verb *does* mutate. Normatively owned by `execution-ownership.md`. | See [Test coverage and gaps](#test-coverage-and-gaps) — this is the weakest-enforced invariant in the set. |
+| **2. No direct service-manager invocation** (`systemctl`, `launchctl`, SCM, `crontab`). | Not machine-checked by a dedicated guard. The hand-written enforcement is the `windows-service-host` CI job, which drives every Windows service mutation through the product's own operator CLI and Eggup's typed SCM adapter against a real registration, so the shape of the mutation is visible in a hosted run; plus `operational-qualification.yml`'s `windows-installed-execution` job, whose recorded *service-refusal* disposition is a separate, still-open item (see below). Normatively owned by `execution-ownership.md`. | See [Test coverage and gaps](#test-coverage-and-gaps) — this is the weakest-enforced invariant in the set. |
 | **Windows owns the whole process tree, and that is checked where it happens.** | The `windows-runner` CI job on `windows-latest` running `cargo test --locked -p eggwork-runner --all-targets`, which compiles the `#![cfg(windows)]` tree-lifecycle suite; plus `cargo clippy --locked --workspace --all-targets -- -D warnings` on the same host | Nonzero exit on any Windows-path regression, and the Linux job's silence no longer reads as Windows coverage. |
 | **3. Fixed target.** The client names its target explicitly. | Structural: `eggwork-client` is denied a dependency on the node crates by `check_dependencies()`; no workflow resolves a "latest" release. | Nonzero exit from the ownership guard if `eggwork-client` ever gains a `eggwork-runner`/`eggwork-server` edge. |
 | **4. Isolation claims are earned, never assumed.** | Exercised, not enforced statically: `installed_release_admits_execution_and_refuses_unsupported_isolation` in `crates/eggwork-server/tests/installed_qualification.rs`, driven from the qualification workflow on three hosted targets. | That ignored integration test fails; the hosted job goes red and its receipts are not uploaded. |
-| **5. Fail closed on uncertainty** for guarantees the caller demanded. | Same installed-execution test asserts required isolation is *refused* before the target runs; the Windows job records the service disposition and `throw`s if the refusal ever disappears (`the fail-closed guarantee is gone`). | Hard job failure. The Windows step deliberately ends `exit 0` only *after* recording the refusal, so the daemon's non-zero refusal exit is not inherited as the step's result. |
+| **5. Fail closed on uncertainty** for guarantees the caller demanded. | Same installed-execution test asserts required isolation is *refused* before the target runs. The Windows job's separate service-refusal assertion (`the fail-closed guarantee is gone`) is a *platform-support* disposition rather than an uncertainty check, so it does not enforce this invariant — see the open item below. | Hard job failure. The Windows step deliberately ends `exit 0` only *after* recording the refusal, so the daemon's non-zero refusal exit is not inherited as the step's result. |
 | **6. Identity-free release configuration.** No tag, SHA, digest, or size under `release/eggpack/`. | `release_contract.rs::static_release_configuration_embeds_no_future_release_identity`, run inside `cargo test --locked --workspace --all-targets`; plus the `CONTRIBUTING.md` prohibition. | Test failure inside the `rust` job. |
 | **7. Generated release workflow; no second hand-maintained matrix.** | `release-drift` job running `eggpack ci check` with the pinned revision from `release/eggpack/github-policy.json`; reinforced by `release_contract.rs::the_generated_workflow_is_derived_only_from_static_configuration`, `the_embedded_workflow_shape_matches_the_checked_in_configuration`, and `no_second_hand_maintained_release_matrix_exists`. | `eggpack ci check` exits nonzero on any byte drift; `release-drift` red. |
 | **8. No published state.** Config, database, workspace, blob, and artifact state never ship in a release artifact. | `release_contract.rs::no_release_asset_carries_node_state`; `.gitignore` excludes `/target/`, `__pycache__/`, `*.sqlite`, `*.sqlite-shm`, `*.sqlite-wal`, `.env` from the tree. | Test failure; the `*_RUSTFLAGS`/rustflags policy is separately asserted by `the_windows_msvc_build_policy_is_deterministic_and_target_scoped`. |
@@ -229,6 +229,15 @@ A second job in the same workflow, on `windows-latest`, added by Foundation M004
         run: cargo test --locked -p eggwork-runner --all-targets -- --nocapture
       - name: declared-artifact capture disposition suite
         run: cargo test --locked -p eggwork-server --test artifact_capture_disposition
+      - name: service-host lifecycle suite
+        run: cargo test --locked -p eggwork-server --bin eggworkd -- --nocapture
+      - name: service-host identity contract
+        run: cargo test --locked -p eggwork-server --test windows_service_contract -- --nocapture
+      # Only the two Windows targets are linted. `--tests` would build the
+      # server's Linux-shaped unit-test target as well, and that target does
+      # not compile for Windows.
+      - name: service-host test targets
+        run: cargo clippy --locked -p eggwork-server --test windows_service_contract --test windows_service_lifecycle -- -D warnings
 ```
 
 **The capability probe's loud failure is not expected here, and the reason is
@@ -249,7 +258,7 @@ comment, so the reason is visible where a reader looks for it.
 
 **What it deliberately does not run.** `cargo test --workspace` is not used, and test-target clippy is scoped to `eggwork-runner`. The server's and client's unit tests are Linux-shaped: they spawn `/bin/sh` and set `0700`/`0600` modes through `std::os::unix::fs`, so several test helpers do not even *compile* for Windows (`place_trusted_helper` in `crates/eggwork-server/src/lib.rs`, the `PermissionsExt` uses in `artifact.rs`, `blob.rs`, `operations.rs`, and `deployment.rs`). Making them portable is its own milestone.
 
-One server integration target **is** portable and **is** run: the declared-artifact capture disposition, `cargo test --locked -p eggwork-server --test artifact_capture_disposition`. It is a contract about the *decision* rather than about the host, so it compiles for Windows without a Linux-shaped harness, and it is the native evidence that a node which cannot capture declared outputs refuses them and ends the execution in a state that is not a success. The rest of the server's test surface is still Linux-only and is not claimed here.
+Three server targets **are** Windows-shaped and **are** run: the declared-artifact capture disposition, `cargo test --locked -p eggwork-server --test artifact_capture_disposition`, which is a contract about the *decision* rather than about the host, so it compiles for Windows without a Linux-shaped harness and is the native evidence that a node which cannot capture declared outputs refuses them and ends the execution in a state that is not a success; the service-host lifecycle suite, `cargo test --locked -p eggwork-server --bin eggworkd`, whose tests live in the binary target because the server's *unit* tests are Linux-shaped and do not compile for Windows; and the service-host identity contract, `cargo test --locked -p eggwork-server --test windows_service_contract`, which asserts the `service-host` argv, the exact executable and config, and the ownership comparison that makes a foreign registration `Foreign` rather than `Owned`. The rest of the server's test surface is still Linux-only and is not claimed here.
 
 That gap is stated rather than papered over, and the split is deliberate:
 
@@ -261,12 +270,76 @@ That gap is stated rather than papered over, and the split is deliberate:
 
 This job is still earning its keep: it found three real Windows-only lints that
 Linux can never see — an un-gated `landlock_runner.rs` header, a Linux-only
-`deadline` binding plus a needless `return` in the Windows SCM refusal path, and
+`deadline` binding plus a needless `return` in the Windows SCM path, and
 an ungated `PathBuf` import in the capability probe. The installed production
 path stays qualified by `operational-qualification.yml` from a staged release's
 own bytes; a build-tree job could not prove release identity.
 
 **Cross-check against the local guard.** Before pushing, `cargo check --locked -p eggwork-runner --all-targets --target x86_64-pc-windows-msvc` compiles the Windows-only code paths on a Linux host. It catches types, imports, and lints; it does not catch kernel behaviour, which is the entire point of the hosted job. (A full `--workspace --target x86_64-pc-windows-msvc` check does not work on Linux: `cc-rs` needs MSVC's `lib.exe` for a transitive C dependency.)
+
+## The `windows-service-host` CI job
+
+Another job on `windows-latest`, added with the service host. It is the only place in CI
+where a real service control manager is driven through a **full** lifecycle — install,
+start, stop, restart, uninstall — and it is a different kind of evidence from the
+`windows-runner` job: that one proves the host's *logic* compiles and behaves on a
+Windows kernel; this one proves that a Windows *service* actually works. The
+`windows-installed-execution` qualification job also touches the manager, but only to
+register a service and record a disposition; it never starts one successfully.
+
+```yaml
+  windows-service-host:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc
+      - name: build the daemon under test
+        run: cargo build --locked -p eggwork-server --bin eggworkd
+      - name: stage the installation root
+        shell: bash
+        run: …
+      - name: reserve the loopback port
+        shell: pwsh
+        run: …
+      - name: materialise the bounded fixture
+        shell: bash
+        run: …
+      - name: qualify the hosted service lifecycle
+        shell: bash
+        run: cargo test --locked -p eggwork-server --test windows_service_lifecycle -- --ignored --nocapture
+      - name: the registration is gone
+        shell: pwsh
+        run: …
+```
+
+**What it proves.** The daemon is built from source, the repository's own `rcgen`-based
+qualification fixture is materialised, and the `#[ignore]`d
+`crates/eggwork-server/tests/windows_service_lifecycle.rs` suite drives a real registration
+through the product's own operator CLI: install, start, an authenticated request while the
+manager says Running, stop with an active execution, start again, restart, uninstall, a
+foreign same-name registration that Eggwork never touches, and a node whose configuration
+cannot be loaded never reporting Running. The final step fails the job if a registration
+survived the run, so a failed assertion cannot leave a service behind on the runner.
+
+Every mutation goes through the operator CLI and Eggup's typed adapter. The one exception
+is the foreign-ownership negative, which has to create a registration that is not
+Eggwork's — that is test orchestration, not a second production manager.
+
+**Why the fixture is the repository's own.** The same reason the qualification job
+materialises its own: a certificate the binary rejects would look like a product defect
+rather than a fixture problem, and a runner-provided certificate is exactly the kind of
+thing that disagrees about version, extensions, and key encodings.
+
+**The boundary of the claim.** This job proves the *source-built* service lifecycle. The
+*installed release* service lifecycle — release lineage and the exact installed bytes — is
+a separate subject, and the repository has no immutable release containing both the M004
+and the M007 work, so there is no exact-release Windows service receipt to cite. The
+`operational-qualification.yml` job that would eventually carry that receipt still records
+the older service-*refusal* disposition, which is a separate, still-open item.
 
 ## The `quickstart` CI job
 
@@ -584,7 +657,7 @@ The fixture comes from the repository's own `rcgen`-based harness, not from whic
 
 **`native-service-lifecycle`** — macOS only (`aarch64-apple-darwin` and `x86_64-apple-darwin`, both flagged `unsupported_service: true`): `install`, fixture, `qualify_release.py service`, then `qualify_release.py update --prior-release-tag …` to exercise drain, update, and rollback against real generations.
 
-**`windows-installed-execution`** — a hand-written, non-matrix job, and the most interesting one in the file. The header records two structural gaps found by hosted qualification: the installed `eggworkd` implements no service-control dispatcher, so SCM registers the service and then fails to start it with Windows error 1053; and the runner handed every child a Unix-only baseline environment (`PATH=/usr/bin:/bin`, no `SystemRoot`), so a Windows child started and exited with no capturable exit code. Both were fixed on `main` and neither is in the qualified candidate's bytes. So Windows is **dispositioned, not claimed**: the job records the real disposition and "fails if the observation ever diverges from it, so the limitation cannot silently rot." The pwsh step runs `service install`, writes a receipt, and then:
+**`windows-installed-execution`** — a hand-written, non-matrix job, and the most interesting one in the file. The header records two structural gaps found by hosted qualification: the `eggworkd` in the qualified candidate implements no service-control dispatcher, so SCM registers the service and then fails to start it with Windows error 1053; and the runner handed every child a Unix-only baseline environment (`PATH=/usr/bin:/bin`, no `SystemRoot`), so a Windows child started and exited with no capturable exit code. The environment gap was fixed on `main`; the dispatcher gap was fixed later, by the service host; and neither fix is in the qualified candidate's bytes. So Windows is **dispositioned, not claimed**: the job records the real disposition and "fails if the observation ever diverges from it, so the limitation cannot silently rot." The pwsh step runs `service install`, writes a receipt, and then:
 
 ```powershell
 if (-not $unsupported) {
@@ -597,6 +670,19 @@ exit 0
 ```
 
 The trailing `exit 0` is deliberate and commented: the refusal *is* the recorded disposition, so the step must not inherit the daemon's nonzero exit as its own result. A release that registers a service has lost the guarantee, and that is a hard failure, not a note.
+
+**That disposition is release-scoped, and re-pointing it is an open item — not a service
+lifecycle.** The step asserts that `service install` *refuses*: the output has to match
+`unsupported` and the exit code has to be non-zero. It runs against the **staged release's
+own bytes**, so today it still passes — the released candidate predates the service host
+and still refuses. The moment a release carrying the service host is staged, that
+assertion inverts: the install succeeds, the output does not match `unsupported`, and the
+job throws "Windows service install did not refuse; the fail-closed guarantee is gone".
+Re-pointing the job at the new disposition is a separate, still-open item, and until that
+is done this job says nothing about whether a Windows service works. It is not a service
+lifecycle and must not be read as one: the lifecycle evidence is the hosted
+`windows-service-host` CI job, and the *installed release* service lifecycle is a
+separate subject that no candidate covers yet.
 
 Every job uploads **bounded receipts** — `${{ runner.temp }}/receipts/*.json` (plus `windows-service.txt`) under a run-id-and-attempt-suffixed artifact name, `if-no-files-found: error`, 7-day retention. The harness internals — token handling, retry policy, size bounds, stage sequencing — are covered in [release-qualification.md](release-qualification.md).
 
@@ -740,7 +826,7 @@ Land and tag, push the tag, then run the **Release** workflow with `release_tag`
 - **The Windows determinism policy is a flag-and-observe pairing, not a guarantee.** It is enforced only when `windows-reproducibility.yml` is dispatched. `release_contract.rs` can assert the flags are present and target-scoped; it cannot assert the linker honored them. The native two-build proof is the only real check, and it is manual.
 - **`ci.yml` pins `actions/checkout@v4`, `dtolnay/rust-toolchain@1.89.0`, and `Swatinem/rust-cache@v2` by mutable tag**, while the generated release workflow pins all four of its actions by immutable commit SHA. CI therefore has a supply-chain posture weaker than the release path, and `github-policy.json` does not govern it.
 - **The token path in the qualification workflow is trusted, not verified here.** The claim that `RELEASE_QUALIFICATION_TOKEN` never appears in argv, stdout, or a receipt is asserted in the workflow header and in the harness docstring; this layer does not independently test the workflow's own environment handling.
-- **No guard checks for direct `systemctl` / `launchctl` / SCM / `crontab` invocation.** Invariant 2 rests on review plus the Windows disposition job, not on a mechanical check. A `systemctl` call in a non-approved crate would not trip the ownership guard, because `systemctl` is not one of the four spawn patterns — it would be a `Command::new("systemctl", …)`, which *is* one of them, and so the guard does cover the ordinary spelling. The gap is a *direct* binding, or a new process-owner crate that is allowlisted.
+- **No guard checks for direct `systemctl` / `launchctl` / SCM / `crontab` invocation.** Invariant 2 rests on review plus the hosted Windows service job, not on a mechanical check. A `systemctl` call in a non-approved crate would not trip the ownership guard, because `systemctl` is not one of the four spawn patterns — it would be a `Command::new("systemctl", …)`, which *is* one of them, and so the guard does cover the ordinary spelling. The gap is a *direct* binding, or a new process-owner crate that is allowlisted. The `windows-service-host` job narrows the SCM half of that gap without closing it: it shows that the product's *own* service mutations go through Eggup's adapter on a real host, but a direct binding inside the server would still not be caught by any guard.
 
 ## Review focus
 

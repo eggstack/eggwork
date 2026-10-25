@@ -324,14 +324,16 @@ has the exact `chmod` incantation.
 ## Service management
 
 Service verbs require an explicit product policy for the platform — Linux
-`--unit-path`/`--scope`, macOS `--plist-path`/`--launchd-domain`/`--launchd-target`.
-See [deployment.md](deployment.md).
+`--unit-path`/`--scope`, macOS `--plist-path`/`--launchd-domain`/`--launchd-target`,
+and on Windows the optional `--windows-start-type` (`automatic`, `manual`, or
+`disabled`, defaulting to `manual`). See [deployment.md](deployment.md).
 
-On **Windows every mutating `service` verb is refused before any mutation**,
-because `eggworkd` implements no service-control dispatcher; a registered
-service can never reach `Running`, and registering anyway would leave a working
-installation with no service behind it. Windows binary installation and daemon
-runtime are unaffected.
+On **Windows the daemon hosts the service**: `eggworkd service-host --config
+<absolute-path>` is what the service control manager launches, and the mutating
+`service` verbs go through Eggup's SCM adapter. A registration whose executable,
+config, or critical argv is not this node's is foreign, and Eggwork never touches
+it. Windows binary installation and daemon runtime are unaffected by the service
+policy.
 
 ## Design reference
 

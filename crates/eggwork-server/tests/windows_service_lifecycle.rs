@@ -216,17 +216,47 @@ fn delete_registration() {
         .output();
 }
 
+/// A registration that is not Eggwork's, removed when the test ends.
+struct ForeignRegistration;
+
+impl Drop for ForeignRegistration {
+    fn drop(&mut self) {
+        delete_registration();
+    }
+}
+
 /// Create a registration that is not Eggwork's.
-fn create_foreign_registration(subject: &Subject) -> Result<(), String> {
+///
+/// The registration uses the *same name* and the same argv shape, but a
+/// different executable — which is what "same-name, different-executable"
+/// means in Eggup's own ownership model. The binary is a real copy, so the
+/// registration is plausible rather than a dangling path.
+fn create_foreign_registration(subject: &Subject) -> Result<ForeignRegistration, String> {
     delete_registration();
+    let foreign_dir = subject
+        .config
+        .parent()
+        .ok_or_else(|| "the installation root has no parent".to_owned())?
+        .join("foreign");
+    std::fs::create_dir_all(&foreign_dir).map_err(|error| {
+        format!("the foreign installation directory could not be created: {error}")
+    })?;
+    let foreign_executable = foreign_dir.join("foreign-eggworkd.exe");
+    std::fs::copy(&subject.daemon, &foreign_executable)
+        .map_err(|error| format!("the foreign daemon could not be staged: {error}"))?;
+
+    // The command line is quoted the way the manager quotes it: one quoted
+    // token per argument, so the registration is parseable and its
+    // difference is a real difference rather than a quoting artefact.
+    let command_line = format!(
+        "\"{}\" \"service-host\" \"--config\" \"{}\"",
+        foreign_executable.display(),
+        subject.config.display()
+    );
     let output = Command::new("sc.exe")
         .arg("create")
         .arg(SERVICE_ID)
-        .arg(format!(
-            "binPath= \"{} service-host --config {}\"",
-            subject.daemon.display(),
-            subject.config.display()
-        ))
+        .arg(format!("binPath= {command_line}"))
         .arg("start=")
         .arg("disabled")
         .output()
@@ -237,7 +267,7 @@ fn create_foreign_registration(subject: &Subject) -> Result<(), String> {
             String::from_utf8_lossy(&output.stdout)
         ));
     }
-    Ok(())
+    Ok(ForeignRegistration)
 }
 
 /// The environment a qualified target declares for its child.
@@ -309,6 +339,8 @@ async fn the_windows_service_lifecycle_is_owned_and_reachable() -> Result<(), St
         subject: subject.clone(),
         installed: false,
     };
+    println!("RECEIPT: daemon {}", subject.daemon.display());
+    println!("RECEIPT: config {}", subject.config.display());
 
     // 1. Install.
     let install = service_verb(&subject, "install");
@@ -323,6 +355,10 @@ async fn the_windows_service_lifecycle_is_owned_and_reachable() -> Result<(), St
         observed.ownership, "Owned",
         "the registration Eggwork just made must be owned"
     );
+    println!(
+        "RECEIPT: install completed; ownership={} state={}",
+        observed.ownership, observed.state
+    );
 
     // 2. Start, and wait until the manager reports it running.
     let start = service_verb(&subject, "start");
@@ -333,6 +369,10 @@ async fn the_windows_service_lifecycle_is_owned_and_reachable() -> Result<(), St
     );
     let observed = await_state(&subject, "Running")?;
     assert_eq!(observed.ownership, "Owned");
+    println!(
+        "RECEIPT: start completed; ownership={} state={}",
+        observed.ownership, observed.state
+    );
 
     // 3. The service says Running *and* the node answers an authenticated
     // request. The manager's state alone would not prove the node is
@@ -356,6 +396,10 @@ async fn the_windows_service_lifecycle_is_owned_and_reachable() -> Result<(), St
         status.node_id,
         NodeId::new("qualification-node").expect("the fixture node id"),
         "the authenticated request reached a different node"
+    );
+    println!(
+        "RECEIPT: the service-hosted node answered an authenticated capabilities and status request at {}",
+        subject.endpoint()?
     );
 
     // 4. A stop converges an active execution before the process exits.
@@ -411,6 +455,10 @@ async fn the_windows_service_lifecycle_is_owned_and_reachable() -> Result<(), St
     );
     let observed = await_state(&subject, "Stopped")?;
     assert_eq!(observed.ownership, "Owned");
+    println!(
+        "RECEIPT: stop completed; ownership={} state={}",
+        observed.ownership, observed.state
+    );
 
     // 6. The execution converged: the node reached Stopped only after its
     // active executions finished, so the durable record is already terminal.
@@ -419,9 +467,11 @@ async fn the_windows_service_lifecycle_is_owned_and_reachable() -> Result<(), St
         state.is_terminal(),
         "the execution was still {state:?} after the service stopped"
     );
+    println!("RECEIPT: the active execution converged to {state:?} before the process exited");
     drain.abort();
 
     // 7. Start again, and prove it runs.
+    println!("RECEIPT: the second start begins");
     let start = service_verb(&subject, "start");
     assert!(
         start.status.success(),
@@ -432,6 +482,7 @@ async fn the_windows_service_lifecycle_is_owned_and_reachable() -> Result<(), St
     assert_eq!(observed.ownership, "Owned");
 
     // 8. Restart, and prove it runs.
+    println!("RECEIPT: the restart begins");
     let restart = service_verb(&subject, "restart");
     assert!(
         restart.status.success(),
@@ -454,22 +505,34 @@ async fn the_windows_service_lifecycle_is_owned_and_reachable() -> Result<(), St
         observed.ownership, "Owned",
         "the registration survived its own removal"
     );
+    println!(
+        "RECEIPT: uninstall completed; ownership={} state={}",
+        observed.ownership, observed.state
+    );
 
     // 10. A registration that is not Eggwork's is not mutated.
-    create_foreign_registration(&subject)?;
+    //
+    // The property under test is that Eggwork refuses to touch it. The
+    // classification itself — `Foreign` for a registration that provably
+    // belongs to another deployment, `Unknown` for one whose ownership
+    // cannot be proven — is owned by Eggup and is pinned by the service
+    // identity contract; here the requirement is that Eggwork does not
+    // claim it and does not mutate it.
+    let _foreign = create_foreign_registration(&subject)?;
     let observed = observe(&subject)?;
-    assert_eq!(
-        observed.ownership, "Foreign",
+    assert_ne!(
+        observed.ownership, "Owned",
         "a same-name registration with a different identity must not be owned"
     );
     for verb in ["stop", "uninstall", "start"] {
         let output = service_verb(&subject, verb);
         assert!(
             !output.status.success(),
-            "`service {verb}` must refuse a foreign registration"
+            "`service {verb}` must refuse a registration Eggwork does not own"
         );
     }
     delete_registration();
+    println!("RECEIPT: a same-name registration Eggwork does not own was not mutated");
 
     // 11. A node that cannot start never reports Running.
     let unavailable = subject.config.with_extension("unavailable.json");

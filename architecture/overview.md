@@ -250,7 +250,7 @@ inserted into an earlier table would renumber them.
 - Authorization strictly **precedes** resource resolution in `dispatch`, and id parsing touches only the path, so a denied caller cannot distinguish an existing resource from an absent one.
 - Lease expiry **rewrites a successful runner result** in place to `Interrupted`/`LeaseExpired`; success is never claimed without authority.
 - The store uses **literal SQL with `?n` bindings only** — no dynamic SQL construction, so no injection surface.
-- Windows service management fails closed with a detailed, reasoned error **before** any mutation, and the typed adapter is deliberately retained for the future milestone.
+- Windows service management **used to** fail closed with a detailed, reasoned error **before** any mutation, and the typed adapter was deliberately retained for a future milestone. The daemon is now a service host, the adapter is the live path, and the failure it prevented — a registration with no service behind it — is what the hosted lifecycle job now proves cannot happen.
 - The no-clobber rule on staging assets is what proved, during the `v0.1.4` refusal, that **nothing was replaced** when a candidate failed qualification.
 
 ---
