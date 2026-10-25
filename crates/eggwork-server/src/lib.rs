@@ -6,6 +6,7 @@ mod artifact;
 mod blob;
 pub mod deployment;
 pub mod operations;
+pub mod service_host;
 mod store;
 pub mod telemetry;
 mod workspace;

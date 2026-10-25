@@ -2643,7 +2643,11 @@ mod tests {
             )
         } else {
             (
-                vec!["/bin/true".to_owned()],
+                // `/usr/bin/true`, not `/bin/true`: macOS keeps `true` in
+                // `/usr/bin`, and `/bin` holds only the small set of tools
+                // that were always there. A Unix-shaped absolute path is a
+                // macOS-shaped failure.
+                vec!["/usr/bin/true".to_owned()],
                 vec![
                     "/usr/bin/touch".to_owned(),
                     marker.to_str().unwrap().to_owned(),
@@ -2858,9 +2862,18 @@ mod tests {
         let mut cwd = request(temp.path(), &["pwd"]);
         cwd.cwd = Some(RelativePath::new("work").unwrap());
         let result = run(cwd).await.unwrap();
+        // The child reports the *physical* working directory: macOS resolves
+        // `/var` to `/private/var`, so the expectation is canonicalized
+        // rather than compared against the path the temporary directory was
+        // created under.
+        let expected = temp
+            .path()
+            .join("work")
+            .canonicalize()
+            .expect("the confined working directory is canonical");
         assert_eq!(
             String::from_utf8_lossy(&result.stdout.head).trim(),
-            temp.path().join("work").to_string_lossy()
+            expected.to_string_lossy()
         );
 
         let mut overflow = request(

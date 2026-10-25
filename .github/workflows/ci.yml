@@ -86,9 +86,12 @@ jobs:
     # Linux-only until a separate milestone reshapes them. One server
     # integration target is portable and is run below, so it is the native
     # evidence that a node which cannot capture declared outputs refuses them
-    # instead of dropping them. The installed production path (installed
+    # instead of dropping them. The service host adds two more targets that
+    # *are* Windows-shaped — the host's lifecycle and its service identity —
+    # and they are run here. The installed production path (installed
     # release bytes, not a build tree) is qualified by the
-    # `operational-qualification` workflow, not here.
+    # `operational-qualification` workflow, not here, and the real service
+    # control manager lifecycle is the `windows-service-host` job below.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -128,6 +131,101 @@ jobs:
       # test surface is still Linux-only and is not claimed here.
       - name: declared-artifact capture disposition suite
         run: cargo test --locked -p eggwork-server --test artifact_capture_disposition
+      # The service-host lifecycle and the service identity contract.
+      #
+      # These two targets are the Windows service host's own surface. They are
+      # run explicitly here because the server's *unit* tests are
+      # `/bin/sh`-shaped and do not compile for Windows, so the server's test
+      # surface as a whole cannot be claimed here. These two can, and they
+      # are what the service host is made of.
+      - name: service-host lifecycle suite
+        run: cargo test --locked -p eggwork-server --bin eggworkd -- --nocapture
+      - name: service-host identity contract
+        run: cargo test --locked -p eggwork-server --test windows_service_contract -- --nocapture
+      # Only the two Windows targets are linted. `--tests` would build the
+      # server's Linux-shaped unit-test target as well, and that target does
+      # not compile for Windows.
+      - name: service-host test targets
+        run: cargo clippy --locked -p eggwork-server --test windows_service_contract --test windows_service_lifecycle -- -D warnings
+  windows-service-host:
+    # The Windows service host is proved by mutating a real service control
+    # manager registration on the hosted runner: install, start, answer an
+    # authenticated request while the manager says Running, stop with an
+    # active execution, start again, restart, uninstall, and prove that a
+    # same-name registration that is not Eggwork's is never touched.
+    #
+    # The daemon is built from source here. The *installed release* service
+    # lifecycle belongs to Operations M004, which owns release lineage and
+    # the exact installed bytes; this job owns the source-built proof.
+    #
+    # Every mutation goes through the product's own operator CLI and Eggup's
+    # typed adapter. The one exception is the foreign-ownership negative,
+    # which has to create a registration that is not Eggwork's, and that is
+    # test orchestration rather than a second production manager.
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc
+      - name: build the daemon under test
+        run: cargo build --locked -p eggwork-server --bin eggworkd
+      - name: stage the installation root
+        # The directories are created 0755 rather than with the shell's umask,
+        # because the installed helper's trust check walks every ancestor of
+        # its own path and refuses a group- or world-writable one.
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="${{ runner.temp }}/service-host"
+          mkdir -p "$root/bin"
+          install -m 0755 target/debug/eggworkd.exe "$root/bin/eggworkd.exe"
+          chmod 0755 "$root" "$root/bin"
+      - name: reserve the loopback port
+        # The service-hosted node has to bind an address the test can reach,
+        # and the manager's state alone would not prove the node is serving.
+        # The port is reserved and released, and the node binds it for the
+        # duration of the lifecycle.
+        shell: pwsh
+        run: |
+          $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+          $listener.Start()
+          $port = $listener.LocalEndpoint.Port
+          $listener.Stop()
+          "EGGWORK_QUALIFY_BIND=127.0.0.1:$port" >> $env:GITHUB_ENV
+      - name: materialise the bounded fixture
+        # The repository's own rcgen-based fixture, not a runner-provided one:
+        # a certificate the installed binary rejects would look like a product
+        # defect rather than a fixture problem.
+        shell: bash
+        run: |
+          set -euo pipefail
+          EGGWORK_QUALIFY_ROOT="${{ runner.temp }}/service-host" \
+            cargo test --locked -p eggwork-server --features qualification \
+              --test installed_qualification -- --ignored --exact qualification_fixture
+      - name: qualify the hosted service lifecycle
+        shell: bash
+        env:
+          EGGWORK_QUALIFY_ROOT: ${{ runner.temp }}/service-host
+          EGGWORK_SERVICE_DAEMON: ${{ runner.temp }}/service-host/bin/eggworkd.exe
+        run: |
+          set -euo pipefail
+          cargo test --locked -p eggwork-server --test windows_service_lifecycle \
+            -- --ignored --nocapture
+      - name: the registration is gone
+        # The lifecycle removes its own registration, and a failed assertion
+        # must not leave one behind. This step is the belt to the test's
+        # braces: it fails the job if a registration survives the run.
+        shell: pwsh
+        run: |
+          $existing = sc.exe query eggwork-node 2>&1 | Out-String
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "a service registration survived the lifecycle job: $existing"
+            exit 1
+          }
+          Write-Output "no service registration survived the lifecycle job"
   macos-runner:
     # The release matrix builds macos-x64 and macos-arm64, and nothing in this
     # workflow exercised a macOS target, so a macOS-only regression could reach
