@@ -139,6 +139,12 @@ mod imp {
         /// Kill the leader alone, without touching the rest of the group. Used
         /// by the Linux sandbox handshake's refusal paths, where no target
         /// process exists yet and the helper is the only process involved.
+        ///
+        /// Linux-only for the same reason its call sites are: on the other
+        /// Unix targets the handshake has no refusal path, and leaving the
+        /// method defined made the macOS build fail `clippy -D warnings` on a
+        /// dead-code error.
+        #[cfg(target_os = "linux")]
         pub(crate) fn start_kill(&mut self) -> std::io::Result<()> {
             self.child.start_kill()
         }

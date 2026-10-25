@@ -20,17 +20,34 @@
 //! in `crates/eggwork-sandbox-helper/tests/environment_policy_parity.rs`,
 //! because it needs the real helper executable.
 
+// The policy list is readable on every platform, and the two list tests below
+// are not gated. Everything else in this file — observing a child's
+// environment — is Unix-only, so its imports are gated with it. Leaving them
+// unconditional made the hosted Windows build fail `clippy -D warnings` on
+// unused imports.
+#[cfg(unix)]
 use eggwork_core::{OverflowPolicy, Requirement};
+use eggwork_runner::environment_policy;
+#[cfg(unix)]
 use eggwork_runner::{
     LocalProcessRunner, NoExecutionSetup, ResourceSetupRequest, RunnerRequest, SandboxRequest,
-    StdinPolicy, environment_policy,
+    StdinPolicy,
 };
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::sync::mpsc;
+#[cfg(unix)]
 use tokio_util::sync::CancellationToken;
 
 /// The environment the child actually received, sorted.
+///
+/// Only the Unix behavioural tests below observe a child's environment, so
+/// this helper is Unix-only too. Leaving it unconditional made the hosted
+/// Windows build fail `clippy -D warnings` on a dead-code error.
+#[cfg(unix)]
 async fn observed_environment(root: &Path, environment: Vec<(String, String)>) -> Vec<String> {
     let mut request = RunnerRequest::new(vec!["/bin/sh".into(), "-c".into(), "env".into()], root);
     request.set_environment(environment);
