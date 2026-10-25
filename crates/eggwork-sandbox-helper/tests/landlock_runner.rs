@@ -261,24 +261,43 @@ async fn sandbox_timeout_and_cancellation_reap_the_helper_process_group() {
 
     let mut cancel_request = request(&root, &root.join("unused"), &root.join("unused2"));
     cancel_request.resource_setup_request_mut().cpu_millis = Requirement::Required(1000);
+    // The target announces itself on stdout as well as recording its child's
+    // pid. The stdout marker is what the test waits for: a chunk on the
+    // runner's output channel proves the *runner* observed the spawn, which is
+    // strictly later than the target writing the pid file. Waiting on the file
+    // alone raced the helper's spawn-confirmation byte and produced a
+    // `CancelledBeforeSpawn` that was correct runner behaviour but a flaky
+    // test.
     cancel_request.set_argv(vec![
         "/bin/sh".into(),
         "-c".into(),
-        "sleep 30 & echo $! > child-pid; wait".into(),
+        "sleep 30 & echo $! > child-pid; echo EGGWORK-TARGET-SPAWNED; wait".into(),
     ]);
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
     let task_runner = runner;
-    let task = tokio::spawn(async move {
-        let (tx, _rx) = mpsc::channel(8);
-        task_runner.run(cancel_request, task_cancellation, tx).await
-    });
-    for _ in 0..100 {
-        if root.join("child-pid").exists() {
-            break;
+    let (tx, mut rx) = mpsc::channel(8);
+    let task =
+        tokio::spawn(async move { task_runner.run(cancel_request, task_cancellation, tx).await });
+    let mut saw_spawn = false;
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(eggwork_runner::OutputChunk::Stdout(bytes))) => {
+                    if String::from_utf8_lossy(&bytes).contains("EGGWORK-TARGET-SPAWNED") {
+                        saw_spawn = true;
+                        break;
+                    }
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => break,
+            }
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert!(saw_spawn, "target did not announce itself on stdout");
     assert!(
         root.join("child-pid").exists(),
         "target child did not start"
