@@ -1,6 +1,6 @@
 # Operations and Distribution Roadmap
 
-Status: active roadmap; M001-M003, M002a, M004a and M004b closed, M004 conditionally closed; M007 ready
+Status: active roadmap; M001-M003, M002a, M004a and M004b closed, M004 conditionally closed; M007 conditionally closed; M008a and M008b operator-truthfulness correctives closed
 
 Canonical authority:
 
@@ -320,7 +320,13 @@ Closure summary:
 
 Class: corrective capability
 
-Status: **ready**
+Status: **conditionally closed** — implementation commits `22f5337` and
+`e72cd22`; the outstanding condition is the *installed-release* Windows service
+receipt, which is Operations M004's item 2
+
+Closure record:
+
+- `plans/closure/operations-distribution/007-status.md`
 
 Implementation plan:
 
@@ -335,6 +341,60 @@ The registered service invokes an explicit `service-host --config ...` entry. It
 A routine service STOP must not create a new persistent drain marker; persistent drain remains explicit operator/update policy and an existing marker is preserved across service restart.
 
 Verification is deliberately split: state/contract tests plus source-built hosted SCM lifecycle evidence close the implementation side; immutable installed-release evidence remains Operations M004 authority. Foundation M004 is already conditionally closed and is not an implementation dependency. No additional M007 prerequisite plan is required.
+
+Both halves are now in place on the implementation side: the state and contract tests run on any host and on the hosted Windows runner, and the source-built hosted SCM lifecycle passes end to end — install, start, an authenticated request while the manager reports `Running`, a stop that converges an active execution, a second start, a restart, a removal, a same-name registration Eggwork does not touch, and a node whose configuration cannot be loaded never reporting `Running`. What remains is the installed-release receipt, which needs an immutable release carrying both Foundation M004 and this milestone.
+
+### M008a — Operator surface truthfulness corrective
+
+Class: capability
+
+Status: closed — implementation commit `5df1b69`
+
+Corrective addendum:
+
+- `plans/subsystems/operations-distribution-operator-truthfulness-corrective-addendum.md`
+
+Implementation plan:
+
+- `plans/implementation/operations-distribution/008a-operator-surface-truthfulness-corrective.md`
+
+Objective:
+
+Make the operator surface report what the node actually does. Five live metrics are incremented by the server and never reach `eggworkd status`/`eggworkd metrics` because the reported vocabulary is a hand-maintained list; one `active_executions` field name carries two different meanings across the API and the CLI; and every configuration fault — wrong owner, wrong mode, an unsafe helper location, a malformed field — collapses into the single unhelpful message `configuration is invalid or unreadable`.
+
+Exit conditions:
+
+- a metric the server increments cannot be silently dropped by the operator surface, and a test proves it;
+- the two `active_executions` facts are separately named and separately documented, with the API-visible field chosen so deployed clients are not broken;
+- a configuration failure names the path and the rule that failed and what the operator should do;
+- redaction of private-key paths and certificate fingerprints is preserved in both success and failure output.
+
+### M008b — Release harness and documentation single-sourcing corrective
+
+Class: infrastructure (release harness and CI) / polish (documentation drift and citation hygiene)
+
+Status: closed — implementation commits `c8999e1` (release harness and CI), `8e056f8` (the citation gate and the machine-executed quickstart), and `ec67c56` (the citation conversion and the CI wiring of the gate)
+
+Corrective addendum:
+
+- `plans/subsystems/operations-distribution-operator-truthfulness-corrective-addendum.md`
+
+Implementation plan:
+
+- `plans/implementation/operations-distribution/008b-release-harness-and-documentation-single-sourcing-corrective.md`
+
+Objective:
+
+Give the release harness and the design record one owner per fact. The harness re-derives the workspace version, the release asset inventory, the install identities, and the release-target classification that already have owners, and its tag guard is not wired into CI. Separately, the design record has drifted: roughly 92% of its line-number citations no longer point at the symbol they claim, every crate size figure is stale, and one divergences-table entry describes an already-fixed issue as open. CI also type-checks feature-gated code it never executes, and one runner test passes with zero assertions.
+
+Exit conditions:
+
+- the harness derives the version, inventory, identities, and target classification from their owners, and the tag guard runs in CI;
+- the design record cites symbols rather than line numbers, and a durable guard prevents the drift from returning;
+- the divergences table is re-verified entry by entry;
+- `docs/quickstart.md` is machine-verified, or the waiver is recorded where a reader would look;
+- feature-gated code either executes in CI or the reason it does not is recorded in the same place;
+- no released artifact format and no wire protocol changes, and the generated release workflow is never hand-edited.
 
 ### M005 — Reverse-connect relay
 

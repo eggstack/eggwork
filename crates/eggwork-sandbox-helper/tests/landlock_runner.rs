@@ -14,6 +14,7 @@ use eggwork_core::{OverflowPolicy, Requirement};
 use eggwork_runner::{
     ExecutionProvenance, ExecutionSetup, LocalProcessRunner, ResourceSetupRequest, RunnerError,
     RunnerRequest, SandboxOutcome, SandboxRequest, StdinPolicy, TrustedLandlockSetup,
+    WORKSPACE_RW_PROFILE,
 };
 use helper_fixture::TrustedHelperFixture;
 use std::{
@@ -260,24 +261,43 @@ async fn sandbox_timeout_and_cancellation_reap_the_helper_process_group() {
 
     let mut cancel_request = request(&root, &root.join("unused"), &root.join("unused2"));
     cancel_request.resource_setup_request_mut().cpu_millis = Requirement::Required(1000);
+    // The target announces itself on stdout as well as recording its child's
+    // pid. The stdout marker is what the test waits for: a chunk on the
+    // runner's output channel proves the *runner* observed the spawn, which is
+    // strictly later than the target writing the pid file. Waiting on the file
+    // alone raced the helper's spawn-confirmation byte and produced a
+    // `CancelledBeforeSpawn` that was correct runner behaviour but a flaky
+    // test.
     cancel_request.set_argv(vec![
         "/bin/sh".into(),
         "-c".into(),
-        "sleep 30 & echo $! > child-pid; wait".into(),
+        "sleep 30 & echo $! > child-pid; echo EGGWORK-TARGET-SPAWNED; wait".into(),
     ]);
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
     let task_runner = runner;
-    let task = tokio::spawn(async move {
-        let (tx, _rx) = mpsc::channel(8);
-        task_runner.run(cancel_request, task_cancellation, tx).await
-    });
-    for _ in 0..100 {
-        if root.join("child-pid").exists() {
-            break;
+    let (tx, mut rx) = mpsc::channel(8);
+    let task =
+        tokio::spawn(async move { task_runner.run(cancel_request, task_cancellation, tx).await });
+    let mut saw_spawn = false;
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(eggwork_runner::OutputChunk::Stdout(bytes))) => {
+                    if String::from_utf8_lossy(&bytes).contains("EGGWORK-TARGET-SPAWNED") {
+                        saw_spawn = true;
+                        break;
+                    }
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => break,
+            }
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert!(saw_spawn, "target did not announce itself on stdout");
     assert!(
         root.join("child-pid").exists(),
         "target child did not start"
@@ -505,6 +525,120 @@ fn malformed_private_spec_and_unavailable_status_channel_do_not_launch_target() 
         .unwrap();
     assert!(child.wait().unwrap().code().is_some_and(|code| code != 0));
     assert!(!marker.exists());
+}
+
+/// The runner's profile name is the profile the helper grants.
+///
+/// The helper is a standalone binary with no workspace-crate dependency, so it
+/// cannot import the runner's constant and keeps its own `"workspace_rw"`
+/// literal. This test is what pins that unavoidable literal to the runner's
+/// constant, and it does so in both directions:
+///
+/// * the profile the runner produces is accepted, and the target runs;
+/// * a profile that differs from the runner's by one character is refused
+///   *before* the target is spawned, so a renamed profile can never reach a
+///   process.
+///
+/// If the runner's profile name ever moved, the first half fails: the helper
+/// would refuse the specification and the target marker would never appear.
+#[test]
+fn the_runner_profile_is_granted_and_a_differing_one_is_refused_before_the_target_spawns() {
+    use std::{io::Read, os::unix::fs::PermissionsExt};
+
+    let temp = tempfile::tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let fixture = TrustedHelperFixture::stage(built_helper());
+
+    // 1. The profile the runner produces is accepted and the target runs.
+    let granted_marker = temp.path().join("granted-target-ran");
+    let granted_spec = temp.path().join("granted.json");
+    fs::write(
+        &granted_spec,
+        serde_json::json!({
+            "schema_version": 1,
+            "profile": WORKSPACE_RW_PROFILE,
+            "root": root,
+            "cwd": root,
+            "argv": ["/usr/bin/touch", granted_marker],
+            "environment": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::set_permissions(&granted_spec, fs::Permissions::from_mode(0o600)).unwrap();
+    let granted_status = temp.path().join("granted.sock");
+    let granted_listener = std::os::unix::net::UnixListener::bind(&granted_status).unwrap();
+    let mut granted_child = Command::new(fixture.path())
+        .arg("--spec")
+        .arg(&granted_spec)
+        .arg("--status")
+        .arg(&granted_status)
+        .spawn()
+        .unwrap();
+    let (mut granted_stream, _) = granted_listener.accept().unwrap();
+    let mut granted_code = [0u8; 1];
+    granted_stream.read_exact(&mut granted_code).unwrap();
+    assert_eq!(
+        granted_code[0], 1,
+        "the helper must accept the profile the runner produces"
+    );
+    // The second byte is the post-mortem resource status; reading it lets the
+    // helper finish writing before the test reaps it.
+    let mut resource_status = [0u8; 1];
+    granted_stream.read_exact(&mut resource_status).unwrap();
+    granted_child.wait().unwrap();
+    assert!(
+        granted_marker.exists(),
+        "the target must run under the runner's own profile name"
+    );
+
+    // 2. A profile that differs from the runner's is refused before the
+    //    target is spawned.
+    let refused_marker = temp.path().join("refused-target-ran");
+    let refused_spec = temp.path().join("refused.json");
+    fs::write(
+        &refused_spec,
+        serde_json::json!({
+            "schema_version": 1,
+            "profile": format!("{WORKSPACE_RW_PROFILE}x"),
+            "root": root,
+            "cwd": root,
+            "argv": ["/usr/bin/touch", refused_marker],
+            "environment": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::set_permissions(&refused_spec, fs::Permissions::from_mode(0o600)).unwrap();
+    let refused_status = temp.path().join("refused.sock");
+    let refused_listener = std::os::unix::net::UnixListener::bind(&refused_status).unwrap();
+    let mut refused_child = Command::new(fixture.path())
+        .arg("--spec")
+        .arg(&refused_spec)
+        .arg("--status")
+        .arg(&refused_status)
+        .spawn()
+        .unwrap();
+    let (mut refused_stream, _) = refused_listener.accept().unwrap();
+    let mut refused_code = [0u8; 1];
+    refused_stream.read_exact(&mut refused_code).unwrap();
+    assert_eq!(
+        refused_code[0], 12,
+        "a profile that differs from the runner's must be refused as a malformed spec"
+    );
+    assert!(
+        refused_child
+            .wait()
+            .unwrap()
+            .code()
+            .is_some_and(|code| code != 0),
+        "a refused specification must not report success"
+    );
+    assert!(
+        !refused_marker.exists(),
+        "a refused profile must not reach a spawned target"
+    );
 }
 
 // Operations M004a: the fixture-isolation proofs.

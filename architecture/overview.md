@@ -28,11 +28,31 @@ This page is the **bird's-eye view**: what each module owns, how they compose, a
 
 | Crate | Role | Depends on | Size |
 |---|---|---|---|
-| `eggwork-core` | Protocol-neutral bounded domain types: identities, request/result contracts, validation, events | — | 1,671 LOC |
-| `eggwork-runner` | The single owner of finite process lifecycle; resource/isolation setup abstraction | core | 2,336 LOC |
-| `eggwork-sandbox-helper` | Standalone binary that applies Landlock confinement, verifies the cgroup resource limits, then spawns and supervises the target | — | 401 LOC |
-| `eggwork-client` | Explicit single-node client; all HTTP via Eggfetch, optional egress routing | core | 880 LOC |
-| `eggwork-server` | Node service, mTLS admission, control plane, stores, operator surface, deployment | core, runner | 14,104 LOC |
+| `eggwork-core` | Protocol-neutral bounded domain types: identities, request/result contracts, validation, events | — | see the size script |
+| `eggwork-runner` | The single owner of finite process lifecycle; resource/isolation setup abstraction | core | see the size script |
+| `eggwork-sandbox-helper` | Standalone binary that applies Landlock confinement, verifies the cgroup resource limits, then spawns and supervises the target | — | see the size script |
+| `eggwork-client` | Explicit single-node client; all HTTP via Eggfetch, optional egress routing | core | see the size script |
+| `eggwork-server` | Node service, mTLS admission, control plane, stores, operator surface, deployment | core, runner | see the size script |
+
+The size column is **not a number in this document**, and that is deliberate. A
+checked-in line count is a fact about the tree that rots on the next edit and
+is wrong the moment it is written — which is the same defect the citation gate
+removes from the prose above. The figures are printed on demand instead:
+
+```
+python3 scripts/component_sizes.py
+```
+
+The script counts every line of every `.rs` file a crate owns, split into the
+crate's `src/` (the product) and `tests/` (the evidence), and sums to a
+workspace total so a reader can check the arithmetic. It is stdlib-only and
+deterministic: the same tree always produces the same output, and the output
+depends on nothing but the files on disk.
+
+The **script** is the durable artifact here, not any particular run of it. A
+snapshot of its output belongs in a closure record, where it is evidence about
+one commit, rather than in this document, where it would be a second owner of
+a number the tree already owns.
 
 The dependency graph is intentionally **one-way**. `eggwork-core` and `eggwork-sandbox-helper` have no production dependency on any other workspace crate. `eggwork-client` depends only on `eggwork-core`. `eggwork-server` depends on `eggwork-core` and `eggwork-runner` only; its dependency on `eggwork-client` is a `dev-dependency` used by the qualification harness. Direction is machine-checked — see [CI and guardrails](ci-guardrails.md).
 
@@ -78,12 +98,12 @@ Linux-only machinery is `#[cfg]`-gated so the crate compiles everywhere; a non-L
 
 The largest surface, split into seven library modules plus the `eggworkd` binary:
 
-- **`lib.rs` (6,280 LOC)** — node configuration, `NodeServer`, the mTLS-authenticated HTTP service, operation dispatch, local admission, lease enforcement, and the full execution lifecycle (`execute`, `monitor_lease`, `run_execution`, `publish`, `publish_terminal`). Authorization is two traits: `PeerPrincipalResolver` (verified TLS leaf → `NodePrincipal`, resolved by SHA-256 fingerprint) and `Authorizer` (operation grant, with a resource-aware `authorize_request` hook for scoped policies).
+- **`crates/eggwork-server/src/lib.rs`** — node configuration, `NodeServer`, the mTLS-authenticated HTTP service, operation dispatch, local admission, lease enforcement, and the full execution lifecycle (`execute`, `monitor_lease`, `run_execution`, `publish`, `publish_terminal`). Authorization is two traits: `PeerPrincipalResolver` (verified TLS leaf → `NodePrincipal`, resolved by SHA-256 fingerprint) and `Authorizer` (operation grant, with a resource-aware `authorize_request` hook for scoped policies).
 - **`store.rs`** — the durable SQLite execution and event journal, including idempotency reservation, lease records, and paginated event reads.
 - **`blob.rs`** — node-owned content-addressed blob storage with quota enforcement and GC.
 - **`workspace.rs`** — validated, execution-owned workspace materialization from manifests.
 - **`artifact.rs`** — declared output capture, artifact metadata, retention, and bounded cleanup.
-- **`operations.rs` + `bin/eggworkd.rs`** — the JSON-only operator surface: config, `doctor`, drain, execution listing, storage summary, GC, inspection, and service/deployment commands.
+- **`operations.rs` + `crates/eggwork-server/src/bin/eggworkd.rs`** — the JSON-only operator surface: config, `doctor`, drain, execution listing, storage summary, GC, inspection, and service/deployment commands.
 - **`deployment.rs`** — consumer deployment and service lifecycle backed by Eggup.
 
 → Deep dives: [server node](server-node.md) · [storage journal](storage-journal.md) · [data plane](data-plane.md) · [operations CLI](operations-cli.md) · [deployment lifecycle](deployment-lifecycle.md)
@@ -160,22 +180,24 @@ The deep dives surfaced a set of places where the code, the documentation, and t
 
 None of these are presented as bugs already judged to be bugs. They are the places where a reviewer should decide whether the code, the doc, or the invariant should move.
 
+**Re-verification, 2026-10-25 (M008b).** Every row was re-checked against the tree rather than assumed. Row **3** was corrected (the flag is documented in `docs/deployment.md`, not in a README) and row **20** was closed (the client's transport already caps every decoded body). Every other row was checked and left alone: each observation is still true of the code as it stands, and the already-closed rows **4**, **17**, **22** and **23** still hold, residual boundaries included. Row **24** was preserved verbatim. No row was renumbered; a closed row is closed in place, and a new row takes the next free number at the end of the document.
+
 ### Where the implementation differs from the prose
 
 | # | Observation | Where |
 |---|---|---|
 | 1 | The sandbox helper **does not `execve`**. It `spawn`s the target and `wait`s, because it must stay alive to read post-mortem cgroup counters and report the real resource outcome to the runner. Confinement still holds — the Landlock ruleset is inherited across the fork and survives the target's own `execve`. | [sandbox-helper.md](sandbox-helper.md) |
 | 2 | The helper sets **no `RLIMIT_*`**. `verify_resource_limits` *verifies* that the runner's cgroup already bounds `memory.max`, `memory.swap.max`, `pids.max`, and `cpu.max`. Resource enforcement lives in the runner, not the helper. | [sandbox-helper.md](sandbox-helper.md) |
-| 3 | `--windows-start-type` is documented in the README and passed by `scripts/qualify_release.py`, but **no code path parses it**. This is currently harmless: the Windows arm of `product_service_manager` discards `args` and refuses before reaching a manager. It becomes live work when Windows becomes a service host. | [operations-cli.md](operations-cli.md) |
+| 3 | `--windows-start-type` is documented in `docs/deployment.md` and passed by `scripts/qualify_release.py`, but **no code path parses it**. This is currently harmless: the Windows arm of `product_service_manager` discards `args` and refuses before reaching a manager. It becomes live work when Windows becomes a service host. | [operations-cli.md](operations-cli.md) |
 
 ### Where an invariant is weaker in practice than the wording suggests
 
 | # | Observation | Where |
 |---|---|---|
-| 4 | `GrantAuthorizer` implements only `Authorizer::authorize`, **not** the resource-aware `authorize_request` hook. Resource-scoped authorization is therefore inert on the real deployment path; ownership is enforced only in the store, by `principal_id` comparison. | [operations-cli.md](operations-cli.md) · [server-node.md](server-node.md) |
+| 4 | ~~`GrantAuthorizer` implements only `Authorizer::authorize`, **not** the resource-aware `authorize_request` hook. Resource-scoped authorization is therefore inert on the real deployment path; ownership is enforced only in the store, by `principal_id` comparison.~~ **Closed 2026-10-25 by [ADR-0007](../plans/adrs/ADR-0007-resource-scoped-authorization.md) (Option A).** `GrantAuthorizer` now implements `authorize_request`: a grant may carry a bounded, optional list of resource scopes naming an operation, a resource kind, and a typed identifier, and the decision narrows the operation grant against that configuration-derived set. The scope is per `(operation, kind)`, so a scope for `Execute`/`Execution` does not narrow `Execute`/`Workspace`. The store's `principal_id` fences remain authoritative for ownership, so a scope naming another principal's execution, workspace, or artifact is still refused there. **Residual boundary:** a grant with no scope is still operation-wide, so a broad `BlobRead` still reaches any known digest — blob storage is content-addressed and shared, so a blob has no owner to fence it, and a blob scope is an explicit digest list the operator must configure. | [operations-cli.md](operations-cli.md) · [server-node.md](server-node.md) · [threat-model.md](../plans/security/threat-model.md) |
 | 5 | `deployment::check_helper_compatibility_with_timeout` checks the helper **file** only, while `eggwork_runner::verify_trusted_helper` also walks every ancestor directory. The deployment trust path is the weaker subset plus version coherence. | [deployment-lifecycle.md](deployment-lifecycle.md) · [runner-execution.md](runner-execution.md) |
-| 6 | Invariant 2 (no direct node-service manager invocation) has **no dedicated mechanical guard**. The only automated check is the Rust test `no_direct_service_manager_invocation_exists` in `deployment.rs`, and it scans just three files (`src/deployment.rs`, `src/operations.rs`, `src/bin/eggworkd.rs`) for manager *string literals*. `eggwork-runner` is outside that scope entirely. | [ci-guardrails.md](ci-guardrails.md) |
-| 7 | The ownership guard globs only `crates/*/src/**/*.rs`. `tests/`, `examples/`, and `build.rs` are unscanned, and the allowlist is keyed by crate name rather than path. | [ci-guardrails.md](ci-guardrails.md) |
+| 6 | Invariant 2 (no direct node-service manager invocation) has **no dedicated mechanical guard**. The only automated check is the Rust test `no_direct_service_manager_invocation_exists` in `deployment.rs`, and it scans just three files (`crates/eggwork-server/src/deployment.rs`, `crates/eggwork-server/src/operations.rs`, `crates/eggwork-server/src/bin/eggworkd.rs`) for manager *string literals*. `eggwork-runner` is outside that scope entirely. | [ci-guardrails.md](ci-guardrails.md) |
+| 7 | The ownership guard globs only `crates/*/src/**/*.rs`. `tests/`, `examples/`, and a Cargo build script are unscanned, and the allowlist is keyed by crate name rather than path. | [ci-guardrails.md](ci-guardrails.md) |
 | 8 | `--prove-negative-exit` is **narrower than its name**: in that mode the guard runs its self-test and then proves the negative exit, but never runs `scan_sources()` or `check_dependencies()`. It proves the scanner detects, not that the full guard path fails correctly. | [ci-guardrails.md](ci-guardrails.md) |
 | 9 | `blob_download` takes **no reference lease**, unlike `artifact_download`. A concurrent GC can unlink the file mid-transfer; this is safe only because Unix keeps the open descriptor alive. | [data-plane.md](data-plane.md) |
 | 10 | Workspace materialization opens destinations with `create_new(true)` on a plain `Path::join` — no `O_NOFOLLOW`, no `openat2` — whereas artifact capture uses a descriptor-relative `NOFOLLOW` chain. Workspace is the weaker symlink path in the codebase, mitigated by the fresh `0700` staging root. | [data-plane.md](data-plane.md) |
@@ -185,7 +207,7 @@ None of these are presented as bugs already judged to be bugs. They are the plac
 | # | Observation | Where |
 |---|---|---|
 | 11 | **No schema version or migration path.** Only `CREATE TABLE IF NOT EXISTS`; no `PRAGMA user_version`. `ExecutionSnapshot.schema_version` lives inside the JSON and is never validated on read. | [storage-journal.md](storage-journal.md) |
-| 12 | The store **does not enforce the state machine.** `commit_event` accepts any non-terminal → non-terminal transition; all legality lives in `publish`. The terminal/non-terminal sets are spelled out in four places with nothing keeping them in sync. | [storage-journal.md](storage-journal.md) |
+| 12 | The store **does not enforce the state machine.** `commit_event` accepts any non-terminal → non-terminal transition; all legality lives in `publish`. The terminal/non-terminal *classification* is now spelled out in one place — `eggwork-core`'s `ExecutionState::is_terminal` / `is_non_terminal` — and the server's queries and predicates derive from it, so the sets can no longer drift apart; the *legality* of a transition is still enforced nowhere but `publish`. | [storage-journal.md](storage-journal.md) |
 | 13 | **Unchecked `u64 → i64` narrowing.** `ExecutionGeneration::new` rejects only `0`, yet the store casts `generation.get() as i64` in **eleven** places (the deep dive previously said six). Same class of issue for `after_sequence as i64` in `load_page`, guarded only at the HTTP route. | [storage-journal.md](storage-journal.md) |
 | 14 | `load_page` has **no `LIMIT`** and is not a consistent read — three separate autocommit statements, bounded only indirectly. | [storage-journal.md](storage-journal.md) |
 | 15 | `MAX_EXECUTION_IDENTITIES` counts `(id, generation)` rows rather than identities and **never evicts**, so it is a permanent 503 after the cap. | [storage-journal.md](storage-journal.md) |
@@ -198,15 +220,37 @@ None of these are presented as bugs already judged to be bugs. They are the plac
 | # | Observation | Where |
 |---|---|---|
 | 19 | `events()` puts the lease id — documented in core as **bearer authority** and redacted from `Debug` — into a **URL query string**, while `cancel`/`renew` put it in a JSON body. | [client-transport.md](client-transport.md) |
-| 20 | `decode_json` calls `response.bytes()` with **no size cap**. The node bounds its own request bodies, but the client bounds only the NDJSON line buffer, leaving the JSON paths open to memory exhaustion from a hostile node. | [client-transport.md](client-transport.md) |
+| 20 | ~~`decode_json` calls `response.bytes()` with **no size cap**. The node bounds its own request bodies, but the client bounds only the NDJSON line buffer, leaving the JSON paths open to memory exhaustion from a hostile node.~~ **Closed 2026-10-25 by the `17ff53f` corrective.** The client's `HttpClient` is built with `.max_decoded_body_size(MAX_BUFFERED_BODY_BYTES)`, so Eggfetch wraps the response body in a limiting stream that refuses to decode more than 16 MiB — on the compressed path and the uncompressed path alike — and `decode_json` reads a body the transport has already bounded. The telemetry route is bounded twice: the transport cap, then a 64 KiB check on the decoded length. **Residual boundary:** the cap is a *transport* bound, not a per-route one, so a hostile node can still make the client buffer up to 16 MiB before the route's own check rejects the reply. The node's own request-body bounds are unchanged. | [client-transport.md](client-transport.md) |
 | 21 | Redirect and retry safety is an **accident of the dependency profile**: the workspace's `standard-http1` omits eggfetch's `redirects` and `logical-retry` features, so 3xx is returned unfollowed. Bumping to the `http1` alias would silently enable both and no test would fail. | [client-transport.md](client-transport.md) |
+
+### Platform limitations
+
+This table carries the rows that are about *a platform*, not about a module. It
+is separate so the numbering stays monotonic: rows 1-21 are cited elsewhere by
+number, and a row inserted into an earlier table would renumber them.
+
+| # | Observation | Where |
+|---|---|---|
+| 22 | **Declared artifacts are refused, not captured, on a platform that cannot open a file beneath the workspace root safely.** `open_file_beneath` is a descriptor-relative `NOFOLLOW` chain with no non-Unix implementation, so a non-Unix node cannot capture declared outputs. ~~Before the M005a corrective, the finalization set the finalization-failure marker and left the terminal state `Succeeded`, so a caller that declared outputs saw a successful execution with zero artifacts and no error — the declared outputs were silently dropped — and the node advertised `artifact.declared.v1` on every platform.~~ **Closed by the M005a corrective.** The platform's capture-capability fact now reports the limitation, a node that cannot capture does not advertise `artifact.declared.v1`, and an execution that declares outputs there ends in `Failed` with a `Failed` capture disposition and a diagnostic event. The limitation itself remains: the product's top-level claim of *terminal state plus declared artifacts* holds on a Unix platform only. | [data-plane.md](data-plane.md) · [protocol.md](protocol.md) |
+
+### Operator-surface corrections
+
+This table carries the rows the M008a corrective closed. It is separate for
+the same reason the platform table is: the rows are numbered monotonically
+across the document, rows 1-22 are cited elsewhere by number, and a row
+inserted into an earlier table would renumber them.
+
+| # | Observation | Where |
+|---|---|---|
+| 23 | ~~The operator surface's metric vocabulary had no owner that was the producer.~~ **Closed by the M008a corrective.** `operations.rs` declared a hand-maintained `METRIC_NAMES` and the report copied a stored value *only* when the name was already in its map, so a counter the server incremented but the list did not name was dropped by the report — five of them, all workspace counters. The vocabulary is now a typed `Metric` enumeration declared with the producers in `crates/eggwork-server/src/lib.rs`; the report reads that declaration, and a row whose name the vocabulary does not know is reported under its own name rather than dropped. | [operations-cli.md](operations-cli.md) · [storage-journal.md](storage-journal.md) |
+| 24 | ~~One field name, `active_executions`, carried two facts.~~ **Closed by the M008a corrective.** On the wire it is the number of execution permits the node holds; in the operator's own listing it was the number of durable execution rows in a non-terminal state, and nothing in the output said which was which. The wire field keeps its published name and its published meaning — renaming it would break every deployed client that deserializes `NodeStatus` — and the operator surface now names the two facts apart: `execution_permits_held` for the permit count, `non_terminal_executions` for the row count. The old operator-side `active_executions` key is removed rather than aliased, because an alias would keep the ambiguity alive and a silently changed meaning is worse than a missing key. | [operations-cli.md](operations-cli.md) · [server-node.md](server-node.md) |
 
 ### Positive notes worth keeping
 
 - Authorization strictly **precedes** resource resolution in `dispatch`, and id parsing touches only the path, so a denied caller cannot distinguish an existing resource from an absent one.
 - Lease expiry **rewrites a successful runner result** in place to `Interrupted`/`LeaseExpired`; success is never claimed without authority.
 - The store uses **literal SQL with `?n` bindings only** — no dynamic SQL construction, so no injection surface.
-- Windows service management fails closed with a detailed, reasoned error **before** any mutation, and the typed adapter is deliberately retained for the future milestone.
+- Windows service management **used to** fail closed with a detailed, reasoned error **before** any mutation, and the typed adapter was deliberately retained for a future milestone. The daemon is now a service host, the adapter is the live path, and the failure it prevented — a registration with no service behind it — is what the hosted lifecycle job now proves cannot happen.
 - The no-clobber rule on staging assets is what proved, during the `v0.1.4` refusal, that **nothing was replaced** when a candidate failed qualification.
 
 ---

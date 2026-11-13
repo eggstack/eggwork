@@ -1,6 +1,15 @@
 # Operations M007 — Windows service host
 
-Status: **ready**
+Status: **conditionally closed**
+
+Closure record: `plans/closure/operations-distribution/007-status.md`
+
+Implementation commits: `22f5337` (the service host), `e72cd22` (the adapter
+module made reachable, and the `macos-x64` CI job).
+
+The outstanding condition is the *installed-release* Windows service receipt,
+which needs an immutable release carrying both Foundation M004 and M007 and is
+Operations M004's item 2.
 
 Class: corrective capability / platform lifecycle
 

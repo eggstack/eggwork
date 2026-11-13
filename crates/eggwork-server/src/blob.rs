@@ -3,12 +3,12 @@
 use bytes::Bytes;
 use eggwork_core::BlobDigest;
 use futures_util::{Stream, StreamExt};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
-    io,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -70,6 +70,99 @@ struct BlobStoreInner {
     write_lock: Mutex<()>,
 }
 
+/// The canonical blob-candidate statement.
+///
+/// One producer for the predicate. The collector's dry run, the collector's
+/// real pass, and the operator's preview all evaluate this exact statement,
+/// so the preview cannot answer a different question from the pass it
+/// previews.
+///
+/// The selection is on the *reference rows*, never on the `reference_count`
+/// counter. The counter is a denormalization maintained only by the
+/// `blob_reference_insert` / `blob_reference_delete` triggers, so it can
+/// drift from the rows that actually pin bytes; the rows are the truth.
+const UNREFERENCED_CANDIDATES_SQL: &str = "SELECT digest, size_bytes FROM blobs
+     WHERE NOT EXISTS (SELECT 1 FROM blob_references r WHERE r.digest = blobs.digest)
+     ORDER BY last_used_unix_ms ASC LIMIT ?1";
+
+/// Expired blob references, counted without a bound.
+///
+/// The collector reports this number and the operator's preview reports the
+/// same number, so the statement lives here rather than being copied into
+/// the operator.
+const EXPIRED_REFERENCE_COUNT_SQL: &str = "SELECT COUNT(*) FROM blob_references WHERE expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?1";
+
+/// The blob store's metadata database path.
+///
+/// The store owns this file name. The operator resolves it through this
+/// function instead of spelling `metadata.sqlite` itself, so renaming the
+/// store's database is a one-line change here.
+pub fn metadata_path(root: &Path) -> PathBuf {
+    root.join("metadata.sqlite")
+}
+
+/// The shard directory that holds `digest`.
+///
+/// The store's layout is one level of sharding on the first two hex
+/// characters of the digest. Pure, so a caller that only needs to resolve a
+/// path does not need a store instance - and therefore does not need the
+/// creating, reconciling open that `BlobStore::open` performs.
+pub fn shard_path(root: &Path, digest: &BlobDigest) -> PathBuf {
+    root.join(&digest.as_str()[..2])
+}
+
+/// The object's path inside the blob root.
+///
+/// Pure, and the single implementation of the layout: `BlobStore::path_for`
+/// delegates to it, so the store and every consumer of the layout agree.
+pub fn object_path(root: &Path, digest: &BlobDigest) -> PathBuf {
+    shard_path(root, digest).join(digest.as_str())
+}
+
+/// What the collector would act on, evaluated without opening the store.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcPreview {
+    /// Expired blob references: the unbounded count the collector reports.
+    pub expired_references: u64,
+    /// Unreferenced blobs, coldest first: `(digest, size_bytes)`.
+    pub candidates: Vec<(String, u64)>,
+}
+
+/// Open the store's metadata database without the ability to change it.
+///
+/// `SQLITE_OPEN_READ_ONLY` never creates the file and never writes to it,
+/// which is what lets the operator's preview read a store that does not
+/// exist (it fails) instead of bringing one into being (it must not).
+fn open_metadata_read_only(path: &Path) -> Result<Connection, BlobError> {
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(BlobError::from)
+}
+
+/// The blob candidates the collector would act on, without opening the store.
+///
+/// `BlobStore::open` is not read-only: it creates the root and the metadata
+/// database when they are absent and it calls `remove_stale_parts`, which
+/// deletes stale part files and reconciles index rows. An operator preview
+/// that opened the store would therefore mutate the store it is reporting
+/// on, so it reaches the canonical statement through this entry point
+/// instead: the same database file, opened read-only, and the same
+/// statement.
+pub fn preview_gc(path: &Path, now_unix_ms: u64, limit: usize) -> Result<GcPreview, BlobError> {
+    let connection = open_metadata_read_only(path)?;
+    let expired_references: i64 =
+        connection.query_row(EXPIRED_REFERENCE_COUNT_SQL, [now_unix_ms as i64], |row| {
+            row.get(0)
+        })?;
+    let candidates = BlobStore::unreferenced_candidates(&connection, limit)?;
+    Ok(GcPreview {
+        expired_references: expired_references.max(0) as u64,
+        candidates,
+    })
+}
+
 impl BlobStore {
     pub fn open(root: impl AsRef<Path>, quota_bytes: u64) -> Result<Self, BlobError> {
         let root = root.as_ref().to_path_buf();
@@ -81,7 +174,7 @@ impl BlobStore {
         }
         let quarantine = root.join("quarantine");
         fs::create_dir_all(&quarantine)?;
-        let metadata = Connection::open(root.join("metadata.sqlite"))?;
+        let metadata = Connection::open(metadata_path(&root))?;
         metadata.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
@@ -124,10 +217,7 @@ impl BlobStore {
     }
 
     pub fn path_for(&self, digest: &BlobDigest) -> PathBuf {
-        self.inner
-            .root
-            .join(&digest.as_str()[..2])
-            .join(digest.as_str())
+        object_path(&self.inner.root, digest)
     }
 
     /// Report which of `digests` the store does not have.
@@ -372,15 +462,15 @@ impl BlobStore {
     /// must be evaluated in both places. Two hand-copied copies of it are what
     /// let the two paths drift apart and made `NodeGcReport.blob_candidates`
     /// under-predict what `--apply` would actually remove.
+    ///
+    /// The operator's preview is a third reader of the same statement. It
+    /// evaluates it through `preview_gc` against a read-only connection, so
+    /// there is exactly one implementation of the predicate in the tree.
     fn unreferenced_candidates(
-        transaction: &rusqlite::Transaction<'_>,
+        connection: &Connection,
         limit: usize,
     ) -> Result<Vec<(String, u64)>, BlobError> {
-        let mut statement = transaction.prepare(
-            "SELECT digest, size_bytes FROM blobs
-             WHERE NOT EXISTS (SELECT 1 FROM blob_references r WHERE r.digest = blobs.digest)
-             ORDER BY last_used_unix_ms ASC LIMIT ?1",
-        )?;
+        let mut statement = connection.prepare(UNREFERENCED_CANDIDATES_SQL)?;
         Ok(statement
             .query_map([limit.min(i64::MAX as usize) as i64], |row| {
                 Ok((
@@ -401,11 +491,10 @@ impl BlobStore {
         let _guard = self.inner.write_lock.lock().await;
         let mut connection = self.inner.metadata.lock().map_err(|_| BlobError::Worker)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let expired_references: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM blob_references WHERE expires_unix_ms IS NOT NULL AND expires_unix_ms <= ?1",
-            [now_unix_ms as i64],
-            |row| row.get::<_, i64>(0),
-        )?;
+        let expired_references: i64 =
+            transaction.query_row(EXPIRED_REFERENCE_COUNT_SQL, [now_unix_ms as i64], |row| {
+                row.get::<_, i64>(0)
+            })?;
         let mut candidates = Self::unreferenced_candidates(&transaction, limit)?;
         let mut removed_blobs = 0u64;
         let mut removed_bytes = 0u64;
@@ -643,6 +732,37 @@ impl BlobStore {
         Ok(tokio::fs::File::open(self.path_for(digest)).await?)
     }
 
+    /// Copy the object for `digest` into `destination`, verifying the digest
+    /// of the bytes that are actually copied.
+    ///
+    /// The digest is computed over the copied stream, not over a separate
+    /// read of the same path. A pre-flight check and a later copy are two
+    /// reads of a mutable file, and only hashing the bytes that reach the
+    /// destination proves the destination holds the manifest's content: a
+    /// file that changes between the two reads cannot be smuggled past a
+    /// check that happened before it.
+    ///
+    /// The verification costs one SHA-256 pass over the copied bytes and no
+    /// additional read of the object.
+    pub fn copy_verified(
+        &self,
+        digest: &BlobDigest,
+        destination: &mut impl Write,
+    ) -> Result<u64, BlobError> {
+        let path = self.path_for(digest);
+        let mut file = fs::File::open(&path)?;
+        let mut writer = VerifyWriter {
+            inner: destination,
+            hasher: Sha256::new(),
+            written: 0,
+        };
+        io::copy(&mut file, &mut writer)?;
+        if hex::encode(writer.hasher.finalize()) != digest.as_str() {
+            return Err(BlobError::DigestMismatch);
+        }
+        Ok(writer.written)
+    }
+
     fn remove_stale_parts(&self) -> Result<(), BlobError> {
         for entry in fs::read_dir(&self.inner.root)? {
             let entry = entry?;
@@ -662,15 +782,17 @@ impl BlobStore {
         // Reconcile the two durable layers after a crash between rename and
         // metadata commit (or metadata commit and external file loss).
         for digest in &known {
-            if BlobDigest::parse(digest.clone()).is_err() {
+            // A row whose digest does not parse cannot name a location, so it
+            // is dropped rather than resolved against the layout.
+            let Ok(parsed) = BlobDigest::parse(digest.clone()) else {
                 self.inner
                     .metadata
                     .lock()
                     .map_err(|_| BlobError::Worker)?
                     .execute("DELETE FROM blobs WHERE digest = ?1", [digest])?;
                 continue;
-            }
-            let path = self.inner.root.join(&digest[..2]).join(digest);
+            };
+            let path = self.path_for(&parsed);
             if !path.is_file() {
                 self.inner
                     .metadata
@@ -714,6 +836,31 @@ impl io::Write for HashWriter {
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// A writer that hashes everything it forwards.
+///
+/// Used by `BlobStore::copy_verified` so that the digest is computed over
+/// the bytes that actually reach the destination, not over a separate read
+/// of the same file.
+struct VerifyWriter<W> {
+    inner: W,
+    hasher: Sha256,
+    written: u64,
+}
+impl<W: Write> Write for VerifyWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        self.written = self
+            .written
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::other("blob size overflow"))?;
+        Ok(written)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 

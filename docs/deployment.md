@@ -36,6 +36,11 @@ service identity must name the exact registered config path, so it is never
 guessed from the operator config you happened to pass. `--executable` defaults
 to the running binary's canonicalized path, but pass it explicitly in scripts.
 
+The registered argv names the platform's service host: `service-host --config
+<path>` on Windows, where the daemon joins the service control manager, and
+`run` everywhere else. The systemd unit and the launchd plist render `run`
+themselves, so they are unchanged.
+
 `spec` is read-only and is the safe way to see what would be installed.
 
 ## Platform policy is explicit
@@ -48,7 +53,7 @@ claim. Each platform therefore requires its own policy flags:
 |---|---|---|
 | Linux | `--unit-path <abs>` `--scope system\|user` | Eggup systemd adapter |
 | macOS | `--plist-path <abs>` `--launchd-domain user\|system` `--launchd-target` | Eggup launchd adapter |
-| Windows | *refused* | Typed adapter retained, unreachable |
+| Windows | none required; optional `--windows-start-type automatic\|manual\|disabled` (default `manual`) | Eggup Windows SCM adapter |
 
 ```bash
 eggworkd service install --config <node.json> \
@@ -67,24 +72,54 @@ Ownership is proven by **exact executable plus critical argv/config** before any
 stop, replace, or uninstall. That is what stops a command from tearing down an
 unrelated service that happens to share a name.
 
-## Windows: unsupported, and refused on purpose
+## Windows: the daemon hosts the service
 
-Hosted qualification registered the `eggwork-node` SCM service and then failed to
-start it with Windows error 1053. The cause was confirmed by inspection, not
-inferred: `eggworkd` implements **no service-control dispatcher**, so the
+**What the evidence said, and when.** Hosted qualification of an earlier release
+candidate registered the `eggwork-node` SCM service and then failed to start it with
+Windows error 1053. The cause was confirmed by inspection, not inferred: that
+candidate's `eggworkd` implements **no service-control dispatcher**, so the
 process the SCM launches never connects back to the manager and the service can
-never reach `Running`.
+never reach `Running`. Registering an external process anyway would have left a
+working installation with *no service behind it*, which is worse than an honest
+refusal — so every mutating `service` verb on Windows was refused **before any
+mutation**, with a message naming the unsupported backend.
 
-Registering an external process anyway would leave a working installation with
-*no service behind it*, which is worse than an honest refusal. So every mutating
-`service` verb on Windows is refused **before any mutation**, with a message
-naming the unsupported backend. The typed adapter and the recorded SCM product
-policy are retained in `deployment::windows_scm_manager` for the future
-service-host milestone (Operations M007, status **ready** in
-[`plans/registry.md`](../plans/registry.md)).
+**What is true now.** The daemon *is* a Windows service host.
+`eggworkd service-host --config <absolute-path>` is the mode the service
+control manager launches, and it is chosen explicitly from argv: the mode is
+never inferred from the parent process, the session, the environment, or a
+dispatcher error, and `run` keeps its existing meaning. On every other
+platform the mode is refused outright.
 
-`--windows-start-type` appears in the qualification harness, but no code parses
-it yet. Do not treat it as a supported knob.
+The host reports its own transitions: `START_PENDING` before any startup work,
+`RUNNING` only once the node is ready to serve, `STOP_PENDING` while the
+active executions converge, and `STOPPED` at the end. A failed start and a
+failed convergence each carry their own service exit code, and a bounded
+checkpoint advances while a transition is pending, so a slow start does not
+read as a hung service. `STOP` and `SHUTDOWN` are the same request and are
+idempotent, and a stop that arrives during startup is latched rather than
+lost — the node converges without ever having claimed to be running.
+
+The `service` verbs are therefore live on Windows and go through Eggup's typed
+SCM adapter, with the same ownership proof as every other platform: a
+registration with a different executable, a different config, or a different
+critical argv is **foreign**, and Eggwork never touches it.
+`--windows-start-type` is a bounded knob — `automatic`, `manual`, or
+`disabled`, defaulting to `manual` so an installed service does not start on
+boot behind the operator's back.
+
+A routine service stop is an **in-memory** drain: admission stops and the
+active executions are cancelled and waited for, but no persistent drain marker
+is written, an existing marker is preserved and still honoured at startup, and
+service mode never undrains. The persistent marker stays the operator's
+explicit mechanism (`eggworkd drain` / `eggworkd undrain`).
+
+**What is not claimed.** The proof is a source-built hosted lifecycle: the
+daemon is built from the repository and then registered, started, stopped,
+restarted, and uninstalled against a real service control manager. The
+*installed release* service lifecycle — release lineage and the exact installed
+bytes — is a separate subject, and no published release carries the service
+host yet, so there is no exact-release Windows service receipt.
 
 ## `deployment apply`
 

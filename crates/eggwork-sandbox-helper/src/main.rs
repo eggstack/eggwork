@@ -1,8 +1,25 @@
 #![forbid(unsafe_code)]
 
+/// The node's environment policy.
+///
+/// The helper is a standalone binary and may not depend on any workspace
+/// crate, so it cannot share the policy as a library. It compiles a generated
+/// copy of the same source of truth the runner uses, and a parity test pins
+/// the two copies together so a one-sided edit fails the build.
+///
+/// The copy carries the whole shared contract and this crate uses only part of
+/// it — the helper does not build the runner's baseline, and the runner does
+/// not enforce the `PATH` value the way the helper does — so the unused items
+/// are part of the contract rather than leftovers.
+#[allow(dead_code)]
+mod environment_policy;
+
 #[cfg(target_os = "linux")]
 mod linux {
 
+    use crate::environment_policy::{
+        self, MAX_ARG_BYTES, MAX_ARG_COUNT, MAX_ENV_COUNT, MAX_ENV_NAME_BYTES, MAX_ENV_VALUE_BYTES,
+    };
     use landlock::{
         ABI, Access, AccessFs, PathBeneath, PathFd, RestrictionStatus, Ruleset, RulesetAttr,
         RulesetCreatedAttr, RulesetStatus,
@@ -17,12 +34,11 @@ mod linux {
         process::{Command, ExitStatus},
     };
 
+    /// The helper's own bound on the specification file.
+    ///
+    /// It is helper-only: `eggwork-core` owns the wire limits and has no
+    /// counterpart for this one, so it stays here rather than being generated.
     const MAX_SPEC_BYTES: u64 = 1024 * 1024;
-    const MAX_ARG_COUNT: usize = 256;
-    const MAX_ARG_BYTES: usize = 32 * 1024;
-    const MAX_ENV_COUNT: usize = 256;
-    const MAX_ENV_NAME_BYTES: usize = 256;
-    const MAX_ENV_VALUE_BYTES: usize = 16 * 1024;
 
     /// Bit 2 of the post-mortem status byte: at least one counter the caller
     /// asked about could not be opened, so "no limit was exceeded" is unknown
@@ -104,7 +120,7 @@ mod linux {
             .args(argv)
             .current_dir(&spec.cwd)
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", environment_policy::PATH_VALUE)
             .envs(
                 spec.environment
                     .iter()
@@ -174,9 +190,23 @@ mod linux {
                     || key.contains('=')
                     || key.contains('\0')
                     || value.contains('\0')
-                    || denied_environment_key(key) && key != "PATH"
-                    || key == "PATH" && value != "/usr/bin:/bin"
             })
+        {
+            return Err(12);
+        }
+        // The environment is judged against the shared environment policy, and
+        // it gets its own status byte so an operator can tell an
+        // environment-policy refusal apart from a specification that is
+        // malformed in some other way. Before the policy was shared, the
+        // collision of a caller's `LANG` with the node's own `LANG` produced a
+        // specification with two `LANG` entries, this refusal, and — for a
+        // best-effort request — a re-spawn of the target with no Landlock
+        // ruleset at all. The status byte is what makes that class of refusal
+        // legible; the shared policy is what stops it happening.
+        if spec
+            .environment
+            .iter()
+            .any(|(key, value)| environment_policy_refuses(key, value))
             || spec
                 .environment
                 .iter()
@@ -185,9 +215,9 @@ mod linux {
                 .len()
                 != spec.environment.len()
         {
-            return Err(12);
+            return Err(13);
         }
-        let root = spec.root.canonicalize().map_err(|_| 13u8)?;
+        let root = spec.root.canonicalize().map_err(|_| 17u8)?;
         let cwd = spec.cwd.canonicalize().map_err(|_| 14u8)?;
         if root != spec.root || !root.is_dir() || !cwd.starts_with(&root) || !cwd.is_dir() {
             return Err(15);
@@ -268,33 +298,38 @@ mod linux {
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
     }
 
-    fn denied_environment_key(key: &str) -> bool {
-        let upper = key.to_ascii_uppercase();
-        [
-            "LD_",
-            "DYLD_",
-            "PATH",
-            "IFS",
-            "SHELLOPTS",
-            "CDPATH",
-            "BASH_ENV",
-            "ENV",
-            "PYTHONPATH",
-            "PYTHONHOME",
-            "NODE_OPTIONS",
-            "RUBYOPT",
-            "PERL5OPT",
-            "GIT_ASKPASS",
-            "SSH_ASKPASS",
-            "GIT_CONFIG",
-            "GIT_CONFIG_",
-            "AWS_",
-            "AZURE_",
-            "GOOGLE_",
-            "SSH_AUTH_SOCK",
-        ]
-        .iter()
-        .any(|denied| upper == *denied || upper.starts_with(denied))
+    /// The environment policy's refusal rule, in one place.
+    ///
+    /// The runner *drops* a denied key; the helper *refuses the launch*. That
+    /// difference is deliberate and is the whole two-layer contract: the
+    /// runner is the request-normalisation boundary, and the helper is the
+    /// enforcement point, so a denied key arriving here means the node's own
+    /// filtering did not happen. Only the list is shared, never the behaviour.
+    ///
+    /// Three rules, all read out of the shared policy:
+    ///
+    /// * a denied key may not be present at all. `PATH` is the single
+    ///   exception, because it is denied as a *caller-controlled* key while
+    ///   the node pins its value;
+    /// * a `PATH` that is not the contract value widens what a confined target
+    ///   can execute, and the Landlock ruleset does not restrict `execve` by
+    ///   path;
+    /// * a node-owned key must carry the node's value, and it must carry it
+    ///   under the node's own spelling. A specification that disagreed with
+    ///   the node's baseline is a specification the runner did not build.
+    fn environment_policy_refuses(key: &str, value: &str) -> bool {
+        if key != "PATH" && environment_policy::denied_environment_key(key) {
+            return true;
+        }
+        if key == "PATH" && value != environment_policy::PATH_VALUE {
+            return true;
+        }
+        if let Some((name, expected)) = environment_policy::baseline_entry(key)
+            && (name != key || value != expected)
+        {
+            return true;
+        }
+        false
     }
 
     struct ResourceEvents {

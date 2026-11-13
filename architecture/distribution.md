@@ -96,12 +96,20 @@ drift. There is no second hand-maintained release matrix.
 - Platform service policy is selected explicitly: systemd scope and unit path,
   launchd domain/target and plist path, or the finite Windows SCM start type.
   Native service support is claimed only for backends with live hosted
-  lifecycle evidence recorded in the Operations closure record.
+  lifecycle evidence, and there are two kinds of that evidence which are not
+  the same claim: a *source-built* hosted lifecycle proves the product
+  capability, while an *installed release* lifecycle proves the released bytes.
 - A service backend with no live evidence fails closed rather than staying
-  enabled. Windows service management is the current case: the daemon has no
-  service-control dispatcher, so an SCM registration can never reach Running and
-  every mutating verb is refused before any mutation. The adapter and the
-  recorded policy are retained; only the operator surface is closed.
+  enabled. Windows was the case that made the rule: the daemon had no
+  service-control dispatcher, so an SCM registration could never reach Running
+  and every mutating verb was refused before any mutation. The daemon is now a
+  Windows service host — `service-host` is the platform's critical argv
+  (`crates/eggwork-server/src/deployment.rs::SERVICE_HOST_VERB`) and the
+  mutating verbs go through Eggup's SCM adapter — and the live evidence is a
+  source-built hosted lifecycle, not an installed release. The *installed
+  release* service lifecycle stays unclaimed until a release carries both the
+  M004 and the M007 work; until then there is no exact-release Windows service
+  receipt to cite.
 - First install and update are distinct operations. First-install installers
   refuse existing destinations; updates use Eggup's verified local transaction
   and preserve drain until an operator explicitly clears it. The deployment

@@ -66,6 +66,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import check_release_tag as tag_guard  # noqa: E402
 import release_candidate_probe as probe  # noqa: E402
 
 # Bounds. A qualification harness that can hang, or read an unbounded file, is
@@ -79,11 +80,6 @@ def log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-# The qualified inventory, fixed by plan section 14: five targets, a manifest
-# and a sidecar for every binary, both generated installers, and the manifest's
-# own sidecar. A count that differs is a finding, not a formatting change.
-QUALIFIED_ASSET_COUNT = 17
-
 MAX_ASSET_BYTES = 256 * 1024 * 1024
 # The release API occasionally answers a well-formed request with a 5xx. Retry
 # only that, so qualification reflects the candidate rather than upstream uptime.
@@ -92,14 +88,20 @@ TRANSIENT_BACKOFF_SECONDS = 30
 MAX_MANIFEST_BYTES = 1 << 20
 MAX_PROCESS_OUTPUT_BYTES = 1 << 20
 MAX_TEXT_ASSET_BYTES = 1 << 20
+MAX_CONTRACT_BYTES = 1 << 20
 DEFAULT_PROCESS_TIMEOUT = 180.0
 # A native service transition is bounded by the *product's* own timeout (60s per
 # operation), and Eggup may compose several observations per invocation. The
 # harness bound is deliberately larger so a slow hosted SCM or launchd is
 # reported as a product timeout rather than truncated into a harness error.
 SERVICE_TRANSITION_TIMEOUT = 300.0
-SERVICE_ID = "eggwork-node"
-HELPER_INSTALL_ID = "eggwork-sandbox-helper"
+# The producer release contract, relative to the repository root. It is the
+# sole checked-in authority for the published target set, the release asset
+# names, the install identities, and the checksum sidecar names; it is static
+# and carries no release identity. The harness reads it instead of keeping its
+# own copy of any of those facts.
+CONTRACT_DIRECTORY = ("release", "eggpack")
+CONTRACT_FILE = "distribution.toml"
 
 
 class QualificationFailure(Exception):
@@ -558,24 +560,139 @@ def host_target_triple() -> str:
 def target_daemon_install(target: str) -> str:
     """The release install identity of the daemon for one target triple.
 
+    Read from the producer contract, never remembered: the contract's
+    ``[[targets]]`` entry for the triple states, in contract order, which
+    install identities the target publishes. The daemon is the first of them.
+
+    The contract's bundle order — the daemon, then the sandbox helper — is
+    the same order ``crates/eggwork-server/tests/release_contract.rs`` pins
+    against the deployment unit's own member constants, so the two languages
+    read one owner and are checked against it.
+
     This is a property of the *target*, not of the machine running the
     qualification. Deriving it from the host misbehaves wherever host detection
     is uncertain, and a wrong answer rejects the correct asset as unknown.
     """
-    return "eggworkd.exe" if target.endswith("-pc-windows-msvc") else "eggworkd"
+    return contract_target(target)["installs"][0]
+
+
+def target_helper_install(target: str) -> str | None:
+    """The helper's install identity for one target, or ``None`` when it ships none.
+
+    The contract's asset kind states which assets a target ships: a direct
+    target publishes the daemon alone, and a bundle target publishes the
+    daemon together with the Landlock sandbox helper.
+    """
+    entry = contract_target(target)
+    installs = entry["installs"]
+    if entry["kind"] == "direct":
+        return None
+    helpers = list(installs[1:])
+    if len(helpers) != 1:
+        raise QualificationFailure(
+            f"{target} publishes {len(installs)} bundle members; expected the daemon "
+            "and exactly one sandbox helper"
+        )
+    return helpers[0]
 
 
 def target_ships_helper(target: str) -> bool:
     """Whether one target triple ships the Linux Landlock sandbox helper."""
-    return target.endswith("-unknown-linux-gnu")
+    return target_helper_install(target) is not None
+
+
+def target_install_identities(target: str) -> list[str]:
+    """Every install identity one target publishes, in contract order."""
+    return list(contract_target(target)["installs"])
+
+
+def contract_directory() -> Path:
+    """The checked-in producer release contract directory."""
+    return probe.repository_root().joinpath(*CONTRACT_DIRECTORY)
+
+
+def contract_target(target: str) -> dict[str, Any]:
+    """One target's entry from the producer release contract.
+
+    The contract is the sole checked-in authority for the published target
+    set, the release asset names, the install identities, and the checksum
+    sidecar names. Reading it here is what lets the harness hold no literal
+    install identity of its own.
+    """
+    targets = contract_targets()
+    if target not in targets:
+        raise QualificationFailure(f"{target} is not a published target in the release contract")
+    return targets[target]
+
+
+def contract_targets() -> dict[str, dict[str, Any]]:
+    """The producer contract's published target set, with each target's assets.
+
+    A direct target publishes one install identity; a bundle target publishes
+    the daemon and the sandbox helper, in contract order. The contract's
+    asset kind and entries are what say which, so the harness never classifies
+    a target by the shape of its name.
+    """
+    document = _read_contract(contract_directory() / CONTRACT_FILE)
+    raw_targets = document.get("targets")
+    if not isinstance(raw_targets, list) or not raw_targets:
+        raise QualificationFailure("the release contract declares no targets")
+    targets: dict[str, dict[str, Any]] = {}
+    for raw in raw_targets:
+        if not isinstance(raw, dict):
+            raise QualificationFailure("the release contract has a malformed target entry")
+        triple = str(raw.get("triple", ""))
+        asset = raw.get("asset")
+        if not triple or not isinstance(asset, dict):
+            raise QualificationFailure("the release contract has a malformed target entry")
+        kind = str(asset.get("kind", ""))
+        if kind == "direct":
+            installs = [str(asset.get("install", ""))]
+        elif kind == "bundle":
+            entries = asset.get("entries")
+            if not isinstance(entries, list):
+                raise QualificationFailure(f"{triple} is a bundle without entries")
+            installs = [str(item.get("install", "")) for item in entries]
+        else:
+            raise QualificationFailure(f"{triple} declares an unknown asset kind {kind!r}")
+        if not installs or not all(installs):
+            raise QualificationFailure(f"{triple} declares no install identity")
+        if kind == "direct" and len(installs) != 1:
+            raise QualificationFailure(f"{triple} is direct but declares {len(installs)} members")
+        targets[triple] = {"triple": triple, "kind": kind, "installs": installs}
+    return targets
+
+
+def _read_contract(path: Path) -> dict[str, Any]:
+    """Parse one producer contract file with a real TOML reader."""
+    import tomllib
+
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_CONTRACT_BYTES + 1)
+    except OSError as error:
+        raise QualificationFailure(f"{path} is unreadable") from error
+    if len(raw) > MAX_CONTRACT_BYTES:
+        raise QualificationFailure(f"{path} exceeds the size bound")
+    try:
+        document = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise QualificationFailure(f"{path} is not valid TOML") from error
+    if not isinstance(document, dict):
+        raise QualificationFailure(f"{path} is not a TOML table")
+    return document
 
 
 def daemon_path(installation_root: Path) -> Path:
-    return installation_root / "bin" / ("eggworkd.exe" if is_windows() else "eggworkd")
+    return installation_root / "bin" / target_daemon_install(host_target_triple())
 
 
 def helper_path(installation_root: Path) -> Path:
-    return installation_root / "bin" / HELPER_INSTALL_ID
+    """Where the sandbox helper is installed, on a host that ships one."""
+    identity = target_helper_install(host_target_triple())
+    if identity is None:
+        raise QualificationFailure("this host's release target publishes no sandbox helper")
+    return installation_root / "bin" / identity
 
 
 def copy_installed(source: Path, destination: Path) -> None:
@@ -603,19 +720,48 @@ def harden_installation_tree(root: Path) -> None:
             (Path(current) / directory).chmod(0o755)
         for name in files:
             (Path(current) / name).chmod(0o644)
-    daemon = daemon_path(root)
-    if daemon.is_file():
-        daemon.chmod(0o755)
-    helper = helper_path(root)
-    if helper.is_file():
-        helper.chmod(0o755)
+    # Every install identity the host's target publishes is an executable, so
+    # the mode is applied to each of them by the contract's own list.
+    for identity in target_install_identities(host_target_triple()):
+        installed = root / "bin" / identity
+        if installed.is_file():
+            installed.chmod(0o755)
 
 
-def service_definition_path(root: Path, override: str | None) -> Path:
+def service_identity(executable: Path, config: Path) -> str:
+    """The product's service identity, read from the candidate daemon.
+
+    `crates/eggwork-server/src/deployment.rs` owns the identity; the harness
+    asks the installed daemon for it rather than keeping its own copy. The
+    daemon's `service spec` verb reports it without mutating anything, and
+    needs only the executable and the service config, both of which the
+    harness has once an installation is staged.
+    """
+    report = run(
+        [
+            str(executable),
+            "service",
+            "spec",
+            "--config",
+            str(config),
+            "--executable",
+            str(executable),
+            "--service-config",
+            str(config),
+        ]
+    ).json()
+    identity = report.get("service_id")
+    if not isinstance(identity, str) or not identity:
+        raise QualificationFailure("the installed daemon reported no service identity")
+    return identity
+
+
+def service_definition_path(root: Path, override: str | None, service_id: str) -> Path:
     """The explicit absolute path of this host's product service definition.
 
     The path is always caller-chosen and absolute, which is what the product's
     service identity requires; it is never guessed from a system default.
+    The service identity in the file name is the one the daemon reports.
     """
     if override:
         return Path(override).resolve()
@@ -625,11 +771,11 @@ def service_definition_path(root: Path, override: str | None) -> Path:
         # receipt instead of being used as product input.
         return root / "scm-policy.json"
     if is_macos():
-        return root / "LaunchAgents" / f"{SERVICE_ID}.plist"
-    return default_systemd_user_unit()
+        return root / "LaunchAgents" / f"{service_id}.plist"
+    return default_systemd_user_unit(service_id)
 
 
-def default_systemd_user_unit() -> Path:
+def default_systemd_user_unit(service_id: str) -> Path:
     """The per-user systemd definition directory for the invoking user.
 
     Enablement is only meaningful when the definition lives inside a systemd
@@ -637,10 +783,10 @@ def default_systemd_user_unit() -> Path:
     directory rather than an arbitrary path. `uninstall` removes it again.
     """
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    return Path(base) / "systemd" / "user" / f"{SERVICE_ID}.service"
+    return Path(base) / "systemd" / "user" / f"{service_id}.service"
 
 
-def service_policy_flags(scope: str, definition: Path) -> list[str]:
+def service_policy_flags(scope: str, definition: Path, service_id: str) -> list[str]:
     """Explicit product-owned service policy for this host.
 
     No manager is auto-selected and no default is inferred. The macOS
@@ -661,7 +807,7 @@ def service_policy_flags(scope: str, definition: Path) -> list[str]:
             "--bootstrap-on-install",
         ]
     flags = ["--unit-path", str(definition), "--scope", scope]
-    if definition.parent == default_systemd_user_unit().parent:
+    if definition.parent == default_systemd_user_unit(service_id).parent:
         # The definition sits in a systemd search path, so enablement is a
         # meaningful operator choice rather than a guaranteed failure.
         flags.append("--enable")
@@ -694,7 +840,12 @@ def qualification_config(root: Path) -> Path:
 
 
 def service_argv(
-    executable: Path, config: Path, definition: Path, scope: str, verb: str
+    executable: Path,
+    config: Path,
+    definition: Path,
+    scope: str,
+    verb: str,
+    service_id: str,
 ) -> list[str]:
     """Build one `eggworkd service` argv against an installed executable."""
     return [
@@ -707,20 +858,30 @@ def service_argv(
         str(executable),
         "--service-config",
         str(config),
-        *service_policy_flags(scope, definition),
+        *service_policy_flags(scope, definition, service_id),
     ]
 
 
 def service_operation(
-    executable: Path, config: Path, definition: Path, scope: str, verb: str
+    executable: Path,
+    config: Path,
+    definition: Path,
+    scope: str,
+    verb: str,
+    service_id: str,
 ) -> ProcessResult:
-    return run(service_argv(executable, config, definition, scope, verb), timeout=SERVICE_TRANSITION_TIMEOUT)
+    return run(
+        service_argv(executable, config, definition, scope, verb, service_id),
+        timeout=SERVICE_TRANSITION_TIMEOUT,
+    )
 
 
 def service_state(
-    executable: Path, config: Path, definition: Path, scope: str
+    executable: Path, config: Path, definition: Path, scope: str, service_id: str
 ) -> dict[str, Any]:
-    return service_operation(executable, config, definition, scope, "status").json()
+    return service_operation(
+        executable, config, definition, scope, "status", service_id
+    ).json()
 
 
 @contextlib.contextmanager
@@ -730,6 +891,7 @@ def owned_service(
     definition: Path,
     scope: str,
     receipt: Receipt,
+    service_id: str,
     *,
     start: bool,
 ) -> Iterator[None]:
@@ -738,7 +900,9 @@ def owned_service(
     Cleanup runs on success and on failure alike: a qualification that fails
     halfway must not leave a mutated native service behind.
     """
-    installed = service_operation(executable, config, definition, scope, "install").json()
+    installed = service_operation(
+        executable, config, definition, scope, "install", service_id
+    ).json()
     receipt.expect(
         "service-install",
         installed.get("completed") is True and installed.get("operation") == "install",
@@ -752,18 +916,24 @@ def owned_service(
     )
     receipt.record("service-backend", ok=True, detail=str(installed.get("backend")))
     receipt.record("service-definition", ok=True, detail=str(definition))
+    receipt.expect(
+        "service-identity-from-daemon",
+        installed.get("service_id") == service_id,
+        f"the daemon reported service identity {installed.get('service_id')!r}, "
+        f"expected {service_id!r}",
+    )
     try:
         if start:
-            service_operation(executable, config, definition, scope, "start")
+            service_operation(executable, config, definition, scope, "start", service_id)
         yield
     finally:
         run(
-            service_argv(executable, config, definition, scope, "stop"),
+            service_argv(executable, config, definition, scope, "stop", service_id),
             timeout=SERVICE_TRANSITION_TIMEOUT,
             check=False,
         )
         removed = run(
-            service_argv(executable, config, definition, scope, "uninstall"),
+            service_argv(executable, config, definition, scope, "uninstall", service_id),
             timeout=SERVICE_TRANSITION_TIMEOUT,
             check=False,
         )
@@ -843,24 +1013,25 @@ def stage_install(args: argparse.Namespace) -> Receipt:
         detail=f"{triple} ships " + ", ".join(f"{a.install}={a.name}" for a in artifacts),
     )
     daemon_install = target_daemon_install(triple)
-    helper_required = target_ships_helper(triple)
+    helper_install = target_helper_install(triple)
+    helper_required = helper_install is not None
     shipped = {artifact.install for artifact in artifacts}
-    required = {daemon_install} | ({HELPER_INSTALL_ID} if helper_required else set())
+    required = set(target_install_identities(triple))
     receipt.expect(
         "target-install-identities",
-        required <= shipped,
-        f"expected {sorted(required)}, release ships {sorted(shipped)}",
+        shipped == required,
+        f"the contract publishes {sorted(required)}, release ships {sorted(shipped)}",
     )
     receipt.expect(
         "helper-not-shipped-off-linux",
-        (HELPER_INSTALL_ID in shipped) == helper_required,
+        (helper_install in shipped if helper_install else False) == helper_required,
         f"{triple} ships {sorted(shipped)}; a Linux target requires the helper: {helper_required}",
     )
 
+    # Each artifact is placed at its own install identity, which is the
+    # destination the deployment unit defines for that member.
     for artifact in artifacts:
-        destination = (
-            helper_path(root) if artifact.install == HELPER_INSTALL_ID else daemon_path(root)
-        )
+        destination = root / "bin" / artifact.install
         copy_installed(release.directory / artifact.name, destination)
         receipt.record("artifact-installed", ok=True, detail=f"{artifact.name} -> {destination}")
     harden_installation_tree(root)
@@ -873,7 +1044,18 @@ def stage_install(args: argparse.Namespace) -> Receipt:
             f"installed helper mode is {oct(mode)}",
         )
 
-    expected_version = args.release_tag.lstrip("v")
+    # The expected version is the workspace manifest's, read by the one shared
+    # reader. The tag is not the source of it: the tag is checked against the
+    # manifest by the release gate, and the harness only *delegates* that
+    # comparison to it so the two can never disagree.
+    expected_version = probe.workspace_version()
+    tag_failures = tag_guard.tag_failures(args.release_tag)
+    receipt.expect(
+        "release-tag-matches-workspace-version",
+        not tag_failures,
+        "; ".join(tag_failures)
+        or f"tag {args.release_tag!r} names the workspace version {expected_version!r}",
+    )
     reported = run([str(daemon_path(root)), "version"]).json()
     receipt.expect(
         "installed-daemon-version",
@@ -888,7 +1070,7 @@ def stage_install(args: argparse.Namespace) -> Receipt:
         f"installed daemon sha256={installed_digest} release sha256={declared.sha256}",
     )
     if helper_required:
-        helper_artifact = release.install_identity(triple, HELPER_INSTALL_ID)
+        helper_artifact = release.install_identity(triple, str(helper_install))
         helper_reported = run([str(helper_path(root)), "--version"]).stdout.strip()
         receipt.expect(
             "installed-helper-version",
@@ -1013,9 +1195,19 @@ def stage_service(args: argparse.Namespace) -> Receipt:
     config = qualification_config(root)
     receipt = Receipt(stage=f"service:{args.scope}:{host_target_triple()}")
 
-    definition = service_definition_path(root, args.service_definition)
-    with owned_service(daemon, config, definition, args.scope, receipt, start=False):
-        state = service_state(daemon, config, definition, args.scope)
+    # The service identity is the daemon's to report, not the harness's to
+    # remember: the deployment layer owns it.
+    service_id = service_identity(daemon, config)
+    receipt.record(
+        "service-identity",
+        ok=True,
+        detail=f"the daemon reports service identity {service_id!r}",
+    )
+    definition = service_definition_path(root, args.service_definition, service_id)
+    with owned_service(
+        daemon, config, definition, args.scope, receipt, service_id, start=False
+    ):
+        state = service_state(daemon, config, definition, args.scope, service_id)
         receipt.expect(
             "inspect-owned",
             state.get("ownership") == "Owned",
@@ -1028,24 +1220,24 @@ def stage_service(args: argparse.Namespace) -> Receipt:
         )
 
         for attempt in (1, 2):
-            service_operation(daemon, config, definition, args.scope, "start")
-            state = service_state(daemon, config, definition, args.scope)
+            service_operation(daemon, config, definition, args.scope, "start", service_id)
+            state = service_state(daemon, config, definition, args.scope, service_id)
             receipt.expect(
                 f"start-running-attempt-{attempt}",
                 state.get("state") == "Running",
                 f"after start #{attempt}: {json.dumps(state, sort_keys=True)[:300]}",
             )
-            service_operation(daemon, config, definition, args.scope, "stop")
-            state = service_state(daemon, config, definition, args.scope)
+            service_operation(daemon, config, definition, args.scope, "stop", service_id)
+            state = service_state(daemon, config, definition, args.scope, service_id)
             receipt.expect(
                 f"stop-stopped-attempt-{attempt}",
                 state.get("state") == "Stopped",
                 f"after stop #{attempt}: {json.dumps(state, sort_keys=True)[:300]}",
             )
 
-        service_operation(daemon, config, definition, args.scope, "start")
-        service_operation(daemon, config, definition, args.scope, "restart")
-        state = service_state(daemon, config, definition, args.scope)
+        service_operation(daemon, config, definition, args.scope, "start", service_id)
+        service_operation(daemon, config, definition, args.scope, "restart", service_id)
+        state = service_state(daemon, config, definition, args.scope, service_id)
         receipt.expect(
             "restart-running",
             state.get("state") == "Running",
@@ -1059,7 +1251,9 @@ def stage_service(args: argparse.Namespace) -> Receipt:
         foreign_root.mkdir(parents=True, exist_ok=True)
         foreign_daemon = foreign_root / daemon.name
         copy_installed(daemon, foreign_daemon)
-        foreign_state = service_state(foreign_daemon, config, definition, args.scope)
+        foreign_state = service_state(
+            foreign_daemon, config, definition, args.scope, service_id
+        )
         receipt.expect(
             "foreign-same-name-is-foreign",
             foreign_state.get("ownership") == "Foreign",
@@ -1067,7 +1261,9 @@ def stage_service(args: argparse.Namespace) -> Receipt:
         )
         for verb in ("install", "start", "restart", "stop", "uninstall"):
             refusal = run(
-                service_argv(foreign_daemon, config, definition, args.scope, verb),
+                service_argv(
+                    foreign_daemon, config, definition, args.scope, verb, service_id
+                ),
                 timeout=SERVICE_TRANSITION_TIMEOUT,
                 check=False,
             )
@@ -1077,21 +1273,23 @@ def stage_service(args: argparse.Namespace) -> Receipt:
                 f"returncode={refusal.returncode} "
                 f"output={(refusal.stderr.strip() or refusal.stdout.strip())[:200]}",
             )
-        state = service_state(daemon, config, definition, args.scope)
+        state = service_state(daemon, config, definition, args.scope, service_id)
         receipt.expect(
             "owned-service-survives-foreign-attempts",
             state.get("ownership") == "Owned" and state.get("state") == "Running",
             json.dumps(state, sort_keys=True)[:300],
         )
 
-        service_operation(daemon, config, definition, args.scope, "stop")
-        removed = service_operation(daemon, config, definition, args.scope, "uninstall").json()
+        service_operation(daemon, config, definition, args.scope, "stop", service_id)
+        removed = service_operation(
+            daemon, config, definition, args.scope, "uninstall", service_id
+        ).json()
         receipt.expect(
             "service-uninstall",
             removed.get("completed") is True,
             json.dumps(removed, sort_keys=True)[:300],
         )
-        after = service_state(daemon, config, definition, args.scope)
+        after = service_state(daemon, config, definition, args.scope, service_id)
         receipt.expect(
             "uninstall-clears-registration",
             after.get("ownership") in ("Absent", "Unknown"),
@@ -1128,9 +1326,10 @@ def _update_candidates(
     release = fetch_release(args.repository, tag, downloads / tag)
     candidate = release.directory / release.install_identity(triple, daemon_install).name
     helper_candidate = None
-    if target_ships_helper(triple):
+    helper_install = target_helper_install(triple)
+    if helper_install is not None:
         helper_candidate = release.directory / release.install_identity(
-            triple, HELPER_INSTALL_ID
+            triple, helper_install
         ).name
     return candidate, helper_candidate
 
@@ -1201,6 +1400,16 @@ def stage_update(args: argparse.Namespace) -> Receipt:
     sentinel.parent.mkdir(parents=True, exist_ok=True)
     sentinel.write_bytes(b"terminal-records-outside-the-install-unit")
 
+    # The service identity is read from the candidate daemon, and the service
+    # definition path is named after it.
+    service_id = service_identity(daemon, config)
+    receipt.record(
+        "service-identity",
+        ok=True,
+        detail=f"the daemon reports service identity {service_id!r}",
+    )
+    definition = service_definition_path(root, args.service_definition, service_id)
+
     def apply(source: Path, *, previous: str | None, extra: Sequence[str] = ()) -> ProcessResult:
         argv = [
             str(daemon),
@@ -1216,7 +1425,7 @@ def stage_update(args: argparse.Namespace) -> Receipt:
             str(source),
             "--service-config",
             str(config),
-            *service_policy_flags(args.scope, definition),
+            *service_policy_flags(args.scope, definition, service_id),
             *extra,
         ]
         if helper_candidate is not None:
@@ -1233,8 +1442,9 @@ def stage_update(args: argparse.Namespace) -> Receipt:
     # owns its own drain transitions, so start from an admitted node.
     run([str(daemon), "undrain", "--config", str(config)], check=False)
 
-    definition = service_definition_path(root, args.service_definition)
-    with owned_service(daemon, config, definition, args.scope, receipt, start=True):
+    with owned_service(
+        daemon, config, definition, args.scope, receipt, service_id, start=True
+    ):
         # 1. running -> successful update -> running.
         applied = apply(candidate, previous=installed_digest)
         payload = _json_or_failure(applied)
@@ -1259,7 +1469,7 @@ def stage_update(args: argparse.Namespace) -> Receipt:
             sha256_of(daemon) == candidate_digest,
             f"installed sha256={sha256_of(daemon)} candidate sha256={candidate_digest}",
         )
-        state = service_state(daemon, config, definition, args.scope)
+        state = service_state(daemon, config, definition, args.scope, service_id)
         receipt.expect(
             "update-restores-running",
             state.get("state") == "Running",
@@ -1292,14 +1502,14 @@ def stage_update(args: argparse.Namespace) -> Receipt:
         )
 
         # 3. stopped -> successful update -> stopped (RestoreIntent::Preserve).
-        service_operation(daemon, config, definition, args.scope, "stop")
+        service_operation(daemon, config, definition, args.scope, "stop", service_id)
         preserved = apply(candidate, previous=sha256_of(candidate))
         receipt.expect(
             "update-stopped-succeeds",
             preserved.returncode == 0,
             f"returncode={preserved.returncode} {preserved.stderr.strip()[:400]}",
         )
-        state = service_state(daemon, config, definition, args.scope)
+        state = service_state(daemon, config, definition, args.scope, service_id)
         receipt.expect(
             "update-preserves-stopped",
             state.get("state") == "Stopped",
@@ -1387,7 +1597,7 @@ def stage_update(args: argparse.Namespace) -> Receipt:
                 rollback_payload.get("lifecycle_restoration") == "Restored",
                 f"lifecycle_restoration={rollback_payload.get('lifecycle_restoration')!r}",
             )
-            state = service_state(daemon, config, definition, args.scope)
+            state = service_state(daemon, config, definition, args.scope, service_id)
             receipt.expect(
                 "rollback-leaves-prior-lifecycle-state",
                 state.get("state") == "Stopped",
@@ -1491,7 +1701,34 @@ def stage_inventory(args: argparse.Namespace) -> Receipt:
         "against both their sidecar and the manifest",
     )
 
-    expected: dict[str, int] = {"release-manifest.json": names["release-manifest.json"]["size"]}
+    expected = expected_asset_names(manifest, names)
+
+    missing = sorted(set(expected) - set(names))
+    extra = sorted(set(names) - set(expected))
+    receipt.expect("no-missing-assets", not missing, f"release {tag} is missing {missing}")
+    receipt.expect("no-extra-assets", not extra, f"release {tag} carries unexpected {extra}")
+    receipt.record(
+        "inventory",
+        ok=True,
+        asset_count=len(expected),
+        asset_names=sorted(names),
+        sizes={name: int(asset["size"]) for name, asset in sorted(names.items())},
+    )
+    return receipt
+
+
+def expected_asset_names(manifest: dict[str, Any], names: dict[str, Any]) -> set[str]:
+    """The exact asset set one release manifest declares.
+
+    The manifest is the authority on what should exist; the release's own
+    asset list is the authority on what does. The expected set is *derived*
+    from the manifest — every published binary, every binary's checksum
+    sidecar, the manifest itself, and the generated installers — and the
+    staged set is compared against it. No count of the qualified inventory
+    is remembered here: a count that differs from the derived set is a
+    finding, and the derivation is what says what the set is.
+    """
+    expected: set[str] = {"release-manifest.json"}
     for entry in manifest.get("targets", []):
         form = entry["form"]
         declared = (
@@ -1501,30 +1738,12 @@ def stage_inventory(args: argparse.Namespace) -> Receipt:
         )
         for item in declared:
             name = str(item["name"])
-            expected[name] = int(item["size"])
-            expected[f"{name}.sha256"] = 0
+            expected.add(name)
+            expected.add(f"{name}.sha256")
     for name in ("install.sh", "install.ps1"):
         if name in names:
-            expected[name] = int(names[name]["size"])
-
-    missing = sorted(set(expected) - set(names))
-    extra = sorted(set(names) - set(expected))
-    receipt.expect("no-missing-assets", not missing, f"release {tag} is missing {missing}")
-    receipt.expect("no-extra-assets", not extra, f"release {tag} carries unexpected {extra}")
-    receipt.record(
-        "inventory",
-        ok=True,
-        asset_count=len(names),
-        asset_names=sorted(names),
-        sizes={name: int(asset["size"]) for name, asset in sorted(names.items())},
-    )
-    receipt.expect(
-        "asset-count",
-        len(names) == QUALIFIED_ASSET_COUNT,
-        f"release {tag} carries {len(names)} assets; the qualified inventory is "
-        f"{QUALIFIED_ASSET_COUNT}",
-    )
-    return receipt
+            expected.add(name)
+    return expected
 
 
 def _json_or_failure(result: ProcessResult) -> dict[str, Any]:

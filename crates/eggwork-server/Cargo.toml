@@ -31,6 +31,13 @@ eggup-core = "0.1.1"
 eggup-service = "0.1.1"
 gregg-protocol = "1.0.15"
 
+# The Windows SCM *host*. This crate hosts the service process; it does not
+# register or manage it — Eggup owns that, through `eggup-service`. The
+# dependency is target-scoped because the dispatcher is Windows-only, and it
+# is pinned exactly so the reviewed surface is explicit.
+[target.'cfg(windows)'.dependencies]
+windows-service = "=0.8.1"
+
 # The installed-release qualification harness (Operations M004) is opt-in: it
 # drives an installed `eggworkd` through the production client path and must not
 # be compiled into an ordinary build of the shipped daemon.

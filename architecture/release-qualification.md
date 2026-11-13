@@ -41,6 +41,117 @@ closed when two builds of one source revision disagree.
 The full split — including what Eggwork may still add later — is in
 [distribution.md](distribution.md); it is not restated here.
 
+## Version authority: which number to trust
+
+Two numbers describe a release, and they answer different questions. Before
+Operations M008b the repository stated neither relationship, and the release
+scripts each held their own idea of the answer.
+
+| Number | Owner | Question it answers | Where it is enforced |
+|---|---|---|---|
+| **The build assertion** — `[workspace.package].version` | `Cargo.toml` | What version do the binaries *report*? | `scripts/release_candidate_probe.py` → `workspace_version`; every crate inherits it through `version.workspace = true`, and it surfaces as `env!("CARGO_PKG_VERSION")` in `eggworkd version` |
+| **The release gate** — the tag | the tag the maintainer is about to create | May this release be tagged at all? | `scripts/check_release_tag.py` — the only place in the repository where a tag and a version are compared |
+
+They are permitted to differ in exactly one respect: the tag may carry a `v`
+prefix. `v0.1.5` and `0.1.5` name the same release, and nothing else may
+differ.
+
+**The build assertion is read once.** `scripts/release_candidate_probe.py`
+holds the repository's only manifest reader: `read_manifest` parses `Cargo.toml`
+with `tomllib`, and `workspace_version` reads `[workspace.package].version`
+through it, failing closed on a malformed manifest or a missing version rather
+than falling back to a guess. Every release script obtains the version there —
+the tag guard, the qualification harness, and the two consumer validators
+(`validate-daemon-version.py`, `validate-sandbox-helper.py`), which import
+`expected_version_line` from it.
+
+**The gate derives nothing.** `scripts/check_release_tag.py` compares the tag
+against the manifest's version and against the versions `Cargo.lock` pins for
+this repository's own packages. It reads both files with real TOML readers: a
+guard that decides whether a release may be tagged must not depend on the
+layout of the files it reads. (It used to read the manifest with a regular
+expression that took the *first* `version =` line in the file, which happened
+to be the right one only because of the manifest's current layout.)
+
+**The harness no longer treats the tag as a version.**
+`scripts/qualify_release.py` used to derive its expected version from
+`--release-tag`, which made the tag a second authority over the version — and
+a tag-derived authority that nobody reconciled with the manifest-derived one.
+It now reads the shared manifest-derived version, and *delegates* the
+tag↔version comparison back to the gate, so the two cannot disagree.
+
+### Where the tag gate runs today — and where it does not
+
+This section is deliberately not flattering, because "the guard is in the
+repository" is not "the guard ran".
+
+- **The tag-dependent half runs by hand, before the tag exists.** Whoever cuts
+  the tag runs `python3 scripts/check_release_tag.py vX.Y.Z` on their own
+  checkout. Nothing in this repository executes it on a schedule, and nothing
+  prevents a maintainer from tagging without running it. The producer's
+  version-coherence check remains the backstop that makes that recoverable
+  rather than shippable.
+- **The tag-independent half runs in CI on every push and every pull
+  request.** `python3 scripts/check_release_tag.py --coherence` asserts that
+  the manifest's version and the lock's pinned versions agree — the exact
+  condition that broke the `v0.1.3` release attempt. The guard's *logic* is
+  additionally exercised against fixtures by
+  `tests/release/test_release_tag_guard.py`, so the code path that decides
+  whether a release may be tagged is executed by an automated job rather than
+  trusted.
+- **No automated job runs the tag-dependent half, and none can.** CI never
+  knows the future tag, and `.github/workflows/release.yml` is *generated* by
+  `eggpack ci generate` from `release/eggpack/` — hand-editing it is forbidden
+  and `eggpack ci check` fails on drift. Wiring the guard into that workflow
+  is therefore an **upstream Eggpack change**, not a change this repository can
+  make on its own.
+
+**Upstream prerequisite (Eggpack).** Eggpack must support a repository-local
+preflight step in the generated release workflow that runs the tag guard
+against the tag being released: the workflow's staging job knows the tag it is
+releasing, so the comparison is available there. The configuration point would
+be the release workflow's preflight/staging step — `release/eggpack/workflow-shape.json`
+and `release/eggpack/github-policy.json` — and the hook would invoke
+`python3 scripts/check_release_tag.py <tag>` from the checked-out repository
+root. Until Eggpack ships that, the tag half is a **process requirement**
+(stated in `docs/releases.md`), not an automated one. This repository has not
+faked it locally: the generated workflow is untouched, and the gap is recorded
+here instead of being papered over.
+
+### Where the documentation gates run today — and where they do not
+
+The same shape applies to the two documentation gates, and it is worth stating
+rather than letting a green release workflow imply more than it proves.
+
+- **Both run in CI on every push and every pull request.**
+  `python3 scripts/check_doc_citations.py` asserts that every citation in
+  `architecture/` and `docs/` names a symbol that still resolves in the file it
+  names, and `python3 scripts/check_quickstart_sync.py` asserts that
+  `docs/quickstart.md` and `scripts/quickstart.sh` describe the same
+  procedure. Both are stdlib-only and read the tree, so they need nothing
+  built and run identically on every host. The quickstart document's shown
+  `doctor` output is compared against the node's real report by the
+  `installed-qualification` job, which already stages an installation root.
+- **Neither runs in the generated release workflow.** `.github/workflows/release.yml`
+  is *generated* by `eggpack ci generate` from `release/eggpack/`, hand-editing
+  it is forbidden, and `eggpack ci check` fails on drift. The generated
+  workflow's steps are build, capture, and qualification steps for the five
+  release targets; it has no hook for a repository-local preflight command, and
+  the `consumer_validators` are per-target scripts that validate the *built
+  artifact*, not the repository's source tree. A documentation gate is the
+  wrong shape for either.
+
+**Upstream prerequisite (Eggpack).** The same preflight hook the tag guard
+needs would carry the documentation gates: a repository-local command run from
+the checked-out repository root, before the first target is built. The
+configuration point is again `release/eggpack/workflow-shape.json` and
+`release/eggpack/github-policy.json`. Until Eggpack ships it, the gates are
+covered by CI on every push and every pull request, and the release path
+inherits that coverage *indirectly* — a release is cut from a tagged commit
+that CI already gated — rather than from a step inside the generated workflow.
+This repository has not hand-edited the generated workflow, and the gap is
+recorded here instead of being papered over.
+
 ## Producer configuration
 
 `release/eggpack/` contains nine files, 593 lines total. Every one is static.
@@ -328,7 +439,7 @@ hand-maintained release matrix exists.
 and no workflow or environment can replace the target-scoped rustflags.
 
 **Sealed boundary.** `the_deployment_module_never_parses_eggpack_configuration`
-reads `src/deployment.rs`, `src/operations.rs`, and `src/bin/eggworkd.rs` and
+reads `crates/eggwork-server/src/deployment.rs`, `crates/eggwork-server/src/operations.rs`, and `crates/eggwork-server/src/bin/eggworkd.rs` and
 requires none of them to mention `release/eggpack`, `ReleaseManifest`,
 `release-manifest`, `DistributionContract`, or `eggpack::`. **`eggwork-server`
 has no runtime Eggpack dependency and never parses a producer contract, a
@@ -353,9 +464,51 @@ requires `landlock` and `nix` to be gated behind exactly one platform table each
 
 ## The qualification harness
 
-`scripts/qualify_release.py` (1,638 lines) is the product-owned operational
-qualification harness. It is *not* a producer tool: Eggpack owns release
-construction, assets, sidecars, and publication.
+`scripts/qualify_release.py` is the product-owned operational qualification
+harness. It is *not* a producer tool: Eggpack owns release construction, assets,
+sidecars, and publication.
+
+### What the harness derives, and from whom
+
+The harness asserts facts about a release. Each of those facts has exactly one
+owner, and the harness reads it rather than keeping a copy. A constant that is
+updated when it disagrees with the tree is still a second owner, and it drifts
+again; so the harness's remembered copies were **deleted**, not re-synced.
+
+| Fact | Owner | How the harness obtains it |
+|---|---|---|
+| The expected version | `Cargo.toml` `[workspace.package].version` | `probe.workspace_version()` — the shared reader |
+| The published target set, the asset names, the install identities | `release/eggpack/distribution.toml` | `contract_targets()` / `contract_target()` |
+| Whether a target ships the sandbox helper | the contract's `[[targets]]` asset kind and entries | `target_helper_install()` — a direct target publishes the daemon alone; a bundle target publishes the daemon together with the helper |
+| The daemon's install identity for a target | the same contract entry, in contract order | `target_daemon_install()` |
+| The service identity | `crates/eggwork-server/src/deployment.rs` → `SERVICE_ID` | `service_identity()` asks the **candidate daemon** (`eggworkd service spec`) |
+| The exact asset set of a release | the release's own `release-manifest.json` | `expected_asset_names()` |
+
+Three consequences are worth stating, because they are what the removed
+constants used to hide:
+
+- **The harness classifies no target by the shape of its name.** It used to
+  decide "Windows" by testing whether a triple ended in `-pc-windows-msvc`, and
+  "Linux" by testing whether it ended in `-unknown-linux-gnu`. It now reads the
+  contract's asset kind and entries. The `.exe` suffix is likewise not applied
+  by the harness: the contract states the Windows install identity itself, so
+  the suffix convention is applied in exactly one place and is not an identity.
+- **The harness holds no count of the qualified inventory.** The expected asset
+  set is derived from the release manifest and the staged set is compared
+  against it; the count in the receipt is computed from that derived set. There
+  is no constant to re-sync when a target is added.
+- **The service identity is the daemon's to report.** The harness names the
+  service definition file after the identity the installed daemon reports, and
+  checks that the identity the daemon reports in its mutating answer is the one
+  it was told to use.
+
+The cross-language check is `crates/eggwork-server/tests/release_contract.rs`:
+it pins the Rust deployment constants (`MEMBER_DAEMON`, `MEMBER_HELPER`,
+`SERVICE_ID`) to the contract's own values, so the Rust side and the Python
+side read one owner and are checked against it.
+`tests/release/test_release_harness_derivations.py` proves the same agreement
+from the Python side, and fails if a literal install or service identity is
+re-added to the harness.
 
 ### Stages
 
@@ -820,6 +973,22 @@ the `windows-platform-disposition` gate. A second real bug in the same area: the
 Windows disposition step was inheriting the daemon's exit code (`32e4559`), which
 would have silently turned a recorded disposition into a job failure.
 
+**What changed afterwards.** Operations M007 implemented the service host
+(`plans/closure/operations-distribution/007-status.md`): `eggworkd` now joins the
+dispatcher, the mutating Windows `service` verbs go live through Eggup's typed
+adapter, and the refusal is gone. The receipt above still describes the
+candidates it was taken from, and the `windows-platform-disposition` gate still
+holds those candidates to it — a candidate's bytes are what the gate reads.
+
+The **release-scoped** consequence is that the gate's second observation ("`main`
+fails closed before mutating") is no longer true of `main`. The
+`windows-installed-execution` job therefore still asserts the refusal *for the
+candidate it stages*, which is correct for every candidate published so far, and
+it must be re-pointed at the real-service disposition as soon as a release
+carrying the service host is qualified. That re-pointing is Operations M004's
+outstanding item, not M007's: M007 owns the capability, and M004 owns the
+release lineage that turns it into an installed-release receipt.
+
 ### A Windows-shaped run failure attributed to the wrong cause
 
 `v0.1.2` reproduced the same `Internal`/`null` shape and was attributed to a
@@ -878,7 +1047,9 @@ harness bug and retrying it would hide that behind a delay.
 | One runtime identity, resolved once, re-verified by every job | `github-policy.json` `release_inputs` | `the_generated_workflow_propagates_one_runtime_identity_to_every_job` (18 jobs) |
 | No second hand-maintained release matrix | directory-level policy | `no_second_hand_maintained_release_matrix_exists` |
 | One coherent workspace version across manifest, lock, and binaries | `Cargo.toml` + `Cargo.lock` | `the_release_version_is_one_coherent_workspace_identity` |
-| Tag, version, and lock agree before the tag exists | `scripts/check_release_tag.py` | pre-tag guard, run by whoever cuts the tag |
+| The manifest's version and the lock's pins agree, on every push and pull request | `scripts/check_release_tag.py` `--coherence` | `.github/workflows/ci.yml` → `rust` → `release identity coherence` |
+| Tag, version, and lock agree before the tag exists | `scripts/check_release_tag.py` | the pre-tag gate, run by whoever cuts the tag; the guard's *logic* is exercised by `tests/release/test_release_tag_guard.py` in CI |
+| The harness holds no independently remembered constant for any fact it asserts | `scripts/qualify_release.py` | `tests/release/test_release_harness_derivations.py` |
 | `eggwork-server` never parses producer configuration | consumer/product code | `the_deployment_module_never_parses_eggpack_configuration` |
 | Linux-only deps never enter the non-Linux build graph | crate manifests | `linux_only_dependencies_never_enter_the_non_linux_build_graph` |
 | Windows MSVC build is byte-deterministic and target-scoped | `.cargo/config.toml` | `the_windows_msvc_build_policy_is_deterministic_and_target_scoped` |
@@ -888,17 +1059,35 @@ harness bug and retrying it would hide that behind a delay.
 | Only the exact requested tag is qualified | `qualify_release.py` `_resolve_release` / `fetch_release` | `test_a_draft_read_still_requires_a_token` |
 | A tokened read cannot pose as public evidence | `qualify_release.py` `PUBLIC_MODE` | `test_a_tokened_read_cannot_masquerade_as_public` |
 | Candidate validation is bounded, offline, shell-free, output-free | `scripts/release_candidate_probe.py` | `test_probe_never_shells_out`, `test_probe_never_reaches_the_network`, `test_candidate_environment_is_an_allowlist`, `test_entrypoint_reports_a_fixed_reason_without_candidate_output` |
-| Installed binary admits/denies truthfully and drains | `installed_qualification.rs` | `.github/workflows/operational-qualification.yml` |
-| Qualification is opt-in, never in the shipped daemon | `qualification` feature | `#![cfg(feature = "qualification")]` |
+| Installed binary admits/denies truthfully and drains | `installed_qualification.rs` | `.github/workflows/operational-qualification.yml`, and `.github/workflows/ci.yml` → `installed-qualification` |
+| Qualification is opt-in, never in the shipped daemon, but is *executed* | `qualification` feature | `#![cfg(feature = "qualification")]`; the `installed-qualification` CI job runs the ignored tests |
 
 ## Test coverage and gaps
 
-**`tests/release/` tests the harness, not the product.** Three modules:
+**`tests/release/` tests the harness, not the product.** Five modules:
 
 - `test_qualify_release_harness.py` — the harness's API behaviour: an asset is
   written, transient server errors, rate limits, and transport errors are retried,
   a client error is *not* retried, exhausted retries fail loudly, an oversized
   asset is refused without retrying, and the public/token split behaves.
+- `test_release_tag_guard.py` — the pre-tag guard's own logic, against
+  fixtures rather than against the repository: the tag matches the manifest
+  version with and without the `v` prefix; a mismatched tag is refused; the
+  `v` prefix is the *only* permitted difference; the lock's pinned versions are
+  checked against the same value; a malformed manifest, an unreadable manifest,
+  and a manifest with no `[workspace.package].version` all fail closed; a
+  manifest whose `[workspace.package]` section is **not first** still yields the
+  right version — the case the previous regular-expression reader got wrong,
+  which the test demonstrates against a copy of that reader; a workspace member
+  missing from the lock fails; registry dependencies are not asserted; and the
+  guard's own source contains no regular-expression reader.
+- `test_release_harness_derivations.py` — the harness's derivations: the
+  install identities and the target classification come from
+  `release/eggpack/distribution.toml`; the Rust deployment constants agree with
+  the contract's bundle order; the expected asset set equals the set the
+  contract's own templates produce; and the harness source contains no literal
+  asset count, no literal install or service identity, and no classification by
+  triple suffix.
 - `test_release_candidate_probe.py` — the validators, against fabricated
   candidates: the helper accepts the workspace version and rejects a different one,
   an empty line, more than one line, the daemon as a substitute, a non-zero exit,
@@ -921,9 +1110,32 @@ completely: contract, parity with the consumer, policy, identity-freedom, the
 rendered workflow, build determinism, and the sealed runtime boundary. It needs no
 network, no runner, and no installed release.
 
-**`installed_qualification.rs`** is `#[ignore]`d and opt-in. It never runs in an
-ordinary test run; it runs only from the hosted workflow, or by hand with an
-installed release and a fixture in hand.
+**`installed_qualification.rs`** is `#[ignore]`d and opt-in, and that is a
+deliberate property rather than an accident. The default `cargo test` step does
+not enable the `qualification` feature, and adding `--all-features` would not
+help: the `#[ignore]` attributes keep all three tests out of an ordinary run
+regardless of the feature set, and an ordinary run has no installed release to
+drive in the first place. The suite is therefore **executed** by the
+`installed-qualification` job in `.github/workflows/ci.yml`, which stages an
+installation root, materialises the fixture, and drives the installed daemon
+through the production client path on every push and pull request. The hosted
+`operational-qualification` workflow runs the same suite against a *published*
+release's exact bytes, and a maintainer can still run it by hand against an
+installed release.
+
+Three things that job must get right were found by running it, and each is a
+property of the *product* rather than of the test harness:
+
+- **The installation root's ancestor chain must be free of group- and
+  world-writable bits.** The installed helper's trust check walks every
+  ancestor of its own path, so a staging directory created under a umask of
+  `002` makes the node refuse its own helper.
+- **The suite's two execution tests must run serially.** They share one
+  installation root, one state directory, and one execution-state lock, so a
+  concurrent second daemon cannot start.
+- **The fixture's client grant must name every operation the suite
+  exercises** — `workspace-create` and `artifact-read` for the declared
+  artifact test — or the node refuses the step with a bare `403 forbidden`.
 
 **Honest gaps:**
 
@@ -951,10 +1163,15 @@ installed release and a fixture in hand.
   asserted in the probe tests for some inputs, but the validators' interaction with
   Eggpack's actual handoff (argument passing, cwd, exit-status recording) is
   verified only by the producer run.
-- **The `check_release_tag.py` pre-tag guard is manual by design.** It runs
-  locally, by a person, immediately before a tag. Nothing prevents someone from
-  tagging without running it — the producer's version-coherence check is the
-  backstop that makes that recoverable rather than shippable.
+- **The `check_release_tag.py` pre-tag guard's tag half is manual by design.**
+  It runs locally, by a person, immediately before a tag. Nothing prevents
+  someone from tagging without running it — the producer's version-coherence
+  check is the backstop that makes that recoverable rather than shippable. The
+  *tag-independent* half now runs in CI on every push and pull request, and the
+  guard's logic is exercised against fixtures, but the tag half remains a
+  process requirement until Eggpack supports a repository-local preflight step
+  in the generated release workflow (see
+  [Where the tag gate runs today](#where-the-tag-gate-runs-today--and-where-it-does-not)).
 - **Five targets, three qualification platforms for execution.** Windows installed
   execution and service disposition run, but the deepest Unix evidence
   (required-isolation enforcement with a side-effect marker) is Linux-only by
@@ -1002,10 +1219,16 @@ installed release and a fixture in hand.
 - **The PDB tradeoff is a real, accepted cost.** Release Windows binaries have no
   symbols. Is local-rebuild-from-the-same-revision triage actually practical — do
   the pinned toolchain and build flags reproduce what a triager needs?
-- **The 1053 disposition is time-sensitive.** Every mutating Windows `service`
-  verb is refused, but `deployment::windows_scm_manager` is retained
-  `#[allow(dead_code)]` for a future milestone. Does anything prevent that code
-  from quietly becoming reachable again?
+- **The 1053 disposition is time-sensitive, and its time has come.** The refusal
+  existed because the daemon had no service-control dispatcher. M007 gave it one,
+  so the mutating Windows `service` verbs are live again and
+  `deployment::windows_scm_manager` is no longer `#[allow(dead_code)]`. The
+  remaining question is the one the gate still asks: which *candidate's bytes*
+  does the qualification read? For every candidate published so far the answer
+  is "one that predates the host", so the refusal observation is still the
+  correct one — but the gate's second observation about `main` is now stale, and
+  the job has to be re-pointed at the real-service disposition for the first
+  candidate that carries the host.
 - **The fifth authority.** Is anything in the producer configuration trying to
   override `.cargo/config.toml`, and would a future `pack.toml` change (say,
   adopting CargoZigbuild) silently interact with the MSVC flags?

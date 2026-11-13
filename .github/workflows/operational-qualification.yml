@@ -284,6 +284,28 @@ jobs:
             --test installed_qualification -- --ignored \
             --exact installed_release_admits_execution_and_refuses_unsupported_isolation \
             --nocapture
+      - name: Qualify the truthful declared-artifact disposition
+        # Windows cannot capture declared outputs, and the qualified claim is
+        # the *refusal*: the node must not advertise `artifact.declared.v1`, and
+        # an execution that declares outputs must end in a failed state with a
+        # `failed` capture disposition and a diagnostic event — never a
+        # successful execution whose declared outputs were silently dropped.
+        # Without this step the hosted qualification would never invoke the
+        # suite, because the workflow selects suites by `--exact` name.
+        shell: bash
+        env:
+          RELEASE_QUALIFICATION_TOKEN: ${{ secrets.RELEASE_QUALIFICATION_TOKEN }}
+          EGGWORK_QUALIFY_DAEMON: ${{ runner.temp }}/qualification/bin/eggworkd.exe
+          EGGWORK_QUALIFY_CONFIG: ${{ runner.temp }}/qualification/state/node.json
+          EGGWORK_QUALIFY_TLS_DIR: ${{ runner.temp }}/qualification/state/tls
+          EGGWORK_QUALIFY_RECEIPT: ${{ runner.temp }}/receipts/execution-windows.json
+          EGGWORK_QUALIFY_PLATFORM: windows
+        run: |
+          set -euo pipefail
+          cargo test --locked -p eggwork-server --features qualification \
+            --test installed_qualification -- --ignored \
+            --exact installed_release_reports_a_truthful_declared_artifact_disposition \
+            --nocapture
       - name: Record the service management disposition
         shell: pwsh
         run: |
@@ -291,10 +313,21 @@ jobs:
           $exe = "$root\bin\eggworkd.exe"
           $config = "$root\state\node.json"
           $receipt = "$env:RUNNER_TEMP\receipts\windows-service.txt"
-          # Service management is still `unsupported`: the daemon is not a
-          # service host. What is qualified here is the *refusal*, which must
-          # happen before any mutation. A release that registers a service has
-          # lost that guarantee, so this is a hard failure, not a note.
+          # The disposition is a property of the *candidate's bytes*, and the
+          # candidate is what this job qualifies.
+          #
+          # A candidate that predates the service host refuses the mutating
+          # verbs before any mutation, and that refusal is what is qualified
+          # here. A candidate that carries the host registers a service,
+          # starts it, proves it reaches Running, stops it, and removes it.
+          #
+          # The daemon's own usage names its process modes, so the capability
+          # is read from the candidate under test rather than assumed from
+          # the branch this workflow lives on.
+          $usage = (& $exe 2>&1 | Out-String)
+          $isHost = $usage -match 'service-host'
+          "capability: service-host=$isHost" | Out-File -FilePath $receipt -Encoding utf8
+
           $output = & $exe service install `
             --config $config `
             --executable $exe `
@@ -302,6 +335,57 @@ jobs:
             --windows-start-type manual 2>&1 | Out-String
           $exit = $LASTEXITCODE
           "service install exit=$exit output=$output" | Out-File -FilePath $receipt -Encoding utf8
+
+          if ($isHost) {
+            if ($exit -ne 0) {
+              throw "the candidate hosts a Windows service but the install failed: $output"
+            }
+            $start = & $exe service start `
+              --config $config `
+              --executable $exe `
+              --service-config $config `
+              --windows-start-type manual 2>&1 | Out-String
+            $startExit = $LASTEXITCODE
+            "service start exit=$startExit output=$start" | Out-File -FilePath $receipt -Encoding utf8 -Append
+            if ($startExit -ne 0) {
+              throw "the candidate hosts a Windows service but the service did not start: $start"
+            }
+            $status = & $exe service status `
+              --config $config `
+              --executable $exe `
+              --service-config $config `
+              --windows-start-type manual 2>&1 | Out-String
+            "service status output=$status" | Out-File -FilePath $receipt -Encoding utf8 -Append
+            if ($status -notmatch '"ownership":"Owned"') {
+              throw "the candidate registered the service but does not own it: $status"
+            }
+            if ($status -notmatch '"state":"Running"') {
+              throw "the candidate started the service but it is not Running: $status"
+            }
+            $stop = & $exe service stop `
+              --config $config `
+              --executable $exe `
+              --service-config $config `
+              --windows-start-type manual 2>&1 | Out-String
+            $stopExit = $LASTEXITCODE
+            "service stop exit=$stopExit output=$stop" | Out-File -FilePath $receipt -Encoding utf8 -Append
+            if ($stopExit -ne 0) {
+              throw "the candidate hosts a Windows service but the service did not stop: $stop"
+            }
+            $uninstall = & $exe service uninstall `
+              --config $config `
+              --executable $exe `
+              --service-config $config `
+              --windows-start-type manual 2>&1 | Out-String
+            $uninstallExit = $LASTEXITCODE
+            "service uninstall exit=$uninstallExit output=$uninstall" | Out-File -FilePath $receipt -Encoding utf8 -Append
+            if ($uninstallExit -ne 0) {
+              throw "the candidate hosts a Windows service but the service was not removed: $uninstall"
+            }
+            "DISPOSITION: supported (the candidate registered, started, and stopped the service)" | Out-File -FilePath $receipt -Encoding utf8 -Append
+            exit 0
+          }
+
           $unsupported = $output -match 'unsupported'
           if (-not $unsupported) {
             "DISPOSITION: CHANGED, the service verb mutated state; update the support matrix" | Out-File -FilePath $receipt -Encoding utf8 -Append

@@ -1,6 +1,6 @@
 # Foundation Execution Core CI Corrective C001 — Portable Ownership Guard and CI Enforcement
 
-Status: ready for handoff
+Status: closed — implementation commit `34ef081`; closure evidence in `plans/closure/foundation-execution-core/003-status.md`
 
 Source corrective:
 

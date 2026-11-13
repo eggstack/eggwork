@@ -3,7 +3,7 @@
 `crates/eggwork-server/src/store.rs` (895 lines) is the node's durable memory of
 executions: it is the single place where an accepted execution identity, its
 lifecycle state, its ownership-lease evidence, and its event history survive a
-process crash. It is a private module (`mod store;` at `lib.rs:9`), backed by a
+process crash. It is a private module (`mod store;` at `crates/eggwork-server/src/lib.rs::store`), backed by a
 single `rusqlite` connection (rusqlite 0.40.2 / libsqlite3-sys 0.38.2, bundled)
 at a caller-supplied path, and it is reached only through `eggwork-server`'s
 public surface (`NodeServer`, `eggworkd`, `operations`). Every execution
@@ -43,13 +43,13 @@ Does not own:
   [Drain state and the exclusive lock](#drain-state-and-the-exclusive-lock)).
 
 It is node-local: no cross-node event log, no replication. The file is opened
-with mode `0600` on Unix when it does not yet exist (`store.rs:64-77`).
+with mode `0600` on Unix when it does not yet exist (`crates/eggwork-server/src/store.rs::ExecutionStore::open`).
 
 ## Schema
 
 There is **no schema-version table and no migration mechanism.** The DDL is a
 single `execute_batch` of `CREATE ... IF NOT EXISTS` statements issued on every
-`ExecutionStore::open` (`store.rs:79-114`), preceded by three PRAGMAs:
+`crates/eggwork-server/src/store.rs::ExecutionStore::open`, preceded by three PRAGMAs:
 
 ```sql
 PRAGMA journal_mode=WAL;
@@ -58,10 +58,13 @@ PRAGMA foreign_keys=ON;
 ```
 
 There is no `PRAGMA user_version` read or write, and no `schema_version` column.
-`ExecutionSnapshot.schema_version` (`eggwork-core/src/lib.rs:1117-1123`) is
-*inside* the JSON blob, is set to `API_SCHEMA_VERSION` (`1`, `lib.rs:48`) at
+`ExecutionSnapshot.schema_version` is
+*inside* the JSON blob, is set to `eggwork_core::API_SCHEMA_VERSION` (`1`) at
 construction, and is not validated on read — `serde_json::from_slice` will
-deserialize any `u16` into it.
+deserialize any `u16` into it. That constant is core-owned: the server, the
+client, and the snapshot all read the same number from
+`eggwork_core::API_SCHEMA_VERSION`, so the value that is stored is the value
+the node accepts.
 
 On a version mismatch there is no explicit handling: a database whose
 `executions` table lacks a column the current DDL expects fails at first
@@ -71,7 +74,7 @@ columns to an existing table. Canonicalization *is* versioned, separately, via
 `eggwork_core::CANONICAL_REQUEST_VERSION = 2` and
 `CANONICAL_WORKSPACE_REQUEST_VERSION = 3`, and that version is stored in
 `executions.canonical_version` and compared in `reserve` and in the `execute`
-handler (`lib.rs:1670-1676` → 409 `canonicalization_version_mismatch`).
+handler (`crates/eggwork-server/src/lib.rs::execute` → 409 `canonicalization_version_mismatch`).
 
 ### `executions`
 
@@ -143,8 +146,8 @@ them breaks a distinct guarantee:
 | Column | Type in SQLite | Rust type | Ordering it encodes |
 |---|---|---|---|
 | `execution_id` | `TEXT` | `ExecutionId` (bounded string) | *Which* logical execution. Stable across generations. |
-| `generation` | `INTEGER` | `ExecutionGeneration(u64)`, non-zero | *Who owns it now* — a monotonically increasing ownership epoch (`eggwork-core/src/lib.rs:111-124`). |
-| `next_sequence` / `execution_events.sequence` | `INTEGER` | `EventSequence(u64)` (`lib.rs:129-137`) | *Observation order* of events within one generation. |
+| `generation` | `INTEGER` | `ExecutionGeneration(u64)`, non-zero | *Who owns it now* — a monotonically increasing ownership epoch (`crates/eggwork-core/src/lib.rs::ExecutionGeneration`). |
+| `next_sequence` / `execution_events.sequence` | `INTEGER` | `EventSequence(u64)` (`crates/eggwork-server/src/lib.rs::tests::resource_aware_authorizer_can_scope_blob_capability::OneBlob::authorize_request`) | *Observation order* of events within one generation. |
 | `digest` | `TEXT` | `String` (64 hex chars) | *What was asked for* — content identity of the canonical request. |
 | `lease_token_hash` | `TEXT` | `String` (64 hex chars) | *Who is allowed to control it* — bearer authority. |
 
@@ -152,7 +155,7 @@ them breaks a distinct guarantee:
 generations "monotonically ordered ownership epochs" and fence stale
 controllers: a new generation for the same `execution_id` is a *new owner of the
 same identity*, not a new identity. The store enforces one ordering rule
-(`store.rs:166-179`) — with no rows only `generation == 1` is legal; otherwise
+(`crates/eggwork-server/src/store.rs::tests::reserve`) — with no rows only `generation == 1` is legal; otherwise
 the generation must be `latest + 1` **and** the latest `state` must already be
 one of `Succeeded | Failed | Cancelled | TimedOut | Interrupted`, else
 `ReserveResult::StaleGeneration`. Generations never skip, regress, or overlap.
@@ -165,7 +168,7 @@ satisfied by generation-2 rows; the `sequence` embedded in the JSON always
 equals the row key, so a client can verify it.
 
 **The digest is the idempotency key.** `request_digest_with_workspace`
-(`lib.rs:1605-1616`) normalizes unordered fields (sort environment by name,
+(`crates/eggwork-server/src/lib.rs::execute`) normalizes unordered fields (sort environment by name,
 metadata by key then value, declared outputs by path then required), prefixes a
 domain-separated literal - `b"eggwork-execution-spec\0canonical-json-v2\0"`, or
 `...v3\0` when a `workspace_id` participates - serializes the normalized typed
@@ -184,9 +187,9 @@ merely knows the digest of.
 
 ## Reservation and idempotency
 
-`ReserveResult` (`store.rs:38-45`):
+`crates/eggwork-server/src/store.rs::ReserveResult`:
 
-| Variant | Meaning | Server mapping (`lib.rs:1789-1851`) |
+| Variant | Meaning | Server mapping (`crates/eggwork-server/src/lib.rs::store`) |
 |---|---|---|
 | `Created` | Row inserted; this caller owns the identity. | admit, `executions_accepted`, spawn `run_execution` |
 | `Existing(Box<ExecutionSnapshot>)` | Identical `(canonical_version, digest, principal_id, lease_token_hash)` already reserved for this `(id, generation)`. | re-attach via `recovered_record`, return the event stream from cursor 0; no spawn |
@@ -196,7 +199,7 @@ merely knows the digest of.
 
 `reserve` opens with
 `connection.transaction_with_behavior(TransactionBehavior::Immediate)`
-(`store.rs:132-133`) - a write transaction, so the write lock is taken at
+(`crates/eggwork-server/src/store.rs::tests::reserve`) - a write transaction, so the write lock is taken at
 `BEGIN`, not at first write. Inside that one transaction it (1) point-reads the
 existing row for `(id, generation)` and returns `Existing`/`Conflict`, where
 `Existing` decodes `snapshot_json` so a decode failure is `StoreError::Json`
@@ -210,7 +213,7 @@ now`.
 No, and the guarantee is structural rather than advisory:
 
 - The store has exactly **one** SQLite connection, `Arc<Mutex<Connection>>`
-  (`store.rs:34-36`), and every method clones the `Arc` into a `spawn_blocking`
+  (`crates/eggwork-server/src/store.rs::ExecutionStore`), and every method clones the `Arc` into a `spawn_blocking`
   closure and takes `connection.lock()`. Two concurrent `reserve` calls cannot
   interleave inside the transaction body at all; the second blocks on the
   `std::sync::Mutex` until the first commits.
@@ -220,7 +223,7 @@ No, and the guarantee is structural rather than advisory:
   would already have returned `Existing`.
 - The loser therefore receives `Existing` and the server replays that execution's
   event stream; `run_execution` is spawned only on the `Created` arm
-  (`lib.rs:1852-1882`).
+  (`crates/eggwork-server/src/lib.rs::execute`).
 
 The server adds a weaker second layer - `execute` holds the in-memory
 `state.executions` mutex and a `max_active_executions` permit across the reserve,
@@ -243,9 +246,9 @@ There is no separate lease table and no lease history. A new generation writes a
 new row and therefore a new lease record; the previous generation's row keeps
 its own hash and expiry, so a stale holder's token still "matches" its own
 generation but fails the `latest.generation == handle.generation` check `control`
-applies *before* mutating anything (`lib.rs:2058-2078`).
+applies *before* mutating anything (`crates/eggwork-server/src/lib.rs::control`).
 
-`lease_hash` (`store.rs:632-634`) is
+`crates/eggwork-server/src/store.rs::lease_hash` is
 `hex::encode(sha2::Sha256::digest(lease.as_bytes()))` — unkeyed SHA-256, 64
 lowercase hex chars; the raw `LeaseId` is never persisted. This is credential
 hygiene: `eggwork-core` documents `LeaseId` as "bearer authority" and redacts it
@@ -265,16 +268,16 @@ cannot discover the *next* generation's token.
 
 **TTL and expiry representation.** Expiry is `unix_millis() + lease_ttl`, i.e.
 `Duration::as_millis().min(i64::MAX as u128) as i64` added with `saturating_add`
-(`lib.rs:1661-1662`, `lib.rs:2125-2126`). `unix_millis` (`store.rs:636-642`) is
+(`crates/eggwork-server/src/lib.rs::execute`, `crates/eggwork-server/src/lib.rs::control`). `crates/eggwork-server/src/store.rs::unix_millis` is
 `SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
 .min(i64::MAX as u128) as i64` — pure wall clock, saturating, deliberately free
 of a monotonic component. The *live* deadline is monotonic and in-memory only
-(`LeaseState.expires_at: tokio::time::Instant`, `lib.rs:1902-1906`); the
+(`LeaseState.expires_at: tokio::time::Instant`, `crates/eggwork-server/src/lib.rs::LeaseState`); the
 persisted value is evidence and renewal-idempotency state, per the closure's
 note that on restart every uncertain execution is interrupted "regardless of
 the remaining wall-clock lease".
 
-**Renewal** — `update_lease` (`store.rs:351-406`) in one `Immediate`
+**Renewal** — `crates/eggwork-server/src/store.rs::ExecutionStore::update_lease` in one `Immediate`
 transaction:
 
 1. reads `(lease_token_hash, lease_expires_unix_ms, last_renewal_id, state)`;
@@ -302,22 +305,25 @@ write itself fenced even though the read already compared it.
 new generation row. Effectively the lease is immutable per generation and
 "clearance" is expressed by the state column being terminal, which makes
 `update_lease` return `None`. The in-memory `lease.expired` flag and the
-`CancellationToken` (`monitor_lease`, `lib.rs:1932-1954`) are the *runtime*
+`CancellationToken` (`monitor_lease`, `crates/eggwork-server/src/lib.rs::monitor_lease`) are the *runtime*
 lease state; the store only supplies the durable deadline.
 
 ## State machine persistence
 
-`ExecutionState` (`eggwork-core/src/lib.rs:878-887`) has nine variants.
-`state_name` (`store.rs:644-656`) maps each to its SQLite spelling verbatim
-(`Accepted`, `Preparing`, `Running`, `Cancelling`, `Succeeded`, `Failed`,
-`Cancelled`, `TimedOut`, `Interrupted`) and `is_terminal_name` (`store.rs:658-663`)
-recognizes the last five.
+`ExecutionState` has nine variants. Its SQLite spelling and its terminal
+classification are both **core-owned**: `ExecutionState::wire_name` is the
+PascalCase spelling the column stores verbatim (`Accepted`, `Preparing`,
+`Running`, `Cancelling`, `Succeeded`, `Failed`, `Cancelled`, `TimedOut`,
+`Interrupted`), and `ExecutionState::is_terminal` recognizes the last five.
+The store no longer keeps a list of either; it asks the core for both. The
+spellings are also the strings the derived `Serialize` emits, so the column
+cannot drift away from the enum.
 
 In-memory `ExecutionSnapshot` (`{ schema_version, execution_id, generation,
 state, result: Option<ExecutionResult> }`) is serialized whole into
 `snapshot_json`; the `state` column is written from the *caller's* proposed
-snapshot via `state_name(&snapshot.state)`, never from the row that was read
-back (`store.rs:326-337`). So the stored snapshot and the stored state column
+snapshot via `ExecutionState::wire_name`, never from the row that was read
+back. So the stored snapshot and the stored state column
 are always consistent with each other by construction.
 
 ### Which transitions the store actually enforces
@@ -325,7 +331,7 @@ are always consistent with each other by construction.
 `store.rs` enforces only three things, all as *predicates*, not a state machine:
 
 1. **No mutation after terminal** — `commit_event` returns `Ok(None)` if the
-   stored `state` `is_terminal_name` (`store.rs:310-313`); `update_lease`
+   stored `state` is terminal under `ExecutionState::is_terminal`; `update_lease`
    returns `None` on a terminal row; `reserve` requires the previous
    generation to be terminal before advancing.
 2. **Generation ordering** as described above.
@@ -334,7 +340,7 @@ are always consistent with each other by construction.
 
 It does **not** check that `proposed.state` is a legal successor of the stored
 state — a caller could move `Running → Preparing` and the store would accept it.
-Legality is a caller convention: `publish` (`lib.rs:2569-2595`) holds the
+Legality is a caller convention: `crates/eggwork-server/src/lib.rs::publish` holds the
 in-memory write lock, refuses an already-terminal in-memory state, and is the
 only production writer. The sequence it actually produces:
 
@@ -347,31 +353,31 @@ only production writer. The sequence it actually produces:
 | output chunks | `run_execution` → `publish` | `Running` (re-asserted) | `Stdout`/`Stderr`/`Diagnostic` | interleaved, each consuming one sequence |
 | outcome | `run_execution` → `publish_terminal` | terminal + `result` | `State(terminal)` | last |
 
-`Preparing` is never written by the server; it exists in `state_name`, in
-`recover()`'s `IN` list, and in the `operations.rs` active filters, so a
+`Preparing` is never written by the server; it exists in the core-owned
+non-terminal set, and therefore in `recover()`'s `IN` list and in the
+`operations.rs` active filters, so a
 hand-seeded or future row can carry it.
 
 ### Terminal state is recorded exactly once
 
 Two independent guards, in order: `publish` takes `record.snapshot.write()` and
-returns early if the in-memory state `is_terminal` (`lib.rs:2575-2578`); then
+returns early if the in-memory state `is_terminal()`; then
 `commit_event` re-reads the stored `state` inside the transaction and returns
-`Ok(None)` if it is terminal (`store.rs:306-313`), rolling back, with `publish`
+`Ok(None)` if it is terminal, rolling back, with `publish`
 treating `Ok(None)` as "already terminal — do not touch memory, do not
-broadcast".
+broadcast". Both guards ask the same core-owned classification.
 
 The terminal `UPDATE` of `executions.state`/`snapshot_json` and the `INSERT` of
 the terminal event are the **same `Immediate` transaction**
-(`store.rs:294-344`), so a durable terminal outcome and its journal entry cannot
+(`crates/eggwork-server/src/store.rs::ExecutionStore::commit_event`), so a durable terminal outcome and its journal entry cannot
 diverge. Memory is published only after `commit_event` returns
 `Ok(Some(event))` — "in-memory state changes only after durable commit; a failed
-commit drains the node and cancels that execution" (`lib.rs:2590-2593`).
+commit drains the node and cancels that execution" (`crates/eggwork-server/src/lib.rs::publish`).
 
 
 ### What makes a crash mid-execution recoverable
 
-`recover()` (`store.rs:535-604`), called once from `NodeServer::start`
-(`lib.rs:327-333`) immediately after `ExecutionStore::open` and before the
+`crates/eggwork-server/src/store.rs::ExecutionStore::recover`, called once from `crates/eggwork-server/src/lib.rs::NodeServer::start` immediately after `ExecutionStore::open` and before the
 server binds, inside a single `Immediate` transaction:
 
 - selects every `snapshot_json` where
@@ -402,7 +408,7 @@ lease.
 
 ### Append path
 
-`commit_event(snapshot, kind)` (`store.rs:286-349`) in one `Immediate`
+`crates/eggwork-server/src/store.rs::ExecutionStore::commit_event` in one `Immediate`
 transaction: (1) `SELECT state, next_sequence` for `(id, generation)` - `None` or
 terminal rolls back and returns `Ok(None)`; (2) build
 `ExecutionEvent { sequence: EventSequence::new(sequence as u64), kind, metadata:
@@ -410,11 +416,11 @@ EventMetadata { fields: vec![] } }` - metadata is always empty, the store never
 accepts caller-supplied metadata; (3) `event.validate()`, then
 `serde_json::to_vec`, rejecting `encoded.len() > MAX_RETAINED_EVENT_BYTES` with
 `StoreError::InvalidEvent` (the transaction is dropped, i.e. rolled back);
-(4) `UPDATE executions SET state = state_name(&snapshot.state), next_sequence =
+(4) `UPDATE executions SET state = <ExecutionState::wire_name>, next_sequence =
 sequence + 1, snapshot_json = to_vec(&snapshot), updated_unix_ms = now`;
 (5) `INSERT INTO execution_events (execution_id, generation, sequence, encoded)`;
 (6) `trim_events`; (7) `commit`, returning `Some(event)`. The event is broadcast
-to live subscribers only after the commit, in `publish` (`lib.rs:2585-2588`).
+to live subscribers only after the commit, in `crates/eggwork-server/src/lib.rs::publish`.
 
 
 ### Sequence assignment and gap-freedom
@@ -435,7 +441,7 @@ only: generation 2 restarts at 1.
 `encoded` is a `BLOB` holding the JSON of the whole `ExecutionEvent`, including
 the duplicated `sequence` field. Kinds are `State(ExecutionState)`,
 `Stdout(Vec<u8>)`, `Stderr(Vec<u8>)`, `Diagnostic(String)`.
-`ExecutionEvent::validate` (`eggwork-core/src/lib.rs:1043-1057`) caps the raw
+`ExecutionEvent::validate` (`crates/eggwork-core/src/lib.rs::ExecutionEvent::validate`) caps the raw
 payload at `MAX_EVENT_CHUNK_BYTES = 64 * 1024`; `EventMetadata::validate` caps
 metadata at 64 fields / 128-byte keys / 2048-byte values, but the store always
 writes `fields: vec![]`, so only the 64 KiB payload cap is reachable.
@@ -445,7 +451,7 @@ writes `fields: vec![]`, so only the 64 KiB payload cap is reachable.
 
 `EventPage { base_sequence: u64, next_sequence: u64, events: Vec<ExecutionEvent> }`.
 
-`load_page(id, generation, after_sequence)` (`store.rs:408-460`):
+`crates/eggwork-server/src/store.rs::ExecutionStore::load_page`:
 
 1. reads `next_sequence`; `None` → `Ok(None)` (caller answers 404);
 2. `base_sequence = COALESCE(MIN(sequence), next_sequence).max(1)`;
@@ -459,8 +465,7 @@ writes `fields: vec![]`, so only the 64 KiB payload cap is reachable.
 `after` is exclusive and generation-scoped. `events_route` requires both
 `generation` and `after` as query parameters, rejects `after > i64::MAX as u64`
 with 416, and requires a `lease` query parameter that must match
-`lease_token_hash` and `principal_id` (`lib.rs:2253-2275`). `event_response`
-(`lib.rs:2303-2349`) then maps page shape to HTTP:
+`lease_token_hash` and `principal_id` (`crates/eggwork-server/src/lib.rs::events_route`). `crates/eggwork-server/src/lib.rs::event_response` then maps page shape to HTTP:
 
 | Condition | Response |
 |---|---|
@@ -473,7 +478,7 @@ computed twice; `event_response` is the one that speaks HTTP.
 
 ### Retention / pruning
 
-`trim_events` (`store.rs:607-630`) runs inside the append transaction after the
+`crates/eggwork-server/src/store.rs::trim_events` runs inside the append transaction after the
 insert. It loops `SELECT COUNT(*), COALESCE(SUM(length(encoded)), 0)` for the
 generation, stopping when both are in bounds and otherwise deleting the single
 row at `MIN(sequence)`. The journal is therefore a **ring buffer per
@@ -490,16 +495,16 @@ the client gets 410 `history_expired` and must resynchronize from the snapshot,
 not from a partial window; that 410 is the only way to distinguish "trimmed"
 from "never existed", which is why the store refuses to return a partial page.
 The *live* broadcast channel is a separate, much smaller bound
-(`EVENT_CAPACITY = 32`, `lib.rs:50`): a lagging consumer gets
+(`EVENT_CAPACITY = 32`, `crates/eggwork-server/src/lib.rs::EVENT_CAPACITY`): a lagging consumer gets
 `broadcast::error::RecvError::Lagged` and its stream is terminated with an error
-rather than a gap (`lib.rs:2628-2635`). The two layers can therefore disagree
+rather than a gap (`crates/eggwork-server/src/lib.rs::event_stream_response`). The two layers can therefore disagree
 about what a client has seen — durable history 256 events, live fan-out 32.
 
 ## Transactions and concurrency
 
 **Connection model: one connection, no pool.** `ExecutionStore` is
 `#[derive(Clone)]` over `Arc<Mutex<Connection>>` with a `std::sync::Mutex`
-(`store.rs:33-36`). Every method clones the `Arc` into a
+(`crates/eggwork-server/src/store.rs::StoreError`). Every method clones the `Arc` into a
 `tokio::task::spawn_blocking` closure, so no async task holds a `rusqlite` handle
 across an await and no `!Send` type crosses a thread boundary.
 `spawn_blocking` keeps blocking SQLite calls off the async worker threads; it
@@ -508,7 +513,7 @@ serialized in-process**: a `SELECT COUNT(*)` during `reserve` blocks
 `commit_event`, and a slow WAL commit stalls unrelated readers.
 
 **Busy handling.** `busy_timeout(Duration::from_secs(2))` is set at open
-(`store.rs:78`). There is no application-level retry anywhere in `store.rs`:
+(`crates/eggwork-server/src/store.rs::ExecutionStore::open`). There is no application-level retry anywhere in `store.rs`:
 `SQLITE_BUSY` after 2 s becomes `StoreError::Sql` and, at the server, a 500
 `ServiceError::internal("execution store unavailable")`. Since the mutex waits
 unboundedly and is normally the only contention source, the 2 s timeout mostly
@@ -535,10 +540,10 @@ covers the cross-process case (the read-only CLI connections).
   `base_sequence` with a stale `next_sequence`. Worst case is a spurious 410 or a
   `next_sequence` that understates reality by one — the client re-sees the newer
   event on the next cursor round, so a benign duplicate, never a gap.
-- `load_all` at startup (`lib.rs:346-352`) reads every snapshot to seed the
+- `load_all` at startup (`crates/eggwork-server/src/lib.rs::NodeServer::start`) reads every snapshot to seed the
   in-memory map. It runs *after* `recover()` with no other writer, so it is safe
   there; called at any other time it would be a full-table read under the mutex.
-- The `lookup`-then-`reserve` pair in `execute` (`lib.rs:1664-1763`) is
+- The `lookup`-then-`reserve` pair in `crates/eggwork-server/src/lib.rs::execute` is
   deliberately redundant; it exists only to produce the finer-grained 403
   `forbidden` and 409 `canonicalization_version_mismatch` responses that
   `ReserveResult::Conflict` cannot distinguish. The window between the two calls
@@ -572,7 +577,7 @@ Every limit the module enforces, with values. Rows marked *core* are enforced by
 | `MAX_RETAINED_EVENTS` | `256` | Events retained per `(execution_id, generation)`; `trim_events` |
 | `MAX_RETAINED_EVENT_BYTES` | `eggwork_core::MAX_EVENT_BYTES` (`512 * 1024`) | (a) retained bytes per generation, in `trim_events`; (b) per-event ceiling in `commit_event` (`encoded.len() > MAX_RETAINED_EVENT_BYTES` -> `InvalidEvent`). The same constant does double duty. (b) is **not** implied by the 64 KiB core payload cap: `Stdout`/`Stderr` serialize as a JSON number array at up to four characters per byte, so a maximum-size chunk encodes to ~256 KiB. It is the shared ceiling the client also reads — see `client-transport.md` — so the two sides agree by construction |
 | `MAX_EXECUTION_IDENTITIES` | `2048` | `COUNT(*) FROM executions` - i.e. *rows*, so it counts *(id, generation)* pairs, not distinct `execution_id`s, despite the name. Checked only on the new-row path in `reserve`; a generation bump consumes budget |
-| `MAX_EVENT_CHUNK_BYTES` *(core)* | `64 * 1024` | The real per-event payload ceiling, via `ExecutionEvent::validate` at `store.rs:319` |
+| `MAX_EVENT_CHUNK_BYTES` *(core)* | `64 * 1024` | The real per-event payload ceiling, via `ExecutionEvent::validate` at `crates/eggwork-server/src/store.rs::ExecutionStore::commit_event` |
 | `MAX_ID_BYTES` *(core)* | `128` | `ExecutionId` / `LeaseId` / `PrincipalId`, upstream of the store |
 | metric name length | `1..=64` bytes | `increment_metric` / `increment_metrics` (`store.rs`) |
 | metric value | saturating at `i64::MAX` | `CHECK(value >= 0)` + the upsert `CASE` |
@@ -599,15 +604,15 @@ Not bounded — review concerns:
 
 ## Error model
 
-`StoreError` (`store.rs:21-31`) — four variants, all mapped by callers to a
+`crates/eggwork-server/src/store.rs::StoreError` — four variants, all mapped by callers to a
 generic 500 `ServiceError::internal("execution store unavailable")` except where
 noted:
 
 | Variant | Display | Source | Retryable? |
 |---|---|---|---|
-| `Sql(#[from] rusqlite::Error)` | `execution store failed` | Any SQLite error: `SQLITE_BUSY` after the 2 s busy timeout, `SQLITE_CONSTRAINT_PRIMARYKEY` / `SQLITE_CONSTRAINT_CHECK`, `SQLITE_IOERR`, disk full, corrupt database, and (at `store.rs:73-75`) the file-creation `std::io::Error` wrapped as `rusqlite::Error::ToSqlConversionFailure` | Transient only for `Busy`/`BusyTimeout`/recoverable `Io`. There is no retry anywhere in `store.rs`, so "retryable" is left to the caller, which does not retry. |
+| `Sql(#[from] rusqlite::Error)` | `execution store failed` | Any SQLite error: `SQLITE_BUSY` after the 2 s busy timeout, `SQLITE_CONSTRAINT_PRIMARYKEY` / `SQLITE_CONSTRAINT_CHECK`, `SQLITE_IOERR`, disk full, corrupt database, and (at `crates/eggwork-server/src/store.rs::ExecutionStore::open`) the file-creation `std::io::Error` wrapped as `rusqlite::Error::ToSqlConversionFailure` | Transient only for `Busy`/`BusyTimeout`/recoverable `Io`. There is no retry anywhere in `store.rs`, so "retryable" is left to the caller, which does not retry. |
 | `Json(#[from] serde_json::Error)` | `execution store serialization failed` | Encoding a snapshot/event, or **decoding** a stored blob. A decode failure here means on-disk data is unreadable for this code version — not retryable, and it is indistinguishable from corruption. | No |
-| `Worker` | `execution store worker failed` | Two distinct causes collapsed into one: `connection.lock()` poisoning (`PoisonError`) and `spawn_blocking` `JoinError` (panic or runtime shutdown). `store.rs:131, 212` and the equivalent `.map_err(|_| StoreError::Worker)` on every `await` | Poisoning is a programming/panic bug; join failure is terminal |
+| `Worker` | `execution store worker failed` | Two distinct causes collapsed into one: `connection.lock()` poisoning (`PoisonError`) and `spawn_blocking` `JoinError` (panic or runtime shutdown). `crates/eggwork-server/src/store.rs::tests::reserve` and the equivalent `.map_err(|_| StoreError::Worker)` on every `await` | Poisoning is a programming/panic bug; join failure is terminal |
 | `InvalidEvent` | `execution event exceeds its protocol bound` | `event.validate()` failure, `encoded.len() > MAX_RETAINED_EVENT_BYTES`, **and** an invalid `increment_metric` name. The metric-name reuse is a misnomer: a bad counter name is not an event problem. | No |
 
 **Constraint violation vs. I/O failure.** Both arrive through the same
@@ -625,7 +630,7 @@ enum, which this module does not pattern-match on:
   *contention*, resolved by the 2 s `busy_timeout`.
 - `rusqlite::Error::SqliteFailure` with `SQLITE_IOERR` / `SQLITE_FULL` /
   `SQLITE_CORRUPT` / `SQLITE_NOTADB` - genuine I/O. Disk-full on `commit_event`
-  is the dangerous case: it makes the node drain and cancel (`lib.rs:2590-2593`)
+  is the dangerous case: it makes the node drain and cancel (`crates/eggwork-server/src/lib.rs::publish`)
   but the transition is not persisted, so the execution stays nonterminal durably
   and is interrupted on the next boot.
 
@@ -641,15 +646,15 @@ sibling to it:
 
 - Path: `config.database_path.with_extension("drain")` — for the default
   `state/executions.sqlite` that is `state/executions.drain`
-  (`lib.rs:347`; the same derivation is exposed as
-  `OperatorConfig::drain_path()`, `operations.rs:327`).
-- Written by `operations::set_persistent_drain` (`operations.rs:533-565`):
+  (`crates/eggwork-server/src/lib.rs::NodeServer::start`; the same derivation is exposed as
+  `OperatorConfig::drain_path()`, `crates/eggwork-server/src/operations.rs::OperatorConfig::drain_path`).
+- Written by `operations::set_persistent_drain` (`crates/eggwork-server/src/operations.rs::set_persistent_drain`):
   `create_new` a temp file `executions.drain.<uuid>.tmp` with mode `0600`,
   write the literal `b"draining\n"`, `sync_all`, `rename` over the target, then
   `fsync` the parent directory on Unix. Clearing is `remove_file` (ignoring
   `NotFound`) plus a parent `sync_all`. The rename-then-fsync ordering means a
   reader never sees a half-written marker.
-- Read by `operations::is_persistently_draining` (`operations.rs:568-570`):
+- Read by `operations::is_persistently_draining` (`crates/eggwork-server/src/operations.rs::is_persistently_draining`):
   `fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())`.
   **Contents are never read** — presence is the whole signal. Using
   `symlink_metadata` means a symlink to a file reports `is_file() == false` and
@@ -658,29 +663,29 @@ sibling to it:
 
 A running node consults it **twice per submit**, both before admission:
 `execute` checks `state.draining.load(Ordering::Acquire) ||
-operations::is_persistently_draining(&state.drain_path)` at `lib.rs:1569-1571`
-(-> 503 `draining`, `rejected_draining`) and repeats it at `lib.rs:1702-1711`
+operations::is_persistently_draining(&state.drain_path)` at `crates/eggwork-server/src/lib.rs::execute`
+(-> 503 `draining`, `rejected_draining`) and repeats it at `crates/eggwork-server/src/lib.rs::execute`
 *after* the `lookup` and after taking the in-memory executions mutex, closing the
 window where a concurrent `set_draining(true)` lands mid-request. The in-memory
 `Arc<AtomicBool>` is the fast path; the file is the durable cross-restart path,
-seeded at startup (`lib.rs:346-348`).
+seeded at startup (`crates/eggwork-server/src/lib.rs::NodeServer::start`).
 
-**The exclusive state lock.** `acquire_state_lock` (`lib.rs:540-556`) opens
+**The exclusive state lock.** `crates/eggwork-server/src/lib.rs::acquire_state_lock` opens
 `database_path.with_extension("lock")` - `state/executions.lock` - with mode
 `0600` and calls `fs2::FileExt::try_lock_exclusive`. `NodeServer::start` calls it
-**before** `ExecutionStore::open` (`lib.rs:315-317`) and holds the `File` as
+**before** `ExecutionStore::open` (`crates/eggwork-server/src/lib.rs::NodeServer::start`) and holds the `File` as
 `NodeServer::_state_lock` for the node's lifetime. Therefore:
 
 - A second `NodeServer::start` on the same path fails with
   `NodeStartError::AlreadyRunning` ("another node process already owns this state
   directory") before any SQLite handle exists.
-- `operations::collect_garbage` with `dry_run == false` (`operations.rs:813`, via
-  `acquire_maintenance_lock` at `operations.rs:860-875`) takes the **same**
+- `operations::collect_garbage` with `dry_run == false` (`crates/eggwork-server/src/operations.rs::collect_garbage`, via
+  `acquire_maintenance_lock` at `crates/eggwork-server/src/operations.rs::acquire_maintenance_lock`) takes the **same**
   `try_lock_exclusive` and so fails with `OperationsError::Data` while a node is
   running - deliberate, since CLI GC would otherwise mutate workspace, artifact
   and blob state under a live node. `dry_run_gc` skips the lock because it opens
   only `SQLITE_OPEN_READ_ONLY` connections.
-- Contrast the **live** `NodeServer::collect_garbage` (`lib.rs:460-508`), which
+- Contrast the **live** `crates/eggwork-server/src/lib.rs::NodeServer::collect_garbage`, which
   takes no file lock at all: it uses the already-open `WorkspaceManager`,
   `BlobStore`, and `ArtifactStore` handles inside the owning process, where the
   single store mutex already guarantees exclusion, and it clamps its batch to
@@ -700,8 +705,10 @@ holder.
 `increment_metric` is a thin `let _ = store.increment_metric(name, amount).await;`
 wrapper, and `increment_metrics` its batched sibling — every metric failure is
 silently discarded. The `name: &'static str` argument means metric names are
-compile-time constants chosen by `lib.rs`, never request-derived, so the 64-byte
-name bound is defense in depth. Because `commit_event` needs the *same* connection
+compile-time constants chosen by `crates/eggwork-server/src/lib.rs`, never request-derived, so the 64-byte
+name bound is defense in depth. The server's own wrapper narrows that further:
+it takes a `Metric` and nothing else, so a name that is not in the vocabulary
+cannot be written at all. Because `commit_event` needs the *same* connection
 mutex, unbatched metric traffic queued in front of durable event commits: the
 execution-terminal path used to await up to four sequential increments, and
 `create_workspace_derived` three. `increment_metrics` takes the deltas as a slice
@@ -710,36 +717,40 @@ explicit transaction, with the per-name upsert arithmetic unchanged; both those
 sites now use it. So a terminal transition costs one metric write instead of up
 to four — batching amortises the mutex and the commit, not the number of upserts.
 
-The 20 names in `operations::METRIC_NAMES` (`operations.rs:28-50`) that flow
+The 25 names in the `Metric` vocabulary (`crates/eggwork-server/src/lib.rs::node_metrics`) that flow
 through this store:
 
 | Name | Incremented at | Measures |
 |---|---|---|
-| `executions_accepted` | `lib.rs:1791` | New execution identities durably reserved (`ReserveResult::Created`) |
-| `rejected_route` | `lib.rs:729` | Requests with no matching route |
-| `rejected_unauthenticated` | `lib.rs:733` | Requests without a resolvable verified principal |
-| `rejected_unauthorized` | `lib.rs:748` | Principal failed operation/resource authorization |
-| `rejected_invalid` | `lib.rs:1051, 1172, 1545, 1554, 1562, 1609, 1624, 1651, 1749` | Malformed spec, bad schema version, unusable workspace, runner-request build failure |
-| `rejected_draining` | `lib.rs:1572, 1705` | Submit refused because the node is draining (both checks) |
-| `rejected_capability` | `lib.rs:1580, 1588, 1596` | Isolation / resource / network requirement unavailable |
-| `rejected_busy` | `lib.rs:1715` | `max_active_executions` semaphore exhausted |
-| `rejected_storage` | `lib.rs:1734, 1837` | In-memory `MAX_RECENT_EXECUTIONS` (1024) or durable `MAX_EXECUTION_IDENTITIES` (2048) |
-| `event_history_resync` | `lib.rs:2326` | Client cursor fell behind `base_sequence` → 410 |
-| `stdout_bytes` / `stderr_bytes` | `lib.rs:2499-2500` | Bytes the runner reported as produced, by `execution_result` (not journal bytes) |
-| `terminal_succeeded` / `terminal_failed` / `terminal_cancelled` / `terminal_timed_out` / `terminal_interrupted` | `lib.rs:2488-2498` (by outcome) and `lib.rs:331` (by `recover()` count) | Terminal outcomes; `terminal_interrupted` is the only one incremented at startup |
-| `cleanup_failures` | `lib.rs:2502` | Terminal results carrying a `cleanup_warning` |
-| `blob_upload_bytes` / `blob_download_bytes` | `lib.rs:1296, 1324` | Data-plane byte counters that happen to live in this node DB |
+| `executions_accepted` | `crates/eggwork-server/src/lib.rs::execute` | New execution identities durably reserved (`ReserveResult::Created`) |
+| `rejected_route` | `crates/eggwork-server/src/lib.rs::dispatch` | Requests with no matching route |
+| `rejected_unauthenticated` | `crates/eggwork-server/src/lib.rs::dispatch` | Requests without a resolvable verified principal |
+| `rejected_unauthorized` | `crates/eggwork-server/src/lib.rs::dispatch` | Principal failed operation/resource authorization |
+| `rejected_invalid` | `crates/eggwork-server/src/lib.rs::workspace_create` | Malformed spec, bad schema version, unusable workspace, runner-request build failure |
+| `rejected_draining` | `crates/eggwork-server/src/lib.rs::execute` | Submit refused because the node is draining (both checks) |
+| `rejected_capability` | `crates/eggwork-server/src/lib.rs::execute` | Isolation / resource / network requirement unavailable |
+| `rejected_busy` | `crates/eggwork-server/src/lib.rs::execute` | `max_active_executions` semaphore exhausted |
+| `rejected_storage` | `crates/eggwork-server/src/lib.rs::execute` | In-memory `MAX_RECENT_EXECUTIONS` (1024) or durable `MAX_EXECUTION_IDENTITIES` (2048) |
+| `event_history_resync` | `crates/eggwork-server/src/lib.rs::event_response` | Client cursor fell behind `base_sequence` → 410 |
+| `stdout_bytes` / `stderr_bytes` | `crates/eggwork-server/src/lib.rs::run_execution` | Bytes the runner reported as produced, by `execution_result` (not journal bytes) |
+| `terminal_succeeded` / `terminal_failed` / `terminal_cancelled` / `terminal_timed_out` / `terminal_interrupted` | `crates/eggwork-server/src/lib.rs::run_execution` (by outcome) and `crates/eggwork-server/src/lib.rs::NodeServer::start` (by `recover()` count) | Terminal outcomes; `terminal_interrupted` is the only one incremented at startup |
+| `cleanup_failures` | `crates/eggwork-server/src/lib.rs::run_execution` | Terminal results carrying a `cleanup_warning` |
+| `blob_upload_bytes` / `blob_download_bytes` | `crates/eggwork-server/src/lib.rs::blob_upload` | Data-plane byte counters that happen to live in this node DB |
+| `workspace_manifest_registrations` / `workspace_derived_requests` / `workspace_derived_hits` / `workspace_patch_entries` / `workspace_base_missing` | `crates/eggwork-server/src/lib.rs::workspace_derive_metrics` | The workspace derivation counters |
 
-Gap worth knowing: five names the server writes — `workspace_manifest_
-registrations`, `workspace_derived_requests`, `workspace_derived_hits`,
-`workspace_patch_entries`, `workspace_base_missing` (`lib.rs:1070, 1130, 1192-1208`)
-— are **not** in `METRIC_NAMES`, so `operations::metrics_snapshot`
-(`operations.rs:781`, `SELECT name,value FROM node_metrics`) silently discards
-them: it seeds only the fixed list and skips unknown names. They accumulate
-correctly in the table and are simply invisible to the CLI.
+The vocabulary is closed, and that is the point: `increment_metric` and
+`increment_metrics` accept a `Metric` and nothing else, so a counter the server
+increments but the operator surface does not name cannot exist. The report path
+reads `Metric::ALL`, so the list that decides what may be incremented is the
+same list that decides what is reported. This list used to live in
+`operations.rs` as a hand-maintained `METRIC_NAMES`, and the report path
+copied a stored value only when the name was already in its map; the five
+workspace derivation counters were incremented on real traffic and silently
+dropped by the report. The gap is closed by construction now, not by a list
+being kept in step.
 
 Also note `metrics_snapshot` reads the live database read-only while a node may
-be writing: WAL makes that consistent per-statement, but the 20 counters are
+be writing: WAL makes that consistent per-statement, but the 25 counters are
 individually atomic, so a multi-row snapshot can straddle a commit.
 
 ## Invariants and enforcement
@@ -747,23 +758,23 @@ individually atomic, so a multi-row snapshot can straddle a commit.
 | Invariant | Enforcement site | Test |
 |---|---|---|
 | One row per `(execution_id, generation)` | `PRIMARY KEY (execution_id, generation)` | implicit; `duplicate_identity_is_idempotent_and_conflicting_digest_is_rejected` |
-| Only generation 1 may start an identity | `reserve`, `None if generation != 1 => StaleGeneration` (`store.rs:167`) | not directly unit-tested; `StaleGeneration` reachable via `execute`'s 409 `generation_mismatch` |
-| Generations advance by exactly one from a terminal predecessor | `reserve`, `generation != latest_generation + 1 \|\| !matches!(latest_state, "Succeeded"\|…)` (`store.rs:169-176`) | server test `mtls_authorization_and_fixed_target_execution` (stale-generation cancel → 409) |
-| Same `(id, gen)` + same `(version, digest, principal, lease hash)` is idempotent | `reserve` → `ReserveResult::Existing` (`store.rs:145-150`) | `duplicate_identity_is_idempotent_and_conflicting_digest_is_rejected`; 24-way concurrent submit in `mtls_authorization_and_fixed_target_execution` |
-| Different digest never mutates the existing execution | `reserve` → `ReserveResult::Conflict` (`store.rs:152`); `execute` → 409 | `duplicate_identity_is_idempotent_and_conflicting_digest_is_rejected`; same 409 assertion in the mTLS test |
-| A principal cannot observe another principal's execution | `load_snapshot_for_principal` `AND principal_id = ?3` (`store.rs:263-274`) | `snapshot_lookup_is_principal_fenced_and_hides_foreign_execution`; `cross_principal_execution_fencing_without_lease_oracle` |
+| Only generation 1 may start an identity | `reserve`, `None if generation != 1 => StaleGeneration` (`crates/eggwork-server/src/store.rs::tests::reserve`) | not directly unit-tested; `StaleGeneration` reachable via `execute`'s 409 `generation_mismatch` |
+| Generations advance by exactly one from a terminal predecessor | `reserve`, `generation != latest_generation + 1 \|\| !matches!(latest_state, "Succeeded"\|…)` (`crates/eggwork-server/src/store.rs::tests::reserve`) | server test `mtls_authorization_and_fixed_target_execution` (stale-generation cancel → 409) |
+| Same `(id, gen)` + same `(version, digest, principal, lease hash)` is idempotent | `reserve` → `crates/eggwork-server/src/store.rs::ReserveResult::Existing` | `duplicate_identity_is_idempotent_and_conflicting_digest_is_rejected`; 24-way concurrent submit in `mtls_authorization_and_fixed_target_execution` |
+| Different digest never mutates the existing execution | `reserve` → `crates/eggwork-server/src/store.rs::ReserveResult::Conflict`; `execute` → 409 | `duplicate_identity_is_idempotent_and_conflicting_digest_is_rejected`; same 409 assertion in the mTLS test |
+| A principal cannot observe another principal's execution | `load_snapshot_for_principal` `AND principal_id = ?3` (`crates/eggwork-server/src/store.rs::ExecutionStore::load_snapshot_for_principal`) | `snapshot_lookup_is_principal_fenced_and_hides_foreign_execution`; `cross_principal_execution_fencing_without_lease_oracle` |
 | Raw lease token is never persisted | `lease_hash` = SHA-256 hex; only `lease_token_hash` is a column | none in-file; asserted structurally by `cross_principal_execution_fencing_without_lease_oracle` |
 | Only the lease holder may renew or cancel | `update_lease` `current_hash != lease_token_hash => None` plus `UPDATE … AND lease_token_hash = ?3`; `control` compares `existing.lease_token_hash` and `record.lease_hash` | `cross_principal_execution_fencing_without_lease_oracle` |
-| Renewal is idempotent and never double-extends | `last_renewal_id == Some(renewal_id) => return current_expiry`; `expires = current_expiry.max(requested)` (`store.rs:383-387`) | `lease_renewal_replay_is_idempotent` |
-| An expired lease cannot be renewed | `current_expiry <= unix_millis() => None` (`store.rs:378`) | `expired_lease_terminates_process_with_a_typed_terminal_result`; in-memory mirror at `lib.rs:2117-2124, 2154-2161` |
-| Terminal state is single-assignment | `commit_event` `is_terminal_name(&state) => rollback, Ok(None)`; `publish`'s in-memory `is_terminal` early return | repeated-cancel case in the lifecycle integration test (one `Cancelling`, one `Cancelled`) |
-| State and its event commit atomically | one `Immediate` transaction around `UPDATE` + `INSERT` (`store.rs:294-344`) | `recovery_marks_uncertain_work_interrupted_and_never_replays_it` (asserts the appended event and the advanced sequence) |
+| Renewal is idempotent and never double-extends | `last_renewal_id == Some(renewal_id) => return current_expiry`; `expires = current_expiry.max(requested)` (`crates/eggwork-server/src/store.rs::ExecutionStore::update_lease`) | `lease_renewal_replay_is_idempotent` |
+| An expired lease cannot be renewed | `current_expiry <= unix_millis() => None` (`crates/eggwork-server/src/store.rs::ExecutionStore::update_lease`) | `expired_lease_terminates_process_with_a_typed_terminal_result`; in-memory mirror at `crates/eggwork-server/src/lib.rs::tests::expired_lease_terminates_process_with_a_typed_terminal_result` |
+| Terminal state is single-assignment | `commit_event`'s `ExecutionState::is_terminal` check `=> rollback, Ok(None)`; `publish`'s in-memory `is_terminal()` early return | repeated-cancel case in the lifecycle integration test (one `Cancelling`, one `Cancelled`) |
+| State and its event commit atomically | one `Immediate` transaction around `UPDATE` + `INSERT` (`crates/eggwork-server/src/store.rs::ExecutionStore::commit_event`) | `recovery_marks_uncertain_work_interrupted_and_never_replays_it` (asserts the appended event and the advanced sequence) |
 | Event sequences are gap-free within a generation | read `next_sequence` + write `next_sequence = sequence + 1` in one `Immediate` transaction; `PRIMARY KEY (id, gen, sequence)` | `recovery_...` asserts `events[2].sequence.get() == 3`; `event_journal_trims_...` asserts the retained head equals `base_sequence` |
 | Events are scoped to a generation | `load_page` filters on `execution_id` **and** `generation` | `event_journal_trims_by_count_and_bytes_with_explicit_base_cursor` |
-| Retention is bounded by count and bytes | `trim_events` loop after each insert (`store.rs:607-630`) | `event_journal_trims_by_count_and_bytes_with_explicit_base_cursor` (300 × 2 KiB events) |
-| A single event cannot exceed the byte ceiling | `encoded.len() > MAX_RETAINED_EVENT_BYTES` → `InvalidEvent` (`store.rs:321-323`); payload cap from `ExecutionEvent::validate` | not directly asserted in-file |
+| Retention is bounded by count and bytes | `trim_events` loop after each insert (`crates/eggwork-server/src/store.rs::trim_events`) | `event_journal_trims_by_count_and_bytes_with_explicit_base_cursor` (300 × 2 KiB events) |
+| A single event cannot exceed the byte ceiling | `encoded.len() > MAX_RETAINED_EVENT_BYTES` → `InvalidEvent` (`crates/eggwork-server/src/store.rs::ExecutionStore::commit_event`); payload cap from `ExecutionEvent::validate` | not directly asserted in-file |
 | An expired cursor gets no partial replay | `load_page` returns empty `events` with the true `base_sequence`; `event_response` maps it to 410 | `event_journal_trims_...` ("expired cursor returns no partial replay") |
-| Identities are capped | `execution_count >= MAX_EXECUTION_IDENTITIES => StorageFull` (`store.rs:181-185`) | none — no test drives the 2048 cap |
+| Identities are capped | `execution_count >= MAX_EXECUTION_IDENTITIES => StorageFull` (`crates/eggwork-server/src/store.rs::tests::reserve`) | none — no test drives the 2048 cap |
 | Recovery interrupts, never replays | `recover()` sets `Interrupted` + `ExecutionFailure::Interrupted`, spawns nothing | `recovery_marks_uncertain_work_interrupted_and_never_replays_it` (asserts idempotent second pass); `restart_recovers_uncertain_execution_as_interrupted_without_replay` |
 | One node process owns the state directory | `acquire_state_lock` `try_lock_exclusive` before `ExecutionStore::open` | `operator_drain_persists_across_node_restart` asserts `AlreadyRunning` |
 | Drain is durable across restart | `set_persistent_drain` atomic rename + dir fsync; `is_persistently_draining` existence check | `operator_drain_persists_across_node_restart`; `drain_rejects_new_admission_while_terminal_records_survive`; `concurrent_drain_admission_outcomes_are_closed` |
@@ -782,7 +793,7 @@ In-file (`store.rs` `mod tests` - 5 `#[tokio::test]`s, each on a fresh
 | `lease_renewal_replay_is_idempotent` | the same `renewal_id` replayed with a *later* requested expiry returns the identical persisted deadline |
 
 
-Server-level tests that exercise this store (in `lib.rs` `mod tests`):
+Server-level tests that exercise this store (in `crates/eggwork-server/src/lib.rs` `mod tests`):
 
 - `mtls_authorization_and_fixed_target_execution` — the 24-way
   `join_all` of identical `execute` calls (line ~3831) against one handle, with
@@ -839,13 +850,15 @@ Honest gaps:
   process — confirm that invariant is never relaxed.
 - **The state machine is not enforced by the store.** `commit_event` accepts any
   non-terminal → non-terminal transition; all legality lives in `publish` and
-  its callers, so a new call site could persist an illegal transition. Compounding
-  this, the nonterminal/terminal sets are spelled out in at least four places —
-  `store::is_terminal_name`, `recover()`'s SQL `IN` list, `lib.rs::is_terminal`,
-  and the `operations.rs` active filters — with nothing enforcing agreement when
-  a state variant is added.
+  its callers, so a new call site could persist an illegal transition. The
+  nonterminal/terminal *classification* itself is no longer duplicated: since
+  ADR-0008 it is owned by `eggwork-core`'s `ExecutionState::is_terminal` /
+  `is_non_terminal`, and `store::stored_state_is_terminal`,
+  `recover()`'s SQL `IN` list, and the `operations.rs` active filters all
+  derive from it, so adding a state variant cannot make them disagree. What
+  remains unenforced is the *legality* of a transition, not the vocabulary.
 - **Unchecked integer narrowing.** `ExecutionGeneration::new` only rejects `0`
-  (`eggwork-core/src/lib.rs:113-120`), yet the store does
+  (`crates/eggwork-core/src/lib.rs::ExecutionGeneration`), yet the store does
   `snapshot.generation.get() as i64` in **eleven** places (an earlier revision of this
   document said six); a generation above
   `i64::MAX` wraps negative and would be written to the PK. Same class of issue
@@ -854,10 +867,10 @@ Honest gaps:
   clamps in `unix_millis` / `lease_ttl` conversions are currently safe, but
   `next_sequence` is genuinely unbounded over a long execution.
 - **Lease fencing correctness.** `update_lease` is fenced at both the read and
-  the write. But `control` (`lib.rs:2086-2092`) *additionally* compares the
+  the write. But `crates/eggwork-server/src/lib.rs::control` *additionally* compares the
   in-memory `record.lease_hash`, and records loaded at startup get
-  `lease_hash: String::new()` (`lib.rs:369`), as does `events_route`'s
-  `recovered_record` (`lib.rs:2297`) — a recovered record's in-memory lease hash
+  `lease_hash: String::new()` (`crates/eggwork-server/src/lib.rs::NodeServer::start`), as does `events_route`'s
+  `crates/eggwork-server/src/lib.rs::recovered_record` — a recovered record's in-memory lease hash
   is empty by construction, so any future control path relying on that field for
   a recovered execution would be wrong. Separately, a *different* `renewal_id`
   with an earlier requested expiry is silently clamped by
@@ -880,14 +893,15 @@ Honest gaps:
   the degradation mode is an unexplained 503 with no operator remedy. The
   constant also counts *(id, generation)* rows, not identities.
 - **Error-model and constant hygiene.** `StoreError::InvalidEvent` is reused for
-  a bad metric name (`store.rs:484-486`), so metric failures and event bound
+  a bad metric name (`crates/eggwork-server/src/store.rs::ExecutionStore::increment_metric`), so metric failures and event bound
   violations are indistinguishable at the type level;
   `MAX_RETAINED_EVENT_BYTES` does double duty as both a per-event ceiling and a
   per-generation retention ceiling, with `MAX_EVENT_CHUNK_BYTES` (64 KiB) as the
   actually-binding per-event limit.
-- **Observability gap.** Five `workspace_*` counters are written through this
-  store but absent from `METRIC_NAMES`, so `operations::metrics_snapshot` reads
-  and discards them.
+- **Observability.** The metric vocabulary is closed: the producers own it
+  (`crates/eggwork-server/src/lib.rs::node_metrics`), `increment_metric` accepts a
+  `Metric` and nothing else, and the report reads that same declaration, so no
+  counter written through this store can be invisible to the operator.
 - **No SQL injection surface.** Every statement is a literal with `?n`
   placeholders and `params!`/array bindings; there is no dynamic SQL
   construction anywhere in `store.rs`, both `ORDER BY` clauses are fixed, and
@@ -908,5 +922,5 @@ Honest gaps:
 - [Long-term specification §8, §10, §18](../plans/000-long-term-specification.md)
 
 `server-node.md`, `data-plane.md`, and `operations-cli.md` are the companion
-deep dives for `lib.rs`, the data-plane stores, and `operations.rs`
+deep dives for `crates/eggwork-server/src/lib.rs`, the data-plane stores, and `crates/eggwork-server/src/operations.rs`
 respectively.

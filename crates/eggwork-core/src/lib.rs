@@ -37,6 +37,276 @@ pub const MAX_WORKSPACE_PATH_BYTES: usize = 1024 * 1024;
 pub const MAX_WORKSPACE_DEPTH: usize = 128;
 pub const MAX_WORKSPACE_LOGICAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Prefix of every diagnostic payload.
+///
+/// A diagnostic is carried by [`ExecutionEventKind::Diagnostic`] as a single
+/// bounded string. The grammar is
+/// `eggwork.diagnostic.<class>.v1 key=value key=value …`, so the prefix and
+/// the schema suffix bracket the class name and make the payload
+/// self-describing: a reader can tell what kind of fact it is holding without
+/// out-of-band knowledge.
+pub const DIAGNOSTIC_PREFIX: &str = "eggwork.diagnostic.";
+
+/// Schema version suffix of every diagnostic payload.
+pub const DIAGNOSTIC_SCHEMA_SUFFIX: &str = ".v1";
+
+/// The class of a diagnostic that reports a requested best-effort filesystem
+/// isolation that was not applied.
+pub const DIAGNOSTIC_CLASS_ISOLATION_DEGRADED: &str = "isolation.degraded";
+
+/// The class of a diagnostic that reports a requested best-effort resource
+/// enforcement that was not applied.
+pub const DIAGNOSTIC_CLASS_RESOURCES_DEGRADED: &str = "resources.degraded";
+
+/// The class of a diagnostic that reports declared outputs the node could not
+/// capture.
+///
+/// A capture failure is not a degradation of a best-effort request: the caller
+/// declared the outputs and the node owns delivering them, so the diagnostic
+/// names the failure instead of reporting a `NotApplied` outcome.
+pub const DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED: &str = "artifact.capture.failed";
+
+/// The closed set of diagnostic classes. A payload naming anything else is
+/// refused rather than guessed at, because a class is what a consumer
+/// dispatches on.
+pub const DIAGNOSTIC_CLASSES: [&str; 3] = [
+    DIAGNOSTIC_CLASS_ISOLATION_DEGRADED,
+    DIAGNOSTIC_CLASS_RESOURCES_DEGRADED,
+    DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED,
+];
+
+/// Ceiling on a whole diagnostic payload.
+///
+/// The bound is deliberately the same as one event-metadata value: a
+/// diagnostic is operator-facing text carried inside an event, so it must not
+/// be able to dominate the event it rides in.
+pub const MAX_DIAGNOSTIC_PAYLOAD_BYTES: usize = MAX_METADATA_VALUE_BYTES;
+
+/// Ceiling on one diagnostic key.
+pub const MAX_DIAGNOSTIC_KEY_BYTES: usize = 32;
+
+/// The literal marker appended to a diagnostic value that had to be shortened.
+///
+/// The marker is what makes truncation *observable*: a reader can tell a
+/// shortened reason from a complete one, so a bounded payload never silently
+/// reads as a complete statement.
+pub const DIAGNOSTIC_TRUNCATION_MARKER: &str = "...[truncated]";
+
+/// Errors from building or parsing a diagnostic payload.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DiagnosticError {
+    #[error("diagnostic class {0} is not in the closed class set")]
+    UnknownClass(String),
+    #[error("diagnostic key {0} is not a valid diagnostic key")]
+    InvalidKey(String),
+    #[error("diagnostic key {0} is reserved")]
+    ReservedKey(String),
+    #[error("diagnostic payload does not match the documented grammar")]
+    InvalidGrammar,
+    #[error("diagnostic payload exceeds its {max}-byte limit")]
+    TooLong { max: usize },
+}
+
+/// A bounded, machine-readable diagnostic payload.
+///
+/// The payload is built from a class drawn from [`DIAGNOSTIC_CLASSES`] and an
+/// ordered list of key/value pairs, and is rendered by [`DiagnosticPayload::build`]
+/// as `eggwork.diagnostic.<class>.v1 key=value key=value …`.
+///
+/// Two bounds are enforced here rather than at the call site, because a
+/// diagnostic rides inside an event and a caller that forgets to bound it would
+/// otherwise be able to overflow the event envelope:
+///
+/// * the assembled payload never exceeds [`MAX_DIAGNOSTIC_PAYLOAD_BYTES`];
+/// * a value that does not fit is shortened on a UTF-8 character boundary and
+///   gains [`DIAGNOSTIC_TRUNCATION_MARKER`], so the loss is visible in the
+///   payload instead of being silent.
+///
+/// Values are normalised to printable ASCII (everything outside `!`..=`~`
+/// becomes `_`) so that the space-separated `key=value` grammar stays
+/// unambiguous: a value can never contain the separator or a newline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticPayload {
+    class: String,
+    fields: Vec<(String, String)>,
+}
+
+impl DiagnosticPayload {
+    /// Creates a payload for a class in the closed set.
+    ///
+    /// A class outside [`DIAGNOSTIC_CLASSES`] is refused: the class is what a
+    /// consumer dispatches on, so an unknown one cannot be honoured.
+    pub fn new(class: &str) -> Result<Self, DiagnosticError> {
+        if !DIAGNOSTIC_CLASSES.contains(&class) {
+            return Err(DiagnosticError::UnknownClass(class.to_owned()));
+        }
+        Ok(Self {
+            class: class.to_owned(),
+            fields: Vec::new(),
+        })
+    }
+
+    /// The diagnostic class.
+    pub fn class(&self) -> &str {
+        &self.class
+    }
+
+    /// Adds a key/value pair.
+    ///
+    /// The key must be a lowercase ASCII token of at most
+    /// [`MAX_DIAGNOSTIC_KEY_BYTES`] bytes and must not be `class`, which the
+    /// builder derives from the payload's own class.
+    pub fn set(
+        &mut self,
+        key: &str,
+        value: impl Into<String>,
+    ) -> Result<&mut Self, DiagnosticError> {
+        if key == "class" {
+            return Err(DiagnosticError::ReservedKey(key.to_owned()));
+        }
+        if !valid_diagnostic_key(key) {
+            return Err(DiagnosticError::InvalidKey(key.to_owned()));
+        }
+        let value = normalize_diagnostic_value(&value.into());
+        self.fields.push((key.to_owned(), value));
+        Ok(self)
+    }
+
+    /// Renders the bounded payload.
+    ///
+    /// The result is never longer than [`MAX_DIAGNOSTIC_PAYLOAD_BYTES`]. When
+    /// the fields do not fit, values are shortened in insertion order: the
+    /// first value that does not fit is cut on a UTF-8 character boundary and
+    /// gains [`DIAGNOSTIC_TRUNCATION_MARKER`], and the fields after it are
+    /// omitted. Insert the free-form `reason` last so that it absorbs the
+    /// overage and the structured keys survive intact.
+    pub fn build(&self) -> String {
+        let prefix = format!(
+            "{DIAGNOSTIC_PREFIX}{}{DIAGNOSTIC_SCHEMA_SUFFIX}",
+            self.class
+        );
+        // The class is part of the prefix and of the key set, and it is drawn
+        // from a closed set, so it is never shortened.
+        let fixed = prefix.len() + 1 + "class=".len() + self.class.len();
+        let mut budget = MAX_DIAGNOSTIC_PAYLOAD_BYTES.saturating_sub(fixed);
+        let mut rendered: Vec<String> = Vec::with_capacity(self.fields.len());
+        for (key, value) in &self.fields {
+            let overhead = 1 + key.len() + 1;
+            let available = budget.saturating_sub(overhead);
+            if value.len() <= available {
+                rendered.push(format!("{key}={value}"));
+                budget -= overhead + value.len();
+                continue;
+            }
+            let marker = DIAGNOSTIC_TRUNCATION_MARKER;
+            if overhead + marker.len() > budget {
+                // Not even the marker fits: the field is omitted rather than
+                // pushed past the bound.
+                continue;
+            }
+            let keep = available - marker.len();
+            rendered.push(format!("{key}={}{marker}", truncate_utf8(value, keep)));
+            budget -= overhead + keep + marker.len();
+        }
+        let mut payload = prefix;
+        payload.push_str(" class=");
+        payload.push_str(&self.class);
+        for part in rendered {
+            payload.push(' ');
+            payload.push_str(&part);
+        }
+        payload
+    }
+
+    /// Parses a payload back into its class and fields.
+    ///
+    /// This is the validator a consumer uses to decide whether a diagnostic it
+    /// received is well formed. It refuses a payload that does not match the
+    /// documented grammar, names a class outside the closed set, exceeds the
+    /// bound, or omits one of the required keys.
+    pub fn parse(payload: &str) -> Result<Self, DiagnosticError> {
+        if payload.len() > MAX_DIAGNOSTIC_PAYLOAD_BYTES {
+            return Err(DiagnosticError::TooLong {
+                max: MAX_DIAGNOSTIC_PAYLOAD_BYTES,
+            });
+        }
+        let rest = payload
+            .strip_prefix(DIAGNOSTIC_PREFIX)
+            .ok_or(DiagnosticError::InvalidGrammar)?;
+        let (class, rest) = rest
+            .split_once(DIAGNOSTIC_SCHEMA_SUFFIX)
+            .ok_or(DiagnosticError::InvalidGrammar)?;
+        if !DIAGNOSTIC_CLASSES.contains(&class) {
+            return Err(DiagnosticError::UnknownClass(class.to_owned()));
+        }
+        let mut parsed = Self::new(class)?;
+        for token in rest.split_whitespace() {
+            let (key, value) = token
+                .split_once('=')
+                .ok_or(DiagnosticError::InvalidGrammar)?;
+            if key == "class" {
+                if value != class {
+                    return Err(DiagnosticError::InvalidGrammar);
+                }
+                continue;
+            }
+            if !valid_diagnostic_key(key) {
+                return Err(DiagnosticError::InvalidKey(key.to_owned()));
+            }
+            parsed.fields.push((key.to_owned(), value.to_owned()));
+        }
+        // `class` is implied by the prefix; the other two are the minimum key
+        // set every diagnostic has to carry, so a payload without them is not
+        // a diagnostic this grammar can describe.
+        for required in ["requirement", "reason"] {
+            if !parsed.fields.iter().any(|(key, _)| key == required) {
+                return Err(DiagnosticError::InvalidGrammar);
+            }
+        }
+        Ok(parsed)
+    }
+}
+
+/// A diagnostic key is a lowercase ASCII token.
+fn valid_diagnostic_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_DIAGNOSTIC_KEY_BYTES
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+/// Normalises a diagnostic value to printable ASCII.
+///
+/// The grammar separates fields with spaces, so a value that could contain a
+/// space would make the payload ambiguous. Every character outside `!`..=`~`
+/// becomes `_`, which keeps the value a single token without inventing an
+/// escaping scheme a reader would have to know about.
+fn normalize_diagnostic_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if ('!'..='~').contains(&character) {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Cuts a string to at most `max_bytes`, on a UTF-8 character boundary.
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
     #[error("{field} must not be empty")]
@@ -493,55 +763,93 @@ impl fmt::Debug for CommandSpec {
             .finish()
     }
 }
+/// Validate an argv vector against the core contract.
+///
+/// This is the single owner of the argv rules: the vector is non-empty, its
+/// length is bounded by [`MAX_ARG_COUNT`], and every entry is bounded by
+/// [`MAX_ARG_BYTES`] and free of NUL. [`CommandSpec::validate`] and the
+/// runner both consume this function, so the two cannot drift apart.
+///
+/// The runner is permitted to be *stricter* than this — it rejects an empty
+/// argv entry, which this contract permits, because an empty entry is a
+/// child-process construction hazard rather than a protocol concern. That
+/// addition is the runner's own rule and it is documented and tested there.
+pub fn validate_argv(argv: &[String]) -> Result<(), ValidationError> {
+    if argv.is_empty() {
+        return Err(ValidationError::Empty { field: "argv" });
+    }
+    if argv.len() > MAX_ARG_COUNT {
+        return Err(ValidationError::TooMany {
+            field: "argv",
+            max: MAX_ARG_COUNT,
+        });
+    }
+    if argv
+        .iter()
+        .any(|a| a.len() > MAX_ARG_BYTES || a.as_bytes().contains(&0))
+    {
+        return Err(ValidationError::OutOfRange {
+            field: "argv entry",
+        });
+    }
+    Ok(())
+}
+
+/// Validate a complete environment list against the core contract.
+///
+/// This is the single owner of the environment-entry rules: the list length is
+/// bounded by [`MAX_ENV_COUNT`], every entry's name and value satisfy
+/// [`EnvironmentEntry::new`], and no two entries share a name.
+///
+/// The entries are re-validated rather than trusted, because
+/// [`EnvironmentEntry`] has public fields: a caller can build one that
+/// [`EnvironmentEntry::new`] would have refused. [`CommandSpec::validate`] and
+/// the runner both consume this function.
+pub fn validate_environment_entries(entries: &[EnvironmentEntry]) -> Result<(), ValidationError> {
+    if entries.len() > MAX_ENV_COUNT {
+        return Err(ValidationError::TooMany {
+            field: "environment",
+            max: MAX_ENV_COUNT,
+        });
+    }
+    for entry in entries {
+        EnvironmentEntry::new(&entry.name, &entry.value)?;
+    }
+    let mut environment_names = std::collections::HashSet::with_capacity(entries.len());
+    if entries
+        .iter()
+        .any(|entry| !environment_names.insert(entry.name.as_str()))
+    {
+        return Err(ValidationError::InvalidSyntax {
+            field: "duplicate environment name",
+        });
+    }
+    Ok(())
+}
+
+/// Validate an execution timeout against the core contract.
+///
+/// This is the single owner of the timeout rule: the timeout is non-zero and
+/// no longer than [`MAX_TIMEOUT`]. [`CommandSpec::validate`] and the runner
+/// both consume this function.
+pub fn validate_timeout(timeout: Duration) -> Result<(), ValidationError> {
+    if timeout.is_zero() || timeout > MAX_TIMEOUT {
+        return Err(ValidationError::OutOfRange { field: "timeout" });
+    }
+    Ok(())
+}
+
 impl CommandSpec {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.argv.is_empty() {
-            return Err(ValidationError::Empty { field: "argv" });
-        }
-        if self.argv.len() > MAX_ARG_COUNT {
-            return Err(ValidationError::TooMany {
-                field: "argv",
-                max: MAX_ARG_COUNT,
-            });
-        }
-        if self
-            .argv
-            .iter()
-            .any(|a| a.len() > MAX_ARG_BYTES || a.as_bytes().contains(&0))
-        {
-            return Err(ValidationError::OutOfRange {
-                field: "argv entry",
-            });
-        }
-        if self.environment.len() > MAX_ENV_COUNT {
-            return Err(ValidationError::TooMany {
-                field: "environment",
-                max: MAX_ENV_COUNT,
-            });
-        }
-        for e in &self.environment {
-            EnvironmentEntry::new(&e.name, &e.value)?;
-        }
-        let mut environment_names =
-            std::collections::HashSet::with_capacity(self.environment.len());
-        if self
-            .environment
-            .iter()
-            .any(|entry| !environment_names.insert(entry.name.as_str()))
-        {
-            return Err(ValidationError::InvalidSyntax {
-                field: "duplicate environment name",
-            });
-        }
+        validate_argv(&self.argv)?;
+        validate_environment_entries(&self.environment)?;
         if self.declared_outputs.len() > MAX_OUTPUTS {
             return Err(ValidationError::TooMany {
                 field: "declared outputs",
                 max: MAX_OUTPUTS,
             });
         }
-        if self.timeout_millis == 0 || self.timeout_millis > MAX_TIMEOUT.as_millis() as u64 {
-            return Err(ValidationError::OutOfRange { field: "timeout" });
-        }
+        validate_timeout(Duration::from_millis(self.timeout_millis))?;
         self.stdin.validate()?;
         self.output.validate()?;
         self.resources.validate()?;
@@ -896,6 +1204,89 @@ pub enum ExecutionState {
     TimedOut,
     Interrupted,
 }
+
+/// Every [`ExecutionState`] variant, in declaration order.
+///
+/// The classification below is written as exhaustive matches over the enum, so
+/// a tenth variant is a compile error in this crate rather than a state the
+/// server has never been told about. This array is the range the contract
+/// tests enumerate, which keeps those tests from being satisfiable by a
+/// hand-written list of nine variants that a new one could join unnoticed.
+pub const ALL_EXECUTION_STATES: [ExecutionState; 9] = [
+    ExecutionState::Accepted,
+    ExecutionState::Preparing,
+    ExecutionState::Running,
+    ExecutionState::Cancelling,
+    ExecutionState::Succeeded,
+    ExecutionState::Failed,
+    ExecutionState::Cancelled,
+    ExecutionState::TimedOut,
+    ExecutionState::Interrupted,
+];
+
+impl ExecutionState {
+    /// Whether this state is terminal.
+    ///
+    /// Terminal means the execution has finished and its outcome is settled:
+    /// no later event can change it. The set is spelled out with nine
+    /// exhaustive arms and no wildcard, so adding a variant to
+    /// [`ExecutionState`] breaks the build here instead of producing a state
+    /// that every consumer silently classifies as still running.
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            ExecutionState::Succeeded
+            | ExecutionState::Failed
+            | ExecutionState::Cancelled
+            | ExecutionState::TimedOut
+            | ExecutionState::Interrupted => true,
+            ExecutionState::Accepted
+            | ExecutionState::Preparing
+            | ExecutionState::Running
+            | ExecutionState::Cancelling => false,
+        }
+    }
+
+    /// Whether this state is still in flight.
+    ///
+    /// The exact complement of [`ExecutionState::is_terminal`]. Both are
+    /// exhaustive over the same nine arms, so the two can never disagree
+    /// about a variant — and a variant added to the enum has to be placed in
+    /// one arm of each.
+    pub fn is_non_terminal(&self) -> bool {
+        match self {
+            ExecutionState::Accepted
+            | ExecutionState::Preparing
+            | ExecutionState::Running
+            | ExecutionState::Cancelling => true,
+            ExecutionState::Succeeded
+            | ExecutionState::Failed
+            | ExecutionState::Cancelled
+            | ExecutionState::TimedOut
+            | ExecutionState::Interrupted => false,
+        }
+    }
+
+    /// The canonical wire spelling of this state.
+    ///
+    /// This is the PascalCase spelling `serde` derives for the enum, and it is
+    /// the value a server stores in its journal's `state` column. The store
+    /// reads that column back as text, so the spelling has to be one fact
+    /// rather than two: the enum owns it here and the store asks for it.
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            ExecutionState::Accepted => "Accepted",
+            ExecutionState::Preparing => "Preparing",
+            ExecutionState::Running => "Running",
+            ExecutionState::Cancelling => "Cancelling",
+            ExecutionState::Succeeded => "Succeeded",
+            ExecutionState::Failed => "Failed",
+            ExecutionState::Cancelled => "Cancelled",
+            ExecutionState::TimedOut => "TimedOut",
+            ExecutionState::Interrupted => "Interrupted",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionRejection {
     Busy,
@@ -942,6 +1333,54 @@ pub enum ExecutionFinalizationFailure {
     ArtifactCapture,
     Retention,
 }
+
+/// The disposition of a declared-artifact capture on a terminal execution.
+///
+/// The disposition is the first-class answer to "did the declared outputs
+/// arrive?". It exists because a caller cannot answer that question from the
+/// artifact count alone: the count says how many artifacts exist, not how many
+/// were asked for, so a caller would have to compare the count against a
+/// declared-output count it does not have. Worse, a count of zero is
+/// indistinguishable from "the outputs were silently dropped", which is the
+/// failure this type exists to make impossible to read as success.
+///
+/// The states are:
+///
+/// * `NotRequested` — the execution declared no outputs. Nothing was asked
+///   for, so nothing was lost.
+/// * `Completed` — the capture completed and the declared outputs were
+///   published as artifacts.
+/// * `Failed` — the execution declared outputs and the capture did not
+///   complete, so the declared outputs are not all available. The terminal
+///   state says why: an execution that ended in a state where capture is not
+///   performed keeps that state, and a capture that fails after a successful
+///   target moves the terminal state to `Failed`.
+/// * `Unknown` — the node reported no disposition. A snapshot written before
+///   this field existed decodes this way, so a caller must fall back to the
+///   legacy `finalization_failure` marker and the artifact count rather than
+///   read an absence as a fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactCaptureDisposition {
+    NotRequested,
+    Completed,
+    Failed,
+    Unknown,
+}
+
+impl Default for ArtifactCaptureDisposition {
+    /// The default is `Unknown`, not `NotRequested`.
+    ///
+    /// A snapshot written before this field existed says nothing about its
+    /// capture, and `NotRequested` would be a claim — that the caller asked for
+    /// nothing — that the snapshot cannot support. `Unknown` keeps the
+    /// absence an absence, so a caller falls back to the legacy signals
+    /// instead of believing a fabricated one.
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionResult {
     pub state: ExecutionState,
@@ -956,6 +1395,14 @@ pub struct ExecutionResult {
     pub finalization_failure: Option<ExecutionFinalizationFailure>,
     #[serde(default)]
     pub artifact_count: u32,
+    /// The disposition of the declared-artifact capture.
+    ///
+    /// `#[serde(default)]` keeps the field additive in both directions: a peer
+    /// that predates it ignores it (the struct does not deny unknown fields),
+    /// and a peer that has it decodes a snapshot written before it existed as
+    /// `Unknown` rather than refusing the snapshot.
+    #[serde(default)]
+    pub artifact_capture: ArtifactCaptureDisposition,
     #[serde(default)]
     pub sandbox: Option<SandboxResult>,
     #[serde(default)]
@@ -1096,6 +1543,21 @@ impl NodeCapabilities {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The node's status as published on the control plane.
+///
+/// `active_executions` is the number of execution permits the node currently
+/// holds — how many executions it is running right now. It is **not** the
+/// number of durable execution rows in a non-terminal state: an execution
+/// whose process died keeps its row until the node recovers it, and an
+/// idempotent re-request releases its permit while the original execution
+/// still holds one, so the two counts legitimately disagree. Only the running
+/// node knows the permit count, which is why the operator surface reports it
+/// under its own name (`execution_permits_held`) and reports the row count
+/// separately (`non_terminal_executions`).
+///
+/// The field name, the field set, and this meaning are published: a deployed
+/// client deserializes this type, so renaming the field would break every
+/// client that reads node status, and adding one would change the wire shape.
 pub struct NodeStatus {
     pub node_id: NodeId,
     pub draining: bool,
@@ -1343,6 +1805,26 @@ pub struct HostTelemetry {
 /// The contract is additive within version 1: a reader accepts a version-1
 /// payload and refuses a version it does not know, rather than guessing.
 pub const NODE_TELEMETRY_SCHEMA_VERSION: u16 = 1;
+
+/// Wire schema version of the control-plane request and response bodies.
+///
+/// Every producer and every consumer of a versioned control-plane body refers
+/// to this one constant: a client stamps it into the request bodies it
+/// authors, a server refuses a body that does not carry it (HTTP 426
+/// `protocol_version`), and a stored execution snapshot records it. The value
+/// is frozen for schema version 1 — it may not change without an ADR — and
+/// this declaration is the only one in the workspace, because a second copy in
+/// an endpoint crate would let a future bump desynchronise the producer and
+/// the consumer with neither the compiler nor the test suite objecting.
+pub const API_SCHEMA_VERSION: u16 = 1;
+
+/// Capability feature name for argv-based execution.
+///
+/// A node advertises this feature in `NodeCapabilities.features` and a client
+/// requires it before it will submit an execution, so the spelling is a
+/// contract fact between two crates rather than a string each side types for
+/// itself. The value is frozen and may not change without an ADR.
+pub const EXEC_ARGV_CAPABILITY: &str = "exec.argv.v1";
 
 /// The node's host-wide telemetry observation, as served to an authorized caller.
 ///
@@ -1630,9 +2112,171 @@ fn normalize_execution_spec(spec: &ExecutionSpec) -> ExecutionSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A diagnostic payload matches the documented grammar, carries the class
+    /// and the required keys, and round-trips through the parser.
+    #[test]
+    fn a_diagnostic_payload_matches_the_documented_grammar() {
+        let mut payload = DiagnosticPayload::new(DIAGNOSTIC_CLASS_ISOLATION_DEGRADED).unwrap();
+        payload.set("requirement", "best_effort").unwrap();
+        payload.set("profile", "workspace_rw").unwrap();
+        payload
+            .set("reason", "sandbox helper trust check failed")
+            .unwrap();
+        let built = payload.build();
+        assert!(built.starts_with("eggwork.diagnostic.isolation.degraded.v1 "));
+        assert!(built.contains(" class=isolation.degraded"));
+        assert!(built.contains(" requirement=best_effort"));
+        assert!(built.contains(" profile=workspace_rw"));
+        assert!(built.contains(" reason=sandbox_helper_trust_check_failed"));
+        assert!(built.len() <= MAX_DIAGNOSTIC_PAYLOAD_BYTES);
+        let parsed = DiagnosticPayload::parse(&built).unwrap();
+        assert_eq!(parsed.class(), DIAGNOSTIC_CLASS_ISOLATION_DEGRADED);
+    }
+    /// The bound is enforced, and an over-long reason is truncated in a way a
+    /// reader can see rather than silently.
+    #[test]
+    fn an_over_long_diagnostic_reason_is_truncated_observably() {
+        let mut payload = DiagnosticPayload::new(DIAGNOSTIC_CLASS_RESOURCES_DEGRADED).unwrap();
+        payload.set("requirement", "best_effort").unwrap();
+        payload.set("dimension", "memory").unwrap();
+        payload
+            .set("reason", "r".repeat(MAX_DIAGNOSTIC_PAYLOAD_BYTES * 2))
+            .unwrap();
+        let built = payload.build();
+        assert!(built.len() <= MAX_DIAGNOSTIC_PAYLOAD_BYTES);
+        assert!(built.contains(DIAGNOSTIC_TRUNCATION_MARKER));
+        // The structured keys survive the truncation; only the free-form
+        // reason is shortened.
+        assert!(built.contains(" requirement=best_effort"));
+        assert!(built.contains(" dimension=memory"));
+        let reason = built
+            .split_whitespace()
+            .find(|token| token.starts_with("reason="))
+            .unwrap();
+        assert!(reason.ends_with(DIAGNOSTIC_TRUNCATION_MARKER));
+    }
+    /// A value that cannot be shortened without losing its meaning still
+    /// yields a bounded payload, and the bound holds for a multi-byte value.
+    #[test]
+    fn a_diagnostic_payload_stays_within_its_bound() {
+        let mut payload = DiagnosticPayload::new(DIAGNOSTIC_CLASS_ISOLATION_DEGRADED).unwrap();
+        payload.set("requirement", "best_effort").unwrap();
+        payload
+            .set("reason", "é".repeat(MAX_DIAGNOSTIC_PAYLOAD_BYTES))
+            .unwrap();
+        let built = payload.build();
+        assert!(built.len() <= MAX_DIAGNOSTIC_PAYLOAD_BYTES);
+        assert!(built.contains(DIAGNOSTIC_TRUNCATION_MARKER));
+        assert!(DiagnosticPayload::parse(&built).is_ok());
+    }
+    /// The parser refuses what the grammar does not allow: an unknown class, a
+    /// malformed token, an over-long payload, and a missing required key.
+    #[test]
+    fn a_malformed_diagnostic_payload_is_refused() {
+        assert!(DiagnosticPayload::parse("eggwork.diagnostic.nope.v1 class=nope").is_err());
+        assert!(
+            DiagnosticPayload::parse(
+                "eggwork.diagnostic.isolation.degraded.v1 class=isolation.degraded"
+            )
+            .is_err()
+        );
+        assert!(DiagnosticPayload::parse("not a diagnostic").is_err());
+        assert!(DiagnosticPayload::parse(&"x".repeat(MAX_DIAGNOSTIC_PAYLOAD_BYTES + 1)).is_err());
+        assert!(
+            DiagnosticPayload::parse(
+                "eggwork.diagnostic.isolation.degraded.v1 class=isolation.degraded requirement=best_effort"
+            )
+            .is_err()
+        );
+        assert!(DiagnosticPayload::new("isolation.degraded.other").is_err());
+    }
+    /// The capture-failure class joins the closed set, and a class outside it
+    /// is still refused.
+    ///
+    /// The class is what a consumer dispatches on, so adding one is a
+    /// deliberate act and the set stays closed.
+    #[test]
+    fn the_capture_failure_class_is_in_the_closed_class_set() {
+        assert!(DIAGNOSTIC_CLASSES.contains(&DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED));
+        let mut payload = DiagnosticPayload::new(DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED).unwrap();
+        payload.set("requirement", "declared").unwrap();
+        payload.set("outcome", "platform_unavailable").unwrap();
+        payload
+            .set(
+                "reason",
+                "safe artifact capture is unavailable on this platform",
+            )
+            .unwrap();
+        let built = payload.build();
+        assert!(built.starts_with("eggwork.diagnostic.artifact.capture.failed.v1 "));
+        assert!(built.len() <= MAX_DIAGNOSTIC_PAYLOAD_BYTES);
+        // The diagnostic rides inside an event, so its bound has to stay
+        // inside the event envelope. The relationship is a compile-time fact,
+        // not a runtime check.
+        const _: () = assert!(MAX_DIAGNOSTIC_PAYLOAD_BYTES <= MAX_EVENT_CHUNK_BYTES);
+        let parsed = DiagnosticPayload::parse(&built).unwrap();
+        assert_eq!(parsed.class(), DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED);
+    }
+    /// A terminal snapshot written before the capture disposition existed
+    /// still decodes, and decodes as "no disposition reported".
+    ///
+    /// The field is additive, so a peer that has it must not refuse a
+    /// snapshot that lacks it. The default is `Unknown` rather than
+    /// `NotRequested`: an absent field is an absence, and reading it as "the
+    /// caller asked for nothing" would be a claim the snapshot cannot support.
+    #[test]
+    fn a_snapshot_without_the_capture_disposition_decodes_as_unknown() {
+        let legacy = serde_json::json!({
+            "state": "Succeeded",
+            "exit_code": 0,
+            "failure": null,
+            "stdout_bytes": 0,
+            "stderr_bytes": 0,
+            "stdout_omitted": 0,
+            "stderr_omitted": 0,
+            "cleanup_warning": null,
+            "finalization_failure": null,
+            "artifact_count": 0
+        });
+        let decoded: ExecutionResult = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            decoded.artifact_capture,
+            ArtifactCaptureDisposition::Unknown
+        );
+        assert_eq!(
+            ArtifactCaptureDisposition::default(),
+            ArtifactCaptureDisposition::Unknown
+        );
+    }
+    /// The disposition is carried on the wire and survives a round trip.
+    #[test]
+    fn the_capture_disposition_round_trips() {
+        for disposition in [
+            ArtifactCaptureDisposition::NotRequested,
+            ArtifactCaptureDisposition::Completed,
+            ArtifactCaptureDisposition::Failed,
+            ArtifactCaptureDisposition::Unknown,
+        ] {
+            let encoded = serde_json::to_string(&disposition).unwrap();
+            let decoded: ArtifactCaptureDisposition = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, disposition);
+        }
+        assert_eq!(
+            serde_json::to_string(&ArtifactCaptureDisposition::NotRequested).unwrap(),
+            "\"not_requested\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ArtifactCaptureDisposition::Completed).unwrap(),
+            "\"completed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ArtifactCaptureDisposition::Failed).unwrap(),
+            "\"failed\""
+        );
+    }
     fn spec() -> ExecutionSpec {
         ExecutionSpec {
-            schema_version: 1,
+            schema_version: API_SCHEMA_VERSION,
             command: CommandSpec {
                 argv: vec!["echo".into(), "hi".into()],
                 cwd: Some(RelativePath::new("work").unwrap()),

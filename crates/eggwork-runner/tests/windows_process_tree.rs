@@ -48,19 +48,15 @@ const INTERRUPT_AFTER: Duration = Duration::from_millis(3000);
 /// Generous ceiling for fixtures that are supposed to finish on their own.
 const PATIENCE: Duration = Duration::from_secs(120);
 
-/// The environment every execution child is guaranteed to see. Kept in sync
-/// with `baseline_child_environment` in the crate; a mismatch is a contract
-/// change, not a test fix.
-const BASELINE_KEYS: [&str; 8] = [
-    "CI",
-    "GIT_TERMINAL_PROMPT",
-    "NO_COLOR",
-    "PAGER",
-    "PATH",
-    "SystemRoot",
-    "TERM",
-    "windir",
-];
+/// The environment every execution child is guaranteed to see.
+///
+/// The list is the runner's own baseline, not a copy of it: the runner
+/// derives it from the node-owned baseline it actually installs, so this
+/// suite cannot drift from the crate the way a hand-written list can. A
+/// mismatch here is a contract change, not a test fix.
+fn baseline_keys() -> Vec<&'static str> {
+    eggwork_runner::baseline_environment_keys()
+}
 
 fn cmd() -> String {
     std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned())
@@ -537,9 +533,10 @@ async fn environment_is_the_documented_baseline_and_leaks_nothing() {
     let synthesised_by_cmd: [&str; 3] = ["COMSPEC", "PATHEXT", "PROMPT"];
 
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
-    for key in BASELINE_KEYS {
+    let baseline_keys = baseline_keys();
+    for key in &baseline_keys {
         assert!(
-            child_keys.contains(&key),
+            child_keys.contains(key),
             "baseline key {key} missing from the child environment: {child_keys:?}"
         );
     }
@@ -556,7 +553,7 @@ async fn environment_is_the_documented_baseline_and_leaks_nothing() {
         .iter()
         .copied()
         .filter(|key| std::env::var_os(key).is_some())
-        .filter(|key| !BASELINE_KEYS.contains(key))
+        .filter(|key| !baseline_keys.contains(key))
         .filter(|key| !synthesised_by_cmd.contains(key))
         .collect();
     assert!(

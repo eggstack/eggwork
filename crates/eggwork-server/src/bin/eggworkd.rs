@@ -2,25 +2,106 @@ use eggwork_server::deployment;
 use eggwork_server::operations::{
     OperatorConfig, collect_garbage, doctor, execution_page, execution_show, inspect_artifact,
     inspect_blob, inspect_workspace, is_persistently_draining, metrics_snapshot,
-    set_persistent_drain, start_server, storage_summary,
+    observed_permit_count, set_persistent_drain, storage_summary,
 };
+use eggwork_server::service_host::{LifecycleEdge, serve_until_stopped};
 use serde::Serialize;
 use std::{env, path::PathBuf, process::ExitCode};
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// The process modes the daemon has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The ordinary operator CLI.
+    Cli,
+    /// The Windows service control manager entry.
+    ServiceHost,
+}
+
+/// Choose the process mode from the command line.
+///
+/// The mode is explicit. It is never inferred from the parent process, the
+/// session, the environment, or a dispatcher error, and foreground `run`
+/// keeps its existing meaning: only the literal `service-host` verb selects
+/// the dispatcher, and only on Windows.
+fn mode_for(args: &[String]) -> Mode {
+    match args.first().map(String::as_str) {
+        Some("service-host") => Mode::ServiceHost,
+        _ => Mode::Cli,
+    }
+}
+
+/// The node lifecycle, shared by the foreground and the service-hosted paths.
+///
+/// Both paths run the same function, so they converge the same way: stop
+/// admission, cancel and converge the active executions, shut the listener
+/// down, and **wait** for the listener and the executions to finish before
+/// the process exits. Foreground `run` used to call `shutdown()` without
+/// `wait()`, so a foreground stop could return while an execution was still
+/// converging.
+///
+/// The foreground path resolves the stop edge on Ctrl-C, and the
+/// service-hosted path resolves it when the service control manager
+/// delivers `STOP` or `SHUTDOWN`.
+fn main() -> ExitCode {
+    // The mode is chosen **before** an asynchronous runtime exists.
+    //
+    // The Windows service control dispatcher owns the calling thread until the
+    // service exits, so it cannot run inside a Tokio runtime that the
+    // dispatcher thread is not part of. The service-hosted path therefore
+    // enters its own runtime from the service-main callback, and only the
+    // ordinary CLI builds one here.
+    let args: Vec<String> = env::args().skip(1).collect();
+    match mode_for(&args) {
+        Mode::ServiceHost => service_host_entry(),
+        Mode::Cli => cli_entry(args),
+    }
+}
+
+/// The ordinary CLI path.
+fn cli_entry(args: Vec<String>) -> ExitCode {
     // The operator CLI validates TLS server identity locally (config
     // validate/doctor/status/deployment/service) and serves it (run). No
     // global CryptoProvider is installed by the libraries, so install the
     // process default once; without it every TLS config reports invalid.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    match run(env::args().skip(1).collect()).await {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("eggworkd: could not build the async runtime: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    match runtime.block_on(run(args)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("eggworkd: {error}");
             ExitCode::from(2)
         }
     }
+}
+
+/// The Windows service host entry.
+///
+/// The service control manager launches the registered daemon with the argv
+/// `eggworkd service-host --config <absolute-path>`, so this is the mode the
+/// manager starts. The mode is never inferred from the parent process, the
+/// session, the environment, or a dispatcher error.
+#[cfg(windows)]
+fn service_host_entry() -> ExitCode {
+    eggwork_server::service_host::windows::entry()
+}
+
+/// The service host exists only on Windows.
+///
+/// The dispatcher is a Windows service control manager interface; on every
+/// other platform the mode is refused before it can do anything.
+#[cfg(not(windows))]
+fn service_host_entry() -> ExitCode {
+    eprintln!("eggworkd: the service host is only available on Windows");
+    ExitCode::from(2)
 }
 
 async fn run(args: Vec<String>) -> Result<(), String> {
@@ -41,8 +122,13 @@ async fn run(args: Vec<String>) -> Result<(), String> {
     let mut args = args;
     args.drain(config_index..=config_index + 1);
     let index = 1;
-    let config = OperatorConfig::load(&config_path)
-        .map_err(|_| "configuration is invalid or unreadable".to_owned())?;
+    // A configuration fault renders as `[rule] item: action`. The rule is a
+    // stable identifier an operator can grep for, the item is the file or
+    // path that failed — named by role alone when it is secret-bearing — and
+    // the action says what to change. No other error text is interpolated:
+    // the library's other errors are fixed phrases, and a configuration fault
+    // never carries the underlying `io` or `serde_json` message.
+    let config = OperatorConfig::load(&config_path).map_err(|error| error.to_string())?;
     match command.as_str() {
         "config" => match args.get(index).map(String::as_str) {
             Some("validate") => {
@@ -58,9 +144,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             Some("print") => {
                 println!(
                     "{}",
-                    config
-                        .redacted_json()
-                        .map_err(|_| "configuration could not be rendered".to_owned())?
+                    config.redacted_json().map_err(|error| error.to_string())?
                 );
                 Ok(())
             }
@@ -83,30 +167,37 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             // going to print anyway.
             let report = doctor(&config).await;
             if !report.configuration_ok() {
-                return Err("configuration is invalid".to_owned());
+                // The same rule, item, and action every other surface reports.
+                return Err(report
+                    .configuration_detail()
+                    .unwrap_or("configuration is invalid")
+                    .to_owned());
             }
             let page = execution_page(&config, 1, 0)
                 .await
                 .map_err(|_| "execution state is unavailable".to_owned())?;
             let metrics = metrics_snapshot(&config)
                 .map_err(|_| "operator metrics are unavailable".to_owned())?;
+            // The two execution counts are different facts and are reported
+            // under different names: `execution_permits_held` is how many
+            // execution permits the running node holds, and
+            // `non_terminal_executions` is how many durable rows are still in
+            // a non-terminal state. An execution whose process died keeps its
+            // row long after its permit was released, so the two disagree on
+            // exactly the cases an operator is investigating.
             output(
-                &serde_json::json!({"schema_version":1,"node_id":config.node_id,"draining":is_persistently_draining(&config.drain_path()),"active_executions":page.active_executions,"max_active_executions":config.max_active_executions,"execution_records":page.total,"execution_states":page.states,"stdout_bytes":page.stdout_bytes,"stderr_bytes":page.stderr_bytes,"cleanup_failures":page.cleanup_failures,"metrics":metrics,"doctor":report}),
+                &serde_json::json!({"schema_version":1,"node_id":config.node_id,"draining":is_persistently_draining(&config.drain_path()),"execution_permits_held":observed_permit_count(&config),"non_terminal_executions":page.non_terminal_executions,"max_active_executions":config.max_active_executions,"execution_records":page.total,"execution_states":page.states,"stdout_bytes":page.stdout_bytes,"stderr_bytes":page.stderr_bytes,"cleanup_failures":page.cleanup_failures,"metrics":metrics,"doctor":report}),
             )
         }
         "drain" | "undrain" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            config.validate().map_err(|error| error.to_string())?;
             let draining = command == "drain";
             set_persistent_drain(&config.drain_path(), draining)
                 .map_err(|_| "drain state could not be updated".to_owned())?;
             output(&serde_json::json!({"draining":draining,"persistent":true}))
         }
         "executions" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            config.validate().map_err(|error| error.to_string())?;
             match args.get(index).map(String::as_str) {
                 Some("list") => {
                     let options = &args[index + 1..];
@@ -131,10 +222,15 @@ async fn run(args: Vec<String>) -> Result<(), String> {
                 _ => Err(usage().into()),
             }
         }
+        "metrics" => {
+            config.validate().map_err(|error| error.to_string())?;
+            output(
+                &metrics_snapshot(&config)
+                    .map_err(|_| "operator metrics are unavailable".to_owned())?,
+            )
+        }
         "storage" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            config.validate().map_err(|error| error.to_string())?;
             match args.get(index).map(String::as_str) {
                 Some("summary") => output(
                     &storage_summary(&config)
@@ -144,9 +240,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             }
         }
         "inspect" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            config.validate().map_err(|error| error.to_string())?;
             let kind = args
                 .get(index)
                 .map(String::as_str)
@@ -162,9 +256,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             output(&result)
         }
         "gc" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            config.validate().map_err(|error| error.to_string())?;
             let dry_run = !args[index..].iter().any(|arg| arg == "--apply");
             let limit = parse_option(&args[index..], "--limit", 128usize)?.clamp(1, 1024);
             output(
@@ -174,26 +266,52 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             )
         }
         "run" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
-            let server = start_server(&config)
-                .await
-                .map_err(|_| "node failed to start; check doctor and service logs".to_owned())?;
-            println!(
-                "{}",
-                serde_json::json!({"ready":true,"node_id":config.node_id,"local_addr":server.local_addr()})
-            );
-            tokio::signal::ctrl_c()
-                .await
-                .map_err(|_| "could not wait for shutdown signal".to_owned())?;
-            server.shutdown().await;
-            Ok(())
+            config.validate().map_err(|error| error.to_string())?;
+            // The foreground path and the service-hosted path run the same
+            // lifecycle, so a Ctrl-C and a service stop converge the same
+            // way: admission stops, the active executions are cancelled and
+            // waited for, and the listener closes.
+            let (stop, mut stopped) = tokio::sync::watch::channel(false);
+            let observed = stopped.clone();
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                let _ = stop.send(true);
+            });
+            let node_id = config.node_id.clone();
+            serve_until_stopped(
+                &config,
+                || {
+                    let requested = observed.borrow();
+                    *requested
+                },
+                async move {
+                    loop {
+                        let requested = {
+                            let current = stopped.borrow();
+                            *current
+                        };
+                        if requested {
+                            break;
+                        }
+                        if stopped.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                },
+                move |edge| {
+                    if let LifecycleEdge::Ready(local_addr) = edge {
+                        println!(
+                            "{}",
+                            serde_json::json!({"ready":true,"node_id":node_id,"local_addr":local_addr})
+                        );
+                    }
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())
         }
         "deployment" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            config.validate().map_err(|error| error.to_string())?;
             match args.get(index).map(String::as_str) {
                 Some("status") => {
                     let helper_required = config.sandbox_helper.is_some();
@@ -219,9 +337,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             }
         }
         "service" => {
-            config
-                .validate()
-                .map_err(|_| "configuration is invalid".to_owned())?;
+            config.validate().map_err(|error| error.to_string())?;
             service_command(&args[index..]).await
         }
         _ => Err(usage().into()),
@@ -311,32 +427,34 @@ fn product_service_manager(
             std::time::Duration::from_secs(60),
         )
         .map_err(|error| error.to_string())?;
-        return Ok(Box::new(manager));
+        // The macOS branch is the branch's tail expression on macOS, so a
+        // `return` here is a needless return that `clippy -D warnings` rejects
+        // on that target. It does not fire on Linux or Windows, where the
+        // branch is compiled out.
+        Ok(Box::new(manager))
     }
-    // Windows service management is refused, not merely unqualified.
+    // Windows service management goes through Eggup's typed SCM adapter,
+    // which owns the registration and the manager operations. Eggwork hosts
+    // the service process — `eggworkd service-host` joins the dispatcher —
+    // and never registers or manages it itself.
     //
-    // Hosted M004 qualification created the `eggwork-node` SCM registration and
-    // then failed to start it with Windows error 1053, "the service did not
-    // respond to the start request in a timely fashion". The cause is
-    // structural: `eggworkd` has no service-control dispatcher, so the process
-    // the SCM launches never connects back to the manager. The typed adapter
-    // exists and can register the service, which is exactly why leaving the
-    // mutating path enabled would be misleading — it performs a real, partly
-    // successful, ultimately useless mutation.
-    //
-    // Registering the daemon as a Windows service host is a product capability,
-    // not a qualification fix, so it is a separate milestone. Until then this
-    // backend fails closed before any mutation, and Windows service management
-    // is recorded as unsupported. `deployment status` still reports the host
-    // facts, and binary installation plus daemon runtime remain qualified.
+    // The adapter is only reachable now that the daemon can actually answer
+    // a start request: registering a service whose binary never calls
+    // `StartServiceCtrlDispatcherW` produces a registration that can never
+    // reach `Running`, which is the error 1053 the previous milestone
+    // recorded. The host is the reason this branch is no longer a refusal.
     #[cfg(windows)]
     {
+        // The spec is the identity Eggup mutates; the SCM adapter takes the
+        // registration policy instead, so the spec is not read here.
         let _ = spec;
-        let _ = args;
-        Err(
-            "Windows service management is unsupported: the installed daemon does not              implement a service control dispatcher, so a registered service can never              reach Running. Registering an external process would be a working              installation with no service behind it."
-                .into(),
-        )
+        let start_type =
+            deployment::parse_windows_start_type(option_value(args, "--windows-start-type"))
+                .map_err(|error| error.to_string())?;
+        let manager =
+            deployment::windows_scm_manager(start_type, std::time::Duration::from_secs(60))
+                .map_err(|error| error.to_string())?;
+        Ok(Box::new(manager))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     return Err("service management is unsupported on this platform".into());
@@ -387,9 +505,9 @@ fn service_backend() -> &'static str {
     } else if cfg!(target_os = "macos") {
         "launchd"
     } else if cfg!(windows) {
-        // The backend is named for diagnostics; every mutating verb on Windows
-        // is refused before it reaches a manager.
-        "windows-scm-unsupported"
+        // The backend names the manager Eggup drives. On Windows that is the
+        // service control manager, reached through Eggup's typed adapter.
+        "windows-scm"
     } else {
         "unsupported"
     }
@@ -686,5 +804,121 @@ fn output(value: &impl Serialize) -> Result<(), String> {
 }
 
 fn usage() -> &'static str {
-    "usage: eggworkd <run|config validate|config print|doctor|status|drain|undrain|executions list|executions show|storage summary|inspect|gc|deployment status|deployment apply|service spec|service status|service install|service uninstall|service start|service stop|service restart|version> --config <file>; deployment apply accepts local --daemon/--helper candidates; service backends require explicit systemd, launchd, or Windows SCM policy"
+    "usage: eggworkd <run|service-host|config validate|config print|doctor|status|metrics|drain|undrain|executions list|executions show|storage summary|inspect|gc|deployment status|deployment apply|service spec|service status|service install|service uninstall|service start|service stop|service restart|version> --config <file>; deployment apply accepts local --daemon/--helper candidates; service backends require explicit systemd, launchd, or Windows SCM policy; service-host is the Windows service control manager entry and takes --config <absolute-path>"
+}
+
+/// The service-host lifecycle tests.
+///
+/// They live in the binary target on purpose: `cargo test -p eggwork-server
+/// --bin eggworkd` exercises them on Windows without compiling the server's
+/// own Linux-shaped unit tests, which is what makes this surface reachable
+/// from a hosted Windows runner at all.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eggwork_server::service_host::{ReadyRefused, ServiceExit, ServiceHost, ServiceState};
+    use std::time::{Duration, Instant};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn only_the_service_host_verb_enters_the_dispatcher_path() {
+        assert_eq!(
+            mode_for(&args(&["service-host", "--config", "C:\\node.json"])),
+            Mode::ServiceHost
+        );
+        // Every ordinary verb stays on the CLI path. Foreground `run` keeps
+        // its meaning, and nothing else is inferred.
+        for command in [
+            "run",
+            "status",
+            "doctor",
+            "config",
+            "deployment",
+            "service",
+            "version",
+        ] {
+            assert_eq!(
+                mode_for(&args(&[command, "--config", "node.json"])),
+                Mode::Cli,
+                "{command} must not enter the service host path"
+            );
+        }
+        assert_eq!(mode_for(&args(&[])), Mode::Cli);
+    }
+
+    #[test]
+    fn a_running_claim_needs_the_ready_edge() {
+        let host = ServiceHost::new();
+        assert_eq!(host.state(), ServiceState::StartPending);
+        assert!(!host.served());
+        assert_eq!(host.ready(), Ok(ServiceState::Running));
+        assert!(host.served());
+    }
+
+    #[test]
+    fn a_stop_during_start_is_latched() {
+        let host = ServiceHost::new();
+        host.request_stop();
+        assert!(host.stop_requested());
+        assert_eq!(host.ready(), Err(ReadyRefused::StopLatched));
+        // The node never served, so it never claimed to.
+        assert!(!host.served());
+        assert_eq!(host.state(), ServiceState::StartPending);
+    }
+
+    #[test]
+    fn repeated_stop_and_shutdown_controls_are_idempotent() {
+        let host = ServiceHost::new();
+        host.request_stop();
+        host.request_stop();
+        assert!(host.stop_requested());
+        assert_eq!(host.begin_stop(), ServiceState::StopPending);
+        assert_eq!(host.begin_stop(), ServiceState::StopPending);
+        assert_eq!(host.mark_stopped(), ServiceState::Stopped);
+        assert_eq!(host.mark_stopped(), ServiceState::Stopped);
+    }
+
+    #[test]
+    fn the_control_callback_does_not_block() {
+        let host = ServiceHost::new();
+        let started = Instant::now();
+        host.request_stop();
+        host.request_stop();
+        // The callback does no work. A control handler that blocked here
+        // would stall the service control manager's own thread, and the
+        // manager's timeout would turn that into a failed stop.
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "the stop latch took {:?}",
+            started.elapsed()
+        );
+        assert!(host.stop_requested());
+    }
+
+    #[test]
+    fn stopping_reaches_stopped_only_after_the_convergence_edge() {
+        let host = ServiceHost::new();
+        host.ready().expect("the node is ready");
+        host.begin_stop();
+        // Converging is not stopped: the active executions are still being
+        // cancelled and waited for.
+        assert_eq!(host.state(), ServiceState::StopPending);
+        assert_ne!(host.state(), ServiceState::Stopped);
+        host.mark_stopped();
+        assert_eq!(host.state(), ServiceState::Stopped);
+        assert_eq!(host.exit(), ServiceExit::Normal);
+    }
+
+    #[test]
+    fn a_failed_start_reports_stopped_without_running() {
+        let host = ServiceHost::new();
+        assert_eq!(host.fail_start(), ServiceExit::StartFailed);
+        host.mark_stopped();
+        assert_eq!(host.state(), ServiceState::Stopped);
+        assert_eq!(host.exit(), ServiceExit::StartFailed);
+        assert!(!host.served());
+    }
 }

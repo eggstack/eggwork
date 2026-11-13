@@ -138,8 +138,20 @@ receipts.
 One release is one coherent identity across three places:
 
 ```text
-[workspace.package].version  <->  every eggwork-* pin in Cargo.lock  <->  the git tag
+[workspace.package].version  <->  every pin Cargo.lock records for this repository  <->  the git tag
 ```
+
+Two of those three numbers are owned by the repository, and one is not:
+
+- **`[workspace.package].version` is the build assertion.** It is what the
+  binaries report (`eggworkd version`), it is inherited by every crate through
+  `version.workspace = true`, and it is read once — by
+  `scripts/release_candidate_probe.py`, which every release script uses.
+- **The git tag is the release gate.** It says which release this is, and it is
+  the only thing a consumer sees.
+
+They may differ in exactly one respect: the tag may carry a `v` prefix, so
+`v0.1.6` and `0.1.6` name the same release.
 
 Two releases failed on this, and both were caught late:
 
@@ -161,9 +173,27 @@ Before creating a tag, run the local guard:
 python3 scripts/check_release_tag.py v0.1.6
 ```
 
-It is deliberately **not** a CI check — the generated release workflow is
-producer authority, and CI never knows the future tag. It runs at tag time, by
-whoever cuts the tag.
+**This is a step you perform, not a step CI performs.** Whoever cuts the tag
+runs the guard, on the checkout that is about to be tagged, *before* the tag
+exists. Nothing in this repository runs it for you: the generated release
+workflow is producer authority and cannot be hand-edited to add the step, and CI
+never knows the future tag.
+
+What CI *does* run, on every push and every pull request, is the half that
+needs no tag:
+
+```bash
+python3 scripts/check_release_tag.py --coherence
+```
+
+That asserts the repository's own two numbers agree — the manifest's version
+and the versions `Cargo.lock` pins for this repository's packages — which is
+the condition that broke the `v0.1.3` release attempt. The guard's whole
+logic is also exercised against fixtures by the repository's own test suite, so
+it is a checked instrument rather than a trusted one.
+
+If the guard fails, the remediation is in its own output: bump `Cargo.toml`,
+regenerate the lock, rerun the gates, then tag.
 
 ## Design reference
 

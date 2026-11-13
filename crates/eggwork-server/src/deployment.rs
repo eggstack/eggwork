@@ -22,6 +22,14 @@ use serde::{Deserialize, Serialize};
 pub const PRODUCT_ID: &str = "eggwork";
 /// Stable service identity for the installed node daemon.
 pub const SERVICE_ID: &str = "eggwork-node";
+/// The argv verb that identifies the product service on this platform.
+///
+/// Windows launches the daemon through the service control dispatcher, so
+/// the registered argv names the service host explicitly. Every other
+/// platform runs the same daemon in the foreground, so the registered argv
+/// keeps `run` — and the systemd unit and the launchd plist, which render
+/// `run` themselves, stay unchanged.
+pub const SERVICE_HOST_VERB: &str = if cfg!(windows) { "service-host" } else { "run" };
 /// Artifact member identity for the daemon binary.
 pub const MEMBER_DAEMON: &str = "eggworkd";
 /// Artifact member identity for the Linux sandbox helper.
@@ -166,9 +174,11 @@ pub fn install_unit_matrix(helper_required: bool) -> Vec<InstallMember> {
 /// Build the stable `ServiceSpec` for an installed daemon.
 ///
 /// Ownership identity includes the exact installed executable, the critical
-/// `run` argv marker, and the config path (both argv and config participate
+/// argv marker, and the config path (both argv and config participate
 /// so same-name/different-executable or same-name/different-config can never
-/// compare as owned).
+/// compare as owned). The critical argv marker is the platform's service
+/// host verb: `service-host` on Windows, where the daemon joins the service
+/// control dispatcher, and `run` everywhere else.
 pub fn service_spec_for_install(
     executable: &Path,
     config_path: Option<&Path>,
@@ -181,7 +191,7 @@ pub fn service_spec_for_install(
     }
     let id = eggup_service::ServiceId::new(SERVICE_ID)
         .map_err(|_| DeploymentError::new("invalid", "service identity is invalid"))?;
-    let mut args = vec!["run".to_owned()];
+    let mut args = vec![SERVICE_HOST_VERB.to_owned()];
     let mut config = None;
     if let Some(path) = config_path {
         if !path.is_absolute() {
@@ -934,12 +944,10 @@ pub fn launchd_manager(
 /// Construct the fixed Eggwork SCM product policy through Eggup's typed
 /// Windows adapter. No custom account, dependencies, or elevation are used.
 ///
-/// This is the recorded SCM *policy*, retained for review and for a future
-/// service-host milestone. The operator surface does not expose it: hosted M004
-/// qualification proved the installed daemon cannot answer an SCM start
-/// request, so the mutating path fails closed before reaching this function.
+/// This is the recorded SCM *policy*. Eggup owns every mutating operation
+/// against the service control manager; Eggwork only hosts the service
+/// process, which is what makes the registration worth making.
 #[cfg(windows)]
-#[allow(dead_code)]
 pub fn windows_scm_manager(
     start_type: eggup_service::WindowsStartType,
     transition_timeout: Duration,
@@ -953,6 +961,28 @@ pub fn windows_scm_manager(
     )?
     .with_transition_timeout(transition_timeout)?;
     Ok(eggup_service::WindowsScmManager::new(install))
+}
+
+/// Parse the caller-selected Windows start type.
+///
+/// The policy is bounded: three named values, and anything else is refused
+/// before it can reach the manager. The default is `manual`, so a service
+/// that is installed without an explicit start type does not start on boot
+/// behind the operator's back.
+#[cfg(windows)]
+pub fn parse_windows_start_type(
+    value: Option<&str>,
+) -> Result<eggup_service::WindowsStartType, DeploymentError> {
+    match value {
+        Some("automatic") => Ok(eggup_service::WindowsStartType::Automatic),
+        Some("manual") => Ok(eggup_service::WindowsStartType::Manual),
+        Some("disabled") => Ok(eggup_service::WindowsStartType::Disabled),
+        Some(_) => Err(DeploymentError::new(
+            "invalid",
+            "--windows-start-type must be automatic, manual, or disabled",
+        )),
+        None => Ok(eggup_service::WindowsStartType::Manual),
+    }
 }
 
 /// Candidate managers for the current host (selection policy owned by Eggup).
@@ -1045,7 +1075,10 @@ mod tests {
         assert_eq!(owned.id().as_str(), SERVICE_ID);
         assert_eq!(owned.executable(), exe);
         assert_eq!(owned.config(), Some(config));
-        assert!(owned.args().contains(&"run".to_owned()));
+        // The critical argv marker is the platform's service host verb. On
+        // Unix that is `run`; on Windows it is `service-host`, because the
+        // daemon joins the service control dispatcher there.
+        assert!(owned.args().contains(&SERVICE_HOST_VERB.to_owned()));
 
         let other_exe =
             service_spec_for_install(Path::new("/tmp/evil/eggworkd"), Some(config)).unwrap();
