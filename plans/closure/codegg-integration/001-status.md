@@ -2,7 +2,7 @@
 
 Status: closed (Eggwork substrate-side reference contract only)
 
-Source implementation plan: `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md`
+Source implementation plan: `plans/archive/codegg-integration/001-codegg-fixed-target-remote-executor.md`
 Subsystem roadmap: `plans/subsystems/codegg-integration-roadmap.md`
 Reviewed Eggwork head: `4efc91efa53da06663c9bf7d6a948fa240122454`
 Planning baseline for CodeGG re-audit: planning head `5f4532659dbf0df2cd9f2b3bdb024217d2ea7868`, M001 implementation `67f8f3d33651846bbdbd3e4a3bc239e50a0237a6`, historical M001 closure `338074062e3e8748ba83708ea3c2a7e33de12f74`

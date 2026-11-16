@@ -2,7 +2,7 @@
 
 Status: **closed**
 Closed: 2026-10-19
-Source plan: `plans/implementation/optional-gregg-host-telemetry/002-authenticated-node-telemetry.md`
+Source plan: `plans/archive/optional-gregg-host-telemetry/002-authenticated-node-telemetry.md`
 Subsystem roadmap: `plans/subsystems/optional-gregg-host-telemetry-roadmap.md`
 Decision: `plans/adrs/ADR-0006-optional-gregg-host-telemetry.md`
 Branch: `planning/optional-gregg-telemetry-m001-m002`
@@ -348,7 +348,7 @@ row corresponds to an executed test or an executed probe.
   dependency-ready plan table, the closed-plans table, and the planned /
   blocked work table are updated. The CodeGG worker-telemetry consumer is
   now unblocked: the interface it needs is frozen and closed.
-- `plans/implementation/optional-gregg-host-telemetry/002-authenticated-node-telemetry.md`
+- `plans/archive/optional-gregg-host-telemetry/002-authenticated-node-telemetry.md`
   — status `closed`, with a pointer to this record.
 
 **The CodeGG worker telemetry consumer is unblocked.** The plan's condition

@@ -56,19 +56,7 @@ const MAX_RECENT_EXECUTIONS: usize = 1024;
 const MAX_BLOB_FIND_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_WORKSPACE_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
-/// Declare the metric vocabulary the node can increment.
-///
-/// The producers own the vocabulary: `increment_metric` and `increment_metrics`
-/// accept a `Metric` and nothing else, so a counter the server increments but
-/// the operator surface does not name cannot exist. The report path reads
-/// `Metric::ALL`, so the list that decides what may be incremented is the same
-/// list that decides what is reported.
-///
-/// This list used to live in `operations.rs` as a hand-maintained
-/// `METRIC_NAMES`, and the report path copied a stored value only when the
-/// name was already in its map. Five live counters — the workspace derivation
-/// counters — were incremented on real traffic and silently dropped by the
-/// report, so the operator surface could not see them at all.
+/// Declare the metric names shared by producers and operator reports.
 macro_rules! node_metrics {
     ($($variant:ident => $name:literal),* $(,)?) => {
         /// One counter the node can increment.
@@ -179,32 +167,12 @@ pub struct ArtifactCaptureDecision {
     pub disposition: ArtifactCaptureDisposition,
 }
 
-/// The one mapping from a capture attempt to the terminal facts of the
-/// execution.
+/// Map capture facts to terminal execution facts.
 ///
-/// The mapping lives here, and not in the finalization's match arms, because
-/// it is a contract rather than an implementation detail: a node must not
-/// report a successful execution whose declared outputs were dropped, and a
-/// contract that is only reachable through a live execution cannot be checked
-/// on a platform where the capture is impossible.
-///
-/// The rules are:
-///
-/// * an execution that declared no outputs reports
-///   [`ArtifactCaptureDisposition::NotRequested`] and keeps the target's own
-///   terminal facts — nothing was asked for, so nothing was lost;
-/// * a capture that completed reports
-///   [`ArtifactCaptureDisposition::Completed`] and keeps the target's own
-///   terminal facts;
-/// * a declared output that was not captured reports
-///   [`ArtifactCaptureDisposition::Failed`], and a target that had succeeded
-///   becomes [`ExecutionState::Failed`] with the node's own
-///   [`ExecutionFailure::Internal`]. The target's failure is never overwritten:
-///   a target that failed for its own reason keeps that failure, so a caller
-///   can still tell "the target failed" from "the target succeeded and its
-///   declared outputs could not be collected";
-/// * a platform that cannot capture safely fails every declared output, so the
-///   capability decides the disposition before the attempt does.
+/// No outputs and successful capture preserve the target result. Failed
+/// capture sets the disposition to `Failed` and changes a successful target
+/// to `Failed`/`Internal`, while preserving an existing target failure. An
+/// unavailable capture capability fails every declared output.
 pub fn decide_artifact_capture(facts: ArtifactCaptureFacts) -> ArtifactCaptureDecision {
     if !facts.declared_outputs {
         return ArtifactCaptureDecision {
@@ -253,15 +221,10 @@ pub enum Operation {
 }
 
 impl Operation {
-    /// The resource kinds this operation's requests can name.
+    /// Resource kinds resolved by this operation's request path.
     ///
-    /// A resource scope is refused when its `(operation, kind)` pair is not
-    /// in this table: a scope that could never be consulted would narrow
-    /// nothing while the operator believed it did. The table is exactly the
-    /// set the request path resolves — `resource_for_path` for the
-    /// path-derived operations, and the handler-level `authorize_resource`
-    /// calls for the body-derived ones — so a scope can never be written
-    /// for a resource the node does not resolve.
+    /// Scopes outside this table are rejected; keep it aligned with
+    /// `resource_for_path` and handler-level `authorize_resource` calls.
     pub fn resource_kinds(&self) -> &'static [ResourceKind] {
         match self {
             Self::Execute => &[ResourceKind::Execution, ResourceKind::Workspace],
@@ -453,17 +416,8 @@ struct NodeState {
 
 struct ExecutionRecord {
     snapshot: RwLock<ExecutionSnapshot>,
-    /// Serialises publishers across the durable commit.
-    ///
-    /// Separate from `snapshot` on purpose. `publish` derives `proposed` from a
-    /// snapshot read, so two overlapping publishers would each rebase onto a
-    /// stale base and the later one would erase the earlier one's fields — the
-    /// `snapshot` write guard used to prevent that by being held across the
-    /// whole commit. Holding an `RwLock` write guard across a
-    /// `synchronous=FULL` SQLite commit blocked every reader (`event_response`,
-    /// `control`) for the duration of an fsync, which is why the two jobs are
-    /// now split: this mutex keeps writers serialised, and `snapshot` is only
-    /// held for the cheap read and the short assign.
+    /// Serializes publishers from snapshot read through durable commit.
+    /// Kept separate from `snapshot` so SQLite fsyncs do not block readers.
     commit_lock: tokio::sync::Mutex<()>,
     cancellation: CancellationToken,
     events: broadcast::Sender<ExecutionEvent>,
@@ -3038,18 +2992,7 @@ fn failure_for_runner_error(
     }
 }
 
-/// Publishes the diagnostic that reports a declared-artifact capture that did
-/// not complete.
-///
-/// The diagnostic rides the server's existing event-publishing path: a
-/// diagnostic is an `ExecutionEventKind::Diagnostic`, and this is the one
-/// place the server produces one, so a consumer reads every diagnostic from
-/// the same stream and under the same grammar.
-///
-/// The payload is bounded by the diagnostic grammar itself
-/// (`MAX_DIAGNOSTIC_PAYLOAD_BYTES`), which is well inside the event envelope
-/// (`MAX_EVENT_CHUNK_BYTES`), so a diagnostic can never overflow the event it
-/// rides in.
+/// Publish a bounded artifact-capture diagnostic on the normal event stream.
 async fn publish_capture_diagnostic(record: &ExecutionRecord, outcome: &str, reason: &str) {
     let Ok(mut payload) = DiagnosticPayload::new(DIAGNOSTIC_CLASS_ARTIFACT_CAPTURE_FAILED) else {
         return;
@@ -3200,14 +3143,10 @@ fn terminal_metric(state: &ExecutionState) -> Option<Metric> {
     }
 }
 
-/// Whether declared outputs of an execution are captured.
+/// Whether a completed execution state should attempt declared-output capture.
 ///
-/// This is deliberately *not* the terminal set. A capture happens for an
-/// execution that ran and produced a result the caller may want — `Succeeded`
-/// or `Failed` — and not for an execution that was cancelled, timed out, or
-/// interrupted, where the partial output is not a declared artifact. Folding
-/// the two together would either capture artifacts for cancelled work or
-/// drop the artifacts of a failed run.
+/// Failed runs may have useful outputs; cancelled, timed-out, or interrupted
+/// runs may contain only partial output.
 fn artifact_capture_eligible(state: &ExecutionState) -> bool {
     match state {
         ExecutionState::Succeeded | ExecutionState::Failed => true,
@@ -3276,16 +3215,9 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    /// Wall-clock budget for a whole-execution round trip.
-    ///
-    /// These waits cover a real subprocess, SQLite commits under
-    /// `synchronous=FULL`, a full event-stream drain and artifact capture. A 4 s
-    /// bound only held on an unloaded machine: under the concurrent workspace
-    /// suite — exactly what a shared CI runner looks like — it failed while the
-    /// same test passed in isolation, and measured isolated runs straddled the
-    /// budget by roughly 3x. Each of these assertions tests convergence, never
-    /// latency, so a generous bound loses no signal and costs nothing when the
-    /// code is healthy.
+    /// Bound integration round trips across process, storage, stream, and
+    /// artifact work under parallel CI load. Tests assert convergence, not
+    /// latency.
     const ROUND_TRIP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
     fn init_tls() {
@@ -3431,22 +3363,12 @@ mod tests {
         }
     }
 
-    /// Locate or stage a trusted `eggwork-sandbox-helper` binary for the test
-    /// process. The integration runner currently lives in `target/debug/`
-    /// while cargo test binaries sit under `target/debug/deps/`, so the helper
-    /// cannot rely on `CARGO_BIN_EXE_eggwork-sandbox-helper`. We probe the
-    /// current executable's sibling, then its grandparent, then `CARGO_TARGET_DIR`.
+    /// Locate and stage the trusted helper for integration tests.
     ///
-    /// The helper is staged by hard link, never by copy. Linux refuses to
-    /// execute an inode that is still open for writing, and reports the
-    /// refusal as `ETXTBSY`; a copy is by definition a file that was written,
-    /// so it is exactly the construction that can be refused. A link shares the
-    /// build output's inode and writes nothing, so the refusal cannot arise.
-    /// Because a link also carries the source's mode, the build output's group
-    /// and world write bits are cleared first: a trusted helper must not be
-    /// writable by anyone but its owner, and Cargo derives the executable's
-    /// mode from the umask. The same staging rules live in
-    /// `eggwork-sandbox-helper`'s shared test fixture.
+    /// Cargo places test executables under `target/debug/deps/`, so lookup
+    /// checks the executable's sibling, grandparent, and `CARGO_TARGET_DIR`.
+    /// Stage by hard link to avoid `ETXTBSY`, after clearing group/world write
+    /// bits to satisfy the trust check.
     fn place_trusted_helper() -> Option<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         let source = locate_helper_binary()?;
@@ -4827,24 +4749,10 @@ mod tests {
         server.wait().await.unwrap();
     }
 
-    /// The client and the node agree on the control-plane schema version.
+    /// Verify the real client and node use the shared schema version.
     ///
-    /// This is the test that would have caught the defect this milestone removes.
-    /// Before it, the client and the server each declared a private
-    /// `API_SCHEMA_VERSION`; the two happened to agree by value, but nothing
-    /// connected them, so a bump on either side would have made every client
-    /// request fail with HTTP 426 `protocol_version` — and neither the compiler
-    /// nor the test suite would have said why.
-    ///
-    /// The proof has three links:
-    ///
-    /// 1. The node refuses any body whose version is not the shared constant, and
-    ///    accepts the shared constant.
-    /// 2. A body in the client's exact shape — same fields, same order — carrying
-    ///    the shared constant is accepted, so the client's body and the node's
-    ///    accepted body are the same bytes.
-    /// 3. The real client, building the real body, is accepted by the real node.
-    ///    A private copy on either side would have broken link 3 immediately.
+    /// The test checks accepted and rejected versions, then sends a request
+    /// built by the client to catch drift between endpoint-local copies.
     #[tokio::test]
     async fn the_client_and_the_node_agree_on_the_control_plane_schema_version() {
         init_tls();
@@ -7587,11 +7495,7 @@ mod tests {
         }
     }
 
-    /// A declared output that was not captured is never a success.
-    ///
-    /// This is the regression the corrective exists for: the terminal state of
-    /// an execution whose declared outputs could not be collected must not
-    /// read as a successful execution with nothing in it.
+    /// Failed capture of declared outputs must not leave an execution successful.
     #[test]
     fn a_declared_output_that_was_not_captured_never_reports_success() {
         for capability in [
@@ -7728,15 +7632,8 @@ mod tests {
 
     #[test]
     fn admission_helpers_keep_required_capability_gating_active() {
-        // This test does not exercise live sockets; it pins the admission
-        // contract so a regression that re-introduces a blanket
-        // `IsolationRequirement::None && NetworkRequirement::Unrestricted`
-        // gate is caught here even if the integration tests are skipped on
-        // hosts without Landlock.
-        //
-        // It calls the real admission helpers rather than a local copy of
-        // them: a copy would keep passing after the production rule drifted,
-        // which is the failure mode this milestone exists to remove.
+        // Exercise the production admission helpers directly so the contract
+        // remains covered on hosts without Landlock.
         let features = vec![eggwork_runner::LANDLOCK_WORKSPACE_RW_CAPABILITY.to_owned()];
         assert!(check_isolation_supported(
             &features,

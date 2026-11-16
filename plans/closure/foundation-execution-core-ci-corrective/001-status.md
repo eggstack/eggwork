@@ -2,7 +2,7 @@
 
 Status: closed
 
-Source plan: `plans/implementation/foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md`
+Source plan: `plans/archive/foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md`
 
 Corrective authority: `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md`
 

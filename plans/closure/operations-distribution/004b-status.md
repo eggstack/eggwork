@@ -2,7 +2,7 @@
 
 Status: **closed** — the `ETXTBSY` refusal is eliminated by construction, not characterised
 Closed: 2026-10-19
-Plan: `plans/implementation/operations-distribution/004b-staged-helper-publication-durability-corrective.md`
+Plan: `plans/archive/operations-distribution/004b-staged-helper-publication-durability-corrective.md`
 Roadmap: `plans/subsystems/operations-distribution-roadmap.md`
 Branch: `planning/optional-gregg-telemetry-m001-m002`
 Corrects: `plans/closure/operations-distribution/004a-status.md` §5, §9 criterion 3, §10, and §11

@@ -107,24 +107,12 @@ pub enum DiagnosticError {
     TooLong { max: usize },
 }
 
-/// A bounded, machine-readable diagnostic payload.
+/// A bounded diagnostic rendered as `eggwork.diagnostic.<class>.v1 key=value …`.
 ///
-/// The payload is built from a class drawn from [`DIAGNOSTIC_CLASSES`] and an
-/// ordered list of key/value pairs, and is rendered by [`DiagnosticPayload::build`]
-/// as `eggwork.diagnostic.<class>.v1 key=value key=value …`.
-///
-/// Two bounds are enforced here rather than at the call site, because a
-/// diagnostic rides inside an event and a caller that forgets to bound it would
-/// otherwise be able to overflow the event envelope:
-///
-/// * the assembled payload never exceeds [`MAX_DIAGNOSTIC_PAYLOAD_BYTES`];
-/// * a value that does not fit is shortened on a UTF-8 character boundary and
-///   gains [`DIAGNOSTIC_TRUNCATION_MARKER`], so the loss is visible in the
-///   payload instead of being silent.
-///
-/// Values are normalised to printable ASCII (everything outside `!`..=`~`
-/// becomes `_`) so that the space-separated `key=value` grammar stays
-/// unambiguous: a value can never contain the separator or a newline.
+/// Payloads use a closed class set, bounded fields, and printable ASCII values
+/// so the space-separated grammar stays unambiguous. Oversized values are
+/// shortened at UTF-8 boundaries and marked with
+/// [`DIAGNOSTIC_TRUNCATION_MARKER`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticPayload {
     class: String,
@@ -763,17 +751,10 @@ impl fmt::Debug for CommandSpec {
             .finish()
     }
 }
-/// Validate an argv vector against the core contract.
+/// Validate argv bounds shared by [`CommandSpec`] and the runner.
 ///
-/// This is the single owner of the argv rules: the vector is non-empty, its
-/// length is bounded by [`MAX_ARG_COUNT`], and every entry is bounded by
-/// [`MAX_ARG_BYTES`] and free of NUL. [`CommandSpec::validate`] and the
-/// runner both consume this function, so the two cannot drift apart.
-///
-/// The runner is permitted to be *stricter* than this — it rejects an empty
-/// argv entry, which this contract permits, because an empty entry is a
-/// child-process construction hazard rather than a protocol concern. That
-/// addition is the runner's own rule and it is documented and tested there.
+/// The runner adds a stricter empty-entry rule because empty arguments are a
+/// child-process construction hazard, not a protocol violation.
 pub fn validate_argv(argv: &[String]) -> Result<(), ValidationError> {
     if argv.is_empty() {
         return Err(ValidationError::Empty { field: "argv" });
@@ -1334,31 +1315,11 @@ pub enum ExecutionFinalizationFailure {
     Retention,
 }
 
-/// The disposition of a declared-artifact capture on a terminal execution.
+/// Whether declared outputs were captured for a terminal execution.
 ///
-/// The disposition is the first-class answer to "did the declared outputs
-/// arrive?". It exists because a caller cannot answer that question from the
-/// artifact count alone: the count says how many artifacts exist, not how many
-/// were asked for, so a caller would have to compare the count against a
-/// declared-output count it does not have. Worse, a count of zero is
-/// indistinguishable from "the outputs were silently dropped", which is the
-/// failure this type exists to make impossible to read as success.
-///
-/// The states are:
-///
-/// * `NotRequested` — the execution declared no outputs. Nothing was asked
-///   for, so nothing was lost.
-/// * `Completed` — the capture completed and the declared outputs were
-///   published as artifacts.
-/// * `Failed` — the execution declared outputs and the capture did not
-///   complete, so the declared outputs are not all available. The terminal
-///   state says why: an execution that ended in a state where capture is not
-///   performed keeps that state, and a capture that fails after a successful
-///   target moves the terminal state to `Failed`.
-/// * `Unknown` — the node reported no disposition. A snapshot written before
-///   this field existed decodes this way, so a caller must fall back to the
-///   legacy `finalization_failure` marker and the artifact count rather than
-///   read an absence as a fact.
+/// `NotRequested`, `Completed`, and `Failed` describe the capture outcome.
+/// `Unknown` is used for older snapshots without this field; callers should
+/// then consult the legacy finalization marker and artifact count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactCaptureDisposition {
@@ -1543,21 +1504,11 @@ impl NodeCapabilities {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// The node's status as published on the control plane.
+/// The node's published control-plane status.
 ///
-/// `active_executions` is the number of execution permits the node currently
-/// holds — how many executions it is running right now. It is **not** the
-/// number of durable execution rows in a non-terminal state: an execution
-/// whose process died keeps its row until the node recovers it, and an
-/// idempotent re-request releases its permit while the original execution
-/// still holds one, so the two counts legitimately disagree. Only the running
-/// node knows the permit count, which is why the operator surface reports it
-/// under its own name (`execution_permits_held`) and reports the row count
-/// separately (`non_terminal_executions`).
-///
-/// The field name, the field set, and this meaning are published: a deployed
-/// client deserializes this type, so renaming the field would break every
-/// client that reads node status, and adding one would change the wire shape.
+/// `active_executions` counts held execution permits, not durable non-terminal
+/// rows. The operator reports those counts separately as
+/// `execution_permits_held` and `non_terminal_executions`.
 pub struct NodeStatus {
     pub node_id: NodeId,
     pub draining: bool,
@@ -1568,17 +1519,8 @@ pub struct NodeStatus {
 // ---------------------------------------------------------------------------
 // Optional host telemetry
 // ---------------------------------------------------------------------------
-//
-// These types are the *normalized* vocabulary for host-wide measurements. They
-// are deliberately protocol-neutral: no provider's wire types, field names or
-// collection shapes appear here, and nothing in this module knows how a
-// measurement was obtained. A provider-specific payload is validated and
-// translated into these types before it is cached, so the vocabulary can be
-// projected onto a wire contract without dragging a provider's schema along.
-//
-// Host telemetry is advisory observation, never enforcement evidence. Nothing
-// in this module grants, withholds, or qualifies an execution capability, and
-// `NodeStatus`/`NodeCapabilities` keep their existing meaning.
+// Provider-neutral, validated measurements. These are advisory observations,
+// never evidence for granting or withholding execution capabilities.
 
 /// Ceiling on the accepted sampling cadence of a host observation.
 ///
@@ -1806,16 +1748,10 @@ pub struct HostTelemetry {
 /// payload and refuses a version it does not know, rather than guessing.
 pub const NODE_TELEMETRY_SCHEMA_VERSION: u16 = 1;
 
-/// Wire schema version of the control-plane request and response bodies.
+/// Shared wire schema version for control-plane request and response bodies.
 ///
-/// Every producer and every consumer of a versioned control-plane body refers
-/// to this one constant: a client stamps it into the request bodies it
-/// authors, a server refuses a body that does not carry it (HTTP 426
-/// `protocol_version`), and a stored execution snapshot records it. The value
-/// is frozen for schema version 1 — it may not change without an ADR — and
-/// this declaration is the only one in the workspace, because a second copy in
-/// an endpoint crate would let a future bump desynchronise the producer and
-/// the consumer with neither the compiler nor the test suite objecting.
+/// Producers and consumers use this single constant. Changing it requires an
+/// ADR; endpoint-local copies could drift without compiler errors.
 pub const API_SCHEMA_VERSION: u16 = 1;
 
 /// Capability feature name for argv-based execution.
@@ -1826,48 +1762,11 @@ pub const API_SCHEMA_VERSION: u16 = 1;
 /// itself. The value is frozen and may not change without an ADR.
 pub const EXEC_ARGV_CAPABILITY: &str = "exec.argv.v1";
 
-/// The node's host-wide telemetry observation, as served to an authorized caller.
+/// The host telemetry observation returned to an authorized caller.
 ///
-/// This is the frozen wire contract for the node telemetry response. It is
-/// additive and deliberately separate from
-/// [`NodeStatus`]: `NodeStatus` answers "is this node accepting work", and
-/// this answers "what did this host look like". The two are never merged, and
-/// nothing here qualifies an execution.
-///
-/// The fields mean:
-///
-/// * `schema_version` — the contract version. A reader refuses anything else.
-/// * `node_id` — the node that produced the observation, so a reader can tell
-///   that a response came from the node it asked.
-/// * `source` — where the measurement came from. The set is closed: a reader
-///   refuses a source it does not know. The source names the *kind* of
-///   provider; whether that provider is live is `state`'s answer, not this
-///   field's.
-/// * `state` — what the provider is doing, not what the host is doing. A node
-///   with no provider is `disabled`, which is not the same as a host with no
-///   usage.
-/// * `age_ms` — how long ago, in milliseconds, the node received the
-///   observation, measured on the node's monotonic clock. `None` when there is
-///   no observation.
-/// * `last_error` — the bounded category of the most recent provider failure.
-///   `None` when the last interaction succeeded or none has failed.
-/// * `observation` — the most recent measurement the node holds, or `None` when
-///   it holds none.
-///
-/// The `state` and `observation` pair is the part a reader must understand:
-///
-/// | `state` | `observation` | meaning |
-/// |---|---|---|
-/// | `disabled` | absent | no provider is configured |
-/// | `warming` | absent | the provider is alive but has not produced a sample |
-/// | `ready` | present | a sample is present and within its freshness bound |
-/// | `stale` | present | a sample is present but older than the freshness bound |
-/// | `unavailable` | present or absent | the provider could not be reached |
-/// | `invalid` | present or absent | the provider answered with something unusable |
-///
-/// A sample is *current* only when the state is `ready`. A reader that needs a
-/// fresh measurement must check the state, not merely the presence of an
-/// observation.
+/// This additive wire contract is separate from [`NodeStatus`] and does not
+/// qualify an execution. `state` describes provider health; readers should
+/// treat a sample as current only when the state is `ready`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeTelemetry {

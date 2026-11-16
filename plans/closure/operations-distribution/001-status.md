@@ -7,7 +7,7 @@ Reviewed implementation commits:
 - `1011a2b6401ad54eb8009fcb63da895c0d546a60` — node CLI, configuration, diagnostics, inspection, storage, GC, persistent drain, and metrics.
 - `50b87b2c432a4291755172693cab9642cd593203` — recovery metrics and metadata-verified blob inspection.
 
-Implementation plan: `plans/implementation/operations-distribution/001-node-operations-surface.md`.
+Implementation plan: `plans/archive/operations-distribution/001-node-operations-surface.md`.
 
 ## Requirement-to-evidence matrix
 

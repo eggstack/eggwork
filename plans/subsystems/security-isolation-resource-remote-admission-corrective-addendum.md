@@ -1,6 +1,6 @@
 # Security / Isolation / Resource Post-Closure Corrective — Remote Admission and Capability Truthfulness
 
-Status: active corrective; C001 ready
+Status: corrective closed; C001 closed
 
 Predecessor roadmap:
 
@@ -68,11 +68,11 @@ The corrective MUST NOT pretend that Landlock filesystem isolation supplies netw
 
 Class: invariant/corrective
 
-Status: ready
+Status: closed
 
 Implementation plan:
 
-- `plans/implementation/security-isolation-resource-remote-admission-corrective/001-remote-enforcement-admission-and-capability-truthfulness.md`
+- `plans/archive/security-isolation-resource-remote-admission-corrective/001-remote-enforcement-admission-and-capability-truthfulness.md`
 
 Objective:
 

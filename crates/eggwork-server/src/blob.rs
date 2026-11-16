@@ -70,17 +70,10 @@ struct BlobStoreInner {
     write_lock: Mutex<()>,
 }
 
-/// The canonical blob-candidate statement.
+/// Canonical candidate query shared by previews and collection.
 ///
-/// One producer for the predicate. The collector's dry run, the collector's
-/// real pass, and the operator's preview all evaluate this exact statement,
-/// so the preview cannot answer a different question from the pass it
-/// previews.
-///
-/// The selection is on the *reference rows*, never on the `reference_count`
-/// counter. The counter is a denormalization maintained only by the
-/// `blob_reference_insert` / `blob_reference_delete` triggers, so it can
-/// drift from the rows that actually pin bytes; the rows are the truth.
+/// Reference rows determine whether bytes are pinned; the denormalized
+/// `reference_count` can drift.
 const UNREFERENCED_CANDIDATES_SQL: &str = "SELECT digest, size_bytes FROM blobs
      WHERE NOT EXISTS (SELECT 1 FROM blob_references r WHERE r.digest = blobs.digest)
      ORDER BY last_used_unix_ms ASC LIMIT ?1";
@@ -141,15 +134,10 @@ fn open_metadata_read_only(path: &Path) -> Result<Connection, BlobError> {
     .map_err(BlobError::from)
 }
 
-/// The blob candidates the collector would act on, without opening the store.
+/// List blob candidates without opening or reconciling the store.
 ///
-/// `BlobStore::open` is not read-only: it creates the root and the metadata
-/// database when they are absent and it calls `remove_stale_parts`, which
-/// deletes stale part files and reconciles index rows. An operator preview
-/// that opened the store would therefore mutate the store it is reporting
-/// on, so it reaches the canonical statement through this entry point
-/// instead: the same database file, opened read-only, and the same
-/// statement.
+/// The preview uses the collector's query on a read-only connection because
+/// `BlobStore::open` can create files and delete stale data.
 pub fn preview_gc(path: &Path, now_unix_ms: u64, limit: usize) -> Result<GcPreview, BlobError> {
     let connection = open_metadata_read_only(path)?;
     let expired_references: i64 =
@@ -423,17 +411,10 @@ impl BlobStore {
         Ok(())
     }
 
-    /// List distinct blob-reference owners for one owner kind, bounded by
-    /// `limit`. Used by restart reconciliation to find orphan references
-    /// without scanning blob bytes.
+    /// List owners for restart reconciliation, ordered by `owner_id` and bounded by `limit`.
     ///
-    /// Owners are returned in stable `owner_id` order.
-    ///
-    /// `after` is an exclusive resume cursor: pass the last owner from the
-    /// previous page to continue past it. The ordering is load-bearing, not
-    /// cosmetic — without it a bounded sweep always re-reads the same arbitrary
-    /// first page, so any owner positioned beyond `limit` could never be
-    /// examined and its references would be pinned forever.
+    /// `after` is an exclusive cursor so repeated bounded sweeps eventually
+    /// reach every owner without scanning blob bytes.
     pub fn reference_owners(
         &self,
         owner_kind: &str,
@@ -454,18 +435,10 @@ impl BlobStore {
             .collect::<Result<_, _>>()?)
     }
 
-    /// Unreferenced blobs, coldest first, bounded by `limit`.
+    /// List unreferenced blobs, coldest first, bounded by `limit`.
     ///
-    /// Shared by the dry run and the real run on purpose. They select at
-    /// *different points* in the transaction — a preview before expired
-    /// references are deleted, the real pass after — so the same statement
-    /// must be evaluated in both places. Two hand-copied copies of it are what
-    /// let the two paths drift apart and made `NodeGcReport.blob_candidates`
-    /// under-predict what `--apply` would actually remove.
-    ///
-    /// The operator's preview is a third reader of the same statement. It
-    /// evaluates it through `preview_gc` against a read-only connection, so
-    /// there is exactly one implementation of the predicate in the tree.
+    /// The preview and collector share this query so the reported candidates
+    /// match the apply pass, despite running at different transaction stages.
     fn unreferenced_candidates(
         connection: &Connection,
         limit: usize,
@@ -531,15 +504,9 @@ impl BlobStore {
                         )?;
                     }
                     Err(error) => {
-                        // Stop touching the filesystem, but do not abandon the
-                        // transaction. Earlier candidates in this loop already had
-                        // their files unlinked; rolling their `DELETE`s back would
-                        // resurrect rows for blobs that no longer exist on disk,
-                        // which then count against `blob_quota_bytes`, report the
-                        // digest as present to `find_missing`, and surface as an
-                        // opaque error on the next read. A row whose file could not
-                        // be unlinked is already the consistent state, so commit
-                        // what is true and report the error afterwards.
+                        // Keep deletes for files already unlinked; rollback would
+                        // leave rows pointing to missing files. Commit the consistent
+                        // removals, then report the unlink failure.
                         unlink_error.get_or_insert(error);
                         break;
                     }
@@ -732,18 +699,10 @@ impl BlobStore {
         Ok(tokio::fs::File::open(self.path_for(digest)).await?)
     }
 
-    /// Copy the object for `digest` into `destination`, verifying the digest
-    /// of the bytes that are actually copied.
+    /// Copy the object for `digest`, verifying the bytes written to `destination`.
     ///
-    /// The digest is computed over the copied stream, not over a separate
-    /// read of the same path. A pre-flight check and a later copy are two
-    /// reads of a mutable file, and only hashing the bytes that reach the
-    /// destination proves the destination holds the manifest's content: a
-    /// file that changes between the two reads cannot be smuggled past a
-    /// check that happened before it.
-    ///
-    /// The verification costs one SHA-256 pass over the copied bytes and no
-    /// additional read of the object.
+    /// Hashing the copied stream avoids a time-of-check/time-of-use gap between
+    /// validating the source and writing it.
     pub fn copy_verified(
         &self,
         digest: &BlobDigest,

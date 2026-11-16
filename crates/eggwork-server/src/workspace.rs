@@ -14,10 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-// `File` is only used by `sync_directory`, whose directory-sync call is
-// Unix-only. Importing it unconditionally made the Windows build fail
-// clippy's `-D warnings` on an unused import, which stopped the hosted
-// Windows job before it could prove anything.
+// Used only by the Unix directory-sync implementation.
 #[cfg(unix)]
 use std::fs::File;
 use thiserror::Error;
@@ -184,16 +181,10 @@ fn manifest_candidates(
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
-/// The workspace candidates the collector would act on, without opening the
-/// store.
+/// List workspace candidates without opening or reconciling the store.
 ///
-/// `WorkspaceManager::open` is not read-only: it creates the root and the
-/// metadata database when they are absent and it calls `reconcile`, which
-/// deletes rows and directories that do not match the store. An operator
-/// preview that opened the manager would therefore mutate the store it is
-/// reporting on, so it reaches the canonical statements through this entry
-/// point instead: the same database file, opened read-only, and the same
-/// statements.
+/// The preview uses the collector's queries on a read-only connection because
+/// `WorkspaceManager::open` can create files and delete stale data.
 pub fn preview_gc(
     path: &Path,
     now_unix_ms: u64,
@@ -733,22 +724,9 @@ impl WorkspaceManager {
             }
         }
         let _ = self.manifest_garbage_collect(now_unix_ms, limit, false, blobs)?;
-        // Orphan `manifest` blob references (no matching cache row, e.g. after
-        // a crash between reference creation and row commit) must expire
-        // instead of pinning bytes indefinitely.
-        //
-        // The sweep pages through owners with a resumable cursor. The ordering
-        // and cursor are load-bearing: with an unordered `LIMIT ?` the same
-        // arbitrary page came back every time, so once `limit` legitimate
-        // manifests were retained ahead of the orphans, nothing past them was
-        // ever examined and their blobs stayed pinned forever. The cursor
-        // wraps back to the start once the end is reached, so a bounded pass
-        // still covers every owner across repeated invocations.
-        //
-        // Retention is tested per owner against the `(principal_id,
-        // manifest_digest)` primary key rather than by materialising every
-        // retained key into a `HashSet`: this runs on the startup path, and
-        // `retained_manifests` grows without bound.
+        // Reconcile orphan manifest references left by a crash. Stable paging
+        // with a cursor advances past retained owners without loading the
+        // unbounded cache into memory; short pages restart the sweep.
         let mut cursor = self
             .inner
             .manifest_sweep_cursor
@@ -759,11 +737,9 @@ impl WorkspaceManager {
             .reference_owners("manifest", cursor.as_deref(), limit)
             .map_err(WorkspaceError::from)?;
         for owner in &orphans {
-            // Owners are `"{principal_id}:{manifest_digest}"`. A digest is hex
-            // and contains no colon, so splitting at the *last* one recovers the
-            // key unambiguously even when the principal itself contains colons.
-            // An owner with no colon cannot correspond to any cache row, so it
-            // is an orphan by construction and must still be released.
+            // Split at the last colon because principals may contain colons
+            // while hexadecimal digests cannot. An owner without a colon is
+            // necessarily orphaned.
             let retained = match owner.rsplit_once(':') {
                 Some((principal, digest)) => self.is_retained_manifest(principal, digest),
                 None => false,
@@ -1074,21 +1050,11 @@ fn valid_storage_key(key: &str) -> bool {
         .is_some()
 }
 
-/// The blob-reference owner id for a retained manifest.
+/// Build the stable owner key for a retained manifest.
 ///
-/// One format, one producer. The composite is `"{principal}:{manifest_digest}"`
-/// and it exists here, once. A manifest digest is hex and contains no colon,
-/// so the pair is recovered by splitting at the *last* colon even when the
-/// principal itself contains one; an owner id with no colon in it cannot
-/// match any cache row and is therefore treated as an orphan.
-///
-/// The raw-key entry point exists because two call sites read the principal
-/// out of a SQL row, where it may not parse as a `PrincipalId` - a corrupt
-/// row is exactly the case the reconciliation sweep exists to clean up.
-/// Refusing to release the reference in that case would leak the pin, so the
-/// raw form is the fallback and the validated form delegates to it. Both
-/// produce the same bytes for the same principal, so the choice of entry
-/// point never changes which owner id is used.
+/// The digest contains no colon, so the pair can be split at its last colon.
+/// The raw-key form also lets reconciliation release references for corrupt
+/// rows whose principal cannot be parsed.
 fn manifest_owner_id_for_key(principal_key: &str, manifest_digest: &str) -> String {
     format!("{principal_key}:{manifest_digest}")
 }

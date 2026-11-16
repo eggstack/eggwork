@@ -1,17 +1,4 @@
-//! The operator surface says what it means.
-//!
-//! Two defects are proved against here:
-//!
-//! * the metric vocabulary had no owner that was the producer, so five live
-//!   counters were incremented by the server and dropped by the report
-//!   (`operator_metric_coverage.rs` carries the before/after evidence for
-//!   that one, and `operator_execution_counts.rs` the naming evidence);
-//! * every configuration fault collapsed into `configuration is invalid or
-//!   unreadable`, so an operator with one wrong file mode was told nothing
-//!   about which rule failed.
-//!
-//! The tests drive the real operator binary wherever the behaviour under test
-//! lives in the binary, because the binary is the operator surface.
+//! Exercise operator-visible metrics and configuration diagnostics through the real CLI.
 
 mod common;
 

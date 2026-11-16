@@ -2,7 +2,7 @@
 
 Status: closed
 
-Source plan: `plans/implementation/control-plane-protocol/004-shared-protocol-contract-corrective.md`
+Source plan: `plans/archive/control-plane-protocol/004-shared-protocol-contract-corrective.md`
 
 Corrective addendum: `plans/subsystems/control-plane-protocol-shared-contract-corrective-addendum.md`
 

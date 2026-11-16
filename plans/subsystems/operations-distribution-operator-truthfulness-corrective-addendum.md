@@ -1,6 +1,6 @@
 # Operations and Distribution — Operator Truthfulness Corrective Addendum
 
-Status: active corrective; M008a and M008b proposed
+Status: corrective closed; M008a and M008b closed
 
 Predecessor roadmap:
 
@@ -122,11 +122,11 @@ The fix is not free of tension. `architecture/operations-cli.md` records that th
 
 Class: capability
 
-Status: proposed
+Status: closed
 
 Implementation plan:
 
-- `plans/implementation/operations-distribution/008a-operator-surface-truthfulness-corrective.md`
+- `plans/archive/operations-distribution/008a-operator-surface-truthfulness-corrective.md`
 
 Closure record:
 
@@ -138,11 +138,11 @@ Covers OP-1, OP-2, OP-3. Operator-visible behaviour changes: live metrics become
 
 Class: infrastructure (release harness and CI) / polish (documentation drift and citation hygiene)
 
-Status: proposed
+Status: closed
 
 Implementation plan:
 
-- `plans/implementation/operations-distribution/008b-release-harness-and-documentation-single-sourcing-corrective.md`
+- `plans/archive/operations-distribution/008b-release-harness-and-documentation-single-sourcing-corrective.md`
 
 Closure record:
 

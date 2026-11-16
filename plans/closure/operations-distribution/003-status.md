@@ -3,7 +3,7 @@
 Status: **closed**
 
 Source implementation plan:
-`plans/implementation/operations-distribution/003-eggpack-producer-packaging-integration.md`
+`plans/archive/operations-distribution/003-eggpack-producer-packaging-integration.md`
 (status now `closed`)
 
 Roadmap: `plans/subsystems/operations-distribution-roadmap.md`
@@ -399,7 +399,7 @@ belong to Operations M004, which is ready.
 
 ## Registry and roadmap disposition
 
-- `plans/implementation/operations-distribution/003-eggpack-producer-packaging-integration.md`:
+- `plans/archive/operations-distribution/003-eggpack-producer-packaging-integration.md`:
   conditionally closed → closed.
 - `plans/subsystems/operations-distribution-roadmap.md` M003: conditionally
   closed → closed.

@@ -359,16 +359,9 @@ pub struct ClientGrant {
     /// Lowercase hex SHA-256 digest of the verified leaf certificate DER.
     pub certificate_sha256: String,
     pub operations: Vec<String>,
-    /// Optional resource-scoped narrowing of the operations above.
-    ///
-    /// Absent or empty means the grant is exactly as broad as its operation
-    /// list, which is the meaning every configuration written before
-    /// resource scopes existed has. A scope narrows one operation and one
-    /// resource kind; it never grants an operation the grant does not hold.
-    ///
-    /// `deny_unknown_fields` on this struct is deliberate: an older node
-    /// reading a configuration that carries a scope refuses to start rather
-    /// than silently ignoring the narrowing the operator wrote.
+    /// Optional scopes narrow one operation and resource kind; absent or empty
+    /// preserves operation-wide access. Unknown fields are rejected so older
+    /// nodes cannot silently ignore configured scopes.
     #[serde(default)]
     pub resource_scopes: Vec<ResourceScope>,
 }
@@ -1048,26 +1041,11 @@ impl Authorizer for GrantAuthorizer {
             .is_some_and(|grant| grant.operations.contains(&operation))
     }
 
-    /// The resource-scoped decision.
+    /// Apply optional scopes after the operation grant.
     ///
-    /// The rule, in order:
-    ///
-    /// 1. the operation grant must be present — a scope never grants an
-    ///    operation the principal does not hold;
-    /// 2. a request that carries no resource falls back to the operation-level
-    ///    grant, exactly as before resource scopes existed;
-    /// 3. when a scope is configured for that operation *and* that resource
-    ///    kind, the resource must be inside it;
-    /// 4. otherwise the operation-level grant stands.
-    ///
-    /// Rule 3 is per `(operation, kind)`: scoping `Execute` against
-    /// `Execution` does not scope `Execute` against `Workspace`. An operator
-    /// who wants both constrained writes a scope for each.
-    ///
-    /// This decision can only narrow. It never asks who owns the resource, so
-    /// the store's `principal_id` fences remain the authority on ownership: a
-    /// scope that names another principal's resource lets the request reach
-    /// the store, and the store refuses it there.
+    /// Scopes are keyed by `(operation, resource kind)` and only narrow the
+    /// grant. Requests without a resource, or without a matching scope, retain
+    /// operation-level access. Store ownership fences remain authoritative.
     fn authorize_request(&self, principal: &NodePrincipal, request: &OperationRequest) -> bool {
         if !self.authorize(principal, request.operation) {
             return false;
@@ -1178,15 +1156,8 @@ fn state_root_owned(_: &fs::Metadata) -> bool {
 #[cfg(unix)]
 fn state_root_owner_only(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    // Exactly `0700`, not "the owner has `rwx`". `mode & 0o700 == 0o700` also
-    // accepts `0750` and `0755`, and this predicate gates `execution_root`,
-    // `blob_root`, `workspace_root` and the database parent — the directories
-    // holding every execution's stdout/stderr, every workspace and every blob.
-    // A readable-by-others state directory silently exposes all of it while
-    // `config validate` and `doctor` still report the configuration valid, and
-    // the operator rule we publish (`docs/quickstart.md`) is owner-only `0700`.
-    // The `0o022` clause is kept explicit: it is the property that actually
-    // mattered, and stating it documents why `0o700` alone is insufficient.
+    // Require exactly owner-only `0700`: these directories contain execution
+    // output, workspaces, blobs, and the journal.
     let mode = metadata.permissions().mode();
     mode & 0o777 == 0o700 && mode & 0o022 == 0
 }
@@ -1423,19 +1394,10 @@ pub async fn doctor(config: &OperatorConfig) -> DoctorReport {
     }
 }
 
-/// Whether the configured sandbox helper passes the runner's trust boundary.
+/// Apply the runner's helper-trust check for configuration diagnostics.
 ///
-/// This deliberately delegates instead of restating the policy. A stricter
-/// local copy denies a helper the runner would accept, which turns every
-/// unprivileged user-scope installation into a node that can never advertise
-/// required filesystem isolation, and makes `doctor` contradict the enforcement
-/// path it is meant to describe.
-///
-/// The runner says *which* trust check failed in a fixed phrase. The phrase is
-/// classified into this crate's own rule and then discarded: the operator sees
-/// a greppable rule identifier, never the runner's wording, and a wording the
-/// runner later changes degrades to the general "not trusted" rule rather than
-/// to a wrong one.
+/// Reusing the enforcement check keeps `doctor` and admission consistent. Its
+/// failure reason is mapped to a stable operator rule identifier.
 fn trusted_helper(path: &Path) -> Result<(), ConfigRule> {
     eggwork_runner::verify_trusted_helper(path).map_err(|reason| match reason.as_str() {
         "sandbox helper is unavailable" => ConfigRule::SandboxHelperUnavailable,
@@ -1535,13 +1497,8 @@ pub fn node_is_listening(config: &OperatorConfig) -> bool {
     })
 }
 
-/// The live permit count the running node published, if the node is running.
-///
-/// The published number describes the permits the node held when it wrote it.
-/// A node that has stopped leaves the file behind, so the count is reported
-/// only when the node's bind address is still accepting connections. A node
-/// that is not running has no live permit count, and the operator surface says
-/// so rather than reporting a number that describes a node that is gone.
+/// Read the published permit count only while the node is listening, avoiding
+/// a stale value left by a stopped node.
 pub fn observed_permit_count(config: &OperatorConfig) -> Option<u32> {
     if !node_is_listening(config) {
         return None;
@@ -1610,17 +1567,11 @@ pub fn active_execution_count(config: &OperatorConfig) -> usize {
     }
 }
 
-/// Count non-terminal executions in SQL rather than by decoding snapshots.
+/// Count non-terminal executions using the indexed state column.
 ///
-/// `wait_for_quiescence` polls `active_execution_count` on a timer for the whole
-/// drain window. It used to go through `load_snapshots`, which opened a fresh
-/// connection and `serde_json`-decoded up to 2048 durable snapshots on every
-/// poll — thousands of connections and millions of decodes over one update —
-/// only to filter four state values that `executions.state` already stores as a
-/// real column. The names bound below are the core-owned wire spellings of the
-/// shared non-terminal classification, not the snake_case used by `state_label`
-/// for display, and they are bound as parameters so the runtime-assembled list
-/// never becomes SQL text.
+/// Quiescence checks poll this during updates, so avoid decoding every snapshot.
+/// State names come from core's shared classification and are bound as
+/// parameters rather than interpolated into SQL.
 fn count_active_executions(config: &OperatorConfig) -> Result<usize, OperationsError> {
     require_regular_file(&config.database_path)?;
     let db = read_only_database(&config.database_path)?;
@@ -1699,15 +1650,9 @@ fn load_snapshots(
     Ok(snapshots)
 }
 
-/// The operator-facing label for an execution state.
+/// Operator display labels, separate from the core wire spelling.
 ///
-/// This is a *display* projection, not a protocol fact. The protocol spelling
-/// is `eggwork_core::ExecutionState::wire_name`, and the terminal
-/// classification is `eggwork_core::ExecutionState::is_terminal`; this map
-/// deliberately stays in the operator crate because snake_case is an
-/// operator-facing convention rather than something the protocol-neutral core
-/// should carry. The match is exhaustive with no wildcard arm, so a new state
-/// variant has to be given a label here instead of falling back to a default.
+/// The exhaustive match requires a label for every new state variant.
 fn state_label(state: &eggwork_core::ExecutionState) -> &'static str {
     use eggwork_core::ExecutionState::*;
     match state {
@@ -1776,14 +1721,8 @@ pub fn storage_summary(config: &OperatorConfig) -> Result<StorageSummary, Operat
     })
 }
 
-/// The counters the node holds, as the operator surface reports them.
-///
-/// Every metric the node can increment is present, with `0` when the node has
-/// never incremented it, and every row the node's metrics table holds is
-/// reported under its own name. A name this build does not know — a row
-/// written by another version of the node — is reported as it stands rather
-/// than dropped: a counter that vanishes from the report is a counter an
-/// operator cannot see.
+/// Report known counters (including zero values) and preserve unknown stored
+/// names so version-skewed metrics remain visible to operators.
 pub fn metrics_snapshot(config: &OperatorConfig) -> Result<OperatorMetrics, OperationsError> {
     let mut counters = crate::Metric::ALL
         .iter()
@@ -1864,14 +1803,8 @@ pub async fn collect_garbage(
 fn acquire_maintenance_lock(database_path: &Path) -> Result<File, OperationsError> {
     use fs2::FileExt;
     let lock_path = database_path.with_extension("lock");
-    // Refuse a pre-existing path that is not an owner-only regular file before
-    // adopting it. `create(true)` opens whatever is already there, and without
-    // this check a local user who can write the state directory could pre-create
-    // the lock as a symlink: the victim would then open the *target*, lock it,
-    // and every competing `flock` — including the node's own startup lock, which
-    // uses the same pattern — would fail forever with a generic error. This is
-    // the same discipline `require_regular_file` and `trusted_private_key`
-    // already apply to every other path we adopt.
+    // Refuse symlinks and non-regular files before opening the lock. Otherwise
+    // a pre-created symlink could make the node lock an attacker-chosen target.
     match fs::symlink_metadata(&lock_path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -1912,15 +1845,8 @@ fn read_only_database(path: &Path) -> Result<rusqlite::Connection, OperationsErr
 }
 
 fn dry_run_gc(config: &OperatorConfig, limit: usize) -> Result<NodeGcReport, OperationsError> {
-    // The preview owns no candidate predicate of its own. It asks each owner
-    // module for the set the collector would act on, and the owner evaluates
-    // the same statement the collector evaluates - so the preview and the
-    // apply pass cannot answer different questions.
-    //
-    // The owner entry points open the store's metadata database read-only.
-    // They do not open the store: `BlobStore::open`, `WorkspaceManager::open`
-    // and `ArtifactStore::open` all create and reconcile, and a preview that
-    // created the store it reports on would not be a preview.
+    // Store owners share candidate queries with collection and evaluate them
+    // through read-only connections; opening a store can create or reconcile data.
     let now = crate::artifact::now_unix_ms();
     let workspaces = crate::workspace::preview_gc(
         &crate::workspace::metadata_path(&config.workspace_root),
@@ -2628,15 +2554,7 @@ mod tests {
         counter_high: eggwork_core::BlobDigest,
     }
 
-    /// Seed the blob states and drift the trigger-maintained counter against
-    /// the reference rows of two of them.
-    ///
-    /// `blobs.reference_count` is a denormalization written only by the
-    /// `blob_reference_insert` / `blob_reference_delete` triggers. Drifting it
-    /// here does not fabricate a reference row: it reproduces the condition
-    /// under which a counter-based predicate and a reference-row predicate
-    /// answer different questions, which is the whole point of the
-    /// divergence this milestone removes.
+    /// Seed blob states with counters that disagree with their reference rows.
     async fn seed_blob_states(
         config: &OperatorConfig,
         blobs: &BlobStore,
@@ -3040,15 +2958,7 @@ mod tests {
         assert!(collect_garbage(&config, false, 1).await.is_err());
     }
 
-    /// The report carries every metric the node can increment, and a row the
-    /// report does not recognise is reported under its own name rather than
-    /// dropped.
-    ///
-    /// The old report seeded its map from a hand-maintained list and copied a
-    /// stored value only when the name was already in the map, so a counter the
-    /// server incremented but the list did not name — five of them — was
-    /// invisible to the operator. The vocabulary now lives with the producers,
-    /// so the report cannot fall behind them.
+    /// Known counters and unknown persisted names both remain visible in the report.
     #[test]
     fn metrics_report_carries_every_metric_the_node_can_increment() {
         let temp = TempDir::new().unwrap();

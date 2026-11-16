@@ -2,7 +2,7 @@
 
 Status: closed — implementation commit `63699df`
 
-Source plan: `plans/implementation/workspace-artifact-transport/005b-gc-preview-and-store-ownership-corrective.md`
+Source plan: `plans/archive/workspace-artifact-transport/005b-gc-preview-and-store-ownership-corrective.md`
 Corrective addendum: `plans/subsystems/workspace-artifact-transport-data-plane-corrective-addendum.md`
 Subsystem roadmap: `plans/subsystems/workspace-artifact-transport-roadmap.md`
 Reviewed head at the start of the milestone: `6f41957` (`feat(security): M005a degraded isolation observability`)

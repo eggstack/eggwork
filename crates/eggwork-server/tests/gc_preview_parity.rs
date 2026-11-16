@@ -1,17 +1,4 @@
-//! Structural guard for the operator's garbage-collection preview.
-//!
-//! The behavioural tests in `src/operations.rs` prove that the preview
-//! *reports* the owner module's candidate set. This guard proves the weaker
-//! property that would let the two drift apart again: that the operator
-//! module does not spell a reclamation predicate of its own.
-//!
-//! The guard is deliberately precise. It forbids the reclamation predicates,
-//! the candidate ordering, the store metadata file names and the shard
-//! layout - not SQL in general. The inspection verbs legitimately read a
-//! single record by id, so a guard that forbade those would be a false
-//! positive rather than a rule. It also does not scan the test module: a
-//! fixture has to be able to reach the store's tables to seed the drifted
-//! states the behavioural tests need.
+//! Structural guard that GC preview delegates predicates and storage paths to owner modules.
 
 /// The operator module's source.
 const OPERATOR_SOURCE: &str = include_str!("../src/operations.rs");

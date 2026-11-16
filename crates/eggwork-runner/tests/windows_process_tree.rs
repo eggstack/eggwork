@@ -1,30 +1,7 @@
-//! Windows process-tree lifecycle proofs for the runner.
+//! Native Windows tests for Job Object process-tree behavior.
 //!
-//! These run natively on Windows and nowhere else: they assert the Job Object
-//! behaviour that cannot be observed from a Unix host.
-//!
-//! # Fixtures are `cmd.exe` batch files, and that is deliberate
-//!
-//! The first version of this suite drove PowerShell and eleven of sixteen tests
-//! failed on `windows-latest` (run `37411582121`) — not because the backend
-//! misbehaved, but because sixteen concurrent PowerShell startups on a hosted
-//! runner take longer than the deadlines under test. `cmd.exe` starts in
-//! milliseconds and expresses everything these proofs need: file writes,
-//! loops, environment dumps, stdin reads, exit codes, and child processes.
-//! PowerShell would have made the evidence weaker by making it timing-shaped.
-//!
-//! # How "no process survived" is proven
-//!
-//! There is no safe-Rust process-liveness API in this workspace, so a fixture
-//! appends its own heartbeat on a ~1 s cadence and the test samples that file
-//! *after* the runner has returned. Growth means a descendant is still running;
-//! a frozen file is the evidence that it is not. That is stronger evidence than
-//! a name-based enumeration sweep, which races with process exit and says
-//! nothing about *when* the process died.
-//!
-//! `assert_frozen` first asserts the file is non-empty, so a fixture that never
-//! ran can never make the proof pass vacuously, and it then waits longer than
-//! two beats and re-samples.
+//! `cmd.exe` fixtures avoid shell-startup variance; heartbeat files verify
+//! descendants stop after the runner returns.
 
 #![cfg(windows)]
 

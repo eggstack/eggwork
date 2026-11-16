@@ -1,6 +1,6 @@
 # Control Plane M001 Closure — Authenticated Fixed-Target Execution
 
-Source plan: `plans/implementation/control-plane-protocol/001-authenticated-fixed-target-execution.md`  
+Source plan: `plans/archive/control-plane-protocol/001-authenticated-fixed-target-execution.md`
 Subsystem roadmap: `plans/subsystems/control-plane-protocol-roadmap.md`  
 Reviewed head: `6c6b6e6c227b90dba61dff61a22c82b426df569e`  
 Implementation commits: `6293585` (server/client API), `6c6b6e6` (bounds and lifecycle tests), `e6b7e22` (stream and cancellation semantics)

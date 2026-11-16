@@ -1,26 +1,7 @@
-//! The hosted Windows service lifecycle (Operations M007).
+//! Opt-in Windows lifecycle qualification against a real service registration.
 //!
-//! This suite mutates a real service control manager registration on a
-//! hosted Windows runner. That is why it is `#[cfg(windows)]` and
-//! `#[ignore]`d: an ordinary test run has no service control manager to
-//! mutate, and a test that silently passes because its subject is missing is
-//! worse than no test.
-//!
-//! ```text
-//! EGGWORK_QUALIFY_ROOT      the installation root holding state/node.json and state/tls
-//! EGGWORK_SERVICE_DAEMON    absolute path to the eggworkd under test
-//! ```
-//!
-//! Everything the lifecycle touches goes through the product's own operator
-//! CLI and Eggup's typed adapter. The one exception is the foreign-ownership
-//! negative, which has to create a registration that is *not* Eggwork's, and
-//! that is test orchestration: it creates the registration with the Windows
-//! service tooling and then proves Eggwork refuses to replace, stop, or
-//! remove it. Production code never shells out to a service manager.
-//!
-//! The suite is executed by the `windows-service-host` job in
-//! `.github/workflows/ci.yml`, which builds the daemon from source and
-//! materialises the repository's own qualification fixture.
+//! Set `EGGWORK_QUALIFY_ROOT` and `EGGWORK_SERVICE_DAEMON`. The hosted job
+//! exercises owned operations and verifies foreign registrations are refused.
 
 #![cfg(windows)]
 

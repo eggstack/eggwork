@@ -34,7 +34,7 @@ Status: closed
 
 Implementation plan:
 
-- `plans/implementation/foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md`
+- `plans/archive/foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md`
 
 Closure evidence:
 

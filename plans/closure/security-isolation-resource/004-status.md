@@ -3,7 +3,7 @@
 Status: closed
 
 Source implementation plan:
-`plans/implementation/security-isolation-resource/004-security-closure-and-cross-platform-adversarial-qualification.md`
+`plans/archive/security-isolation-resource/004-security-closure-and-cross-platform-adversarial-qualification.md`
 (status now `closed`; see disposition below)
 
 Source roadmap: `plans/subsystems/security-isolation-resource-roadmap.md`
@@ -250,7 +250,7 @@ attempted. Compilation alone is not claimed as qualification anywhere.
 - Security M004 is closed by this record.
 - `plans/subsystems/security-isolation-resource-roadmap.md` M004:
   ready → closed.
-- `plans/implementation/security-isolation-resource/004-security-closure-and-cross-platform-adversarial-qualification.md`:
+- `plans/archive/security-isolation-resource/004-security-closure-and-cross-platform-adversarial-qualification.md`:
   ready → closed.
 - `plans/registry.md`: Security workstream marked closed; M004 moved to
   the closed-plans table; remaining interface gates unchanged

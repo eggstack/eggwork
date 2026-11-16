@@ -1,22 +1,4 @@
-//! Each shared protocol contract fact has exactly one owner.
-//!
-//! Three facts used to be stated by more than one owner, and the copies had
-//! no mechanical relationship: the control-plane schema version, the
-//! `exec.argv.v1` capability name, and the terminal/non-terminal
-//! classification of `ExecutionState`. Both sides of every pair agreed by
-//! value, so none of it was a live bug — the defect was structural, because a
-//! future rename or bump on the producing side would have desynchronised the
-//! consuming side silently.
-//!
-//! The behavioural tests prove the values agree today. These tests prove the
-//! *shape* of the ownership: that the copies are gone. A private copy
-//! reintroduced in an endpoint crate would leave every behavioural test
-//! green — the copy would hold the same value — and would fail here.
-//!
-//! The scan is a source check rather than a behavioural one on purpose: there
-//! is no way to observe "a second declaration exists" from outside the
-//! crate, and a private copy that happens to hold the right value is exactly
-//! the thing that has to be caught.
+//! Source checks that shared protocol facts have one owner; equal-valued duplicate declarations need structural checks.
 
 use std::path::{Path, PathBuf};
 

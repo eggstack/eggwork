@@ -1,10 +1,4 @@
-//! Integration coverage for the Landlock helper, driven through the real runner.
-//!
-//! The whole file is Linux-only, and the gate is at file level on purpose: every
-//! test here needs the `landlock` kernel interface and a cgroup v2 hierarchy, so
-//! the per-test `#[cfg(target_os = "linux")]` this replaces only left the
-//! file's imports and helpers un-gated -- which is exactly what a Windows
-//! `clippy -D warnings` build flagged (Foundation M004).
+//! Linux integration tests for the Landlock helper through the real runner.
 #![cfg(target_os = "linux")]
 
 #[path = "support/helper_fixture.rs"]
@@ -527,20 +521,8 @@ fn malformed_private_spec_and_unavailable_status_channel_do_not_launch_target() 
     assert!(!marker.exists());
 }
 
-/// The runner's profile name is the profile the helper grants.
-///
-/// The helper is a standalone binary with no workspace-crate dependency, so it
-/// cannot import the runner's constant and keeps its own `"workspace_rw"`
-/// literal. This test is what pins that unavoidable literal to the runner's
-/// constant, and it does so in both directions:
-///
-/// * the profile the runner produces is accepted, and the target runs;
-/// * a profile that differs from the runner's by one character is refused
-///   *before* the target is spawned, so a renamed profile can never reach a
-///   process.
-///
-/// If the runner's profile name ever moved, the first half fails: the helper
-/// would refuse the specification and the target marker would never appear.
+/// Pin the helper's profile literal to the runner constant: matching names run,
+/// while a mismatch is refused before spawn.
 #[test]
 fn the_runner_profile_is_granted_and_a_differing_one_is_refused_before_the_target_spawns() {
     use std::{io::Read, os::unix::fs::PermissionsExt};
@@ -641,34 +623,10 @@ fn the_runner_profile_is_granted_and_a_differing_one_is_refused_before_the_targe
     );
 }
 
-// Operations M004a: the fixture-isolation proofs.
-//
-// The recorded CI failure was an `ETXTBSY` from a helper spawn, which is Linux
-// refusing to open a running executable for writing. These tests assert the
-// properties that make that whole class of failure structurally impossible in
-// this suite, instead of adding a retry or a sleep and hoping.
+// Fixture-isolation checks prevent `ETXTBSY` by never writing a staged executable.
 
-/// A freshly published helper must be executable at once.
-///
-/// This is the regression test for the `ETXTBSY` refusal that CI hit on the
-/// optional-Gregg telemetry branch. The fixture published its helper
-/// atomically but never opened the file it executes for writing, and Linux
-/// refuses to execute an inode that is open for writing — so the refusal was
-/// intermittent and moved between tests, and the suite went red without any
-/// test changing.
-///
-/// The test is non-vacuous in two independent ways, and the second one does
-/// not depend on a race at all:
-///
-/// 1. Thirty-two threads stage and spawn in parallel, and not one spawn may be
-///    refused. Before the fix, 16 threads staging and executing in a loop were
-///    refused 22.6% of the time, so 32 parallel stagings hit the refusal with
-///    probability very close to one.
-/// 2. The staged helper is asserted to *be* the build output's inode. Staging
-///    publishes a directory entry and writes nothing, so the staged path and
-///    the build output share a device and an inode number. A copy would have
-///    its own inode, and the assertion would fail immediately — no load, no
-///    timing and no lucky window is needed to catch a regression to copying.
+/// Concurrent staging runs immediately, and inode identity proves it uses a
+/// hard link rather than a copy.
 #[test]
 fn a_linked_helper_is_executable_immediately_after_publication() {
     const PARALLEL: usize = 32;
@@ -722,15 +680,8 @@ fn a_linked_helper_is_executable_immediately_after_publication() {
     );
 }
 
-/// A build output that anyone but its owner may write cannot be staged by
-/// linking, because a link carries the source's mode and
-/// `verify_trusted_helper` rejects a group- or world-writable helper.
-///
-/// Cargo derives the executable's mode from the umask, so a permissive umask
-/// leaves the build output group-writable. The fixture clears those bits once,
-/// before anything is staged, and the change is one-directional: it removes
-/// write permission for others and keeps the owner's permissions and the
-/// execute bits.
+/// Normalize source permissions before linking; the trust check rejects
+/// group/world-writable helpers, and links share the source mode.
 #[test]
 fn a_group_writable_source_is_normalized_to_a_trusted_mode() {
     let temp = tempfile::tempdir().unwrap();

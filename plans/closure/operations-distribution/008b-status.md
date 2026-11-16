@@ -2,7 +2,7 @@
 
 Status: **closed** — OP-4, OP-5 and OP-6 implemented and verified; every
 acceptance criterion of the plan is met and the evidence is recorded below.
-Plan: `plans/implementation/operations-distribution/008b-release-harness-and-documentation-single-sourcing-corrective.md`
+Plan: `plans/archive/operations-distribution/008b-release-harness-and-documentation-single-sourcing-corrective.md`
 Roadmap: `plans/subsystems/operations-distribution-roadmap.md`
 Source authority: `plans/subsystems/operations-distribution-operator-truthfulness-corrective-addendum.md` — findings OP-4, OP-5 and OP-6
 

@@ -2,7 +2,7 @@
 
 Status: closed
 
-Source plan: `plans/implementation/foundation-execution-core/003-execution-ownership-guards-and-runner-api-hardening.md`
+Source plan: `plans/archive/foundation-execution-core/003-execution-ownership-guards-and-runner-api-hardening.md`
 
 Roadmap: `plans/subsystems/foundation-execution-core-roadmap.md`
 

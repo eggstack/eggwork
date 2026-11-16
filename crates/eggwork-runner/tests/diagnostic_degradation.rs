@@ -1,20 +1,6 @@
-//! A degraded best-effort execution has to say so *while it runs*, not only in
-//! the terminal result.
+//! Verify degraded best-effort execution emits diagnostics before target output.
 //!
-//! The runner is the only party that knows why an enforcement was not applied,
-//! and the output channel is the only carrier that preserves ordering between
-//! the runner's knowledge and the target's output. These tests pin that
-//! ordering at the layer where it is decided: the diagnostic chunk has to be
-//! sent before the target produces a single byte, and it has to be sent at all
-//! exactly when something was degraded.
-//!
-//! `NoExecutionSetup` is used explicitly rather than `LocalProcessRunner::default`:
-//! the default picks a setup from the environment, so a test that wanted "no
-//! enforcement available" could silently get an enforcing one.
-//!
-//! The argv is platform specific because the runner has platform-specific spawn
-//! paths and the diagnostic sits in front of all of them: the Windows CI job
-//! runs this suite, and `/bin/sh` does not exist there.
+//! Explicit `NoExecutionSetup` avoids environment-dependent setup in these cross-platform tests.
 
 use eggwork_core::Requirement;
 use eggwork_runner::{

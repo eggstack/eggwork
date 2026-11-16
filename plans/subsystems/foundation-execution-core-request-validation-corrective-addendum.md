@@ -1,6 +1,6 @@
 # Foundation and Execution Core Post-Closure Corrective — Runner Request Validation Parity
 
-Status: active corrective; M005 proposed
+Status: corrective closed; M005 closed
 
 Predecessor roadmap:
 
@@ -62,11 +62,11 @@ The correct pattern is already present in the same file: `OverflowPolicy` is imp
 
 Class: invariant
 
-Status: proposed
+Status: closed
 
 Implementation plan:
 
-- `plans/implementation/foundation-execution-core/005-runner-request-validation-parity-corrective.md`
+- `plans/archive/foundation-execution-core/005-runner-request-validation-parity-corrective.md`
 
 Objective:
 

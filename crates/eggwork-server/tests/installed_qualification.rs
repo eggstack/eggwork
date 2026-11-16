@@ -1,40 +1,8 @@
-//! Installed-release execution qualification (Operations M004).
+//! Opt-in qualification against an installed daemon over authenticated loopback execution.
 //!
-//! Everything else in the M004 qualification surface exercises the product's
-//! own operator commands. This suite exercises the one property those commands
-//! cannot reach: that the *installed* release binary, exactly as it was staged
-//! and digest-verified by `scripts/qualify_release.py`, accepts a real
-//! authenticated loopback execution and admits or rejects capabilities
-//! truthfully.
-//!
-//! It is deliberately `#[ignore]`d. An ordinary `cargo test --workspace` run
-//! has no installed release to drive, and a test that silently passes because
-//! its subject is missing is worse than no test. Qualification therefore names
-//! the subject explicitly through the environment, and an unset subject is an
-//! error rather than a skip:
-//!
-//! ```text
-//! EGGWORK_QUALIFY_DAEMON   absolute path to the installed eggworkd
-//! EGGWORK_QUALIFY_CONFIG   absolute path to the qualification node config
-//! EGGWORK_QUALIFY_TLS_DIR  directory holding ca.pem / client.pem / client-key.pem
-//! EGGWORK_QUALIFY_RECEIPT  optional path to write the JSON receipt
-//! EGGWORK_QUALIFY_PLATFORM `linux` | `macos` | `windows`
-//! ```
-//!
-//! Where it runs. The default `cargo test` step does not enable the
-//! `qualification` feature, and adding `--all-features` would not help: the
-//! `#[ignore]` attributes keep all three tests out of an ordinary run whatever
-//! the feature set, and an ordinary run has no installed release to drive
-//! anyway.
-//! The suite is therefore *executed* by the `installed-qualification` job in
-//! `.github/workflows/ci.yml`, which stages an installation root and drives
-//! the installed daemon, on every push and pull request; and by the hosted
-//! `operational-qualification` workflow, which drives a *published* release's
-//! exact bytes.
-//!
-//! The node is started as a bounded child of the installed binary and driven
-//! through the repository's own `eggwork-client` over mTLS, so the code path
-//! under test is the production client path rather than a bespoke probe.
+//! Set `EGGWORK_QUALIFY_DAEMON`, `EGGWORK_QUALIFY_CONFIG`, and
+//! `EGGWORK_QUALIFY_TLS_DIR`; receipt and platform are optional. CI stages the
+//! installed subject, while hosted qualification checks published release bytes.
 
 #![cfg(feature = "qualification")]
 
@@ -477,17 +445,9 @@ async fn operator_command(
     .map_err(|error| format!("running `eggworkd {label}` failed: {error}"))
 }
 
-/// Materialise the bounded loopback TLS fixture and node configuration.
+/// Create loopback TLS material and a node config with installation-safe permissions.
 ///
-/// The qualification harness must not depend on whichever OpenSSL or LibreSSL a
-/// runner happens to ship: those disagree about certificate version, extension
-/// flags, and key encodings, and a fixture the installed binary rejects would
-/// look like a product defect. `rcgen` is already this repository's mTLS fixture
-/// library, so the identities are produced the same way on every host.
-///
-/// The node refuses a config whose TLS material is group/world accessible or
-/// whose state directories are not owner-only, so the fixture is written with
-/// exactly the permissions a real installation uses.
+/// `rcgen` keeps certificates portable across host OpenSSL versions.
 #[test]
 #[ignore = "materialises the qualification fixture; run with --ignored"]
 fn qualification_fixture() {
@@ -858,15 +818,8 @@ async fn installed_release_admits_execution_and_refuses_unsupported_isolation() 
     Ok(())
 }
 
-/// The declared-artifact disposition of an installed release binary.
-///
-/// This is the property the corrective establishes, checked on the real host
-/// rather than by inspection: where the node can capture declared outputs it
-/// must capture them and say so, and where it cannot it must refuse them and
-/// end the execution in a state that is not a success. Windows is the case
-/// that matters — there is no descriptor-relative open beneath the workspace
-/// root there — so the qualification proves the refusal path on the real
-/// Windows host instead of asserting it from a Linux one.
+/// Check declared-artifact disposition on the installed binary, including the
+/// Windows refusal path where safe capture is unavailable.
 #[tokio::test]
 #[ignore = "qualifies an installed release binary; run with --ignored"]
 async fn installed_release_reports_a_truthful_declared_artifact_disposition() -> Result<(), String>

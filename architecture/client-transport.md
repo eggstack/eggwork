@@ -55,7 +55,7 @@ production graph is what stops client convenience from constraining server desig
 - Principal identity. The client presents a certificate and nothing else; it never asserts who it
   is in a payload.
 - Local proxy/listener service. The Eggress path is listener-free by construction
-  ([M003 §3](../plans/implementation/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md)).
+  ([M003 §3](../plans/archive/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md)).
 
 This boundary is the client-side half of
 [ADR-0001](../plans/adrs/ADR-0001-fixed-target-scheduler-free-execution.md) decision 1 and 2.
@@ -89,7 +89,7 @@ identity*. Precisely:
   endpoint and calls `connect_tcp_timeout_detailed(target.host(), target.port(), 30s)` **exactly
   once**. It returns the Eggress stream as the raw `DialStream`; eggfetch layers its own HTTP/1.1
   framing and destination TLS on top. TLS ownership does not move to Eggress
-  ([M003 §2](../plans/implementation/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md),
+  ([M003 §2](../plans/archive/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md),
   [ADR-0002 decision 5/6](../plans/adrs/ADR-0002-eggstack-transport-and-mtls.md)).
 - **No fallback exists.** The dialer returns `Err` on failure. There is no second client, no
   default dialer, no retry-direct branch. `crates/eggwork-client/src/lib.rs::ClientError::eggress_error` recovers the
@@ -139,7 +139,7 @@ consequences the reader should hold onto:
   `ClientBuilder::dialer` seam is available.
 
 `eggress-outbound` is used with `default-features = false, features = ["pproxy-compat"]`, matching
-[M003 §5](../plans/implementation/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md)'s
+[M003 §5](../plans/archive/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md)'s
 "smallest feature set" rule.
 
 ## Public API
@@ -476,7 +476,7 @@ All three drive `EggressDialer` directly; none constructs a `NodeClient` or perf
 - **Destination TLS above a routed stream is not asserted here.** `round_trip` is a raw TCP echo.
   The central M003 claim — that Eggfetch still performs destination TLS/mTLS after Eggress
   establishes the route — is not proven by this file, and the "wrong node certificate through a
-  successful proxy route" case from [M003 §9](../plans/implementation/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md)
+  successful proxy route" case from [M003 §9](../plans/archive/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md)
   is not present in it.
 - `DialErrorKind` mapping correctness is untested; only "some source is retained" is asserted.
 - No test for `into_events` framing: line splitting, empty-line skipping, the 128 KiB cap,
@@ -584,7 +584,7 @@ All three drive `EggressDialer` directly; none constructs a `NodeClient` or perf
 - [ADR-0002: Eggstack HTTP Transport with Transport-Derived mTLS Identity](../plans/adrs/ADR-0002-eggstack-transport-and-mtls.md) — HTTP/1.1 + mTLS + optional Eggress, and the no-silent-retry-direct rule.
 - [ADR-0003: Execution Idempotency, Leases, and Fencing](../plans/adrs/ADR-0003-execution-idempotency-leases-and-fencing.md) — what `ExecutionHandle`'s `generation` and `lease_id` fence.
 - [Control-plane roadmap](../plans/subsystems/control-plane-protocol-roadmap.md) — durable invariants 1 and 10, and the M001/M002/M003 milestones.
-- [M001 — Authenticated Fixed-Target Execution](../plans/implementation/control-plane-protocol/001-authenticated-fixed-target-execution.md) — the original client surface, and the "no execute-anywhere" rule.
-- [M003 — Eggress Route Adapter and Protocol Compatibility Hardening](../plans/implementation/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md) — the route adapter, feature shape, and typed-failure requirements implemented here.
+- [M001 — Authenticated Fixed-Target Execution](../plans/archive/control-plane-protocol/001-authenticated-fixed-target-execution.md) — the original client surface, and the "no execute-anywhere" rule.
+- [M003 — Eggress Route Adapter and Protocol Compatibility Hardening](../plans/archive/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md) — the route adapter, feature shape, and typed-failure requirements implemented here.
 - [M003 closure evidence](../plans/closure/control-plane-protocol/003-status.md) — feature graph, TLS-ownership evidence, and the typed failure mapping matrix.
 - [`plans/000-long-term-specification.md`](../plans/000-long-term-specification.md) — §15 transport/Eggstack ownership and the CodeGG → `eggwork-client` → caller-selected `NodeId` chain.

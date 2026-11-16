@@ -41,12 +41,12 @@ greggd existing v2 API (external, no changes)
 ## Milestones
 
 **M001 — Optional loopback Gregg adapter and normalized cache (closed).**
-Implementation: `plans/implementation/optional-gregg-host-telemetry/001-loopback-gregg-adapter.md`.
+Implementation: `plans/archive/optional-gregg-host-telemetry/001-loopback-gregg-adapter.md`.
 Closure: `plans/closure/optional-gregg-host-telemetry/001-status.md` (implementation `ac55985`).
 Exit: zero-default-overhead; validated and bounded native Gregg v2 parsing (prefer existing `gregg-protocol` only if dependency impact is reasonable); typified snapshot with sampling/source/staleness/capability facts; no subprocesses; loopback-only; explicit unknown, warming, stale and invalid conditions. Production node execution remains unaffected. **Met.** `gregg-protocol` 1.0.15 was used: three added packages, no new dependency family, and the provider's own validation rules rather than a copy of them. The frozen normalized contract is `eggwork_core::HostTelemetry` with `TelemetryProviderState` and `TelemetryErrorCategory`.
 
 **M002 — Authorized Eggwork projection and fixed-target client method (closed).**
-Implementation: `plans/implementation/optional-gregg-host-telemetry/002-authenticated-node-telemetry.md`.
+Implementation: `plans/archive/optional-gregg-host-telemetry/002-authenticated-node-telemetry.md`.
 Closure: `plans/closure/optional-gregg-host-telemetry/002-status.md` (implementation `5ccb1e6`).
 Exit: an authorized controller reads a bounded sanitized snapshot through mTLS; an unauthorized principal is refused, and an older node is reported unsupported; no Gregg endpoint reachable or required remotely. Node status, capabilities, execution semantics and error authority unchanged. **Met.** The narrow `telemetry` grant is separate from `status`, so no existing grant widened; the route reads the M001 cache only, so a remote read never becomes a provider request; and the client refuses a response it cannot trust.
 

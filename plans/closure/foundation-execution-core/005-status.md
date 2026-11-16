@@ -2,7 +2,7 @@
 
 Status: **closed** — the core owns the request-validation rules, the runner consumes them, and the coordinator's pre-submit gate is green.
 
-Source plan: `plans/implementation/foundation-execution-core/005-runner-request-validation-parity-corrective.md`
+Source plan: `plans/archive/foundation-execution-core/005-runner-request-validation-parity-corrective.md`
 
 Corrective addendum: `plans/subsystems/foundation-execution-core-request-validation-corrective-addendum.md`
 
@@ -212,7 +212,7 @@ The new suites are non-vacuous. Both were checked by deliberately breaking the c
 - `architecture/overview.md` — **not changed by this worker** (coordinator-owned). No residual divergence is known to remain: the runner is now at least as strict as core on every shared rule and the one stricter rule is explicit. If the coordinator prefers a row in the divergences table, the proposed text is in the handoff report.
 - `AGENTS.md` — **not changed**: the line "Construct validated state behind private fields (`RunnerRequest::from_spec`)" remains accurate. `from_spec` is still the protocol path and the construction path is still private-fields-based.
 - `plans/subsystems/foundation-execution-core-roadmap.md` — updated: the status line and the M005 entry now read `active`, the M005 entry carries the implementation record and the public-API disposition, and the entry points at this closure record.
-- `plans/implementation/foundation-execution-core/005-runner-request-validation-parity-corrective.md` — `Status:` changed from `proposed` to `active`. The coordinator sets the final status after the gate.
+- `plans/archive/foundation-execution-core/005-runner-request-validation-parity-corrective.md` — `Status:` changed from `proposed` to `active`. The coordinator sets the final status after the gate.
 - `docs/` — no change. The loader strictness and the operator verbs are unaffected; the runner's request contract is an embedding-surface concern, not an operator-facing one.
 
 ## Unresolved findings, by severity

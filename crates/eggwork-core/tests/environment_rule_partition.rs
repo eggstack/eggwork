@@ -1,31 +1,4 @@
-//! The core environment-entry rules partition the input space.
-//!
-//! The environment-entry contract is the rule set the runner consumes, so it
-//! has to be *total*: for every name, value and list there is exactly one
-//! answer, and that answer is the documented one. A rule change that widened
-//! the accepted set or narrowed it would silently open a gap between what the
-//! contract says and what it enforces, and the gap would only be visible to a
-//! reader who happened to know the old rule.
-//!
-//! This suite therefore does two things at once:
-//!
-//! 1. It re-derives the documented rule *independently* of the implementation
-//!    -- the predicate below is written from the rule's prose, not from the
-//!    code -- and asserts that the implementation agrees with it on every
-//!    candidate.
-//! 2. It computes the accepted set and the rejected set as sets and asserts
-//!    that they are disjoint and that their union is the whole candidate
-//!    space. A rule change that moved a name from one set to the other
-//!    therefore has to be accompanied by a change to the documented predicate,
-//!    and the test fails if it is not.
-//!
-//! The name rule, as documented:
-//!
-//! - the name is not empty;
-//! - the name is at most `MAX_ENV_NAME_BYTES` bytes long;
-//! - the name is composed only of ASCII alphanumerics and underscore;
-//! - the name does not start with a digit;
-//! - the name contains no NUL byte.
+//! Verify environment-entry validation against an independent predicate and input-set partition.
 
 use eggwork_core::{
     EnvironmentEntry, MAX_ENV_COUNT, MAX_ENV_NAME_BYTES, MAX_ENV_VALUE_BYTES, ValidationError,

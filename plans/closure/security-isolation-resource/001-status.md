@@ -1,6 +1,6 @@
 # Security M001 Closure — Authorization, Redaction, and Threat Model
 
-Source plan: `plans/implementation/security-isolation-resource/001-authorization-redaction-and-threat-model.md`  
+Source plan: `plans/archive/security-isolation-resource/001-authorization-redaction-and-threat-model.md`
 Subsystem roadmap: `plans/subsystems/security-isolation-resource-roadmap.md`  
 Threat model: `plans/security/threat-model.md`  
 Reviewed implementation commit: `f629f9b`  

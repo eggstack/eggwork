@@ -1,15 +1,4 @@
-//! Resource-scoped authorization: the configuration shape, the decision rule,
-//! and the boundaries the decision may not cross.
-//!
-//! These tests drive the authorizer through the same public surface the
-//! daemon uses — the operator configuration's grant table — so they need no
-//! filesystem, no process, no TLS handshake, and no host platform. The
-//! end-to-end proof that a scope cannot reach another principal's resource
-//! lives in the server's own test module, which starts a real node; this
-//! file pins the decision itself.
-//!
-//! Nothing in this file may use `/bin/sh`, `std::os::unix`, or a Unix-only
-//! mode: the target is compiled and run by the Windows job in CI.
+//! Test resource-scope decisions through the portable grant API; server integration tests cover ownership fences.
 
 use eggwork_core::{BlobDigest, ExecutionId, PrincipalId, WorkspaceId};
 use eggwork_server::{

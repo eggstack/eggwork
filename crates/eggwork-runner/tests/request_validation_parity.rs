@@ -1,30 +1,6 @@
-//! The runner's request validation is a projection of the `eggwork_core`
-//! domain contract, not a second copy of it.
+//! Exercise public `RunnerRequest` paths against core validation.
 //!
-//! The defect this suite closes is a drift between two copies of one rule set.
-//! The runner used to re-spell the environment-entry rules in a private helper,
-//! and its copy was *weaker* than core's: it accepted a name containing `-` or
-//! `.`, accepted a name beginning with a digit, and did not detect duplicate
-//! names at all. The runner's public constructor and its public environment
-//! setter reached that weaker gate without passing through core validation at
-//! all, while the crate documentation claimed that callers could not bypass
-//! protocol bounds.
-//!
-//! Every assertion here goes through the runner's **public** API. A test that
-//! only exercised `eggwork_core` would have passed before the corrective and
-//! would have proved nothing about the runner.
-//!
-//! The properties proved are:
-//!
-//! 1. Every public construction path reaches the same verdict as
-//!    `from_spec`, for the same input, with the same typed error.
-//! 2. The runner rejects every environment-name form core rejects.
-//! 3. A duplicate environment name is refused by the duplicate-name rule, and
-//!    the refusal is attributable to that rule specifically.
-//! 4. The runner stays *stricter* than core on exactly one rule -- an empty
-//!    argv entry -- and that rule is explicit.
-//! 5. The stdin and output bounds are core's bounds.
-//! 6. A request that violates the contract never reaches a child.
+//! The checks pin parity, the stricter empty-argv rule, and rejection before spawn.
 
 use eggwork_core::{
     CommandSpec, EnvironmentEntry, ExecutionSpec, IsolationRequirement, MAX_ARG_BYTES,
@@ -352,12 +328,7 @@ async fn the_runner_refuses_an_empty_argv_entry_which_core_permits() {
     );
 }
 
-/// Every public construction path reaches the same verdict as `from_spec`.
-///
-/// This is the parity property the milestone is named for. For the same
-/// input, the protocol path and the builder path must agree on the verdict
-/// *and* on the typed error, so a caller cannot be told one thing by the
-/// protocol and another by the builder.
+/// Public construction and `from_spec` must return the same verdict and typed error.
 #[tokio::test]
 async fn every_public_construction_path_reaches_the_same_contract_verdict() {
     let root = tempfile::tempdir().expect("temp dir");

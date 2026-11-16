@@ -133,7 +133,7 @@ and deliberate. Deep dives:
 - Pre-submit gate: ownership guard, fmt, clippy, workspace tests, workspace check, release-harness tests.
 - Planning changes follow `plans/003-planning-process.md`; do not edit `plans/000`-`002` as part of ordinary implementation.
 - Releases: land and tag first, then run the Release workflow with that exact tag (no `latest` fallback); it stages a **draft** only — publishing is a human action. Tag↔version coherence is enforced by `scripts/check_release_tag.py` + `release_contract.rs`.
-- The next piece of ready work is in `plans/registry.md` (currently Operations M007, the Windows service host).
+- `plans/registry.md` is the current planning control surface; check it for ready work and outstanding evidence.
 
 ## Security
 

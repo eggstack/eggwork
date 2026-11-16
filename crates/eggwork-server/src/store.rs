@@ -480,15 +480,8 @@ impl ExecutionStore {
         self.increment_metrics(&[(name, amount)]).await
     }
 
-    /// Apply several counter increments under one connection acquisition and one
-    /// durable commit.
-    ///
-    /// The execution-terminal path used to await up to four separate
-    /// `increment_metric` calls. Each was its own `spawn_blocking`, its own
-    /// `connection.lock()`, and its own write — and `commit_event` needs the
-    /// *same* connection mutex, so counter bookkeeping queued in front of
-    /// durable event commits. Batching keeps the per-name upsert arithmetic
-    /// identical while collapsing that to one lock and one fsync.
+    /// Apply several counter increments under one connection lock and commit.
+    /// Batching reduces contention with durable event writes.
     pub async fn increment_metrics(
         &self,
         deltas: &[(&'static str, u64)],
@@ -700,14 +693,8 @@ pub(crate) fn non_terminal_state_names() -> Vec<&'static str> {
         .collect()
 }
 
-/// Whether a stored `state` column value names a terminal state.
-///
-/// The column holds the core-owned wire spelling, so a stored row's
-/// terminality is answered by the same core-owned classification the
-/// in-memory paths use. The spelling is resolved back to its state rather
-/// than being matched against a second list of names here, so a new variant
-/// is classified correctly without any change to this function. A value that
-/// names no known state is not terminal, exactly as before.
+/// Classify a stored wire name through core's state set; unknown names remain
+/// non-terminal.
 fn stored_state_is_terminal(stored: &str) -> bool {
     eggwork_core::ALL_EXECUTION_STATES
         .iter()

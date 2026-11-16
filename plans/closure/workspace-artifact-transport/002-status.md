@@ -1,6 +1,6 @@
 # Workspace and Artifact Transport M002 Closure — Manifest and Safe Materialization
 
-Source plan: `plans/implementation/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md`  
+Source plan: `plans/archive/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md`
 Subsystem roadmap: `plans/subsystems/workspace-artifact-transport-roadmap.md`  
 Reviewed implementation commit: `428e2ce`  
 Planning/closure commit: `03da005`

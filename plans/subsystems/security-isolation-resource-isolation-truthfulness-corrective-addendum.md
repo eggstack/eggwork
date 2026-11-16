@@ -1,6 +1,6 @@
 # Security, Isolation, and Resource Enforcement Post-Closure Corrective — Isolation and Authorization Truthfulness
 
-Status: active corrective; M005a proposed, M005b proposed, M005c blocked
+Status: corrective closed; M005a, M005b, and M005c closed
 
 Predecessor roadmap:
 
@@ -100,7 +100,8 @@ The only exerciser of the resource-scoped path is a unit test in `crates/eggwork
 
 A third disposition — deferring while advertising a "not available" marker — is weaker than it looks, because the mechanism would still be present and still inert.
 
-Per `plans/003-planning-process.md` §8, the choice between these is a durable architecture decision and requires an ADR. M005c is therefore written now, to preserve design intent, and is **blocked** on that ADR: `plans/adrs/ADR-0007-resource-scoped-authorization.md` (**proposed, not accepted**).
+ADR-0007 later accepted Option A: implement resource-scoped grants. M005c is
+closed; see its closure record.
 
 ## 2. Corrective milestones
 
@@ -108,11 +109,11 @@ Per `plans/003-planning-process.md` §8, the choice between these is a durable a
 
 Class: invariant
 
-Status: proposed
+Status: closed
 
 Implementation plan:
 
-- `plans/implementation/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`
+- `plans/archive/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`
 
 Objective:
 
@@ -122,11 +123,11 @@ Make a degraded isolation or resource enforcement **visible in the event stream*
 
 Class: invariant
 
-Status: proposed
+Status: closed
 
 Implementation plan:
 
-- `plans/implementation/security-isolation-resource/005b-sandbox-helper-environment-parity-corrective.md`
+- `plans/archive/security-isolation-resource/005b-sandbox-helper-environment-parity-corrective.md`
 
 Objective:
 
@@ -136,15 +137,17 @@ Give the environment deny-list, the `PATH` rule, and the child-environment basel
 
 Class: invariant
 
-Status: blocked
+Status: closed
 
-Concrete blocker:
+Original blocker (cleared):
 
-- `plans/adrs/ADR-0007-resource-scoped-authorization.md` — **proposed, not yet accepted**. The ADR must decide whether resource-scoped grants are implemented or the inert hook and its `ResourceId` plumbing are removed. Until that ADR is accepted, M005c cannot be handed off as ready, per `plans/003-planning-process.md` §4.
+- `plans/adrs/ADR-0007-resource-scoped-authorization.md` was proposed at handoff and later accepted with Option A. M005c implements that choice.
 
 Implementation plan:
 
-- `plans/implementation/security-isolation-resource/005c-resource-scoped-authorization-corrective.md`
+- `plans/archive/security-isolation-resource/005c-resource-scoped-authorization-corrective.md`
+
+Closure record: `plans/closure/security-isolation-resource/005c-status.md`
 
 Objective:
 

@@ -1,6 +1,6 @@
 # Workspace and Artifact Transport M001 Closure — Blob Store and Digest Protocol
 
-Source plan: `plans/implementation/workspace-artifact-transport/001-blob-store-and-digest-protocol.md`  
+Source plan: `plans/archive/workspace-artifact-transport/001-blob-store-and-digest-protocol.md`
 Subsystem roadmap: `plans/subsystems/workspace-artifact-transport-roadmap.md`  
 Reviewed implementation commits: `7738920` (verified streaming store and client transport), `f4f18db` (JSON upload metadata preflight), `1f5893f` (oversize preflight test)  
 Planning/closure commit: `2aea135`

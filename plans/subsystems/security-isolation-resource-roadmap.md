@@ -45,7 +45,7 @@ Status: closed
 
 Implementation plan:
 
-- `plans/implementation/security-isolation-resource/001-authorization-redaction-and-threat-model.md`
+- `plans/archive/security-isolation-resource/001-authorization-redaction-and-threat-model.md`
 
 Objective:
 
@@ -69,7 +69,7 @@ Closure evidence: `plans/closure/security-isolation-resource/002-status.md`
 
 Implementation plan:
 
-- `plans/implementation/security-isolation-resource/002-trusted-landlock-sandbox-path.md`
+- `plans/archive/security-isolation-resource/002-trusted-landlock-sandbox-path.md`
 
 Objective:
 
@@ -95,7 +95,7 @@ Host note: direct writes to this session cgroup are unavailable; the systemd use
 
 Implementation plan:
 
-- `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md`
+- `plans/archive/security-isolation-resource/003-enforced-resource-controls.md`
 
 Objective:
 
@@ -123,7 +123,7 @@ Corrective authority:
 
 Implementation plan:
 
-- `plans/implementation/security-isolation-resource-remote-admission-corrective/001-remote-enforcement-admission-and-capability-truthfulness.md`
+- `plans/archive/security-isolation-resource-remote-admission-corrective/001-remote-enforcement-admission-and-capability-truthfulness.md`
 
 Objective:
 
@@ -142,7 +142,7 @@ Closure evidence: `plans/closure/security-isolation-resource/004-status.md`
 
 Implementation plan:
 
-- `plans/implementation/security-isolation-resource/004-security-closure-and-cross-platform-adversarial-qualification.md`
+- `plans/archive/security-isolation-resource/004-security-closure-and-cross-platform-adversarial-qualification.md`
 
 Closed prerequisites include remote-admission corrective C001, Foundation ownership-CI corrective C001, and Control Plane M003.
 
@@ -165,7 +165,7 @@ Corrective addendum:
 
 Implementation plan:
 
-- `plans/implementation/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`
+- `plans/archive/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`
 
 Objective:
 
@@ -193,7 +193,7 @@ Corrective addendum:
 
 Implementation plan:
 
-- `plans/implementation/security-isolation-resource/005b-sandbox-helper-environment-parity-corrective.md`
+- `plans/archive/security-isolation-resource/005b-sandbox-helper-environment-parity-corrective.md`
 
 Objective:
 
@@ -228,7 +228,7 @@ Corrective addendum:
 
 Implementation plan:
 
-- `plans/implementation/security-isolation-resource/005c-resource-scoped-authorization-corrective.md`
+- `plans/archive/security-isolation-resource/005c-resource-scoped-authorization-corrective.md`
 
 Objective:
 

@@ -1,10 +1,9 @@
 # Eggwork Planning Archive
 
-This directory retains superseded or completed interim planning when those documents no longer belong in the active planning surface.
+This directory retains completed or superseded implementation handoffs by
+subsystem. Closure records remain under `plans/closure/` as the evidence for
+what shipped and what was verified.
 
-Rules:
-
-- preserve original relative structure where practical;
-- do not archive canonical long-term documents or accepted ADR history merely because implementation advanced;
-- do not use archive moves to erase closure/corrective evidence;
-- update `plans/registry.md` when active authority moves to or from an archived document.
+Canonical documents and accepted ADRs stay in their original locations. Update
+links when moving a handoff. Preserve closure records as evidence; do not archive
+them with implementation plans.

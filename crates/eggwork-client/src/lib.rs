@@ -19,33 +19,16 @@ use std::sync::Arc;
 use std::{fmt, path::Path};
 use thiserror::Error;
 
-/// Ceiling on a buffered (non-streamed) response body.
-///
-/// Every non-2xx response goes through `api_error`, and every JSON reply
-/// through `decode_json`, and both used to read the body with no bound at all.
-/// This is generous relative to the protocol's real maxima — the largest single
-/// buffered reply is an execution snapshot, which the journal caps at 256 events
-/// and 512 KiB of encoded events — so it never truncates a legitimate response
-/// while still refusing to accumulate unbounded node-controlled data.
+/// Bound buffered node responses while leaving room for the largest valid
+/// execution snapshot (512 KiB of events).
 const MAX_BUFFERED_BODY_BYTES: usize = 16 * 1024 * 1024;
 
-/// Ceiling on a node telemetry response body.
-///
-/// The telemetry response is a small, bounded document — a schema version, a
-/// node id, a state, and at most seven measurement groups. The transport cap
-/// (`MAX_BUFFERED_BODY_BYTES`) bounds what the client will *accumulate*; this
-/// cap bounds what the client will *accept* for this route, so a node that
-/// answers with a megabyte of measurement-shaped JSON is refused rather than
-/// parsed.
+/// Bound telemetry responses below the general transport cap before parsing.
 const MAX_TELEMETRY_BODY_BYTES: usize = 64 * 1024;
 
-/// Time allowed for a pool slot, the connect/TLS handshake, each request-body
-/// frame, and each *gap* between response chunks.
-///
-/// These are the deadlines a long-lived stream needs. Without the read phase a
-/// hung or black-holed node left `execute`, `events` or `renew` pending forever;
-/// because the read deadline resets on every chunk, an event stream that is
-/// simply quiet between executions is unaffected.
+/// Phase deadlines for pool acquisition, connect/TLS, writes, and gaps between
+/// response chunks. The read deadline resets on each chunk, allowing quiet
+/// long-lived event streams.
 fn transport_timeouts() -> eggfetch_core::Timeout {
     eggfetch_core::Timeout {
         pool: Some(std::time::Duration::from_secs(30)),
@@ -56,12 +39,8 @@ fn transport_timeouts() -> eggfetch_core::Timeout {
     }
 }
 
-/// Wall-clock deadline for the unary request/response calls.
-///
-/// Applied per request rather than on the client, because the streaming calls —
-/// `execute`, `events`, blob upload, blob and artifact download — are legitimately
-/// long-lived and a total deadline would abort a healthy transfer. They are held
-/// to `transport_timeouts` instead.
+/// Total deadline for unary calls. Streaming calls use phase deadlines so a
+/// healthy long transfer is not cut off.
 fn unary_timeout() -> eggfetch_core::Timeout {
     eggfetch_core::Timeout {
         total: Some(std::time::Duration::from_secs(120)),
@@ -225,28 +204,12 @@ impl NodeClient {
         self.get_json("/v1/status").await
     }
 
-    /// Read the node's host-wide telemetry observation.
+    /// Read the node's cached host telemetry observation.
     ///
-    /// The node serves this from its own cache. A remote read never contacts
-    /// the telemetry provider, so a burst of readers cannot become a burst of
-    /// provider requests, and a provider that is down does not turn a read into
-    /// a timeout.
-    ///
-    /// The three states a caller most often needs to tell apart are
-    /// distinguishable without parsing prose:
-    ///
-    /// * the node has no provider configured — the response's `state` is
-    ///   `disabled`;
-    /// * the node's provider is failing — the response's `state` is
-    ///   `unavailable` and `last_error` carries the bounded category;
-    /// * the node does not implement this contract at all — the call fails
-    ///   with [`ClientError::TelemetryUnsupported`].
-    ///
-    /// A node that reports `unavailable` is not reporting zero utilization.
-    /// The per-measurement groups keep the difference explicit: a measurement
-    /// the host platform cannot produce is `unsupported`, one that was
-    /// supported but not reported is `unknown`, and only a real measurement is
-    /// a value.
+    /// `disabled` means no provider is configured; `unavailable` means the
+    /// provider failed; `TelemetryUnsupported` means the node lacks this route.
+    /// An unavailable measurement is not zero utilization. Only `ready` means
+    /// the observation is current.
     pub async fn telemetry(&self) -> Result<NodeTelemetry, ClientError> {
         let mut response = self
             .http
@@ -804,14 +767,9 @@ impl ExecutionStream {
     }
 }
 
-/// Decide whether a node's advertised capabilities are usable by this client.
+/// Check protocol and argv capabilities before using a node.
 ///
-/// The decision is separated from the fetch so the rule can be tested without
-/// a live node, and so the rule names the *owned* constants rather than
-/// literals: the protocol range the client speaks, and the argv feature the
-/// client cannot work without. A node that advertises a different argv
-/// feature name is refused with the typed unsupported-capability error rather
-/// than being talked to in a dialect this client does not implement.
+/// The typed error prevents requests in an unsupported protocol dialect.
 fn protocol_compatibility(capabilities: &NodeCapabilities) -> Result<(), ClientError> {
     let required = eggwork_core::ProtocolVersion { major: 1, minor: 0 };
     let supported = capabilities.protocol.min <= required && capabilities.protocol.max >= required;
@@ -1036,16 +994,9 @@ mod shared_contract_tests {
         }
     }
 
-    /// Every request body the client authors carries the shared schema version.
+    /// Assert all client-authored request shapes carry the shared schema version.
     ///
-    /// The four body shapes are the execute, control, workspace-create and
-    /// workspace-derive requests. Each one is serialized here and its
-    /// `schema_version` field is read back, so this asserts the bytes that
-    /// actually go on the wire rather than the field in isolation. A private
-    /// copy of the constant in this crate would still satisfy the assertion
-    /// only if it happened to equal the shared value — which is exactly why
-    /// the server crate additionally checks that this client's request is not
-    /// rejected as `protocol_version`.
+    /// A server integration test also verifies that the node accepts them.
     #[test]
     fn every_authored_request_body_carries_the_shared_schema_version() {
         let handle = handle();
@@ -1119,14 +1070,7 @@ mod shared_contract_tests {
         );
     }
 
-    /// The client refuses a node whose argv feature name differs.
-    ///
-    /// The differing name is one character away from the owned one, so this is
-    /// the regression test for the drift this milestone removes: a server that
-    /// advertised `exec.argv.v2` while the client demanded `exec.argv.v1`
-    /// would have been refused with a typed error rather than a silent
-    /// mismatch — and, before the shared constant existed, nothing in either
-    /// crate would have said the two names had to agree.
+    /// Refuse a node that advertises a different argv capability.
     #[test]
     fn a_node_advertising_a_differing_argv_feature_is_refused() {
         let differing = format!("{EXEC_ARGV_CAPABILITY}v2");
@@ -1197,11 +1141,8 @@ mod event_framing_tests {
 
     #[tokio::test]
     async fn a_maximum_size_chunk_is_delivered_not_rejected() {
-        // Regression: the framing cap used to be 128 KiB, but a caller may legally
-        // ask for `MAX_EVENT_CHUNK_BYTES` of output, which encodes to ~256 KiB
-        // because `Vec<u8>` serializes as a JSON number array. The client rejected
-        // the line, and because the stream is `try_unfold` that discarded every
-        // event already delivered.
+        // A valid maximum-size chunk encodes above 128 KiB because `Vec<u8>` is
+        // a JSON number array. The stream must still deliver it and later events.
         let payload = vec![0xFFu8; eggwork_core::MAX_EVENT_CHUNK_BYTES];
         let event = stdout_event(1, &payload);
         let line = serde_json::to_vec(&event).unwrap();

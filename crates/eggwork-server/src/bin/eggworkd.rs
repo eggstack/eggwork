@@ -30,18 +30,9 @@ fn mode_for(args: &[String]) -> Mode {
     }
 }
 
-/// The node lifecycle, shared by the foreground and the service-hosted paths.
+/// Run the shared shutdown path for foreground and service-hosted nodes.
 ///
-/// Both paths run the same function, so they converge the same way: stop
-/// admission, cancel and converge the active executions, shut the listener
-/// down, and **wait** for the listener and the executions to finish before
-/// the process exits. Foreground `run` used to call `shutdown()` without
-/// `wait()`, so a foreground stop could return while an execution was still
-/// converging.
-///
-/// The foreground path resolves the stop edge on Ctrl-C, and the
-/// service-hosted path resolves it when the service control manager
-/// delivers `STOP` or `SHUTDOWN`.
+/// Both paths drain executions and wait for listener and execution tasks before exit.
 fn main() -> ExitCode {
     // The mode is chosen **before** an asynchronous runtime exists.
     //
@@ -433,16 +424,8 @@ fn product_service_manager(
         // branch is compiled out.
         Ok(Box::new(manager))
     }
-    // Windows service management goes through Eggup's typed SCM adapter,
-    // which owns the registration and the manager operations. Eggwork hosts
-    // the service process — `eggworkd service-host` joins the dispatcher —
-    // and never registers or manages it itself.
-    //
-    // The adapter is only reachable now that the daemon can actually answer
-    // a start request: registering a service whose binary never calls
-    // `StartServiceCtrlDispatcherW` produces a registration that can never
-    // reach `Running`, which is the error 1053 the previous milestone
-    // recorded. The host is the reason this branch is no longer a refusal.
+    // Eggup owns service registration and management. Eggwork only hosts the
+    // process through `service-host` and the SCM dispatcher.
     #[cfg(windows)]
     {
         // The spec is the identity Eggup mutates; the SCM adapter takes the
@@ -590,14 +573,8 @@ fn deployment_apply(
         &verifier,
         || eggwork_server::operations::active_execution_count(config),
         move |remaining| {
-            // One deadline for the whole post-commit check. `remaining` is a
-            // *duration* measured when Eggup computed it, not a deadline, so
-            // deriving `now + remaining` again further down — after the daemon
-            // probe has already been allowed up to 5 s of it — would hand this
-            // phase the entire remaining allowance a second time. Computing the
-            // deadline once here makes the Linux helper check below spend what
-            // is genuinely left, which is what `deployment-lifecycle.md` and
-            // `operations-cli.md` both describe.
+            // Share one deadline across the daemon and helper probes. Reusing
+            // the duration later would grant the helper a fresh budget.
             let deadline = std::time::Instant::now() + remaining;
             let timeout = std::cmp::min(remaining, std::time::Duration::from_secs(5));
             if timeout.is_zero() {

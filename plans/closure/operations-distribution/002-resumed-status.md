@@ -3,7 +3,7 @@
 Status: closed
 
 Source implementation plan:
-`plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md`
+`plans/archive/operations-distribution/002-eggup-deployment-and-service-integration.md`
 (status now `closed`; see disposition below)
 
 Roadmap: `plans/subsystems/operations-distribution-roadmap.md` (M002 now closed)
@@ -140,7 +140,7 @@ auto-select. This restores the already-designed M001 operator behavior
 - Operations M002 is closed (resumed). The historical `002-status.md`
   blocker record is preserved immutably.
 - `plans/subsystems/operations-distribution-roadmap.md` M002: ready → closed.
-- `plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md`:
+- `plans/archive/operations-distribution/002-eggup-deployment-and-service-integration.md`:
   ready for handoff → closed.
 - Security M004: blocked on Operations M002 → ready (dependency satisfied by
   this closure).

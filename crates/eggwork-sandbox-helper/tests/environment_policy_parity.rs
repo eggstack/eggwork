@@ -1,38 +1,4 @@
-//! The environment-policy parity gate.
-//!
-//! The node's environment policy — the denied-key list and its matching rule,
-//! the node-owned (reserved) keys, the node-owned baseline, and the `PATH`
-//! value contract — has one owner: `crates/eggwork-runner/policy/environment-policy.toml`.
-//! The runner compiles a generated copy of it. The sandbox helper is a
-//! standalone binary that may not depend on any workspace crate, so it
-//! compiles a generated copy of the *same* source.
-//!
-//! Two copies of one contract is a hole unless something pins them together.
-//! What pins them is this file, and it does so in two independent ways:
-//!
-//! 1. **Element by element.** The helper's own generated module is compiled
-//!    into this test, and compared with the runner's public copy, entry by
-//!    entry, in order. A one-sided edit to either copy fails here.
-//! 2. **Behaviourally.** The *real* helper executable is driven with a launch
-//!    specification for every probe key, and its accept/refuse decision is
-//!    compared with what the runner's copy of the policy says. A one-sided
-//!    edit that changed a rule rather than a list fails here, and so does an
-//!    edit that changed the matching rule itself.
-//!
-//! The second is the one that matters. A structural comparison of two files
-//! proves that two files are alike; it does not prove that the helper enforces
-//! the policy the runner applies. The live defect was exactly that gap: the
-//! runner appended the caller's `LANG` to the node's baseline, so the launch
-//! specification carried two `LANG` entries, the helper refused the
-//! specification, and a best-effort request answered that pre-target refusal
-//! by re-spawning the target with no Landlock ruleset at all. The observable
-//! result was a successful, entirely unconfined execution whose only record of
-//! the degradation was a `NotApplied` in the terminal snapshot.
-//!
-//! The element-wise part of this file is platform-independent on purpose: the
-//! lists are platform-independent, and the parity gate must run everywhere.
-//! Only the behavioural part needs Linux, because only Linux has a helper that
-//! enforces anything.
+//! Compare generated policy copies and, on Linux, verify the real helper enforces the runner's policy.
 #![allow(dead_code)]
 
 /// The helper's own generated copy of the policy, compiled into this test.
@@ -53,18 +19,7 @@ use eggwork_runner::environment_policy as runner_policy;
 #[path = "support/helper_fixture.rs"]
 mod helper_fixture;
 
-/// The runner's policy, stated over a launch specification rather than over a
-/// request.
-///
-/// The runner *drops* a denied key, *replaces* a node-owned key's value with
-/// the node's, and passes everything else through. The helper refuses a
-/// specification that does not already reflect that, because the helper is the
-/// enforcement point and the runner is the request-normalisation boundary.
-/// Only the list is shared between them; the behaviour deliberately is not.
-///
-/// This is the contract, written against the *runner's* copy of the policy. The
-/// helper enforces the same contract with its own copy, and the difference
-/// between the two is what this test measures.
+/// Model helper refusal for the launch specification produced by runner normalization.
 fn the_runner_policy_refuses(key: &str, value: &str) -> bool {
     if key != "PATH" && runner_policy::denied_environment_key(key) {
         return true;
@@ -405,13 +360,7 @@ mod linux {
         }
     }
 
-    /// A specification with a duplicate environment key is refused with the
-    /// environment-policy status.
-    ///
-    /// The duplicate is what the live defect produced: the caller's `LANG` and
-    /// the node's `LANG` in one specification. The runner can no longer build
-    /// such a specification, but the helper must still refuse one, because a
-    /// duplicate key is an environment the node did not build.
+    /// Refuse duplicate keys because the runner must never produce them.
     #[test]
     fn a_duplicate_environment_key_is_refused_with_the_environment_policy_status() {
         let environment = vec![
@@ -477,20 +426,9 @@ mod linux {
         );
     }
 
-    /// A request that sets a node-owned key keeps its confinement.
+    /// A caller-supplied `LANG` is replaced by the node value without losing confinement.
     ///
-    /// This is the regression for the live defect. The caller's `LANG` used to
-    /// be appended to the node's baseline, so the launch specification carried
-    /// two `LANG` entries, the helper refused the specification, and the
-    /// runner — for a best-effort request only — answered that pre-target
-    /// refusal by re-spawning the target directly with no Landlock ruleset at
-    /// all. The observable result was a successful, entirely unconfined
-    /// execution whose only record of the degradation was a `NotApplied` in the
-    /// terminal snapshot.
-    ///
-    /// So the assertion is not only that the execution succeeded. It is that
-    /// the sandbox outcome is `Applied`, that the child saw the node's `LANG`
-    /// and not the caller's, and that the child saw exactly one `LANG`.
+    /// Assert `Applied` and exactly one `LANG` in the child environment.
     #[tokio::test]
     async fn a_caller_supplied_node_owned_key_keeps_the_execution_confined() {
         let temp = tempfile::tempdir().expect("temp dir");

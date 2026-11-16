@@ -1,15 +1,4 @@
-//! The declared-artifact capture disposition, checked portably.
-//!
-//! This target exists because the server's own `#[cfg(test)]` harness is
-//! Linux-shaped: it starts `/bin/sh`, uses `std::os::unix`, and sets
-//! Unix-only file modes, so it does not compile for a Windows host. The
-//! contract this milestone establishes — a declared output that was not
-//! captured must never be reported as a successful execution — is a contract
-//! about the *decision*, not about the host, so it is checked here against
-//! the crate's public API on every platform.
-//!
-//! Nothing in this file may use `/bin/sh`, `std::os::unix`, or a Unix-only
-//! mode: the target is compiled and run by the Windows job in CI.
+//! Portable checks for declared-artifact disposition and capture decisions.
 
 use eggwork_core::{ArtifactCaptureDisposition, ExecutionFailure, ExecutionState};
 use eggwork_server::{
@@ -79,14 +68,7 @@ fn the_capture_capability_fact_matches_the_platform() {
     }
 }
 
-/// A declared output that was not captured is never reported as a success.
-///
-/// This is the regression the corrective exists for. Before it, the finalization
-/// set the finalization-failure marker and left the terminal state
-/// `Succeeded`, so a caller that declared outputs saw a successful execution
-/// with zero artifacts and no error: the declared outputs were silently
-/// dropped. The decision is checked here from outside the crate, so the
-/// contract is reachable on a platform where the capture cannot run at all.
+/// Failed capture of a declared output must turn target success into failure.
 #[test]
 fn a_declared_output_that_was_not_captured_never_reports_success() {
     let capability = artifact_capture_capability();

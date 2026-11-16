@@ -1,18 +1,4 @@
-//! The operator surface reports every metric the node can increment.
-//!
-//! These tests read the *report path* only: they write rows into the node's
-//! metrics table and read the counters back. They are written that way on
-//! purpose, because it is what lets them run against the code as it was
-//! before the metric vocabulary moved to the producers — they are evidence
-//! about the report, not a restatement of the fix.
-//!
-//! The report used to seed its counter map from a hand-maintained list of
-//! names and copy a stored value *only* when the name was already in that
-//! map. A counter the server incremented but the list did not name was
-//! therefore incremented on real traffic and dropped by the report: five of
-//! them, all of them workspace counters. A test that asserted only that the
-//! current five are present would not have caught that, and — more to the
-//! point — would not have failed against the pre-change code either.
+//! Check that the operator metrics report preserves known and unknown stored counters.
 
 use eggwork_server::operations::{OperatorConfig, metrics_snapshot};
 use std::path::Path;

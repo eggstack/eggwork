@@ -3,7 +3,7 @@
 Status: closed — implementation commit `63699df`
 
 Source implementation plan:
-`plans/implementation/security-isolation-resource/005b-sandbox-helper-environment-parity-corrective.md`
+`plans/archive/security-isolation-resource/005b-sandbox-helper-environment-parity-corrective.md`
 
 Source corrective addendum (authoritative where it disagrees with the plan):
 `plans/subsystems/security-isolation-resource-isolation-truthfulness-corrective-addendum.md`
@@ -454,7 +454,7 @@ the change is worth a line in the release notes: see §9 finding S-03.
 | `AGENTS.md` | **Not edited — the coordinator owns it.** See §13 for the recommended wording of the "Isolation claims are earned" line. |
 | `plans/subsystems/security-isolation-resource-roadmap.md` | The M005b entry's status was set to "implemented — closure record written, implementation commit pending" and the closure-evidence pointer was added, matching the M005a entry's shape. The roadmap's status line was updated to "closed through M004 (remote-admission C001 and Operations M002 included); M005a and M005b implemented (closure records written, implementation commits pending); M005c blocked on ADR-0007". |
 | `plans/registry.md` | **Not edited — the coordinator owns it.** See §14. |
-| `plans/implementation/security-isolation-resource/005b-sandbox-helper-environment-parity-corrective.md` | **Not edited** — the plan is not in this milestone's ownership and is left as the authoritative statement of what was asked. |
+| `plans/archive/security-isolation-resource/005b-sandbox-helper-environment-parity-corrective.md` | **Not edited** — the plan is not in this milestone's ownership and is left as the authoritative statement of what was asked. |
 
 New text in the deep dives uses symbol references rather than line numbers, so
 it does not add to the repository's stale-line-number defect.
@@ -566,7 +566,7 @@ the roadmap entry. **Done:** the implementation commit is `63699df`.
   set out to close and the closure record says it is closed.
 - `plans/registry.md`: **not edited** — the registry is the coordinator's
   file. See §14.
-- `plans/implementation/security-isolation-resource/005b-sandbox-helper-environment-parity-corrective.md`:
+- `plans/archive/security-isolation-resource/005b-sandbox-helper-environment-parity-corrective.md`:
   **not edited** — the plan is not in this milestone's ownership and is left
   as the authoritative statement of what was asked.
 

@@ -22,7 +22,7 @@ Related authority:
 - `architecture/overview.md` — divergence #12
 - `plans/subsystems/control-plane-protocol-shared-contract-corrective-addendum.md` —
   the corrective that owns the findings and the ownership decision
-- `plans/implementation/control-plane-protocol/004-shared-protocol-contract-corrective.md` —
+- `plans/archive/control-plane-protocol/004-shared-protocol-contract-corrective.md` —
   the implementation plan, whose §12.3 stop condition requires this record
 - `plans/003-planning-process.md` §8 (architecture changes)
 
@@ -173,5 +173,5 @@ D. **`eggwork-core` owns the contract facts that both endpoints consume; the
 This ADR records an ownership decision. It does not specify the implementation
 of that ownership, the tests that prove it, or the milestone that delivers it;
 those belong to
-`plans/implementation/control-plane-protocol/004-shared-protocol-contract-corrective.md`
+`plans/archive/control-plane-protocol/004-shared-protocol-contract-corrective.md`
 and its closure record.

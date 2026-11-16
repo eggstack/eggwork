@@ -1,24 +1,6 @@
-//! The runner's environment construction, observed through its public API.
+//! Inspect child environments built from the shared policy through the runner's public API.
 //!
-//! The runner builds a child's environment in one place, and both of its
-//! launch paths — the direct path and the sandbox-helper path — use it. The
-//! rules it applies come from the shared environment policy, whose single
-//! owner is `crates/eggwork-runner/policy/environment-policy.toml` and whose
-//! generated copy this crate compiles.
-//!
-//! The live defect these tests close was that the caller's `LANG` was
-//! *appended* to the node's baseline. The child saw the caller's locale, the
-//! launch specification carried two `LANG` entries, the helper refused the
-//! specification, and — for a best-effort request only — the runner answered
-//! that pre-target refusal by re-spawning the target directly with no
-//! Landlock ruleset at all. The observable result was a successful, entirely
-//! unconfined execution whose only record of the degradation was a `NotApplied`
-//! in the terminal snapshot.
-//!
-//! The helper-side half of that proof — that the helper *accepts* the
-//! resulting specification and that the execution keeps its confinement — is
-//! in `crates/eggwork-sandbox-helper/tests/environment_policy_parity.rs`,
-//! because it needs the real helper executable.
+//! Helper acceptance and confinement are covered by the parity suite.
 
 // The policy list is readable on every platform, and the two list tests below
 // are not gated. Everything else in this file — observing a child's
@@ -141,8 +123,6 @@ fn the_installed_baseline_is_the_policy_baseline() {
 }
 
 /// A caller's value for a node-owned key does not reach the child.
-///
-/// This is the regression for the live defect, observed on the direct path.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_caller_supplied_node_owned_key_does_not_reach_the_child() {

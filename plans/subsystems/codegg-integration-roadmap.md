@@ -67,7 +67,7 @@ Status: Eggwork reference contract closed; downstream CodeGG M001+C001+M002+M002
 
 Eggwork integration-contract plan:
 
-- `plans/implementation/codegg-integration/001-codegg-fixed-target-remote-executor.md`
+- `plans/archive/codegg-integration/001-codegg-fixed-target-remote-executor.md`
 
 Controlling downstream records in CodeGG:
 
@@ -119,7 +119,7 @@ Status: closed downstream; this milestone's Eggwork prerequisite was consumed by
 
 Eggwork upstream prerequisite:
 
-- `plans/implementation/workspace-artifact-transport/004-reusable-manifest-cas-and-derived-materialization.md`
+- `plans/archive/workspace-artifact-transport/004-reusable-manifest-cas-and-derived-materialization.md`
 - planning commit `ed0fc838bd006103021f1fb4749f579cabc2db87`
 - implementation `1e89dacd2b2635a9f439547db8b9077b168063ec`; closure `5b989c966158e958dfb12fb9020728e4e7cbc92a` at `plans/closure/workspace-artifact-transport/004-status.md`, satisfying the `workspace.derive.v1`, principal-scoped retained-manifest, canonical patch-equivalence, retained-blob, and typed `base_manifest_missing` prerequisites M003 was registered against.
 

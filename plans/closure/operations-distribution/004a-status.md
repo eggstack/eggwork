@@ -3,7 +3,7 @@
 Status: **closed** — the fixture-isolation invariant is implemented and proven;
 one residual `ETXTBSY` window is characterised and recorded rather than papered over
 Closed: 2026-10-05
-Plan: `plans/implementation/operations-distribution/004a-release-qualification-fixture-isolation-corrective.md`
+Plan: `plans/archive/operations-distribution/004a-release-qualification-fixture-isolation-corrective.md`
 Roadmap: `plans/subsystems/operations-distribution-roadmap.md`
 Branch: `m004-windows-process-tree`
 
@@ -251,7 +251,7 @@ The residual `ETXTBSY` window characterised in §5 and dispositioned in §11 was
 later eliminated, after it failed CI run `39306109740` on the optional-Gregg
 host-telemetry branch. The elimination and its evidence are recorded in
 `plans/closure/operations-distribution/004b-status.md`
-(`plans/implementation/operations-distribution/004b-staged-helper-publication-durability-corrective.md`).
+(`plans/archive/operations-distribution/004b-staged-helper-publication-durability-corrective.md`).
 
 Two statements above should be read with that record in hand:
 

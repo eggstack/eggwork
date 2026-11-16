@@ -3,7 +3,7 @@
 Status: closed — implementation commit `6f41957`; the outstanding evidence item (the Windows and macOS exercise of the runner's `OutputChunk` shape change) is discharged by the hosted `windows-runner`, `macos-runner`, and `macos-x64-runner` jobs
 
 Source implementation plan:
-`plans/implementation/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`
+`plans/archive/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`
 
 Source corrective addendum (authoritative where it disagrees with the plan):
 `plans/subsystems/security-isolation-resource-isolation-truthfulness-corrective-addendum.md`
@@ -453,7 +453,7 @@ separate, still-open item that this milestone neither closes nor worsens.
   record `plans/closure/security-isolation-resource/005a-status.md`) and to
   fill the real commit SHA in this record and in the roadmap entry. **Done:**
   the implementation commit is `6f41957`.
-- `plans/implementation/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`:
+- `plans/archive/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`:
   **not edited** — the plan is not in this milestone's ownership and is left
   as the authoritative statement of what was asked.
 

@@ -4,7 +4,7 @@ Status: closed
 
 Reviewed implementation commit: `26f42bb84533fd9d77812377e4603d591810a12c`
 
-Implementation plan: `plans/implementation/security-isolation-resource/003-enforced-resource-controls.md`
+Implementation plan: `plans/archive/security-isolation-resource/003-enforced-resource-controls.md`
 
 Dependencies: Security M002 closure `plans/closure/security-isolation-resource/002-status.md` and corrective closure `plans/closure/security-isolation-resource/002a-status.md`.
 

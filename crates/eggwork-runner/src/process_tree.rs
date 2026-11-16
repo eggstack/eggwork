@@ -1,60 +1,8 @@
-//! The platform process-tree owner behind [`LocalProcessRunner`](crate::LocalProcessRunner).
+//! Platform-specific process-tree owner for the shared runner lifecycle.
 //!
-//! There is exactly one runner lifecycle in `lib.rs`; this module is the only
-//! place where "how do I create, own, wait for, and terminate a process tree"
-//! differs between platforms. Everything else — request validation, command
-//! construction, pipe readers, bounded capture, timeout/cancellation selection,
-//! terminal conversion, and provenance — is shared, so a second runner can never
-//! grow here.
-//!
-//! # Why the tree owner is not `tokio::process::Child`
-//!
-//! A bare child owns *itself*. Eggwork's invariant is stronger:
-//!
-//! > process-tree cleanup completes before the execution owner releases its
-//! > lifetime permit.
-//!
-//! On Unix the leader is spawned into its own process group, so signalling the
-//! group reaches every descendant the target creates. On Windows there is no
-//! process group and `GenerateConsoleCtrlEvent` is not a tree-wide, catchable
-//! signal for an arbitrary argv target, so the tree owner is a Job Object.
-//!
-//! The Job Object must exist *before* the first instruction of the target runs.
-//! Spawning normally and calling `AssignProcessToJobObject` afterwards leaves a
-//! window in which the target has already run and already created descendants
-//! that were never owned. [`process_wrap::tokio::JobObject`] closes that window
-//! by adding `CREATE_SUSPENDED` to the creation flags, assigning the still
-//! suspended process, and only then resuming it. Spawn failure, assignment
-//! failure, and resume failure all terminate the created process before
-//! returning, so no target is left running when setup fails.
-//!
-//! # What Windows convergence does and does not claim
-//!
-//! Windows has no `SIGTERM`/`SIGKILL` escalation to emulate, and the invariant is
-//! deterministic tree convergence rather than signal fidelity. Termination is
-//! therefore `TerminateJobObject` on the owned Job Object, which the kernel
-//! applies to every member of the job.
-//!
-//! Eggwork does **not** claim to observe each descendant's final exit status: no
-//! safe-Rust surface in the reviewed dependency exposes a job-membership query,
-//! and adding one would mean Eggwork-owned `unsafe` Win32 FFI, which this
-//! repository denies at the workspace level. Instead convergence is established
-//! by three facts that the shared lifecycle relies on:
-//!
-//! 1. the Job Object stays owned for the whole execution, so no descendant can
-//!    ever escape the tree by outliving a leader;
-//! 2. after `TerminateJobObject` returns, the kernel has suspended and marked
-//!    every member terminating, so no member can execute further user code; and
-//! 3. the shared lifecycle joins the pipe readers after termination, and a pipe
-//!    only reaches EOF once every process holding it has exited — the same
-//!    evidence the Unix path has always used.
-//!
-//! Closing the Job Object handle is the final backstop: the job is created with
-//! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the kernel terminates any member that
-//! somehow survived, and that close happens when the tree owner is dropped —
-//! before `run` returns, and therefore before the caller's execution permit is
-//! released. Kill-on-drop is the backstop, never a substitute for the explicit
-//! normal-path termination above.
+//! Unix uses process groups; Windows assigns the suspended child to a Job
+//! Object before resume. The runner releases permits after convergence. Windows
+//! uses kernel termination and pipe EOF as evidence; kill-on-close is a backstop.
 
 use std::process::ExitStatus;
 use std::time::Duration;
@@ -174,14 +122,8 @@ mod imp {
             }
         }
 
-        /// Timeout, cancellation, or output-limit termination: ask the group to
-        /// stop, let it have `grace`, then force it and reap the leader.
-        ///
-        /// `grace` is honoured in both places it applies: the wait between
-        /// `SIGTERM` and `SIGKILL`, and the bounded reap afterwards. It used to
-        /// sleep the module constant here while still using the parameter for the
-        /// reap, so a caller passing anything other than `TERMINATION_GRACE` got a
-        /// silent no-op for half its request.
+        /// Ask the group to stop, wait `grace`, then force termination and reap
+        /// the leader. The bound applies to both waits.
         pub(crate) async fn terminate_and_reap(&mut self, grace: Duration) -> TreeConvergence {
             let mut signal_error = match terminate_group(self.group) {
                 Ok(true) => {
@@ -281,14 +223,8 @@ mod imp {
             self.child.wait().await
         }
 
-        /// The leader exited on its own, so any descendant it left behind is
-        /// still owned by the Job Object and is terminated here.
-        ///
-        /// No exit status is reported for descendants: the job-membership query
-        /// that would be required is not available without Eggwork-owned `unsafe`
-        /// FFI. The reader EOF barrier the shared lifecycle joins after this call
-        /// is the convergence evidence, and the job handle closes under
-        /// kill-on-job-close before the runner returns.
+        /// Terminate descendants left in the Job Object after the leader exits.
+        /// Pipe EOF provides convergence evidence; kill-on-close is the backstop.
         pub(crate) async fn converge_after_leader_exit(&mut self) -> TreeConvergence {
             match self.child.start_kill() {
                 Ok(()) => TreeConvergence::converged(None),
@@ -300,16 +236,10 @@ mod imp {
             }
         }
 
-        /// Timeout, cancellation, or output-limit termination. `TerminateJobObject`
-        /// covers the leader and every descendant in one call, so there is no
-        /// Unix-style escalation window and nothing to wait for beyond the call
-        /// returning.
+        /// Terminate the job's leader and descendants in one call.
         ///
-        /// The leader's exit status is deliberately not awaited: a job
-        /// termination exit code describes Eggwork's kill, not the target's own
-        /// outcome, and reporting it as `exit_code` would be a fabricated fact.
-        /// Unix already reports `None` here because a signalled process has no
-        /// exit code, so both platforms now agree.
+        /// Do not report the leader's exit status: it describes Eggwork's kill,
+        /// not the target's outcome.
         pub(crate) async fn terminate_and_reap(&mut self, _grace: Duration) -> TreeConvergence {
             match self.child.start_kill() {
                 Ok(()) => TreeConvergence::converged(None),

@@ -3,7 +3,7 @@
 Status: **closed** — the three findings are closed in the code, the closure evidence is complete, and the coordinator's pre-submit gate is green.
 the working tree; the coordinator owns the final status
 Closed: — (the coordinator sets this when the gate passes)
-Plan: `plans/implementation/operations-distribution/008a-operator-surface-truthfulness-corrective.md`
+Plan: `plans/archive/operations-distribution/008a-operator-surface-truthfulness-corrective.md`
 Roadmap: `plans/subsystems/operations-distribution-roadmap.md`
 Addendum: `plans/subsystems/operations-distribution-operator-truthfulness-corrective-addendum.md`
 Reviewed head: `721768d` (`feat(server): M005c resource-scoped authorization — implement the ADR-0007 boundary`)

@@ -57,7 +57,7 @@ Status: closed
 
 Implementation plan:
 
-- `plans/implementation/control-plane-protocol/001-authenticated-fixed-target-execution.md`
+- `plans/archive/control-plane-protocol/001-authenticated-fixed-target-execution.md`
 
 Objective:
 
@@ -80,7 +80,7 @@ Status: closed
 
 Implementation plan:
 
-- `plans/implementation/control-plane-protocol/002-idempotency-leases-events-and-recovery.md`
+- `plans/archive/control-plane-protocol/002-idempotency-leases-events-and-recovery.md`
 
 Objective:
 
@@ -104,7 +104,7 @@ Status: closed
 
 Implementation plan:
 
-- `plans/implementation/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md`
+- `plans/archive/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md`
 
 Interface review:
 
@@ -135,7 +135,7 @@ Corrective addendum:
 
 Implementation plan:
 
-- `plans/implementation/control-plane-protocol/004-shared-protocol-contract-corrective.md`
+- `plans/archive/control-plane-protocol/004-shared-protocol-contract-corrective.md`
 
 Decision record:
 

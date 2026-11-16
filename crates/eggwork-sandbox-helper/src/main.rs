@@ -1,16 +1,9 @@
 #![forbid(unsafe_code)]
 
-/// The node's environment policy.
+/// Generated copy of the runner-owned environment policy.
 ///
-/// The helper is a standalone binary and may not depend on any workspace
-/// crate, so it cannot share the policy as a library. It compiles a generated
-/// copy of the same source of truth the runner uses, and a parity test pins
-/// the two copies together so a one-sided edit fails the build.
-///
-/// The copy carries the whole shared contract and this crate uses only part of
-/// it — the helper does not build the runner's baseline, and the runner does
-/// not enforce the `PATH` value the way the helper does — so the unused items
-/// are part of the contract rather than leftovers.
+/// The helper stays independent of workspace crates; a parity test keeps its
+/// copy aligned with the source policy.
 #[allow(dead_code)]
 mod environment_policy;
 
@@ -194,15 +187,8 @@ mod linux {
         {
             return Err(12);
         }
-        // The environment is judged against the shared environment policy, and
-        // it gets its own status byte so an operator can tell an
-        // environment-policy refusal apart from a specification that is
-        // malformed in some other way. Before the policy was shared, the
-        // collision of a caller's `LANG` with the node's own `LANG` produced a
-        // specification with two `LANG` entries, this refusal, and — for a
-        // best-effort request — a re-spawn of the target with no Landlock
-        // ruleset at all. The status byte is what makes that class of refusal
-        // legible; the shared policy is what stops it happening.
+        // Keep policy refusals distinct from malformed specifications so the
+        // runner can report the failure without treating it as degradation.
         if spec
             .environment
             .iter()
@@ -222,14 +208,8 @@ mod linux {
         if root != spec.root || !root.is_dir() || !cwd.starts_with(&root) || !cwd.is_dir() {
             return Err(15);
         }
-        // Pin the validated inode. `restrict` used to re-resolve `spec.root` by
-        // name, so any process able to write the *parent* of the workspace root
-        // could swap it for a symlink in the gap between the checks above and
-        // the ruleset, and confinement would then be granted beneath the link
-        // target — while still reporting `FullyEnforced`. Opening once, here,
-        // makes the enforced object the same object that was validated. This is
-        // the same discipline the spec file itself already gets: refuse a
-        // symlink, then compare dev/ino on the descriptor actually read.
+        // Keep the validated inode open so a rename or symlink swap cannot
+        // redirect confinement between validation and ruleset creation.
         let root = open_directory(&root).map_err(|_| 16u8)?;
         Ok((spec, root))
     }
@@ -298,25 +278,12 @@ mod linux {
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
     }
 
-    /// The environment policy's refusal rule, in one place.
+    /// Reject a launch that violates the shared environment policy.
     ///
-    /// The runner *drops* a denied key; the helper *refuses the launch*. That
-    /// difference is deliberate and is the whole two-layer contract: the
-    /// runner is the request-normalisation boundary, and the helper is the
-    /// enforcement point, so a denied key arriving here means the node's own
-    /// filtering did not happen. Only the list is shared, never the behaviour.
-    ///
-    /// Three rules, all read out of the shared policy:
-    ///
-    /// * a denied key may not be present at all. `PATH` is the single
-    ///   exception, because it is denied as a *caller-controlled* key while
-    ///   the node pins its value;
-    /// * a `PATH` that is not the contract value widens what a confined target
-    ///   can execute, and the Landlock ruleset does not restrict `execve` by
-    ///   path;
-    /// * a node-owned key must carry the node's value, and it must carry it
-    ///   under the node's own spelling. A specification that disagreed with
-    ///   the node's baseline is a specification the runner did not build.
+    /// The runner drops denied caller keys; the helper rejects any that remain.
+    /// `PATH` must match the pinned value, and node-owned keys must use the
+    /// expected spelling and value. This prevents a forged specification from
+    /// widening executable lookup or bypassing runner normalization.
     fn environment_policy_refuses(key: &str, value: &str) -> bool {
         if key != "PATH" && environment_policy::denied_environment_key(key) {
             return true;

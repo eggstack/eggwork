@@ -1,29 +1,4 @@
-//! The protocol contract facts `eggwork-core` owns.
-//!
-//! Before this milestone the control-plane schema version, the `exec.argv.v1`
-//! capability name and the terminal/non-terminal classification of
-//! `ExecutionState` were each stated by more than one owner, and the copies
-//! had no mechanical relationship: both sides of every pair happened to agree
-//! by value, so a future rename or bump on the producing side would have
-//! desynchronised the consuming side silently.
-//!
-//! These tests are the mechanical half of the fix. They pin the *values* (so a
-//! careless edit is a test failure rather than a protocol break), they pin the
-//! *classification* (so the two sets cannot drift or lose a member), and they
-//! pin the wire spelling to the derived `Serialize` (so the journal's `state`
-//! column stays honest against the enum).
-//!
-//! **Adding a tenth variant to `ExecutionState` breaks this suite.** The
-//! primary mechanism is structural: `ExecutionState::is_terminal`,
-//! `ExecutionState::is_non_terminal` and `ExecutionState::wire_name` are
-//! exhaustive `match`es over all nine variants with no wildcard arm, so a new
-//! variant does not compile in `eggwork-core` at all. The secondary mechanism
-//! is `the_execution_state_enum_has_exactly_nine_variants`, which fails if the
-//! enumeration constant is widened without the classification being updated.
-//! The property test ranges over the crate-owned
-//! `eggwork_core::ALL_EXECUTION_STATES`, never over a list written here, so it
-//! cannot be satisfied by a hand-written list of nine variants that a tenth
-//! one simply joins unnoticed.
+//! Check core-owned schema, capability, and execution-state contract facts.
 
 use eggwork_core::{
     ALL_EXECUTION_STATES, API_SCHEMA_VERSION, EXEC_ARGV_CAPABILITY, ExecutionState,

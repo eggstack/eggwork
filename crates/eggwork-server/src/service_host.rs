@@ -1,29 +1,8 @@
-//! The service host: one node lifecycle, and the states a hosted node reports.
+//! Platform-neutral service lifecycle state machine.
 //!
-//! This module is deliberately free of Win32 calls. The SCM wrapper drives it
-//! and reports the states it produces; the state machine itself decides
-//! *which* state comes next and *whether* a transition is allowed. That
-//! separation is what makes the transitions testable on any host, and it is
-//! what keeps the control callback free of work: the callback latches a stop
-//! request and returns, and the service thread does the reporting.
-//!
-//! The states are the ones the Windows service control manager understands:
-//!
-//! ```text
-//! START_PENDING
-//!       |
-//!       | configuration valid + the node is ready
-//!       v
-//! RUNNING
-//!       |
-//!       | STOP or SHUTDOWN received
-//!       v
-//! STOP_PENDING
-//!       |
-//!       | the shared shutdown and wait converged
-//!       v
-//! STOPPED
-//! ```
+//! The Windows adapter reports transitions to the SCM; this module decides
+//! which transitions are valid. The control callback only latches a stop
+//! request, keeping it bounded and leaving lifecycle work on the service task.
 
 use std::{
     future::Future,
@@ -379,25 +358,12 @@ pub async fn converge_node(server: NodeServer) -> Result<(), LifecycleError> {
         .map_err(|error| LifecycleError::Converge(error.to_string()))
 }
 
-/// The node lifecycle, shared by the foreground and the service-hosted paths.
+/// Run the shared foreground/service lifecycle.
 ///
-/// Both paths run this exact function, so they converge the same way: stop
-/// admission, cancel and converge the active executions, shut the listener
-/// down, and **wait** for the listener and the executions to finish before
-/// the process exits. Foreground `run` used to call `shutdown()` without
-/// `wait()`, so a foreground stop could return while an execution was still
-/// converging.
-///
-/// `stop_requested` is consulted once the node is ready. A stop that arrived
-/// while the node was starting means the node never served, so it is
-/// converged without a readiness edge: claiming that it served would be a
-/// false claim about a node the operator had already stopped.
-///
-/// `await_stop` is awaited after the readiness edge, and must resolve when a
-/// stop is requested.
-///
-/// `observe` receives the lifecycle edges. The service-hosted path reports
-/// them to the service control manager; the foreground path ignores them.
+/// A stop during startup skips the readiness edge. Otherwise, `observe`
+/// receives readiness and convergence edges around the shutdown sequence,
+/// which stops admission, cancels active executions, and waits for completion.
+/// `await_stop` must resolve when a stop is requested.
 pub async fn serve_until_stopped<S, A, O>(
     config: &OperatorConfig,
     stop_requested: S,

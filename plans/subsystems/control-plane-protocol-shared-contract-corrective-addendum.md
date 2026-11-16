@@ -1,6 +1,6 @@
 # Control-Plane Protocol Post-Closure Corrective — Shared Protocol Contract Ownership
 
-Status: active corrective; M004 proposed
+Status: corrective closed; M004 closed
 
 Predecessor roadmap:
 
@@ -98,21 +98,19 @@ The client does not currently duplicate the terminal set — `crates/eggwork-cli
 
 Class: invariant
 
-Status: proposed
+Status: closed
 
 Implementation plan:
 
-- `plans/implementation/control-plane-protocol/004-shared-protocol-contract-corrective.md`
+- `plans/archive/control-plane-protocol/004-shared-protocol-contract-corrective.md`
 
 Objective:
 
 Give each of the three duplicated contract facts a single owner, so that client, server, and runner agree by construction rather than by convention, and a future change to any of them is a compile-time or test-detectable event.
 
-Status is **proposed**, not **ready**, for three reasons recorded here rather than left to the implementing agent:
-
-1. M004 requires an intentional, reviewed ownership change to `eggwork-core`: the crate must take ownership of a terminal-state classification it does not currently have. `plans/003-planning-process.md` §8 requires that an ownership-boundary change be recorded as an ADR or canonical amendment before the implementation lands. **That record now exists**: `plans/adrs/ADR-0008-core-protocol-contract-ownership.md` (accepted, 2026-10-23) records the ownership change, the alternatives rejected, and the constraint that no wire value changes. The plan's §12.3 stop condition is satisfied by that ADR.
-2. Two dispositions are still open and are not implementation detail: where the operator-facing `state_label` map lives, and whether the artifact-capture eligibility predicate stays server-local or moves to core. §3.4.4 states the constraint on each; the plan must record the decision it makes.
-3. This corrective is not registered in `plans/registry.md`. Registry ownership is not this document's, so a handoff before registration would present a plan as ready when the control surface does not say so.
+The original stop conditions are resolved: ADR-0008 records the ownership
+change, §3.4.4 records the two dispositions, and the corrective is registered.
+See the M004 closure record for evidence.
 
 ## 3. Shared-contract design
 

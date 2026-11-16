@@ -1,6 +1,6 @@
 # Workspace and Artifact Transport Post-Closure Corrective — Data-Plane Ownership and Fail-Closed Capture
 
-Status: active corrective; M005a proposed, M005b proposed
+Status: M005a conditionally closed; M005b closed
 
 Predecessor roadmap:
 
@@ -214,7 +214,7 @@ report explains.
 
 Class: invariant
 
-Status: proposed
+Status: conditionally closed
 
 Implementation plan:
 
@@ -230,11 +230,11 @@ platform claim must match the code on every shipped target.
 
 Class: invariant
 
-Status: proposed
+Status: closed
 
 Implementation plan:
 
-- `plans/implementation/workspace-artifact-transport/005b-gc-preview-and-store-ownership-corrective.md`
+- `plans/archive/workspace-artifact-transport/005b-gc-preview-and-store-ownership-corrective.md`
 
 Objective:
 

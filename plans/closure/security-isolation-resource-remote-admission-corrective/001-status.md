@@ -2,7 +2,7 @@
 
 Status: closed
 
-Implementation plan: `plans/implementation/security-isolation-resource-remote-admission-corrective/001-remote-enforcement-admission-and-capability-truthfulness.md`
+Implementation plan: `plans/archive/security-isolation-resource-remote-admission-corrective/001-remote-enforcement-admission-and-capability-truthfulness.md`
 
 Corrective authority: `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md`
 

@@ -1,30 +1,9 @@
 //! Optional, default-off host telemetry.
 //!
-//! A node may be configured to read *host-wide* measurements from a local
-//! telemetry provider and expose them to callers. The feature is opt-in: with
-//! no configuration the node creates no provider, starts no task, and claims
-//! nothing.
-//!
-//! Three properties are load-bearing here and are enforced by construction
-//! rather than by convention:
-//!
-//! * **The endpoint is a validated loopback URL.** The configured endpoint is
-//!   parsed and checked once, at load time, against a closed rule set: plain
-//!   HTTP, an explicit TCP port, an IP literal that is a loopback address, and
-//!   exactly the provider's status path. Hostnames — including `localhost` —
-//!   are refused, so no DNS answer can move the request off the loopback
-//!   interface. The client is built without redirect and proxy support, so a
-//!   redirect hop or an inherited `HTTP_PROXY` cannot move it either.
-//! * **One owner polls.** A single background task performs every provider
-//!   request. Readers consult the cache; they never trigger a provider
-//!   request, so a caller cannot amplify into a poll storm.
-//! * **Failures are bounded and typed.** Every failure becomes one of a closed
-//!   set of categories. No response body, URL, or host path is ever carried
-//!   into a category, a log line, or a metric.
-//!
-//! The measurements themselves are normalized into
-//! [`eggwork_core::HostTelemetry`], which carries no provider vocabulary. The
-//! provider's own wire types stop at this module's boundary.
+//! One background task polls a configured loopback provider; readers use its
+//! cache. Endpoints are restricted to explicit loopback IPs without redirects
+//! or proxies. Failures map to bounded categories, and provider wire types are
+//! normalized into [`eggwork_core::HostTelemetry`] at this boundary.
 
 use std::{
     sync::Arc,
@@ -160,14 +139,10 @@ impl HostTelemetryConfig {
     }
 }
 
-/// Validate a provider endpoint and return its normalized form.
+/// Validate and normalize a loopback provider endpoint.
 ///
-/// The rule set is closed on purpose. A provider that lives on this machine
-/// is addressed by an IP literal, so there is no name to resolve and no
-/// answer to be rebound between validation and use. Everything the caller
-/// could otherwise smuggle past the check — a scheme other than plain HTTP, a
-/// userinfo section, a query string, a fragment, another path, a missing or
-/// non-numeric port, a hostname of any kind — is refused.
+/// Only plain HTTP to an explicit loopback IP and the provider status path is
+/// accepted; hostnames and extra URL components are refused.
 fn validate_endpoint(raw: &str) -> Result<String, TelemetryConfigError> {
     let parsed = Url::parse(raw).map_err(|_| TelemetryConfigError::InvalidEndpoint)?;
     if parsed.scheme() != "http" {

@@ -916,7 +916,7 @@ Honest gaps:
 - [operations CLI](operations-cli.md)
 - [protocol](protocol.md)
 - [ADR-0003: Execution Idempotency, Ownership Leases, and Generation Fencing](../plans/adrs/ADR-0003-execution-idempotency-leases-and-fencing.md)
-- [M002 plan: Idempotency, Leases, Resumable Events, and Recovery](../plans/implementation/control-plane-protocol/002-idempotency-leases-events-and-recovery.md)
+- [M002 plan: Idempotency, Leases, Resumable Events, and Recovery](../plans/archive/control-plane-protocol/002-idempotency-leases-events-and-recovery.md)
 - [M002 closure evidence](../plans/closure/control-plane-protocol/002-status.md)
 - [M002 corrective closure: lease expiry before runner spawn](../plans/closure/control-plane-protocol/002-lease-expiry-race-correction.md)
 - [Long-term specification §8, §10, §18](../plans/000-long-term-specification.md)

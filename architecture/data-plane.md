@@ -1109,13 +1109,13 @@ runner's confinement to the materialized root.
   Artifacts](../plans/adrs/ADR-0004-content-addressed-workspaces-and-artifacts.md) - the normative
   decision.
 - Plans: [001 blob store and digest
-  protocol](../plans/implementation/workspace-artifact-transport/001-blob-store-and-digest-protocol.md),
+  protocol](../plans/archive/workspace-artifact-transport/001-blob-store-and-digest-protocol.md),
   [002 workspace manifest and safe
-  materialization](../plans/implementation/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md),
+  materialization](../plans/archive/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md),
   [003 declared artifacts retention and
-  GC](../plans/implementation/workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md),
+  GC](../plans/archive/workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md),
   [004 reusable manifest CAS and derived
-  materialization](../plans/implementation/workspace-artifact-transport/004-reusable-manifest-cas-and-derived-materialization.md).
+  materialization](../plans/archive/workspace-artifact-transport/004-reusable-manifest-cas-and-derived-materialization.md).
 - Recorded evidence: [001](../plans/closure/workspace-artifact-transport/001-status.md),
   [002](../plans/closure/workspace-artifact-transport/002-status.md),
   [003](../plans/closure/workspace-artifact-transport/003-status.md),

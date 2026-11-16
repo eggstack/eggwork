@@ -1,6 +1,6 @@
 # Control Plane M002 Closure — Idempotency, Leases, Resumable Events, and Recovery
 
-Source plan: `plans/implementation/control-plane-protocol/002-idempotency-leases-events-and-recovery.md`  
+Source plan: `plans/archive/control-plane-protocol/002-idempotency-leases-events-and-recovery.md`
 Subsystem roadmap: `plans/subsystems/control-plane-protocol-roadmap.md`  
 Reviewed implementation commit: `83600ec`  
 Planning/closure commit: `9b34717`

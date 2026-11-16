@@ -1,6 +1,6 @@
 # Foundation M001 Closure — Repository Bootstrap and Domain Contract
 
-Source plan: `plans/implementation/foundation-execution-core/001-repository-bootstrap-and-domain-contract.md`  
+Source plan: `plans/archive/foundation-execution-core/001-repository-bootstrap-and-domain-contract.md`
 Subsystem roadmap: `plans/subsystems/foundation-execution-core-roadmap.md`  
 Reviewed baseline: `a5ac532`  
 Implementation commit: `0de99cf9bf36b61090915223a6486b0893830459`

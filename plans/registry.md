@@ -1,295 +1,46 @@
-# Eggwork Active Planning Registry
+# Eggwork Planning Registry
 
-This file is the compact control surface for active Eggwork planning. Detailed requirements remain in canonical documents, ADRs, subsystem roadmaps, implementation plans, closure records, corrective addenda, and Git history.
+This is the control surface for current work. Long-term direction lives in the
+[canonical plans](000-long-term-specification.md), durable decisions in
+[ADRs](adrs/README.md), and implementation evidence in `closure/`. Planning
+rules are in [003-planning-process.md](003-planning-process.md).
 
-## Canonical direction
+## Current status
 
-- `plans/000-long-term-specification.md`
-- `plans/001-terminology-and-domain-model.md`
-- `plans/002-long-term-roadmap.md`
-- `plans/003-planning-process.md`
+No implementation handoff is ready. Four conditionally closed plans retain
+named evidence requirements; see their closure records before reopening work.
+Closed and superseded handoffs are in `archive/`. Their closure evidence stays
+in `closure/`.
 
-Founding ADRs:
-
-- `plans/adrs/ADR-0001-fixed-target-scheduler-free-execution.md`
-- `plans/adrs/ADR-0002-eggstack-transport-and-mtls.md`
-- `plans/adrs/ADR-0003-execution-idempotency-leases-and-fencing.md`
-- `plans/adrs/ADR-0004-content-addressed-workspaces-and-artifacts.md`
-- `plans/adrs/ADR-0005-runner-service-separation-and-local-admission.md`
-
-Follow-up accepted ADR: `plans/adrs/ADR-0006-optional-gregg-host-telemetry.md` (Eggwork reads local Gregg optionally; Gregg unchanged).
-
-Follow-up accepted ADR: `plans/adrs/ADR-0008-core-protocol-contract-ownership.md` (2026-10-23) — `eggwork-core` owns the control-plane API schema version, the `exec.argv.v1` capability name, and the terminal/non-terminal classification of `ExecutionState`; the runner keeps producer ownership of the capability names it produces and of the sandbox profile name. No wire value, wire field, or capability byte changes. This is the `plans/003-planning-process.md` §8 record that Control-plane M004's §12.3 stop condition requires.
-
-Accepted ADR: `plans/adrs/ADR-0007-resource-scoped-authorization.md` (2026-10-25) — **Option A: implement resource-scoped grants.** The node gains a real per-resource authorization boundary: `GrantAuthorizer` implements the existing `authorize_request` hook so the typed `ResourceId` is consulted, `ClientGrant` gains an optional, additive, bounded resource-scope list, the store's `principal_id` fences remain authoritative for ownership (the authorizer narrows, never widens), and blobs are governed by an explicit digest list because content-addressed blob storage has no owner. No wire value, wire field, capability byte, or `API_SCHEMA_VERSION` changes. Security M005c is unblocked and implements Branch A.
-
-## Status vocabulary
-
-- **proposed** — plan exists but is not approved for execution.
-- **ready** — hard dependencies/interfaces are satisfied; plan may be handed off.
-- **active** — implementation is in progress.
-- **blocked** — a named dependency/evidence requirement prevents progress.
-- **closing** — implementation landed and closure evidence is being gathered.
-- **closed** — closure record accepted.
-- **qualified** — the implemented baseline is closed for its explicitly stated platform/scope while later expansion/closure work may remain.
-- **conditionally closed** — implementation is substantially complete but named evidence remains.
-- **corrective required** — a later finding must close before the area is treated as currently qualified.
-- **superseded** — replaced by another document.
-- **archived** — retained for traceability and no longer active.
-
-## Current Eggwork implementation baseline
-
-Latest Eggwork implementation/closure head reviewed for this planning batch:
-
-- Operations M004b — the staged-helper write-access corrective: the residual
-  `ETXTBSY` refusal that M004a characterised is eliminated by making the
-  staged helper a link that is never written, with no copy path left to fail;
-  the mechanism is confirmed against the kernel's own `i_writecount`
-  accounting, and two regression tests are proven non-vacuous;
-
-- `5ccb1e6` / `2190818` — optional Gregg host telemetry M002 and M001 closed: the default-off
-  loopback adapter, the frozen `NodeTelemetry` contract, the narrow `telemetry` read grant, and the
-  fixed-target client method;
-
-- `d4db4e72` — merged Foundation M004 + Operations M004a line: Windows Job Object process-tree execution is native-qualified, helper fixture isolation is closed, and current CI is green;
-- `d992ca5` — architecture deep dives: module overview plus systematic
-  per-component documents, including the cross-cutting divergences table;
-- `926e06a` — corrected the Windows execution diagnosis
-  (`UnsupportedPlatform` on `not(unix)`, not an output-monitor race);
-- `4a6e7f5` / `c3ece0c` — release version coherence: bump to `0.1.5`, fail fast
-  when tag and version disagree, and keep the generated workflow generated by
-  moving the tag guard into `scripts/check_release_tag.py`;
-- `b31f117` — `--locked` on CI's clippy and test steps, and `Cargo.lock` brought
-  to the workspace version;
-- `fc67f8d` — Operations M004 release determinism and qualification harness, and
-  the source of the corrected `v0.1.1` candidate;
-- `caa3918` — Windows service management fails closed before any mutation;
-- `202d395` / `9f909bc` — platform-shaped execution child environment;
-- `ec2b0e2` — Windows platform-disposition qualification job;
-- `c33e9d6` — Operations M002a recovery-safe Eggup lifecycle composition;
-- tags through **`v0.1.5`** exist. `v0.1.0`–`v0.1.4` are immutable
-  failure/discovery evidence and must never be published as a qualified release.
-  The workspace version is `0.1.5`.
-
-Release lineage, and why each tag exists:
-
-| Tag | Disposition |
-|---|---|
-| `v0.1.0` | Historical draft; proved one source revision can yield two different Windows binaries. Never publish. |
-| `v0.1.1` | Corrected M004 candidate; systemd and launchd service-qualified, Linux required Landlock qualified, all 17 assets reused on same-tag rerun. |
-| `v0.1.2` | Reproduced the `Internal`/`null` Windows execution shape; initially misattributed to an output-monitor race. |
-| `v0.1.3` | Failed closed: version bumped without regenerating `Cargo.lock`, so every `--locked` release build failed. |
-| `v0.1.4` | Failed closed: staged binaries reported `0.1.3`. Hosted qualification refused every install stage with `installed-daemon-version`. Staging itself was sound — 17 assets, draft, `reused=17` on rerun. |
-| `v0.1.5` | Carries the monitor fix; still reproduces the identical Windows shape, which proved the real cause is `LocalProcessRunner::run` refusing with `UnsupportedPlatform` on `not(unix)` before any child exists. |
-
-The repository is no longer planning-only.
-
-## Repository interrogation corrective batch
-
-A repository-wide code interrogation pass over the reviewed baseline found no `todo!()`/`unimplemented!()` and only five production panic sites, all benign — but it found that several protocol, data-plane, and operator facts are stated by more than one owner, and that the copies have drifted. The findings are grouped into five subsystem corrective addenda, each with bounded implementation milestones:
-
-| Addendum | Milestones | Class | Status |
-|---|---|---|---|
-| `plans/subsystems/control-plane-protocol-shared-contract-corrective-addendum.md` | M004 shared protocol contract | invariant | closed |
-| `plans/subsystems/workspace-artifact-transport-data-plane-corrective-addendum.md` | M005a declared-artifact capture fail-closed; M005b GC preview and store ownership | invariant | M005a conditionally closed; M005b closed |
-| `plans/subsystems/security-isolation-resource-isolation-truthfulness-corrective-addendum.md` | M005a degraded-isolation observability; M005b sandbox-helper environment parity; M005c resource-scoped authorization | invariant | M005a conditionally closed; M005b closed; **M005c closed** |
-| `plans/subsystems/operations-distribution-operator-truthfulness-corrective-addendum.md` | M008a operator surface truthfulness; M008b release harness and documentation single-sourcing | capability; infrastructure/polish | M008a closed; M008b closed |
-| `plans/subsystems/foundation-execution-core-request-validation-corrective-addendum.md` | M005 runner request validation parity | invariant | closed |
-
-None of these milestones is dependency-ready. M007 has been implemented and is closing. The batch is registered so that the new findings are visible as current authority rather than as unwritten observations, and so that the five subsystems' roadmaps can be amended to point at their correctives.
-
-Two findings in this batch were deliberately **not** given a milestone, because they are already owned:
-
-- the foreground `run` path calling `shutdown()` without `wait()` was M007's scope, and it now uses the same shutdown-and-wait convergence contract as the service-hosted path;
-- the inert resource-scoped authorization hook was already recorded as divergence #4, so M005c is a decision about an existing gap, not a new defect report.
-
-## Active workstreams
-
-| Workstream | Status | Current work | Authority |
-|---|---|---|---|
-| Optional Gregg host telemetry | **closed; M001 and M002 both closed** | M001 closed the default-off loopback Gregg adapter, normalized cache and single polling owner (`plans/closure/optional-gregg-host-telemetry/001-status.md`, implementation `ac55985`); M002 closed the authorized node telemetry API/client behind a narrow `telemetry` grant (`plans/closure/optional-gregg-host-telemetry/002-status.md`, implementation `5ccb1e6`). The frozen contract is `eggwork_core::NodeTelemetry` schema version 1. No Gregg changes, no Eggwork scheduling, no capability feature added. The CodeGG worker-telemetry consumer is unblocked. | `plans/subsystems/optional-gregg-host-telemetry-roadmap.md`, `plans/adrs/ADR-0006-optional-gregg-host-telemetry.md` |
-| Foundation / execution core | M001-M003 closed; M004 conditionally closed; M005 corrective closed; no ready implementation work | Windows execution is implemented: M004 replaced the `UnsupportedPlatform` gate with a Job Object process-tree backend and qualified the tree lifecycle on hosted `windows-latest`. What remains is the installed-release receipt, which needs a release containing M004. A repository interrogation pass added M005: the runner's request validation is a weaker restatement of the core domain contract, and the runner's public constructor and environment setter bypass even that | `plans/subsystems/foundation-execution-core-roadmap.md`, `plans/closure/foundation-execution-core/004-status.md`, `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md`, `plans/subsystems/foundation-execution-core-request-validation-corrective-addendum.md` |
-| Control-plane protocol | M001-M004 closed; no milestone in flight | M001-M003 complete. A repository interrogation pass added M004: `API_SCHEMA_VERSION` is declared independently in the client and the server that must agree on it, the capability feature-name strings are re-typed across runner, server, and client, and the terminal-state classification is enumerated in roughly nine places because `eggwork-core` owns no terminal concept — **implemented**: `eggwork-core` now owns the control-plane schema version, the `exec.argv.v1` capability name, and the terminal/non-terminal classification, and the runner owns the capability names it produces. No wire value, wire field, or capability byte changed. Closure record: `plans/closure/control-plane-protocol/004-status.md` | `plans/subsystems/control-plane-protocol-roadmap.md`, `plans/subsystems/control-plane-protocol-shared-contract-corrective-addendum.md` |
-| Workspace / artifacts | M001-M004 closed; M005a conditionally closed, M005b closed | M001-M004 closed, including reusable manifest CAS + derived materialization (`plans/closure/workspace-artifact-transport/004-status.md`). A repository interrogation pass added M005a (on a non-Unix target declared-artifact capture is refused while the execution still reports `Succeeded` with zero artifacts) — **implemented**: a declared output that was not captured now ends the execution in a truthful non-success state with a first-class disposition and a diagnostic event, and a node whose platform cannot capture no longer advertises `artifact.declared.v1` — and M005b (the operator's GC dry-run preview and the apply pass use different candidate predicates, and the store's path layout and manifest owner-id format are re-derived outside their owners) | `plans/subsystems/workspace-artifact-transport-roadmap.md`, `plans/closure/workspace-artifact-transport/004-status.md`, `plans/subsystems/workspace-artifact-transport-data-plane-corrective-addendum.md`, `plans/closure/workspace-artifact-transport/005a-status.md`, `plans/closure/workspace-artifact-transport/005b-status.md` |
-| Security / isolation / resources | M001-M004 plus remote-admission corrective C001 closed; M005a conditionally closed, M005b closed, M005c closed | M001-M004 plus remote-admission corrective C001 are closed (`plans/closure/security-isolation-resource/004-status.md`); macOS/Windows hosted qualification remains future Operations M004 work, not a Security defect. A repository interrogation pass added M005a (degraded isolation is recorded in the terminal snapshot but never emitted as a production diagnostic event, so an event-streaming caller cannot see it) — **implemented**: a degraded best-effort request now produces a bounded diagnostic event published by the runner before the target spawns, so it precedes any target output and the terminal event; the diagnostic grammar is owned by `eggwork-core`. Also added M005b (the sandbox environment deny-list is maintained twice, with different drop-versus-reject semantics), and M005c, whose disposition of the already-recorded inert resource-scoped authorization hook was **decided by ADR-0007** (accepted 2026-10-25, Option A — implement resource-scoped grants) and is now being implemented as Branch A of its plan | `plans/subsystems/security-isolation-resource-roadmap.md`, `plans/subsystems/security-isolation-resource-remote-admission-corrective-addendum.md`, `plans/subsystems/security-isolation-resource-isolation-truthfulness-corrective-addendum.md`, `plans/closure/security-isolation-resource/005a-status.md`, `plans/adrs/ADR-0007-resource-scoped-authorization.md` |
-| Operations / distribution | M004 conditionally closed; M004a and M004b closed; M007 conditionally closed; M008a/M008b closed | Foundation M004's Windows runner is implemented/native-qualified; M004 still needs immutable installed-release evidence and Windows SCM service qualification. M004a closed the fixture-ownership defect; M004b closed the residual `ETXTBSY` refusal it left open, by staging the helper as a link that is never written — no copy path, no barrier, and the mechanism confirmed against the kernel's own write-access accounting. M007 was the only substantive Phase-6 implementation capability still ready; it is now implemented and conditionally closed, and the remaining Phase-6 gap is the *installed-release* Windows service receipt, which is M004's. A repository interrogation pass added M008a (five live metrics are never reported by the operator surface; one `active_executions` field name carries two meanings; every configuration fault collapses into one unhelpful message) and M008b (the release harness re-derives facts that already have an owner, and the design record's line citations and size figures are stale with no gate) | `plans/subsystems/operations-distribution-roadmap.md`, `plans/closure/operations-distribution/004-status.md`, `plans/closure/operations-distribution/004a-status.md`, `plans/closure/operations-distribution/004b-status.md`, `plans/subsystems/operations-distribution-operator-truthfulness-corrective-addendum.md` |
-| CodeGG integration | Eggwork reference closed; downstream M001+C001+M002+M002a+M003 closed | CodeGG required-Landlock live qualification closed at `f5f8d96d`; downstream M003 closed at CodeGG `d51afe46` (implementation `1ce377ce`, hosted `36745285774`) against this repository's Workspace M004 contract; only downstream M004 remains, deferred. | `plans/subsystems/codegg-integration-roadmap.md` |
-
-## Dependency-ready implementation plans
-
-No Eggwork implementation handoff is dependency-ready. M007 has been implemented and is closing on a hosted Windows source-build lifecycle. The optional Gregg telemetry line is closed and remains dependency history. Closed downstream CodeGG rows remain dependency history.
-
-The repository interrogation corrective batch is registered and is being worked. Security M005c was `blocked` on ADR-0007; that ADR was **accepted** on 2026-10-25 (Option A — implement resource-scoped grants), so M005c is no longer blocked and its plan's Branch A is the work being executed. Every milestone in the batch is now implemented; the two that remain open are closed only on Linux-hosted evidence (`Security M005a`, `Workspace M005a`), which is recorded as a named evidence item rather than a blocker. The batch was executed in parallel with M007, and the correctives are mutually independent of one another.
-
-| Workstream | Milestone | Status | Implementation plan | Handoff note |
-|---|---|---|---|---|
-| CodeGG downstream | M001+C001+M002+M002a fixed-target remote execution/policy/live isolation | **closed in CodeGG** | `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution/002a-status.md` | Required-Landlock production mTLS path closed at `f5f8d96d`. Downstream M003 is also closed (see below). |
-
-## Closed and superseded implementation plans
-
-| Workstream | Milestone | Status | Evidence / note |
-|---|---|---|---|
-| Foundation | M001 domain/bootstrap | closed | `plans/closure/foundation-execution-core/001-status.md` |
-| Foundation | M002 local runner | closed | `plans/closure/foundation-execution-core/002-status.md` |
-| Foundation | M003 execution-ownership guards + runner API hardening | closed | `plans/closure/foundation-execution-core/003-status.md` |
-| Foundation | M004 Windows Job Object finite-process backend | conditionally closed | `plans/closure/foundation-execution-core/004-status.md` — tree lifecycle qualified on hosted `windows-latest`; the installed-release receipt still needs a release containing M004 |
-| Foundation corrective | C001 portable ownership guard + CI enforcement | closed | `plans/closure/foundation-execution-core-ci-corrective/001-status.md` |
-| Control plane | M001 authenticated execution | closed | `plans/closure/control-plane-protocol/001-status.md` |
-| Control plane | M002 idempotency/leases/events/recovery | closed | `plans/closure/control-plane-protocol/002-status.md` + lease-expiry correction |
-| Control plane | M004 shared protocol contract | closed | `plans/closure/control-plane-protocol/004-status.md` — `eggwork-core` now owns the control-plane API schema version, the `exec.argv.v1` capability name, and the terminal/non-terminal classification of `ExecutionState`; the runner owns the capability names it produces. No wire value, wire field, or capability byte changed. The ownership change is recorded in `plans/adrs/ADR-0008-core-protocol-contract-ownership.md`. |
-| Workspace | M001 blob store | closed | `plans/closure/workspace-artifact-transport/001-status.md` |
-| Workspace | M002 materialization | closed | `plans/closure/workspace-artifact-transport/002-status.md` |
-| Workspace | M003 artifacts/retention/GC | closed | `plans/closure/workspace-artifact-transport/003-status.md` |
-| Workspace | M004 reusable manifest CAS + derived materialization | closed | `plans/closure/workspace-artifact-transport/004-status.md`; consumed by closed downstream CodeGG M003 |
-| Workspace | M005a declared-artifact capture fail-closed | conditionally closed | `plans/closure/workspace-artifact-transport/005a-status.md` — a declared output that was not captured now ends the execution in a truthful non-success state with a first-class capture disposition, and a node whose platform cannot capture does not advertise `artifact.declared.v1`. The platform limitation itself remains: declared artifacts are captured on a Unix platform only. |
-| Workspace | M005b GC preview and store ownership | closed | `plans/closure/workspace-artifact-transport/005b-status.md` — the operator's GC preview and the apply pass now select candidates through the same store-owned statement, the store's path layout and metadata filenames have one owner, the materializer verifies the bytes it writes against the manifest digest while copying, and the manifest owner-id composite has one producer. |
-| Security | M001 authz/redaction/threat model | closed | `plans/closure/security-isolation-resource/001-status.md` |
-| Security | M002 Landlock | closed | `plans/closure/security-isolation-resource/002-status.md` |
-| Security | M002a `/dev/null` corrective | closed | `plans/closure/security-isolation-resource/002a-status.md` |
-| Security | M003 resource enforcement | qualified/closed | `plans/closure/security-isolation-resource/003-status.md` |
-| Security | M004 adversarial + cross-platform closure | closed | `plans/closure/security-isolation-resource/004-status.md` (implementation `283f3ea`, incl. null-device write hardening fix); platform claims limited to hosted Linux with macOS/Windows fail-closed by construction |
-| Security corrective | C001 remote enforcement admission + capability truthfulness | closed | `plans/closure/security-isolation-resource-remote-admission-corrective/001-status.md` |
-| Security corrective | M005a degraded-isolation observability | conditionally closed | `plans/closure/security-isolation-resource/005a-status.md` — a degraded best-effort request now produces a bounded diagnostic event published before the target's first output and before the terminal event; the diagnostic grammar is owned by `eggwork-core`. The runner's public `OutputChunk` became an enum carrying a `Diagnostic` variant, which is release-visible. |
-| Security corrective | M005b sandbox-helper environment parity | closed | `plans/closure/security-isolation-resource/005b-status.md` — the environment policy has one owner, a deterministic generator, and generated copies pinned by a behavioural parity test; a caller-supplied node-owned key can no longer produce a duplicate launch-specification key and cause a best-effort execution to lose its confinement. |
-| Optional Gregg telemetry | M001 default-off loopback adapter/cache | closed | `plans/closure/optional-gregg-host-telemetry/001-status.md` (implementation `ac55985`) |
-| Optional Gregg telemetry | M002 authenticated node telemetry API/client | closed | `plans/closure/optional-gregg-host-telemetry/002-status.md` (implementation `5ccb1e6`); frozen contract `eggwork_core::NodeTelemetry` schema version 1, narrow `telemetry` grant, `NodeClient::telemetry`/`telemetry_for` |
-| Operations | M001 node operations | closed | `plans/closure/operations-distribution/001-status.md` |
-| Operations | M002 Eggup deployment/service integration | closed (resumed) | `plans/closure/operations-distribution/002-resumed-status.md` (implementation `d5722d9`, published `eggup-core`/`eggup-service` 0.1.1); historical pre-M007 blocker preserved immutably at `plans/closure/operations-distribution/002-status.md` |
-| Operations | M003 Eggpack producer packaging integration | closed | `plans/closure/operations-distribution/003-status.md` (implementation `012383b` plus hosted-run portability correctives `4b95443`/`8827ed4`; `release/eggpack/` producer configuration, generated `.github/workflows/release.yml`, CI drift guard, static release/deployment parity suite). Hosted evidence: run `36787942079`, all 20 jobs green across the five required targets; draft `eggwork v0.1.0` (release id `400502116`, 17 assets) staged, nothing published, tag unmoved by the workflow. |
-| Operations corrective | M002a RecoveryRequired restart suppression + lifecycle composition | closed | `plans/closure/operations-distribution/002a-status.md` (implementation `c33e9d6`; published Eggup 0.1.1 lifecycle composition) |
-| Operations | former combined M002 packaging/services/Eggup | superseded | `plans/implementation/operations-distribution/002-packaging-services-and-eggup.md`; split because Eggpack now owns producer packaging |
-| CodeGG | M001 fixed-target remote executor (Eggwork reference contract) | closed | `plans/closure/codegg-integration/001-status.md`; downstream CodeGG M001+C001+M002+M002a+M003 are now closed, and downstream M004 is the only milestone left, deferred on the stable AgentRun worker-entry contract. |
-
-## Planned / blocked work
-
-| Work | Status | Blocker / rationale |
+| Workstream | Status | Closure evidence |
 |---|---|---|
-| Optional Gregg host telemetry M002 authenticated node API/client | **closed** | `plans/closure/optional-gregg-host-telemetry/002-status.md` (implementation `5ccb1e6`). The mTLS-authorized read-only projection is implemented, the contract is frozen, and the default-off no-Gregg execution is proven by an installed-release receipt. |
-| Foundation M004 Windows finite-process backend | **conditionally closed** | Implemented at `f41a8ae`; tree lifecycle qualified on hosted `windows-latest` (`plans/closure/foundation-execution-core/004-status.md`). Remaining evidence is the installed-release receipt, which needs a release containing M004 — a release-lineage action reserved for the maintainer. |
-| Operations M004a qualification helper fixture isolation | **closed** | `plans/closure/operations-distribution/004a-status.md`. The fixture-isolation invariant is implemented and proven; the recorded `ETXTBSY` finding is re-dispositioned there as a host-level kernel window with measurements, not as a fixture defect. That residual was subsequently eliminated by M004b — see the addendum appended to the M004a record. |
-| Operations M004b staged helper write-access corrective | **closed** | `plans/closure/operations-distribution/004b-status.md`. The residual `ETXTBSY` refusal M004a characterised is eliminated by construction: the staged helper is linked rather than copied, so the file the fixture executes is never written, and no copy path remains to fail. The mechanism is the inode's write access — `execve()` refuses an inode that is open for writing — read from the kernel rather than inferred, and the copy-and-commit barrier the first attempt proposed was itself refused 3 times in 32 stagings on CI. Two regression tests: one asserts the staged helper *is* the build output's inode, the other the one-time trust-mode normalisation. |
-| Operations M004 operational/release qualification | **conditionally closed** | `plans/closure/operations-distribution/004-status.md`. Foundation M004 has now implemented/native-qualified Windows child execution, but immutable installed-release evidence still needs a new candidate containing it. Windows SCM service hosting is implemented (M007, conditionally closed) and its installed-release receipt is the remaining gap; public publication/bootstrap remains a maintainer action. |
-| Operations M005 reverse-connect relay | deferred (not unblocked) | M004 neither implements nor claims a remote connect/accept path, so it does not supply the interface M005 relies on. No immediate product need; stable identity/lease semantics already exist. |
-| Operations M006 PTY extension | deferred (not unblocked) | PTY capability streams are out of M004 scope. Requires a separate interactive ownership/attach design. |
-| CodeGG M003 content-aware derived workspace transfer | closed downstream | Closed in CodeGG at `d51afe46` (implementation `1ce377ce`; hosted `36745285774` success, live derived reuse under required isolation) on Eggwork `e6a5d82`; closure record `dbowm91/codegg: plans/closure/eggwork-fixed-target-remote-execution/003-status.md` |
-| CodeGG M004 remote AgentRun worker | deferred | M003 is closed; only the stable AgentRun worker-entry contract remains outstanding |
-| Operations M007 Windows service host | **conditionally closed** | `plans/closure/operations-distribution/007-status.md` (implementation `22f5337`, corrective `e72cd22`). Explicit `service-host --config` entry, shared shutdown+wait convergence, normal STOP does not create persistent drain, dedicated native Windows contract/SCM evidence, Eggup remains manager owner. Every implementation and native criterion passes; the remaining condition is the *installed-release* Windows service receipt, which needs a candidate containing both Foundation M004 and M007 and is M004's outstanding item. |
-| Control-plane M004 shared protocol contract corrective | **closed** | `plans/implementation/control-plane-protocol/004-shared-protocol-contract-corrective.md`. `API_SCHEMA_VERSION` is declared independently in the client and the server that must agree on it. The capability feature names are re-typed: the server hardcodes the three `resources.cgroups-v2.*` names that the runner produces, and the client hardcodes `exec.argv.v1` that the server also hardcodes; the runner pushes the Landlock name as a literal while the constant that names it exists beside it. The terminal-state classification is enumerated in roughly nine places because `eggwork-core` owns no terminal concept. Addendum: `plans/subsystems/control-plane-protocol-shared-contract-corrective-addendum.md`. Independent of M007. Implemented: `eggwork-core` owns the control-plane API schema version, the `exec.argv.v1` capability name, and the terminal/non-terminal classification of `ExecutionState`; the runner owns the capability names it produces. The classification is an exhaustive match over all nine variants with no wildcard arm, so adding a tenth variant is a compile error in `eggwork-core` rather than a silent behaviour change downstream. No wire value, wire field, or capability byte changed. The ownership change is recorded in `plans/adrs/ADR-0008-core-protocol-contract-ownership.md`. Closure record: `plans/closure/control-plane-protocol/004-status.md`. |
-| Workspace M005a declared-artifact capture fail-closed corrective | **conditionally closed** | `plans/implementation/workspace-artifact-transport/005a-declared-artifact-capture-fail-closed-corrective.md`. On a non-Unix target, declared-artifact capture is refused with a nested `finalization_failure` marker while the execution still reports `Succeeded` with zero artifacts — a shipped target silently loses half the data plane. Two facts sharpen this: the static capability list advertises `artifact.declared.v1` on every platform, so a node advertises a capability it refuses; and the "capture failure does not change the terminal state" behavior is currently *asserted by a test* on the missing-declared-file path, so the corrective must decide whether the platform-refusal case follows that same contract or instead fails closed, and revise the test deliberately rather than incidentally. Not recorded in the divergences table. Implemented: the terminal result carries a first-class capture disposition (`ExecutionResult.artifact_capture`), the mapping from a capture attempt to the terminal facts is one public decision (`eggwork_server::decide_artifact_capture`), the platform's capture capability is one fact (`artifact::capture_capability`), the `artifact.declared.v1` advertisement follows that fact, and the capture failure is published on the server's existing event-publishing path as a diagnostic of class `artifact.capture.failed`. Closure record: `plans/closure/workspace-artifact-transport/005a-status.md` The portable test target's non-unix run is discharged by the hosted `windows-runner`, `macos-runner`, and `macos-x64-runner` jobs; the only remaining condition is the hosted Windows qualification's receipt, which needs a published release carrying this corrective. |
-| Workspace M005b GC preview and store ownership corrective | **closed** | `plans/implementation/workspace-artifact-transport/005b-gc-preview-and-store-ownership-corrective.md`. The operator's GC dry-run preview and the apply pass used different candidate predicates, in a module whose own doc comment states the two must be shared. Implemented: the candidate predicate, the metadata filenames, and the blob path layout each have one owner; the preview reaches owner code through a read-only, non-reconciling seam (`blob::preview_gc`, `workspace::preview_gc`, `artifact::preview_gc`); the materializer verifies the bytes it writes against the manifest digest **while copying** (`BlobStore::copy_verified`); and the manifest owner-id composite has one producer with two entry points. Closure record: `plans/closure/workspace-artifact-transport/005b-status.md`. |
-| Security M005a degraded-isolation observability corrective | **closed** | `plans/implementation/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`. `ExecutionEventKind::Diagnostic` was emitted only from test code, so a degraded best-effort isolation or resource enforcement was invisible to an event-streaming caller. Implemented: the runner emits a bounded diagnostic through its output channel **before the target spawns**, the server forwards it as `ExecutionEventKind::Diagnostic`, and the diagnostic grammar is owned by `eggwork-core` so producer and server share one definition. The diagnostic precedes the target's first output and the terminal event, is durable in the journal, and is emitted exactly once per degradation. The `Required` path is untouched. Closure record: `plans/closure/security-isolation-resource/005a-status.md`. |
-| Security M005b sandbox-helper environment parity corrective | **closed** | `plans/implementation/security-isolation-resource/005b-sandbox-helper-environment-parity-corrective.md`. The environment deny-list was maintained in the runner and again in the standalone sandbox helper, with different semantics — the runner silently drops denied keys, the helper rejects the whole launch — and the helper's `PATH` rule had no runner counterpart. The helper's no-workspace-dependency rule makes the duplication architecturally forced, so the fix is a shared artifact plus a pinning test, not a shared crate. **This was the most severe finding in the batch**, and it was live: the runner's launch-spec builder started from a fixed baseline and appended every non-denied caller key, and none of those baseline keys except `PATH` was denied. A caller that set `LANG` produced a launch specification with two `LANG` entries; the helper refused it with status 12; the runner read that as a pre-target setup failure and — for a **best-effort** request only — rewrote the sandbox outcome to `NotApplied` and **re-spawned the target directly with no Landlock ruleset at all**. Implemented: the environment policy now has one checked-in source of truth (`crates/eggwork-runner/policy/environment-policy.toml`), a deterministic generator (`scripts/generate_environment_policy.py`), and generated copies in each crate; one builder serves both the direct and the helper launch path; the runner drops denied keys and lets the node's value win for node-owned keys; the helper refuses a policy violation with its own status byte, **13**, distinct from the general specification-validation status 12. The `Required` path is untouched and still fails closed. Closure record: `plans/closure/security-isolation-resource/005b-status.md`. |
-| Security M005c resource-scoped authorization corrective | **closed** | `plans/implementation/security-isolation-resource/005c-resource-scoped-authorization-corrective.md`. ADR-0007 is **accepted** — Option A: implement resource-scoped grants. The hook is real: `GrantAuthorizer` implements `authorize_request` and a grant may carry a bounded, optional resource-scope list naming an operation, a resource kind, and a typed identifier. The store's `principal_id` fences remain authoritative for ownership, and blobs are governed by an explicit digest list because content-addressed blob storage has no owner. A resource-scoped denial is indistinguishable from an operation-level denial. No wire value, wire field, capability byte, or `API_SCHEMA_VERSION` changes. Implemented: the scope list is additive and bounded, every configuration error class is refused at load time, and the store's ownership fences stay authoritative — a scope naming another principal's resource is still refused there. The residual boundary is stated plainly: a grant with no blob scope still reaches any known digest, because content-addressed blob storage has no owner to fence it. Closure record: `plans/closure/security-isolation-resource/005c-status.md`. |
-| Operations M008a operator surface truthfulness corrective | **closed** | `plans/implementation/operations-distribution/008a-operator-surface-truthfulness-corrective.md`. Five live metrics are incremented by the server and never reported by `eggworkd status`/`eggworkd metrics`; one `active_executions` field name carries two different meanings across the API and the CLI; and every configuration fault collapses into the single unhelpful message `configuration is invalid or unreadable`. Addendum: `plans/subsystems/operations-distribution-operator-truthfulness-corrective-addendum.md`. Implemented: the metric vocabulary is a typed enumeration declared with the producers, so an unregistered metric is a compile error rather than a runtime drop, and the report now shows every stored counter; the operator surface names the two `active_executions` facts apart (`execution_permits_held` and `non_terminal_executions`) while the published wire field keeps its name and its meaning; and a configuration fault is reported as a stable rule identifier, the offending item, and the corrective action, with a secret-bearing item named by role rather than by path. Closure record: `plans/closure/operations-distribution/008a-status.md`. |
-| Operations M008b release harness and documentation single-sourcing corrective | **closed** | `plans/implementation/operations-distribution/008b-release-harness-and-documentation-single-sourcing-corrective.md`. The release harness re-derives the workspace version, the release asset inventory, the install identities, and the target classification that already have owners; the tag guard's own docstring deliberately keeps it out of CI, so the defect is the divergent parser and the absence of any automated exercise, not the missing CI wiring. Roughly 92% of the design record's line-number citations no longer point at the symbol they claim, every crate size figure in `architecture/overview.md` is stale, and divergence #20 now describes a fixed issue as open. CI type-checks feature-gated code it never executes — the qualification workflow is `workflow_dispatch`-only, so the suite runs on no ordinary pull request, and adding `--all-features` would not close the gap because those tests are `#[ignore]`d — while one runner test passes with zero assertions on the normal CI path. Addendum: `plans/subsystems/operations-distribution-operator-truthfulness-corrective-addendum.md`. Implemented: the workspace version, the release asset inventory, the install identities, and the target classification each have one owner and the harness holds no remembered copy of any of them; the tag guard is now exercised by an automated job, and its tag-dependent half is recorded as the place the gate runs and the place it does not; the qualification suite's ignored tests execute in a CI job that has the environment they need; the design record's line-number citations were converted to symbol citations (651 of them, resolved against the file as it stood when the citation was written) and `scripts/check_doc_citations.py` now fails the build on any that drift; the quickstart is machine-executed by `scripts/quickstart.sh` and kept in agreement with its document; the divergences table was re-verified entry by entry (row 3 corrected, row 20 closed, no row renumbered); and the checked-in crate size figures were replaced by `scripts/component_sizes.py`. Closure record: `plans/closure/operations-distribution/008b-status.md`. |
-| Foundation M005 runner request validation parity corrective | **closed** | `plans/implementation/foundation-execution-core/005-runner-request-validation-parity-corrective.md`. The runner's private request validation is a weaker restatement of the `eggwork-core` contract — it accepts environment names core rejects and does not detect duplicate names — and the runner's public constructor and public environment setter reach that gate without passing through core validation at all, contradicting the runner's own documented claim that callers cannot bypass protocol bounds. Addendum: `plans/subsystems/foundation-execution-core-request-validation-corrective-addendum.md`. Implemented: `eggwork-core` now owns the argv, environment-entry and timeout rules as three public functions and `CommandSpec::validate` delegates to them; the runner's duplicate checks are deleted and it consumes the core functions, keeping only its own stricter empty-argv-entry rule, which protects the child-process construction; the runner's duplicate `StdinPolicy` is gone and the core type is imported directly; and a validation failure is attributable to the rule that produced it, because `RunnerError::InvalidRequest` now carries `eggwork_core::ValidationError` rather than a string. Closure record: `plans/closure/foundation-execution-core/005-status.md`. |
+| Foundation / execution core | M001–M003 and M005 closed; M004 conditionally closed | [M004](closure/foundation-execution-core/004-status.md), [M005](closure/foundation-execution-core/005-status.md) |
+| Control-plane protocol | M001–M004 closed | [M004](closure/control-plane-protocol/004-status.md) |
+| Workspace / artifacts | M001–M004 and M005b closed; M005a conditionally closed | [M005a](closure/workspace-artifact-transport/005a-status.md), [M005b](closure/workspace-artifact-transport/005b-status.md) |
+| Security / isolation / resources | M001–M004, remote-admission C001, and M005a–M005c closed | [M005a](closure/security-isolation-resource/005a-status.md), [remote-admission C001](closure/security-isolation-resource-remote-admission-corrective/001-status.md) |
+| Operations / distribution | M001–M003, M002a, M004a/b, and M008a/b closed; M004 and M007 conditionally closed | [M004](closure/operations-distribution/004-status.md), [M007](closure/operations-distribution/007-status.md), [M008a](closure/operations-distribution/008a-status.md), [M008b](closure/operations-distribution/008b-status.md) |
+| Optional Gregg telemetry | M001–M002 closed | [M001](closure/optional-gregg-host-telemetry/001-status.md), [M002](closure/optional-gregg-host-telemetry/002-status.md) |
+| CodeGG integration | Eggwork reference contract closed; downstream M001–M003 closed | [Eggwork closure](closure/codegg-integration/001-status.md) |
 
-Operations M003, M002a, and conditionally M004 are closed. Foundation M004 has since implemented and native-qualified the Windows process-tree backend, but no immutable candidate contains it yet. M004 used the historical `v0.1.0` draft only as discovery evidence and qualified a corrected `v0.1.1` draft with the then-current support matrix. Do not widen M004 into runtime release discovery, service-manager duplication, or Eggpack/Eggup interoperability. Windows service hosting was a **new** milestone, not an M004 continuation, because it required a service-control dispatcher that the daemon did not have. M007 added the dispatcher and is conditionally closed; what remains for M004 is the *installed-release* receipt, which needs a candidate carrying both.
+## Remaining evidence
 
-## Corrected execution graph
+The four conditionally closed plans are retained in `implementation/` because they
+still define named evidence requirements:
 
-```text
-Foundation M003 [closed] --+--> Foundation corrective C001 [CLOSED]
-Control Plane M003 [closed]
-Operations M001 [closed] + Eggup 0.1.1 (published) ------> Operations M002 [CLOSED]
+- [Foundation M004 — Windows process-tree backend](implementation/foundation-execution-core/004-windows-job-object-process-tree-backend.md)
+- [Workspace M005a — declared-artifact capture](implementation/workspace-artifact-transport/005a-declared-artifact-capture-fail-closed-corrective.md)
+- [Operations M004 — release qualification](implementation/operations-distribution/004-operational-and-release-qualification.md)
+- [Operations M007 — Windows service host](implementation/operations-distribution/007-windows-service-host.md)
 
-Eggwork Phases 0-5 [historical] -----------> CodeGG M001+C001 [CLOSED]
-                                                   |
-                                                   +--> Eggwork remote-admission C001 [CLOSED]
-                                                              |
-                                                              +--> CodeGG M002+M002a [CLOSED]
+The release receipt for M004 also gates the installed-service evidence for M007.
+The closure records identify exactly what remains; no qualification is implied
+by these plans' conditional status.
 
-Workspace M001-M003 [closed] -------------> Workspace M004 derived materialization [CLOSED]
-                                                              |
-                                                              +--> CodeGG M003 [CLOSED downstream; Eggwork contract consumed]
+## Deferred work
 
-Security remote-admission C001 [CLOSED] --+
-Control M003 [closed] -----------------+--> Security M004 [CLOSED]
-Operations M002 [CLOSED] --------------+
+- CodeGG M004 remains downstream-owned and waits on its stable AgentRun
+  worker-entry contract.
+- Reverse-connect and PTY support remain deferred.
 
-Eggpack producer chain [CLOSED through CI M003g] --> Operations M003 [CLOSED]
-Operations M002 [historically CLOSED] --> Operations M002a [CLOSED corrective]
-                                              |
-Operations M003 [CLOSED] ---------------------+--> Operations M004 [CONDITIONALLY CLOSED]
-                                                                |
-Foundation M004 Windows Job Object runner [CONDITIONALLY CLOSED] <-+--> Windows child execution (release receipt outstanding)
-Operations M004a fixture isolation [CLOSED] <----------------------+--> deterministic qualification invariant
-Operations M004b write-access staging [CLOSED] <--------------------+--> executable staged helper
-Operations M007 Windows service host [CLOSING] <----------------+--> Windows service management
-Operations release publication  [HUMAN ACTION: §14]       <----+--> public bootstrap evidence
-
-Optional Gregg M001 loopback adapter/cache [CLOSED] --> Optional Gregg M002 authenticated API/client [CLOSED]
-             --> CodeGG worker telemetry consumer [UNBLOCKED; separately registered]
-
-Repository interrogation corrective batch [PARTLY IMPLEMENTED] --+--> Control-plane M004 shared protocol contract [CLOSED]
-                                                      +--> Workspace M005a artifact capture fail-closed [CONDITIONALLY CLOSED]
-                                                      +--> Workspace M005b GC preview and store ownership [CLOSED]
-                                                      +--> Security M005a degraded-isolation observability [CONDITIONALLY CLOSED]
-                                                      +--> Security M005b helper environment parity [CLOSED]
-                                                      +--> Security M005c resource-scoped authorization [CLOSED]
-                                                      +--> Operations M008a operator surface truthfulness [CLOSED]
-                                                      +--> Operations M008b release harness and docs single-sourcing [CLOSED]
-                                                      +--> Foundation M005 runner request validation parity [CLOSED]
-
-The batch is mutually independent and independent of M007. It introduces no inter-milestone dependency, and it must not be sequenced behind M007 or folded into it.
-```
-
-Operations M002 is not a dependency of CodeGG M001. The canonical long-term roadmap already defines CodeGG Phase 7 as depending on Eggwork Phases 0-5, not completion of Phase 6 packaging.
-
-## Current upstream interface baselines
-
-These are reviewed research baselines, not permanent dependency pins.
-
-| Project | Reviewed baseline | Current relevant state |
-|---|---|---|
-| process-wrap | 10.0.1, reviewed 2026-10-05 | Preferred Foundation M004 Windows runner seam: Tokio JobObject wrapper assigns the suspended process before resume; MIT OR Apache-2.0; MSRV 1.87. Pin exact because upstream allows MSRV movement without a major bump. |
-| windows-service | 0.8.1, reviewed 2026-10-05 | The Operations M007 service-host seam, now in use: dispatcher/control/status APIs, pinned exactly, and a `cfg(windows)` target dependency of `eggwork-server`; MIT OR Apache-2.0; MSRV 1.71. Eggup remains the manager/registration owner. |
-| CodeGG | current reviewed `0fae5c55051c895061b26b6eb5b0d5d90cd64ebc`; remote-execution M002a closure `f5f8d96d7b7371c8583196c58d36ef7b3118ed3c` | M001+C001+M002+M002a+M003 closed; M003 implemented at `1ce377ce` on Eggwork `e6a5d82` and closed at `d51afe46`; M004 deferred. Stale current-state text reconciled at CodeGG `0fae5c55`. The advance from `841ad117` is planning plus the M003 implementation, which pins this repository at `e6a5d82`. |
-| Eggfetch | `b90b32541bd5dac6c5256feed141cadfd124debe` / `eggfetch-core 0.2.0` | public advanced-routing `Dialer` and `ClientBuilder::dialer` preserve Eggfetch-owned HTTP/TLS |
-| Eggress | `e141d4082d211cc5f122414c74617fde846ffbae` / 1.0.8 line | listener-free `OutboundConnector::connect_tcp_detailed` returns a Tokio stream and typed route failure facts |
-| EggServe | `dc8ce30e2c9f0a95f73682cea07163e8076995bd` / 0.2.x line | server/TLS service baseline; re-check exact published patch before dependency changes |
-| Eggup | published `v0.1.1` -> `881c95ff069d3d465a282cb6a495ba6fcb70cb6f`; current main reviewed `0f791324be406b9a07dd35c1c1121279bc38dcdb` | Eggwork remains pinned to registry `eggup-core`/`eggup-service` 0.1.1. That published service crate includes systemd/launchd/Windows SCM plus `commit_with_lifecycle`, whose `RecoveryRequired` contract suppresses automatic restart; newer main service work is not required for M002a/M004. |
-| Eggpack | current reviewed main `56ed7e747fd39e4d6a32a9f1fe3e09dd44355069`; Eggwork remains pinned to durable `32a0903936fcc283863e0bfb86151b13b4d75ce9` | producer authority; the pinned revision contains qualified M003e/f/g behavior and M003h reconciliation, and `eggpack ci check` is zero-drift. Windows byte determinism is product-owned and does not require an Eggpack change. Runtime Eggup-manifest consumer adoption remains separate. |
-| eggsact | `f1352101dab748066c788e65e21e1bf303cfe995` | prior-art evidence only: its product-owned MSVC `/BREPRO` + `/DEBUG:NONE` correction demonstrates the mechanism behind the same Windows mismatch; Eggwork must implement and qualify its own policy and does not depend on eggsact closure |
-| Gregg | `5b2c7e8c67616f872070e2acdcce90790f750fbf`; `gregg-protocol 1.0.15` published, reviewed 2026-10-19 | telemetry/protocol patterns only; not an execution control plane. M001 consumed the published `gregg-protocol` v2 types and its own `validate_payload_v2`; the published `v2.rs` is byte-identical to the reviewed working tree. No Gregg change was made. |
-
-Implementation agents MUST re-check current APIs at execution time.
-
-## Resolved planning defects
-
-1. **False Operations → CodeGG dependency:** removed. CodeGG M001 is independently ready.
-2. **Foundation M003 stale blocker:** M002 is closed; M003 now has a concrete ready handoff.
-3. **Control Plane M003 stale dial-interface blocker:** Eggfetch/Eggress now expose a compatible public raw-stream boundary; M003 is ready.
-4. **Operations M002 blocker:** the historical post-commit rollback gap was real at Eggup `66813b3b...`; Eggup M007 later closed that exact seam, so M002 is re-opened. Historical blocker evidence remains immutable.
-5. **Eggup/Eggpack authority mix:** corrected. Eggup owns local deployment/service lifecycle; Eggpack owns producer packaging/release construction/evidence.
-6. **Final security sweep ordering:** M004 now waits for the newly ready route/ownership/deployment surfaces instead of incorrectly claiming only M001-M003 prerequisites.
-7. **CodeGG execution authority:** the downstream implementation handoff is now registered in the CodeGG repository; Eggwork's M001 document is reference-contract material only.
-8. **Foundation M003 CI enforcement defect:** registered as corrective C001 because the guard used undeclared `rtk` and was not invoked by ordinary GitHub Actions; C001 is now closed (`plans/closure/foundation-execution-core-ci-corrective/001-status.md`) — the guard calls `cargo metadata` directly, runs as a required GitHub Actions step on push/PR, and a deterministic `--prove-negative-exit` mode exercises the failure path on every CI run.
-9. **CodeGG M001 post-closure correctness:** CodeGG C001 is now closed at `d3d390d5`; lease identity and real-node mTLS/restart/cancel/renew behavior are qualified.
-10. **Remote enforcement admission gap:** that live qualification proved Eggwork's server rejects all remote filesystem-isolation requests even though the canonical runner can enforce the closed Landlock `workspace_rw` profile. Registered as Security remote-admission corrective C001 (now closed: `plans/closure/security-isolation-resource-remote-admission-corrective/001-status.md`); network-disabled/allow-list remain intentionally unsupported.
-11. **Stale upstream baselines:** reconciled. CodeGG M003 is closed (`d51afe46`, implementation `1ce377ce`, hosted `36745285774`). Eggpack's `main` head is now `404f63e`, which records the Eggwork producer-only adoption boundary in the Eggpack registry and ecosystem/eggup-interoperability roadmaps. Operations M003 is implemented and closed; its tool pin is Eggpack `8507fbe` rather than the plan's `398cd43` candidate, because the CI M003e/f/g correctives between them fixed real generated-workflow execution defects and `8507fbe` carries the only hosted end-to-end five-target evidence. That pin lives on a published non-`main` branch and is a recorded low-severity dependency.
-12. **Operations M003 hosted-evidence gap:** resolved. Runs `36784830178` and `36786345079` found two bounded Eggwork-side portability defects (unconditional `landlock` dependency; a cfg-dependent inference gap), both corrected inside M003 (`4b95443`, `8827ed4`); run `36787942079` is green across all five required targets and staged draft `eggwork v0.1.0` with 17 assets.
-13. **M002 RecoveryRequired restart gap:** resolved. M002a implemented published Eggup 0.1.1 `commit_with_lifecycle` at `c33e9d6`, preserves the public compatibility API, and suppresses automatic restoration on `RecoveryRequired`; closure is `plans/closure/operations-distribution/002a-status.md`.
-
-14. **Windows rerun ownership diagnosis:** corrected. The `v0.1.0` rerun mismatch is not an Eggpack blocker and does not require eggsact to close. Eggwork itself lacks deterministic MSVC link policy. eggsact `f1352101` demonstrates the product-side `/BREPRO` + `/DEBUG:NONE` approach; M004 now requires Eggwork-local adoption plus an independent two-build/reuse proof.
-15. **M004 release candidate:** rebaselined. The immutable `v0.1.0` draft contains the runner warning found by live smoke, so it remains historical evidence. M004 success targets a new coherent `v0.1.1` candidate after the runner fix, Windows determinism guard, and version bump are present.
-16. **`v0.1.3` stale lockfile:** resolved by `b31f117`, which added `--locked` to CI's clippy and test steps and brought `Cargo.lock` to the workspace version. `--locked` is now load-bearing on those two commands; see `architecture/ci-guardrails.md`.
-17. **`v0.1.4` version/tag disagreement:** resolved by `4a6e7f5` (bump to `0.1.5`, fail fast when tag and version disagree) and `c3ece0c` (keep the generated workflow generated; move the tag guard out of the workflow into `scripts/check_release_tag.py`). The refusal was the version-coherence check working as designed.
-18. **Windows execution diagnosis:** corrected at `926e06a`. The `Internal`/`null` shape was attributed to an output-monitor race on the theory that earlier fixes had finally exposed the path. `v0.1.5` contains the monitor fix and reproduces the identical shape while every Unix target passes. The real cause predates all of them: `LocalProcessRunner::run` returns `UnsupportedPlatform` on `not(unix)` before any child exists. The monitor race is real and now pinned by a test, but it was never the Windows cause. Recorded because the process failure is the durable lesson — a hypothesis that explains a symptom is not evidence.
-19. **Cross-cutting review surface:** `architecture/overview.md` carries a divergences table of known, deliberate gaps between code, deep-dive prose, and top-level invariant wording. Consult it before opening new work; a "new" finding may already be recorded there.
-
-## Remaining interface gates
-
-1. **Eggup publication:** satisfied for M002 — published `eggup-core 0.1.1` / `eggup-service 0.1.1` (checksums in `Cargo.lock`) supply the M007 `commit_with_post_commit` seam and manager adapters; no floating branch was used. Eggwork's producer path is already hosted-qualified by M003 run `36787942079`; M004 owns installed/service/update qualification and any authorized publication/public-bootstrap evidence.
-2. **Eggpack producer contract:** satisfied and consumed. Eggwork pins durable Eggpack `32a0903936fcc283863e0bfb86151b13b4d75ce9`; generated workflow drift is zero. No producer-interface blocker remains for M004. Windows byte determinism is Eggwork product build policy, while Eggpack correctly keeps same-name digest mismatches fail-closed.
-3. **Platform qualification:** Linux is the exercised execution/security platform. For release packaging, all five required targets now have hosted build/qualification/validation evidence (run `36787942079`); installed first-install smoke and service lifecycle/update/rollback on qualified hosts remain M004 work. Windows/macOS runtime claims beyond the producer pipeline still require hosted M004 evidence; cross-compilation is not qualification.
-4. **Eggress feature scope:** SOCKS5 and HTTP CONNECT should be the required deterministic route fixtures. SSH is advertised only if its feature/runtime path is actually exercised.
-
-## Planning hygiene
-
-- Register before handoff.
-- Historical closure evidence is immutable; use corrective records for later findings.
-- Do not copy Eggfetch/Eggress/EggServe/Eggup/Eggpack functionality into Eggwork to avoid an upstream boundary.
-- Do not treat a plan as implementation evidence.
-- Keep scheduling/placement outside Eggwork.
-- Parallel-ready work may proceed independently, but each closure must verify the actual merged head before unblocking downstream milestones.
+Recheck external interfaces when dependency work resumes. Do not copy upstream
+transport, deployment, or release functionality into Eggwork.

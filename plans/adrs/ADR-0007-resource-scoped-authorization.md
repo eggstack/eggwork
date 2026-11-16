@@ -19,7 +19,7 @@ Related authority:
 - `plans/security/threat-model.md`
 - `architecture/overview.md` — divergence #4
 - `plans/subsystems/security-isolation-resource-isolation-truthfulness-corrective-addendum.md` — finding SI-3
-- `plans/implementation/security-isolation-resource/005c-resource-scoped-authorization-corrective.md` — the implementation plan this decision authorises (Branch A)
+- `plans/archive/security-isolation-resource/005c-resource-scoped-authorization-corrective.md` — the implementation plan this decision authorises (Branch A)
 - `plans/003-planning-process.md` §4 (dependency discipline) and §8 (architecture changes)
 
 ## Context
@@ -208,7 +208,7 @@ This decision class requires architecture review, and this ADR is that review's 
 
 The implementation milestone must update, in this order of authority: `architecture/overview.md`'s divergences table (divergence #4), `plans/security/threat-model.md`'s remaining-boundary column for the "Authenticated unauthorized principal" row, `architecture/server-node.md`, `architecture/operations-cli.md`, and `examples/eggworkd.example.json`. The divergences row must state what now enforces the boundary and what residual boundary remains; it must not describe the blob boundary as closed.
 
-The implementation plan is `plans/implementation/security-isolation-resource/005c-resource-scoped-authorization-corrective.md`, whose §5 (Branch A) is the work this decision authorises.
+The implementation plan is `plans/archive/security-isolation-resource/005c-resource-scoped-authorization-corrective.md`, whose §5 (Branch A) is the work this decision authorises.
 
 
 ## Supersession

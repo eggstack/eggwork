@@ -1,7 +1,7 @@
 # Control Plane M002 Corrective Closure — Lease Expiry Before Runner Spawn
 
 Historical closure: `plans/closure/control-plane-protocol/002-status.md`  
-Source plan: `plans/implementation/control-plane-protocol/002-idempotency-leases-events-and-recovery.md`  
+Source plan: `plans/archive/control-plane-protocol/002-idempotency-leases-events-and-recovery.md`
 Reviewed corrective commit: `428e2ce`  
 Planning/corrective closure commit: `03da005`
 

@@ -2,15 +2,10 @@
 
 //! Canonical owner of finite, noninteractive process execution.
 //!
-//! Embedding API: construct a validated [`RunnerRequest`] from an
-//! [`eggwork_core::ExecutionSpec`] with [`RunnerRequest::from_spec`], then run
-//! it through [`LocalProcessRunner`]. Request fields remain private, and every
-//! public construction path is covered by the `eggwork_core` domain contract:
-//! [`RunnerRequest::contract_error`] reports a violation without running
-//! anything, and [`LocalProcessRunner::run`] refuses one before setup and
-//! before any child exists. Platform setup is supplied through
-//! [`ExecutionSetup`]; neither this API nor its result types carry scheduler
-//! placement, priority, or project fairness policy.
+//! Build validated [`RunnerRequest`] values from [`eggwork_core::ExecutionSpec`]
+//! and run them through [`LocalProcessRunner`]. Requests remain private and are
+//! rejected before setup or spawn when invalid. [`ExecutionSetup`] supplies
+//! platform policy; scheduling remains caller-owned.
 
 use eggwork_core::{
     CommandSpec, EnvironmentEntry, ExecutionFailure, ExecutionGeneration, ExecutionId,
@@ -50,18 +45,10 @@ use tokio_util::sync::CancellationToken;
 
 mod process_tree;
 
-/// The node's environment policy.
+/// Generated environment policy owned by `policy/environment-policy.toml`.
 ///
-/// The policy — the denied-key list and its matching rule, the node-owned
-/// (reserved) keys, the node-owned baseline, and the `PATH` value contract —
-/// has exactly one owner: `crates/eggwork-runner/policy/environment-policy.toml`.
-/// This module is the runner's generated copy of it.
-///
-/// The standalone sandbox helper enforces the same policy and may not depend
-/// on any workspace crate, so it compiles its own generated copy of the same
-/// source. The two copies are pinned together by a parity test, which is what
-/// makes a one-sided edit fail the build instead of silently changing what is
-/// enforced.
+/// The standalone helper has its own generated copy; a parity test prevents
+/// the two enforcement paths from drifting.
 pub mod environment_policy;
 
 use process_tree::{ProcessTree, TreeConvergence};
@@ -76,18 +63,10 @@ pub struct ExecutionProvenance {
     pub generation: Option<ExecutionGeneration>,
 }
 
-/// A bounded output chunk, or a diagnostic about the execution's enforcement.
+/// Arbitrary output bytes or an enforcement diagnostic.
 ///
-/// Consumers must treat the bytes of `Stdout`/`Stderr` as arbitrary binary
-/// data.
-///
-/// `Diagnostic` is the only way a degradation reaches the caller, and it is
-/// deliberately carried on the *same* channel as the target's output: the
-/// server's forwarding loop drains one channel in order, so a diagnostic the
-/// runner sends before it spawns the target is published before any output the
-/// target produces. A diagnostic derived from the runner's result instead
-/// would necessarily arrive after all target output, which is the gap this
-/// carrier exists to close.
+/// Diagnostics share the ordered output channel, so one emitted before spawn
+/// reaches the caller before target output.
 #[derive(Clone, PartialEq, Eq)]
 pub enum OutputChunk {
     /// Target standard output.
@@ -568,8 +547,7 @@ pub enum ResourceSetupOutcome {
     Failed { reason: String },
 }
 
-/// Hook implementations may prepare a command before it is spawned. This
-/// milestone ships only an explicit unavailable implementation.
+/// Prepare platform enforcement before the child is spawned.
 #[async_trait::async_trait]
 pub trait ExecutionSetup: Send + Sync {
     async fn prepare(
@@ -725,14 +703,8 @@ pub const CGROUPS_V2_PIDS_CAPABILITY: &str = "resources.cgroups-v2.pids";
 
 /// The only sandbox profile the protocol can request.
 ///
-/// `SandboxRequest::{BestEffort, Required}` carry a profile name, and
-/// `workspace_rw` is the only one the runner will run and the only one the
-/// trusted helper will grant — the helper is a standalone binary with no
-/// workspace-crate dependency, so it keeps its own literal and the test in
-/// `crates/eggwork-sandbox-helper/tests/landlock_runner.rs` pins that literal
-/// to this constant. The value must not change without an ADR: a rename would
-/// make the runner ask for a profile the helper refuses, which fails closed
-/// as "unsupported sandbox profile" rather than silently degrading.
+/// The standalone helper pins its spelling in a parity test. Renaming it
+/// requires an ADR because mismatched names fail closed.
 pub const WORKSPACE_RW_PROFILE: &str = "workspace_rw";
 
 /// The cgroup v2 probes the runner runs before it advertises a resource
@@ -769,13 +741,10 @@ const CGROUP_PROBE_TABLE: [(&str, ResourceSetupRequest); 3] = [
     ),
 ];
 
-/// Probe the kernel Landlock ABI V4 with the same set of handles and rules
-/// the trusted helper uses for `workspace_rw`. Returns `true` only if the
-/// in-process ruleset can be created and the runtime read paths can be added;
-/// this proves the kernel supports the exact rights needed without actually
-/// applying Landlock to the probe process. Failures (kernel too old, missing
-/// runtime paths, unsupported rights) are folded into `false` so callers can
-/// treat the result as a single boolean capability fact.
+/// Probe whether Landlock can create the helper's `workspace_rw` ruleset.
+///
+/// The probe adds the same handles and rights without applying restrictions
+/// to this process; any unsupported path or right returns `false`.
 #[cfg(target_os = "linux")]
 fn probe_landlock_ruleset() -> bool {
     use landlock::{
@@ -825,15 +794,9 @@ fn probe_landlock_ruleset() -> bool {
     false
 }
 
-/// Whether the sandbox helper at `path` is trusted enough to enforce Landlock.
+/// Check the helper trust boundary used by execution, admission, and diagnostics.
 ///
-/// This is the single trust boundary for the Linux sandbox helper: the runner
-/// refuses to enforce a required profile when it returns `Err`. It is public so
-/// operator diagnostics report the same answer the enforcement path will give,
-/// rather than a second, independently drifting copy of the policy. A duplicated
-/// stricter copy denies a user-owned helper that this function would accept,
-/// which makes an unprivileged user-scope installation permanently unable to
-/// advertise required filesystem isolation.
+/// Required isolation fails closed when this check returns `Err`.
 #[cfg(target_os = "linux")]
 pub fn verify_trusted_helper(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1043,9 +1006,8 @@ async fn send_diagnostic(output_tx: &mpsc::Sender<OutputChunk>, payload: Option<
         // recorded in the terminal snapshot.
         return;
     };
-    // `send` rather than `try_send`: a dropped diagnostic would silently
-    // reopen the gap this milestone closes, and the channel is bounded, so
-    // awaiting it costs back-pressure and not correctness.
+    // Await the bounded channel so a degradation diagnostic is never silently
+    // dropped; backpressure is preferable to losing the event.
     let _ = output_tx.send(OutputChunk::Diagnostic(payload)).await;
 }
 
@@ -1252,19 +1214,10 @@ impl RunnerRequest {
         })
     }
 
-    /// The first violation of the request contract, if this request has one.
+    /// Return the first request-contract violation without touching the filesystem.
     ///
-    /// The request contract is the `eggwork_core` domain contract -- the argv,
-    /// environment-entry, output-policy, timeout, stdin and resource rules --
-    /// plus the runner's own stricter argv-entry rule. It is checked here
-    /// without touching the filesystem, so an embedder can ask whether what it
-    /// built is acceptable before it runs anything.
-    ///
-    /// [`LocalProcessRunner::run`] refuses a request that has a violation,
-    /// before setup and before any child exists, with the same error. The
-    /// root-directory and working-directory rules are deliberately not part of
-    /// this answer: they are the runner's own, they need filesystem access, and
-    /// they are enforced at the same point.
+    /// `run` uses the same check before setup or spawn. Root and working
+    /// directory checks are separate because they require filesystem access.
     pub fn contract_error(&self) -> Option<ValidationError> {
         self.contract_violation()
     }
@@ -1303,16 +1256,8 @@ impl RunnerRequest {
         }
     }
 
-    /// The first contract violation in the request, in the canonical order.
-    ///
-    /// The order is the one `eggwork_core::CommandSpec::validate` uses -- argv,
-    /// environment, timeout, stdin, output, resources -- with the runner's own
-    /// argv-entry rule immediately after the argv bounds, so that a request
-    /// built through the builder path and the same request built through
-    /// `from_spec` report the *same* rule for the same input.
-    ///
-    /// Every rule below is owned by `eggwork_core` except the argv-entry rule,
-    /// which is the runner's own and is stricter than the core contract.
+    /// Return the first violation in core's validation order, with the runner's
+    /// stricter argv-entry check immediately after argv bounds.
     fn contract_violation(&self) -> Option<ValidationError> {
         validate_argv(&self.argv)
             .err()
@@ -1324,15 +1269,7 @@ impl RunnerRequest {
             .or_else(|| self.resource_requirements().validate().err())
     }
 
-    /// The runner's own argv-entry rule.
-    ///
-    /// `eggwork_core` permits an empty argv entry; the runner does not. An
-    /// empty argument is not a protocol problem -- it is a child-process
-    /// construction hazard: the runner hands the argv to the operating system
-    /// as an argument vector, where an empty element is either a silent no-op
-    /// argument or an ambiguity the caller cannot see. The runner is therefore
-    /// deliberately *stricter* than its owner here, and this is the only rule
-    /// it adds on top of the core contract.
+    /// Reject empty arguments, which core permits but process construction does not.
     fn argv_entry_violation(&self) -> Option<ValidationError> {
         self.argv
             .iter()
@@ -1595,16 +1532,9 @@ impl LocalProcessRunner {
             return Err(RunnerError::CancelledBeforeSpawn);
         }
         let cwd = request.validate()?;
-        // Process-tree ownership is platform specific and lives in
-        // `process_tree::ProcessTree`; the lifecycle below is shared. Validation,
-        // setup, command construction, pipe readers, bounded capture, timeout and
-        // cancellation selection, terminal conversion, and provenance are
-        // identical on every platform that has a tree owner, so there is one
-        // runner with two tree backends rather than two runners. `ProcessTree::
-        // spawn_platform` is the typed refusal point (`UnsupportedPlatform`) for
-        // compile targets with no tree story at all.
-        // Only the Linux helper handshake rewrites the prepared outcome, so the
-        // binding is immutable everywhere else.
+        // Process-tree ownership is platform-specific; request preparation and
+        // result handling stay shared. Unsupported targets refuse before spawn.
+        // Only the Linux helper handshake updates the prepared setup outcome.
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut setup = self
             .setup
@@ -1996,52 +1926,23 @@ impl LocalProcessRunner {
     }
 }
 
-/// True when the node owns `key` on this platform.
+/// Whether the node baseline owns `key` on this platform.
 ///
-/// The node-owned class is the node's own baseline: the node owns exactly the
-/// keys its baseline sets. On the Unix baseline that is
-/// `environment_policy::RESERVED_KEYS`, which is the shared policy's class.
-/// The Windows baseline is runner-local — its values are read from the parent
-/// process at spawn time, and the sandbox helper is Linux-only so it never
-/// sees a Windows launch — so it is derived from the baseline the runner
-/// actually installs rather than from the shared list.
-///
-/// The rule is deliberately *not* "is this key on the deny-list". A deny-list
-/// entry is a key the caller may not set at all; a node-owned key is one the
-/// node sets itself, and the caller's value for it is discarded in favour of
-/// the node's.
+/// Unix baseline keys come from the shared policy. Windows uses a local,
+/// platform-specific baseline. Denied keys are separate: they are dropped,
+/// while node-owned keys keep the baseline value.
 fn node_owned_key(key: &str, baseline: &[(&'static str, String)]) -> bool {
     baseline
         .iter()
         .any(|(owned, _)| owned.eq_ignore_ascii_case(key))
 }
 
-/// The environment a child process receives, built from the shared policy.
+/// Build the child environment from the node baseline and shared policy.
 ///
-/// This is the single place the runner builds an environment, and both of the
-/// runner's launch paths use it, so the direct path and the sandbox-helper
-/// path cannot disagree about what a child sees.
-///
-/// Three rules, in the order they are applied:
-///
-/// 1. **The node's baseline wins.** The baseline is installed first and a
-///    caller-supplied value for a node-owned key is discarded. Before this
-///    rule, a caller that set `LANG` produced a launch specification with two
-///    `LANG` entries; the helper refuses a specification with duplicate keys,
-///    and a best-effort request answered that pre-target refusal by
-///    re-spawning the target with no Landlock ruleset at all. The
-///    observable result was a successful, entirely unconfined execution.
-/// 2. **A denied key is dropped.** Silently, and only here: the runner is the
-///    request-normalisation boundary, and a hardened environment has to be a
-///    property of the node rather than something the caller has to get right.
-///    The helper refuses a launch that contains one; the difference is a
-///    deliberate two-layer contract, and only the list is shared.
-/// 3. **Everything else is the caller's**, with a repeated key resolved to
-///    its last value. Collapsing the repeat is what keeps the launch
-///    specification free of duplicate keys, which the helper refuses.
-///
-/// The provenance entries are appended last and are node-owned too: they are
-/// neutral attribution, and a caller cannot forge them.
+/// The baseline wins, denied caller keys are dropped, and other caller keys
+/// use last-value-wins handling. Both launch paths use this builder, keeping
+/// their environments consistent and free of duplicate keys rejected by the
+/// helper. Node provenance variables are appended last.
 fn build_child_environment(request: &RunnerRequest) -> Vec<(String, String)> {
     let baseline = baseline_child_environment();
     let mut environment: Vec<(String, String)> = baseline
@@ -2100,57 +2001,20 @@ fn direct_command(request: &RunnerRequest, cwd: PathBuf) -> Command {
     command
 }
 
-/// What a settled output monitor means for the running child.
+/// Return a termination reason only when output overflowed.
 ///
-/// `Some` is a termination reason and ends the wait. `None` means the monitor
-/// settled *without* overflowing, which is not a termination: the readers
-/// simply finished. This distinction is the whole point of the function.
-///
-/// The output monitor closes as soon as every reader has seen EOF, which can
-/// only happen once the child has exited. So a settled monitor always races an
-/// already-settled `child.wait()`. Treating the settled-but-not-overflowed case
-/// as `Exited` with a `None` status discarded the real exit code and surfaced
-/// as `state: Failed, failure: Internal, exit_code: null` -- a shape that reads
-/// as a product execution failure and is not one. The wait below is `biased`
-/// toward the monitor, so which arm wins is pure timing, and the race is
-/// invisible in most runs on every platform; the unit test below pins it
-/// deterministically instead of relying on timing.
-///
-/// This race is real but it was NOT the Windows execution cause. At the time it
-/// was diagnosed, `run` refused with `UnsupportedPlatform` before any child
-/// existed on Windows, so the monitor code never ran there; the identical
-/// receipt shape is what sent the diagnosis down the wrong path. Foundation
-/// M004 removed that refusal, so this monitor now runs on every platform and
-/// is covered by `windows_process_tree.rs` as well as the Unix suite.
+/// Normal reader completion is not a termination reason; `child.wait()` still
+/// supplies the child's exit status. The regression test pins this distinction
+/// so the select race cannot turn a normal exit into an internal failure.
 fn monitor_termination(overflowed: bool) -> Option<TerminationReason> {
     overflowed.then_some(TerminationReason::OutputLimit)
 }
 
-/// The platform-appropriate minimum environment for an execution child.
+/// Platform-specific baseline entries installed for each child.
 ///
-/// The baseline is the node's own: it is installed before any caller-supplied
-/// entry, and a caller-supplied value for a baseline key is discarded in
-/// favour of the node's. See `build_child_environment` for the rules.
-///
-/// The Unix baseline is the shared policy's, and it is read from the generated
-/// policy module rather than written out here, so the runner and the sandbox
-/// helper cannot disagree about it.
-///
-/// The Windows baseline is deliberately runner-local and platform-shaped. It
-/// used to declare a Unix-only environment unconditionally, including
-/// `PATH=/usr/bin:/bin`, so a Windows child would have been handed a `PATH`
-/// that does not exist on Windows and no `SystemRoot`. That shaping was
-/// written against the M004 qualification symptom of `state: Failed`,
-/// `failure: Internal`, `exit_code: null` -- and it could not have fixed
-/// Windows qualification, because at that time no Windows child existed at
-/// all: `run` refused with `UnsupportedPlatform` before spawn and the server
-/// mapped that refusal to `Internal`. Foundation M004 removed the refusal,
-/// which makes this shaping load-bearing instead of merely aspirational.
-///
-/// Windows gets the system directories its loader and `cmd.exe` require,
-/// without inheriting the caller's full environment. The Windows `PATH` is
-/// deliberately *not* the shared policy's `PATH` value: the `PATH` contract is
-/// a Linux/Unix contract, and the sandbox helper never sees a Windows launch.
+/// Unix reads the generated shared policy. Windows provides its required
+/// system paths and native `PATH` without inheriting the caller's full
+/// environment. Caller values for baseline keys are ignored.
 fn baseline_child_environment() -> Vec<(&'static str, String)> {
     platform_baseline()
 }
@@ -2280,20 +2144,11 @@ impl SandboxWaitError {
     }
 }
 
-/// The runner's reading of the helper's first status byte.
+/// Decode the helper's status byte.
 ///
-/// `Ok(false)` means the helper will not report resource counters and the run
-/// continues. `Ok(true)` means the helper applied its mechanics and the second
-/// byte says whether the target started. `Err` is a refusal that happened
-/// before the target existed, and the byte is carried in the message so an
-/// operator can tell an environment-policy refusal (13) apart from the general
-/// specification-validation refusal (12) — the two are different failures and
-/// a single "the helper refused" line cannot distinguish them.
-///
-/// Every refusal, whatever the byte, is a *pre-target* failure: the target did
-/// not exist yet, so nothing ran unconfined by accident. What a caller does
-/// with that refusal is the caller's decision, and the required path fails
-/// closed on it.
+/// `Ok(true)` means resource counters follow; `Ok(false)` means the run
+/// continues without them. Refusals happen before the target starts and retain
+/// their status code for diagnostics.
 #[cfg(target_os = "linux")]
 fn classify_helper_status(status: u8) -> Result<bool, SandboxWaitError> {
     match status {
@@ -2567,20 +2422,9 @@ mod tests {
         assert_eq!(monitor_termination(false), None);
     }
 
-    /// A short-lived child that writes to both pipes.
-    ///
-    /// The runner watches the output monitor with a `biased` select, so a
-    /// reader that finishes before `child.wait()` resolves used to win the race
-    /// and report `Exited` with no exit status. That surfaced as
-    /// `state: Failed, failure: Internal, exit_code: null` -- indistinguishable
-    /// from a genuine execution failure. The race is timing, so it is
-    /// exercised repeatedly, and it is not Unix-only.
-    ///
-    /// This test guards the race, not Windows execution: on Windows
-    /// `LocalProcessRunner::run` refuses with `UnsupportedPlatform` before any
-    /// child exists, which produces the same receipt shape for a different
-    /// reason. Do not read a Windows qualification failure as evidence about
-    /// this race.
+    /// Ensure normal pipe completion does not discard the child's exit status.
+    /// Repeated short-lived runs exercise the race between reader EOF and
+    /// `child.wait()` on every supported platform.
     #[tokio::test]
     async fn a_short_lived_child_that_closes_its_pipes_keeps_its_exit_status() {
         let temp = tempfile::tempdir().unwrap();
@@ -2907,14 +2751,9 @@ mod tests {
         assert!(descendant_converged(pid).await);
     }
 
-    /// Wait for a descendant to reach a terminal outcome: reaped (`/proc` entry
-    /// gone) or a zombie awaiting reaping by its new parent.
-    ///
-    /// The runner escalates to `SIGKILL` on the process group and returns as
-    /// soon as the *leader* has been reaped. Kernel delivery of that `SIGKILL`
-    /// to an already-orphaned descendant is asynchronous, so a single immediate
-    /// read races it and can observe `S` or `R` on a loaded machine. The
-    /// property under test is convergence, not one instantaneous sample.
+    /// Wait until `/proc` shows a descendant gone or zombie. Group `SIGKILL`
+    /// delivery is asynchronous after leader reap, so poll instead of assuming
+    /// an immediate terminal state.
     #[cfg(target_os = "linux")]
     async fn descendant_converged(pid: i32) -> bool {
         for _ in 0..200 {
@@ -3052,12 +2891,8 @@ mod tests {
         assert!(runtime.is_empty());
     }
 
-    /// The node-owned class is the node's own baseline.
-    ///
-    /// If the two could drift, the runner would discard a caller's value for a
-    /// key the helper still expects to carry the node's value, and the helper
-    /// would refuse the launch — the same collision that used to cost a
-    /// best-effort execution its confinement.
+    /// The reserved-key set matches the baseline keys; drift would make the
+    /// helper reject a launch the runner accepted.
     #[test]
     fn the_node_owned_class_is_the_node_owned_baseline() {
         let baseline_keys: Vec<&str> = environment_policy::BASELINE
@@ -3082,19 +2917,10 @@ mod tests {
         }
     }
 
-    /// A caller's value for a node-owned key never reaches the child.
+    /// Caller values cannot override node baseline keys.
     ///
-    /// The live defect was that the caller's `LANG` was *appended* to the
-    /// node's baseline, so the child saw the caller's locale and the launch
-    /// specification carried two `LANG` entries.
-    ///
-    /// The node-owned class is the **platform** baseline: the node owns a key
-    /// only where it installs that key. The Unix baseline pins the locale, so
-    /// `LANG` and `LC_ALL` are the node's there; the Windows baseline
-    /// deliberately installs no locale keys, so on Windows they are the
-    /// caller's. The rule under test therefore holds on every platform: for
-    /// every key the node installs *here*, the node's value wins and the key
-    /// appears exactly once.
+    /// The baseline is platform-specific, so the test checks every installed
+    /// key appears once with the node's value.
     #[test]
     fn a_caller_supplied_node_owned_key_does_not_replace_the_node_value() {
         let root = tempfile::tempdir().expect("temp dir");
@@ -3184,14 +3010,8 @@ mod tests {
         assert_eq!(matching, vec!["second"]);
     }
 
-    /// The launch specification carries exactly one entry per node-owned key,
-    /// with the node's value.
-    ///
-    /// This is the regression for the live defect. The helper refuses a
-    /// specification with duplicate keys, so a specification that carried the
-    /// caller's `LANG` *and* the node's `LANG` was refused with status 12,
-    /// and a best-effort request then ran the target with no Landlock ruleset
-    /// at all.
+    /// The launch specification carries each node-owned key once with the
+    /// node's value. Duplicates are rejected by the helper.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_launch_specification_carries_one_entry_per_node_owned_key() {
@@ -3252,11 +3072,7 @@ mod tests {
         );
     }
 
-    /// The direct path and the launch specification agree.
-    ///
-    /// They used to disagree: the direct path applied the caller's `LANG`
-    /// after the node's baseline, so the child saw the caller's locale, while
-    /// the specification carried both entries and was refused.
+    /// The direct and helper launch paths build the same child environment.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_direct_path_and_the_launch_specification_agree() {

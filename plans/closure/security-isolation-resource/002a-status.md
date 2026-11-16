@@ -4,7 +4,7 @@ Status: closed
 
 Reviewed implementation commit: `26f42bb84533fd9d77812377e4603d591810a12c`
 
-Corrective implementation plan: `plans/implementation/security-isolation-resource/002a-landlock-runtime-devnull.md`
+Corrective implementation plan: `plans/archive/security-isolation-resource/002a-landlock-runtime-devnull.md`
 
 Historical M002 closure: `plans/closure/security-isolation-resource/002-status.md` (preserved unchanged).
 

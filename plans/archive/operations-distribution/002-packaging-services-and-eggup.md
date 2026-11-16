@@ -4,7 +4,7 @@ Status: superseded
 
 Superseded by:
 
-- `plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md`
+- `plans/archive/operations-distribution/002-eggup-deployment-and-service-integration.md`
 
 Reason:
 

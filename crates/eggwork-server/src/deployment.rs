@@ -1,14 +1,8 @@
-//! Consumer deployment and service lifecycle backed by Eggup (Operations M002).
+//! Eggup-backed consumer deployment and service lifecycle.
 //!
-//! Ownership boundary: Eggup owns filesystem transaction/rollback mechanics,
-//! install receipts, and platform service-manager adapters. Eggwork owns the
-//! install-unit policy (which artifacts form one coherent node installation),
-//! the decision that remote execution must drain before replacement, helper
-//! compatibility policy, and bounded post-update health validation.
-//!
-//! Eggwork never invokes a platform service manager directly and never
-//! implements file backup/restoration itself. All `systemctl`, `launchctl`,
-//! SCM, and `crontab` interaction goes through `eggup-service` adapters.
+//! Eggup owns filesystem transactions and service-manager adapters. Eggwork
+//! owns installation contents, drain policy, helper compatibility, and
+//! bounded post-update health checks. Manager operations go through Eggup.
 
 use std::{
     fmt,
@@ -38,9 +32,9 @@ pub const MEMBER_HELPER: &str = "eggwork-sandbox-helper";
 pub const DEST_DAEMON: &str = "bin/eggworkd";
 /// Destination of the helper relative to the installation root.
 pub const DEST_HELPER: &str = "bin/eggwork-sandbox-helper";
-/// Pinned Eggup consumer dependency qualified by this milestone.
+/// Pinned Eggup core version.
 pub const EGGUP_CORE_VERSION: &str = "0.1.1";
-/// Pinned Eggup service dependency qualified by this milestone.
+/// Pinned Eggup service adapter version.
 pub const EGGUP_SERVICE_VERSION: &str = "0.1.1";
 /// Maximum candidate source bytes accepted for staging (bounded).
 pub const MAX_CANDIDATE_BYTES: u64 = 256 * 1024 * 1024;
@@ -48,14 +42,10 @@ pub const MAX_CANDIDATE_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default bounded post-update health probe budget.
 pub const DEFAULT_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
-/// Quiescence poll interval.
+/// Poll cadence while waiting for update quiescence.
 ///
-/// This used to be 5 ms, which over a 30 s drain window meant up to 6,000 polls.
-/// Each poll opened its own read-only SQLite connection, so a single update could
-/// spend minutes of I/O just watching for quiescence. The probe is now a single
-/// indexed `COUNT(*)`, and 100 ms keeps drain latency well under a tenth of the
-/// timeout while cutting the poll count ~20x. The granularity was never a
-/// correctness property — the loop is bounded by `drain_timeout` either way.
+/// The 100 ms interval limits repeated SQLite reads; total wait remains bounded
+/// by `drain_timeout`.
 pub const QUIESCENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Secret-safe deployment error with bounded detail.
@@ -84,14 +74,10 @@ impl DeploymentError {
         self.kind
     }
 
-    /// Record, on a failure, that the node was left refusing new work.
+    /// Add the undrain instruction when a failed update leaves the node drained.
     ///
-    /// The drain marker is set *before* quiescence and is deliberately never
-    /// cleared on any error path — an update that dies mid-flight must not let
-    /// the node resume accepting executions against a half-installed release.
-    /// That is the right behaviour, but it used to be invisible: only the
-    /// success report carried `drain_remains_active`, so an operator reading a
-    /// failure had no way to learn that a later `eggworkd undrain` was needed.
+    /// The marker stays set on errors to prevent admission during a partial
+    /// update; the detail tells operators how to clear it.
     fn note_drain_remains(self, drain_remains_active: bool) -> Self {
         const SUFFIX: &str = "; node left draining, run `eggworkd undrain` to clear";
         if !drain_remains_active || self.detail.contains(SUFFIX) {
@@ -266,16 +252,10 @@ impl InstalledVersionCheck {
 /// Maximum bytes accepted from an installed daemon's `version` probe.
 pub const MAX_VERSION_PROBE_BYTES: usize = 1024;
 
-/// Decide whether an installed daemon reports the expected release version.
+/// Check that the installed daemon reports the expected release version.
 ///
-/// The daemon answers `version` with a JSON object (`{"version": "..."}`), not a
-/// bare string, so a raw string comparison would fail every real update. This
-/// reads the same bounded, shell-free probe output and requires the reported
-/// version field to equal the expected release exactly.
-///
-/// The comparison is exact on purpose: a build that reports a different version
-/// is a different release generation, and admitting it would let a post-install
-/// check pass for a binary the operator did not stage.
+/// The bounded probe returns JSON; an exact match prevents a different binary
+/// generation from passing post-install validation.
 pub fn check_installed_daemon_version(stdout: &[u8], expected: &str) -> InstalledVersionCheck {
     if stdout.len() > MAX_VERSION_PROBE_BYTES {
         return InstalledVersionCheck::Unreadable {
@@ -623,23 +603,11 @@ pub fn inspect_service(
     manager.inspect(spec).map_err(DeploymentError::from)
 }
 
-/// Thin orchestration: drain, stop owned service, transactional replace with
-/// post-commit health validation, restore running state.
+/// Inputs for an Eggup-backed service update.
 ///
-/// Each step fails closed:
-/// - candidate validation happens before any service mutation;
-/// - the persistent drain marker is set before replacement when a marker
-///   path is supplied, so new execution admission stops while draining;
-/// - only an `Owned` service is stopped or replaced;
-/// - `Foreign`/`Unknown` registrations are never touched;
-/// - active executions block the update unless `force` is explicit;
-/// - post-commit health failure rolls back through Eggup (default) while
-///   backups remain retained.
-///
-/// The Eggup transaction only replaces `bin/` members; execution recovery
-/// state (database, workspaces, blobs, artifacts) is never part of the
-/// install unit, so retained terminal records survive update/restart
-/// truthfully and a failed update cannot fabricate execution completion.
+/// The update validates before mutation, touches only an owned service, and
+/// replaces installed binaries without including execution state in the
+/// transaction. Post-commit health failure uses Eggup's rollback path.
 pub struct UpdateRequest<'a> {
     /// Owned service identity to stop/replace/restart.
     pub spec: &'a eggup_service::ServiceSpec,
@@ -995,7 +963,7 @@ pub fn candidate_managers_for(
 /// Deployment status snapshot for machine-readable operator output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentStatus {
-    /// Pinned Eggup dependency versions qualified by this milestone.
+    /// Pinned Eggup core version.
     pub eggup_core_version: String,
     /// Pinned Eggup service dependency version.
     pub eggup_service_version: String,
@@ -1003,7 +971,7 @@ pub struct DeploymentStatus {
     pub install_unit: Vec<InstallMember>,
     /// Helper compatibility outcome.
     pub helper: HelperCompatibility,
-    /// Whether producer packaging remains outside this milestone.
+    /// Whether producer packaging remains external to Eggwork.
     pub producer_packaging_external: bool,
 }
 

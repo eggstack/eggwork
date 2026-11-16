@@ -4,7 +4,7 @@ Status: **closed** — the ADR-0007 Option A boundary is implemented, the closur
 the full pre-submit gate and sets the final status.
 
 Source implementation plan:
-`plans/implementation/security-isolation-resource/005c-resource-scoped-authorization-corrective.md`
+`plans/archive/security-isolation-resource/005c-resource-scoped-authorization-corrective.md`
 
 Source corrective addendum (authoritative where it disagrees with the plan):
 `plans/subsystems/security-isolation-resource-isolation-truthfulness-corrective-addendum.md`
@@ -491,14 +491,14 @@ Two places still read "blocked" and need the change:
 - **Line 183** (the milestone table row):
 
   ```markdown
-  | Security M005c resource-scoped authorization corrective | **blocked** | `plans/implementation/security-isolation-resource/005c-resource-scoped-authorization-corrective.md`. Blocked on ADR-0007 (`plans/adrs/ADR-0007-resource-scoped-authorization.md`, **proposed, not accepted**), which must decide whether resource-scoped grants are implemented or the inert hook and its `ResourceId` plumbing are removed. The gap itself is already recorded as divergence #4; this is a decision about a known gap, not a new defect. |
+  | Security M005c resource-scoped authorization corrective | **blocked** | `plans/archive/security-isolation-resource/005c-resource-scoped-authorization-corrective.md`. Blocked on ADR-0007 (`plans/adrs/ADR-0007-resource-scoped-authorization.md`, **proposed, not accepted**), which must decide whether resource-scoped grants are implemented or the inert hook and its `ResourceId` plumbing are removed. The gap itself is already recorded as divergence #4; this is a decision about a known gap, not a new defect. |
   ```
 
   becomes (with `Status:` set to the final status from
   `plans/003-planning-process.md` §2 after the gate):
 
   ```markdown
-  | Security M005c resource-scoped authorization corrective | **active** | `plans/implementation/security-isolation-resource/005c-resource-scoped-authorization-corrective.md`. ADR-0007 is **accepted** — Option A: implement resource-scoped grants. The hook is real: `GrantAuthorizer` implements `authorize_request` and a grant may carry a bounded, optional resource-scope list. The store's `principal_id` fences remain authoritative for ownership, and blobs are governed by an explicit digest list. No wire value, wire field, capability byte, or `API_SCHEMA_VERSION` changes. Closure evidence: `plans/closure/security-isolation-resource/005c-status.md`. |
+  | Security M005c resource-scoped authorization corrective | **active** | `plans/archive/security-isolation-resource/005c-resource-scoped-authorization-corrective.md`. ADR-0007 is **accepted** — Option A: implement resource-scoped grants. The hook is real: `GrantAuthorizer` implements `authorize_request` and a grant may carry a bounded, optional resource-scope list. The store's `principal_id` fences remain authoritative for ownership, and blobs are governed by an explicit digest list. No wire value, wire field, capability byte, or `API_SCHEMA_VERSION` changes. Closure evidence: `plans/closure/security-isolation-resource/005c-status.md`. |
   ```
 
 - **Line 230** (the dependency diagram):

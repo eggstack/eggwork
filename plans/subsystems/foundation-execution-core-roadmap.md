@@ -52,7 +52,7 @@ Status: closed
 
 Implementation plan:
 
-- `plans/implementation/foundation-execution-core/001-repository-bootstrap-and-domain-contract.md`
+- `plans/archive/foundation-execution-core/001-repository-bootstrap-and-domain-contract.md`
 
 Objective:
 
@@ -75,7 +75,7 @@ Status: closed
 
 Implementation plan:
 
-- `plans/implementation/foundation-execution-core/002-canonical-local-runner.md`
+- `plans/archive/foundation-execution-core/002-canonical-local-runner.md`
 
 Objective:
 
@@ -97,7 +97,7 @@ Status: closed
 
 Implementation plan:
 
-- `plans/implementation/foundation-execution-core/003-execution-ownership-guards-and-runner-api-hardening.md`
+- `plans/archive/foundation-execution-core/003-execution-ownership-guards-and-runner-api-hardening.md`
 
 Objective:
 
@@ -163,7 +163,7 @@ Corrective addendum:
 
 Implementation plan:
 
-- `plans/implementation/foundation-execution-core/005-runner-request-validation-parity-corrective.md`
+- `plans/archive/foundation-execution-core/005-runner-request-validation-parity-corrective.md`
 
 Objective:
 
@@ -225,7 +225,7 @@ Foundation M003 remains historically closed, but a later review found that its e
 Closed corrective authority:
 
 - `plans/subsystems/foundation-execution-core-post-closure-ci-corrective-addendum.md`
-- C001 implementation: `plans/implementation/foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md`
+- C001 implementation: `plans/archive/foundation-execution-core-ci-corrective/001-portable-ownership-guard-ci-enforcement.md`
 - C001 closure: `plans/closure/foundation-execution-core-ci-corrective/001-status.md`
 
 C001 closed: the guard now invokes `cargo metadata` directly, runs as a required GitHub Actions step on push/PR, and a deterministic `--prove-negative-exit` mode exercises the failure path on every CI run. The M003 closure record remains immutable historical evidence; ownership-CI enforcement is now closed rather than corrective-required.

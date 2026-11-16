@@ -37,7 +37,7 @@ Closure evidence: `plans/closure/operations-distribution/001-status.md`
 
 Implementation plan:
 
-- `plans/implementation/operations-distribution/001-node-operations-surface.md`
+- `plans/archive/operations-distribution/001-node-operations-surface.md`
 
 Objective:
 
@@ -56,11 +56,11 @@ Closure evidence: `plans/closure/operations-distribution/002-resumed-status.md`
 
 Implementation plan:
 
-- `plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md`
+- `plans/archive/operations-distribution/002-eggup-deployment-and-service-integration.md`
 
 Supersedes:
 
-- `plans/implementation/operations-distribution/002-packaging-services-and-eggup.md`
+- `plans/archive/operations-distribution/002-packaging-services-and-eggup.md`
 
 Objective:
 
@@ -82,7 +82,7 @@ Status: closed
 
 Implementation plan:
 
-- `plans/implementation/operations-distribution/002a-recovery-required-restart-suppression-and-lifecycle-composition-corrective.md`
+- `plans/archive/operations-distribution/002a-recovery-required-restart-suppression-and-lifecycle-composition-corrective.md`
 
 Finding:
 
@@ -109,7 +109,7 @@ Closure evidence: `plans/closure/operations-distribution/003-status.md`
 
 Implementation plan:
 
-- `plans/implementation/operations-distribution/003-eggpack-producer-packaging-integration.md`
+- `plans/archive/operations-distribution/003-eggpack-producer-packaging-integration.md`
 
 Objective:
 
@@ -221,7 +221,7 @@ Status: **closed** — `plans/closure/operations-distribution/004a-status.md`
 
 Implementation plan:
 
-- `plans/implementation/operations-distribution/004a-release-qualification-fixture-isolation-corrective.md`
+- `plans/archive/operations-distribution/004a-release-qualification-fixture-isolation-corrective.md`
 
 Objective:
 
@@ -259,7 +259,7 @@ Status: **closed** — `plans/closure/operations-distribution/004b-status.md`
 
 Implementation plan:
 
-- `plans/implementation/operations-distribution/004b-staged-helper-publication-durability-corrective.md`
+- `plans/archive/operations-distribution/004b-staged-helper-publication-durability-corrective.md`
 
 Objective:
 
@@ -356,7 +356,7 @@ Corrective addendum:
 
 Implementation plan:
 
-- `plans/implementation/operations-distribution/008a-operator-surface-truthfulness-corrective.md`
+- `plans/archive/operations-distribution/008a-operator-surface-truthfulness-corrective.md`
 
 Objective:
 
@@ -381,7 +381,7 @@ Corrective addendum:
 
 Implementation plan:
 
-- `plans/implementation/operations-distribution/008b-release-harness-and-documentation-single-sourcing-corrective.md`
+- `plans/archive/operations-distribution/008b-release-harness-and-documentation-single-sourcing-corrective.md`
 
 Objective:
 

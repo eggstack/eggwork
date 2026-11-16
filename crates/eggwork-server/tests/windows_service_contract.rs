@@ -1,15 +1,4 @@
-//! The Windows service-host contract.
-//!
-//! This target is Windows-only and is run explicitly on `windows-latest`,
-//! not through `--workspace --all-targets`: the server's own unit tests are
-//! `/bin/sh`-shaped and are not claimed as Windows coverage, and this
-//! contract is about the Windows surface specifically.
-//!
-//! The contract is a *contract*, not an installation. Nothing here mutates
-//! the service control manager: the ownership comparison is exercised
-//! through Eggup's own classification, and the manager is only constructed,
-//! never run against a real registration. Mutating a real registration is
-//! the hosted lifecycle job's job, and it is a different kind of evidence.
+//! Windows-only service contract tests; they classify registrations without mutating SCM.
 
 #![cfg(windows)]
 

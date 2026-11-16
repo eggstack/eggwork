@@ -1,13 +1,5 @@
-//! Capability advertisement is backed by the same trust check the runner uses at
-//! execution time, so this test has to present the helper the way an
-//! installation does: owner-only directory, executable file.
-//!
-//! The staging rules live in one place, shared with the Landlock suite, because
-//! two copies of "copy the built helper somewhere trustable" is exactly how a
-//! fixture starts overwriting an executable another test may be running
-//! (Operations M004a). The `#[path]` include is deliberate: the alternative is a
-//! dev-only workspace member, and the release contract enumerates workspace
-//! members.
+//! Verify capability advertisement uses the execution trust check.
+//! The shared fixture stages trusted helpers without modifying build output bytes.
 
 use eggwork_runner::{LANDLOCK_WORKSPACE_RW_CAPABILITY, LocalProcessRunner, TrustedLandlockSetup};
 #[cfg(target_os = "linux")]
@@ -20,20 +12,9 @@ use std::path::PathBuf;
 #[path = "../../eggwork-sandbox-helper/tests/support/helper_fixture.rs"]
 mod helper_fixture;
 
-/// The built sandbox helper, located deterministically.
+/// Locate the helper beside the test binary's Cargo profile directory.
 ///
-/// The helper belongs to another package, so `CARGO_BIN_EXE_eggwork-sandbox-helper`
-/// is not available here: Cargo only sets that variable for the package that
-/// owns the binary. What *is* available is this test's own executable, which
-/// Cargo places under the target directory's `deps` directory, one level below
-/// the profile directory that holds the package's binaries. The helper is
-/// therefore the sibling of the `deps` directory — the same walk
-/// `eggwork_server`'s `locate_helper_binary` performs.
-///
-/// The lookup fails **loudly**. A test that returns early when it cannot find
-/// its fixture reports success without asserting anything, which is a hole
-/// rather than a check: the previous implementation did exactly that, and the
-/// skip was the normal path in CI as well as locally.
+/// Missing fixtures panic instead of silently skipping the assertion.
 #[cfg(target_os = "linux")]
 fn built_helper() -> PathBuf {
     let executable = std::env::current_exe().expect("the test executable has a path");

@@ -1,15 +1,8 @@
-//! The Windows service control manager adapter.
+//! Windows SCM host adapter; Eggup remains the service manager.
 //!
-//! This is the only place in the workspace that talks to the Windows service
-//! control manager, and it is a *host*, not a *manager*: it registers a
-//! control handler, reports truthful lifecycle state, and runs the shared
-//! node lifecycle. It never installs, starts, stops, or removes a service —
-//! Eggup owns those mutations, through `eggup-service`.
-//!
-//! The wrapper it uses (`windows-service`) is pinned exactly and is a
-//! Windows-target-only dependency. Nothing here needs `unsafe`: the service
-//! entry is a plain `extern "system" fn` and the wrapper does the calling
-//! convention work.
+//! This module reports lifecycle state and runs the shared node lifecycle.
+//! Its `windows-service` wrapper is target-specific and contains the calling
+//! convention, so Eggwork does not need unsafe FFI.
 
 use std::{
     path::{Path, PathBuf},
@@ -36,11 +29,8 @@ use crate::{
 
 /// How long the manager is told to wait for a pending transition.
 ///
-/// The manager treats this as its timeout for the transition, so it is
-/// bounded and it is backed by a checkpoint that advances while the
-/// transition is in flight. Without the checkpoint a slow start would look
-/// like a hung service, which is exactly the error the previous milestone
-/// recorded.
+/// A bounded heartbeat advances before this hint expires so slow transitions
+/// are not reported as hung.
 const WAIT_HINT: Duration = Duration::from_secs(30);
 
 /// How often the pending checkpoint advances.

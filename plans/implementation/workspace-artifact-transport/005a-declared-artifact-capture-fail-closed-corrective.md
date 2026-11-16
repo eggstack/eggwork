@@ -260,7 +260,7 @@ available on the running platform. Today that fact exists only implicitly, as th
   kind. `ExecutionEventKind::Diagnostic` has none today — every use of the variant in the
   repository is in test code. The plan must either add the publisher here, or record an explicit
   dependency on the Security M005a degraded-isolation observability corrective
-  (`plans/implementation/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`),
+  (`plans/archive/security-isolation-resource/005a-degraded-isolation-observability-corrective.md`),
   which needs the same publisher. Two correctives must not grow two divergent publishers for the
   same event kind; the server's event-publishing path must be the single place either one of them
   extends. The published payload must be bounded by `MAX_EVENT_CHUNK_BYTES`, which

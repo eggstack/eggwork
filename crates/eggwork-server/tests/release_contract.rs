@@ -1,14 +1,4 @@
-//! Static producer/consumer parity between Eggpack release facts and Eggwork
-//! deployment facts (Operations M003).
-//!
-//! Eggpack owns the checked-in release contract, manifests, installers, and
-//! generated release CI. Eggwork owns which binaries constitute one installed
-//! node and how they are moved together. This suite reconciles the two sets of
-//! facts using only the checked-in static configuration and Eggwork's own
-//! deployment constants, so neither library takes a runtime dependency on the
-//! other. Eggpack's own schema validation, expansion, and workflow drift checks
-//! run through the pinned `eggpack` tool in CI; this suite proves the declared
-//! configuration still says what Eggwork means.
+//! Check that Eggpack's static release contract matches Eggwork's install-unit facts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -1170,7 +1160,7 @@ fn the_deployment_module_never_parses_eggpack_configuration() {
             assert!(
                 !text.contains(forbidden),
                 "{file} must not depend on Eggpack producer configuration at runtime; \
-                 release selection and acquisition stay outside this milestone"
+                 release selection and acquisition stay outside Eggwork"
             );
         }
     }
@@ -1237,13 +1227,8 @@ fn linux_only_dependencies_never_enter_the_non_linux_build_graph() {
 
 #[test]
 fn the_windows_msvc_build_policy_is_deterministic_and_target_scoped() {
-    // The `v0.1.0` same-tag rerun (`36868105194`) built the identical source
-    // revision and produced a different Windows SHA-256 than the staged asset:
-    // a different COFF timestamp plus a different CodeView/PDB RSDS signature.
-    // Eggpack correctly refused to replace the same-name asset, so the defect is
-    // Eggwork's own link policy. This test parses the checked-in Cargo config
-    // and requires both correcting link arguments, scoped to the MSVC target
-    // only, and requires that nothing anywhere can replace them.
+    // Pin reproducible MSVC link arguments to the Windows target and prevent
+    // environment overrides from replacing them.
     let config: Toml =
         toml::from_str(&read(".cargo/config.toml")).expect(".cargo/config.toml is valid TOML");
     let targets = config

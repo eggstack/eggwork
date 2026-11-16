@@ -2,7 +2,7 @@
 
 Status: blocked; implementation not started beyond dependency/API qualification.
 
-Source implementation plan: `plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md`
+Source implementation plan: `plans/archive/operations-distribution/002-eggup-deployment-and-service-integration.md`
 
 Roadmap: `plans/subsystems/operations-distribution-roadmap.md`
 

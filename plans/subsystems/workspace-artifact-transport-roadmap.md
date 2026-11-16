@@ -44,7 +44,7 @@ Status: closed
 
 Implementation plan:
 
-- `plans/implementation/workspace-artifact-transport/001-blob-store-and-digest-protocol.md`
+- `plans/archive/workspace-artifact-transport/001-blob-store-and-digest-protocol.md`
 
 Objective:
 
@@ -67,7 +67,7 @@ Status: closed
 
 Implementation plan:
 
-- `plans/implementation/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md`
+- `plans/archive/workspace-artifact-transport/002-workspace-manifest-and-safe-materialization.md`
 
 Objective:
 
@@ -89,7 +89,7 @@ Status: closed
 
 Implementation plan:
 
-- `plans/implementation/workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md`
+- `plans/archive/workspace-artifact-transport/003-declared-artifacts-retention-and-gc.md`
 
 Objective:
 
@@ -112,7 +112,7 @@ Status: closed
 
 Implementation plan:
 
-- `plans/implementation/workspace-artifact-transport/004-reusable-manifest-cas-and-derived-materialization.md`
+- `plans/archive/workspace-artifact-transport/004-reusable-manifest-cas-and-derived-materialization.md`
 
 Closure record:
 
@@ -183,7 +183,7 @@ Corrective addendum:
 
 Implementation plan:
 
-- `plans/implementation/workspace-artifact-transport/005b-gc-preview-and-store-ownership-corrective.md`
+- `plans/archive/workspace-artifact-transport/005b-gc-preview-and-store-ownership-corrective.md`
 
 Closure record:
 

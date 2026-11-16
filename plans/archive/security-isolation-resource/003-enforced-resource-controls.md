@@ -4,7 +4,7 @@ Status: closed
 
 Dependency evidence: `plans/closure/security-isolation-resource/002-status.md`
 
-Related correction: `plans/implementation/security-isolation-resource/002a-landlock-runtime-devnull.md`
+Related correction: `plans/archive/security-isolation-resource/002a-landlock-runtime-devnull.md`
 
 Source roadmap:
 

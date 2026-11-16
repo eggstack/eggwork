@@ -1,16 +1,4 @@
-//! The operator surface names the two execution facts apart.
-//!
-//! One name, `active_executions`, carried two facts: the permits the running
-//! node holds, and the durable rows that are still in a non-terminal state.
-//! The two are different measurements and they legitimately disagree — an
-//! execution whose process died keeps its row long after its permit was
-//! released, and an idempotent re-request releases its permit while the
-//! original execution still holds one.
-//!
-//! These tests drive the operator binary and read its JSON, and they use no
-//! API that the fix introduced, so they can be run against the code as it was
-//! before the change as well as against the code as it is now. That is what
-//! makes them evidence rather than a restatement of the fix.
+//! Verify operator status separates held permits from durable non-terminal rows.
 
 mod common;
 

@@ -2,7 +2,7 @@
 
 Status: closed
 
-Source plan: `plans/implementation/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md`
+Source plan: `plans/archive/control-plane-protocol/003-eggress-route-adapter-and-protocol-hardening.md`
 
 Roadmap: `plans/subsystems/control-plane-protocol-roadmap.md`
 

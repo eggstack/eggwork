@@ -1,6 +1,6 @@
 # Foundation M002 Closure — Canonical Local Runner
 
-Source plan: `plans/implementation/foundation-execution-core/002-canonical-local-runner.md`  
+Source plan: `plans/archive/foundation-execution-core/002-canonical-local-runner.md`
 Subsystem roadmap: `plans/subsystems/foundation-execution-core-roadmap.md`  
 Reviewed baseline: `7d263c7fa030aca3f33f62117983368836f64942`  
 Implementation commits: `5dd4274eca71b952311c95a431851ddae96ee8f3`, `6dba4c6b895c9893dc206ec621245797725713b2`

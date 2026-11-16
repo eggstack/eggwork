@@ -2,7 +2,7 @@
 
 Status: **closed**
 Closed: 2026-10-19
-Source plan: `plans/implementation/optional-gregg-host-telemetry/001-loopback-gregg-adapter.md`
+Source plan: `plans/archive/optional-gregg-host-telemetry/001-loopback-gregg-adapter.md`
 Subsystem roadmap: `plans/subsystems/optional-gregg-host-telemetry-roadmap.md`
 Decision: `plans/adrs/ADR-0006-optional-gregg-host-telemetry.md`
 Branch: `planning/optional-gregg-telemetry-m001-m002`
@@ -236,9 +236,9 @@ preferred only if the dependency impact is reasonable.
 - `plans/registry.md` — the Optional Gregg host telemetry workstream row,
   the dependency-ready plan table, the closed-plans table, and the planned /
   blocked work table are updated. M002 is unlocked.
-- `plans/implementation/optional-gregg-host-telemetry/001-loopback-gregg-adapter.md`
+- `plans/archive/optional-gregg-host-telemetry/001-loopback-gregg-adapter.md`
   — status `closed`, with a pointer to this record.
-- `plans/implementation/optional-gregg-host-telemetry/002-authenticated-node-telemetry.md`
+- `plans/archive/optional-gregg-host-telemetry/002-authenticated-node-telemetry.md`
   — status `ready`; its blocker (M001 closure freezing the bounded normalized
   provider contract) is discharged by `eggwork_core::HostTelemetry` and
   `eggwork_core::TelemetryProviderState`.

@@ -912,8 +912,8 @@ verified intact afterwards. "No platform passed by bypassing an ownership check.
   service lifecycle, and Windows disposition.
 - `../plans/subsystems/operations-distribution-roadmap.md` — the Operations
   subsystem roadmap, including the M004 Windows disposition and M007.
-- `../plans/implementation/operations-distribution/002-eggup-deployment-and-service-integration.md`
-  and `../plans/implementation/operations-distribution/002a-eggup-deployment-and-service-integration-corrective.md`
+- `../plans/archive/operations-distribution/002-eggup-deployment-and-service-integration.md`
+  and `../plans/archive/operations-distribution/002a-recovery-required-restart-suppression-and-lifecycle-composition-corrective.md`
   — the plan and corrective that landed this module.
 - `../plans/implementation/operations-distribution/007-windows-service-host.md` —
   the milestone that lifted the Windows refusal by making the daemon a service
