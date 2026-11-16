@@ -244,7 +244,7 @@ jobs:
     # test targets are portable and run here; the server's own unit tests are
     # `/bin/sh`-shaped and are not claimed here, except for the one portable
     # integration target the Windows job already runs.
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
