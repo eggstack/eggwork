@@ -29,8 +29,8 @@
 # Environment overrides (all optional):
 #
 #   CARGO_TARGET_DIR                   where the binaries are built and run
-#   EGGWORK_QUICKSTART_ROOT            installation root (default ~/.local/share/eggwork)
-#   EGGWORK_QUICKSTART_HELPER_DIR      trusted helper directory (default ~/.local/lib/eggwork)
+#   EGGWORK_QUICKSTART_ROOT            installation root (default ~/.local/share/eggwork-quickstart)
+#   EGGWORK_QUICKSTART_HELPER_DIR      trusted helper directory (default ~/.local/lib/eggwork-quickstart)
 #   EGGWORK_QUICKSTART_SKIP_QUALIFY   set to 1 to skip step 7 (local convenience only)
 
 set -euo pipefail
@@ -40,7 +40,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 DAEMON="$TARGET_DIR/debug/eggworkd"
 HELPER_BINARY="$TARGET_DIR/debug/eggwork-sandbox-helper"
-HELPER_DIR="${EGGWORK_QUICKSTART_HELPER_DIR:-$HOME/.local/lib/eggwork}"
+HELPER_DIR="${EGGWORK_QUICKSTART_HELPER_DIR:-$HOME/.local/lib/eggwork-quickstart}"
 HELPER="$HELPER_DIR/eggwork-sandbox-helper"
 DOC="$REPO_ROOT/docs/quickstart.md"
 SYNC_CHECK="$REPO_ROOT/scripts/check_quickstart_sync.py"
@@ -142,8 +142,8 @@ step "2" "Create TLS material"
 
 # step: 2-tls
 # doc:begin
-ROOT="${EGGWORK_QUICKSTART_ROOT:-$HOME/.local/share/eggwork}"
-mkdir -p "$ROOT"/{tls,state,blobs,workspaces,executions,bin}
+ROOT="${EGGWORK_QUICKSTART_ROOT:-$HOME/.local/share/eggwork-quickstart}"
+mkdir -p "$ROOT"/{tls,state,blobs,workspaces,executions}
 
 cd "$ROOT/tls"
 openssl req -x509 -newkey rsa:2048 -nodes -keyout ca-key.pem -out ca.pem -days 30 \
@@ -178,12 +178,14 @@ echo "$FP"
 # Step 3 — install the helper where it is trusted
 # ---------------------------------------------------------------------------
 step "3" "Install the helper where it is trusted"
-# The helper's directory is created and then explicitly tightened. `mkdir -p`
-# would inherit the ambient umask, and a group-writable directory makes the
-# helper untrusted — the node would then refuse the isolation it is required
-# to enforce, and the refusal would look like a product defect.
+# step: 3-install-helper
+# doc:begin
 install -d -m 0755 "$HELPER_DIR"
 chmod 0755 "$HELPER_DIR"
+# doc:end
+
+# Check the complete path before installing the helper. The node repeats this
+# check when it loads the config.
 check_trusted_path "$HELPER"
 
 # step: 3-install-helper

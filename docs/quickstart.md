@@ -1,11 +1,15 @@
 # Quickstart
 
-Build a node from source, give it real TLS material, and prove it executes a
-sandboxed request. Every command on this page has been run against this
-repository at `0.1.5`; the output shown is real.
+Build and run a Linux node from source, then verify an authenticated execution.
+The qualification check also proves that required isolation is enforced when
+the host supports it, and refused when it does not. Use the
+[release guide](releases.md) for published binaries.
 
-Expect about five minutes. The TLS material is the only fiddly part, and
-step 2 does it for you.
+You need Linux, Rust through `rustup`, OpenSSL, Python 3, and a host where the
+node can access its execution and storage directories. The repository pins the
+Rust toolchain in `rust-toolchain.toml`. These commands use Bash. Start from the
+repository root, replace `/path/to/repo` with its absolute path, and keep the
+same shell open through step 7 so `$ROOT` and `$FP` remain available.
 
 ## 1. Build the two Linux binaries
 
@@ -15,27 +19,31 @@ cargo build --locked -p eggwork-sandbox-helper
 ```
 
 Linux ships two binaries because the daemon delegates Landlock confinement to a
-separate helper. macOS and Windows ship the daemon only — Landlock is Linux-only,
-so there is nothing for the helper to apply.
+separate helper. macOS and Windows ship the daemon only. Landlock is Linux-only,
+so those platforms do not use the helper.
 
-Check them:
+Check their version reports:
 
 ```bash
 ./target/debug/eggworkd version
-# {"version": "0.1.5"}
 ./target/debug/eggwork-sandbox-helper --version
-# 0.1.5
 ```
 
 ## 2. Create TLS material
 
+The walkthrough writes test data under a separate `eggwork-quickstart`
+directory. If that path already contains data from another node, change `ROOT`
+to a new empty directory before running these commands.
+
 A node requires mTLS in both directions and will not start without it. The node
 presents a server certificate; every controller must present a client
-certificate signed by a CA the node trusts.
+certificate signed by a CA the node trusts. These short-lived self-signed
+certificates are for local testing. Use your organization's certificate
+authority and key-management practices for a deployed node.
 
 ```bash
-ROOT=$HOME/.local/share/eggwork
-mkdir -p "$ROOT"/{tls,state,blobs,workspaces,executions,bin}
+ROOT=$HOME/.local/share/eggwork-quickstart
+mkdir -p "$ROOT"/{tls,state,blobs,workspaces,executions}
 
 cd "$ROOT/tls"
 openssl req -x509 -newkey rsa:2048 -nodes -keyout ca-key.pem -out ca.pem -days 30 \
@@ -62,27 +70,27 @@ openssl x509 -req -in client.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
   -out client.pem -days 30 -extfile client.ext
 ```
 
-Eggwork identifies a controller by the **SHA-256 of its certificate's DER
-encoding**, lowercase hex, no colons. Compute it exactly this way:
+Eggwork identifies a controller by the SHA-256 of its certificate's DER
+encoding, written as lowercase hex without colons:
 
 ```bash
 FP=$(openssl x509 -in client.pem -outform DER | openssl dgst -sha256 -hex | sed 's/^.*= //')
 echo "$FP"
-# e5f5ed1f65af60579208b93b5cfc880f997f6264062113b0980bb350d8272be6
 ```
 
 ## 3. Install the helper where it is trusted
 
 ```bash
+install -d -m 0755 "$HOME/.local/lib/eggwork-quickstart"
+chmod 0755 "$HOME/.local/lib/eggwork-quickstart"
 install -m 0755 /path/to/repo/target/debug/eggwork-sandbox-helper \
-  "$HOME/.local/lib/eggwork/eggwork-sandbox-helper"
+  "$HOME/.local/lib/eggwork-quickstart/eggwork-sandbox-helper"
 ```
 
-The helper is trusted only when it is root- or effective-user-owned, not
-group/world writable, **and every ancestor directory is non-writable**. That
-last clause is why a helper under `/tmp` is rejected: `/tmp` is world-writable,
-so anything inside it fails the walk. Install it somewhere like
-`~/.local/lib/eggwork`, never in a shared temporary directory.
+The helper file and its containing directory must be owned by root or the
+effective user and must not be group-writable or world-writable. Ancestors are
+checked too. Keep the helper in `~/.local/lib/eggwork-quickstart`, not directly
+under `/tmp`.
 
 ## 4. Write the config
 
@@ -100,7 +108,7 @@ cat > "$ROOT/node.json" <<EOF
   "workspace_quota_bytes": 1073741824,
   "max_active_executions": 4,
   "lease_ttl_seconds": 30,
-  "sandbox_helper": "$HOME/.local/lib/eggwork/eggwork-sandbox-helper",
+  "sandbox_helper": "$HOME/.local/lib/eggwork-quickstart/eggwork-sandbox-helper",
   "tls": {
     "certificate_chain": "$ROOT/tls/node-chain.pem",
     "private_key": "$ROOT/tls/node-key.pem",
@@ -125,18 +133,13 @@ The field shape is also available as a committed example:
 [`examples/eggworkd.example.json`](../examples/eggworkd.example.json). Replace
 its paths and fingerprint with your own.
 
-Host telemetry is optional and **off unless you ask for it**. The config above
-has no `host_telemetry` block, so the node creates no provider, starts no
-polling task, and reports no host measurements. See
-[operations.md](operations.md#host-telemetry-optional-off-by-default) if you
-want to point the node at a telemetry provider bound to the loopback
-interface.
+Host telemetry is optional and disabled unless configured. See
+[node operations](operations.md#host-telemetry) if you use a local provider.
 
 ## 5. Set permissions (required)
 
-Eggwork refuses to load a config or certificate that others could tamper with,
-and refuses a state directory that others could write. Getting this wrong
-names the rule that was broken, the file that broke it, and the fix:
+Eggwork refuses unsafe config, TLS, or state permissions. Errors name the rule
+that failed and the corrective action:
 
 ```text
 eggworkd: [config_file_world_writable] /srv/eggwork/node.json: remove group- and world-write permission from the configuration file
@@ -148,8 +151,8 @@ chmod 600 "$ROOT"/node.json "$ROOT"/tls/{node-key.pem,ca-key.pem,client-key.pem}
 chmod 644 "$ROOT"/tls/{node-chain.pem,node.pem,ca.pem,client.pem}
 ```
 
-The rule in one line: **directories owner-only (`0700`), the private key
-`0600`, and nothing group- or world-writable.**
+Use owner-only (`0700`) directories, a private key readable only by its owner
+(`0600`), and no group- or world-writable config or TLS files.
 
 ## 6. Validate, then run
 
@@ -158,30 +161,28 @@ cd /path/to/repo
 ./target/debug/eggworkd doctor --config "$ROOT/node.json"
 ```
 
-A ready node reports every check green:
+A ready node reports `ready: true` and all eight checks as `ok: true`. The
+following excerpt omits each check's detail field:
 
 ```json
 {
+  "schema_version": 1,
   "ready": true,
   "checks": [
-    { "name": "configuration", "ok": true, "detail": "configuration and TLS policy are valid" },
-    { "name": "host-telemetry", "ok": true,
-      "detail": "host telemetry is disabled; the node reports no host measurements" },
-    { "name": "sandbox-resource-backend", "ok": true,
-      "detail": "runtime-probed capabilities: isolation.landlock.workspace-rw.v1, resources.cgroups-v2.memory, resources.cgroups-v2.cpu, resources.cgroups-v2.pids" },
-    { "name": "listener", "ok": true, "detail": "bind address is available" },
-    { "name": "execution-root", "ok": true, "detail": "directory is available" },
-    { "name": "blob-root", "ok": true, "detail": "directory is available" },
-    { "name": "workspace-root", "ok": true, "detail": "directory is available" },
-    { "name": "storage-headroom", "ok": true, "detail": "116914479104 bytes available" }
+    { "name": "configuration", "ok": true },
+    { "name": "host-telemetry", "ok": true },
+    { "name": "sandbox-resource-backend", "ok": true },
+    { "name": "listener", "ok": true },
+    { "name": "execution-root", "ok": true },
+    { "name": "blob-root", "ok": true },
+    { "name": "workspace-root", "ok": true },
+    { "name": "storage-headroom", "ok": true }
   ]
 }
 ```
 
-The `sandbox-resource-backend` line is the important one: it is a **runtime
-probe**, not a static claim. It reports the capabilities this host can actually
-enforce right now. If the helper is untrusted, that line fails and required
-isolation is refused rather than degraded.
+`sandbox-resource-backend` reports the capabilities this host can enforce now.
+If the helper is untrusted, the check fails and required isolation is refused.
 
 Start the node:
 
@@ -190,30 +191,33 @@ Start the node:
 # {"local_addr":"127.0.0.1:7443","node_id":"worker-01","ready":true}
 ```
 
-`ready: true` is the node listening and serving. In another terminal:
+`ready: true` means the node is listening. In another terminal, run the
+following commands. If you changed `ROOT`, update the config path accordingly:
 
 ```bash
-./target/debug/eggworkd status --config "$ROOT/node.json"
-./target/debug/eggworkd executions list --config "$ROOT/node.json" --limit 5
-./target/debug/eggworkd storage summary --config "$ROOT/node.json"
+/path/to/repo/target/debug/eggworkd status --config "$HOME/.local/share/eggwork-quickstart/node.json"
+/path/to/repo/target/debug/eggworkd executions list --config "$HOME/.local/share/eggwork-quickstart/node.json" --limit 5
+/path/to/repo/target/debug/eggworkd storage summary --config "$HOME/.local/share/eggwork-quickstart/node.json"
 ```
 
-## 7. Prove an execution is actually confined
+## 7. Verify execution and isolation
 
-This is the step worth doing. It runs one authenticated execution end to end —
-mTLS client, admission, runner, Landlock sandbox — and then tries to write
-*outside* the workspace to confirm the sandbox stopped it.
+This qualification check uses the production client over mTLS and submits a
+bounded execution. If the node advertises Landlock isolation, the check also
+tries to write outside the workspace and confirms that the write is denied. If
+the host does not support isolation, it confirms that a request requiring it
+is refused before the target runs.
 
-> **Stop the node first.** The check below takes an exclusive lock on the state
-> directory, so it fails if an `eggworkd` is already running against the same
-> `EGGWORK_QUALIFY_ROOT`. If you ran step 6, stop it first: `pkill -x eggworkd`.
+Stop the node started in step 6 with Ctrl-C before continuing. The check takes
+an exclusive lock on the state directory and cannot run while the node is
+using the same `EGGWORK_QUALIFY_ROOT`.
 
 Materialize the fixture (it mints its own TLS and node config under
 `$EGGWORK_QUALIFY_ROOT`):
 
 ```bash
 EGGWORK_QUALIFY_ROOT="$ROOT" \
-EGGWORK_QUALIFY_HELPER="$HOME/.local/lib/eggwork/eggwork-sandbox-helper" \
+EGGWORK_QUALIFY_HELPER="$HOME/.local/lib/eggwork-quickstart/eggwork-sandbox-helper" \
   cargo test --locked -p eggwork-server --features qualification \
   --test installed_qualification -- --ignored --exact qualification_fixture
 ```
@@ -224,13 +228,13 @@ Then run the execution against it:
 EGGWORK_QUALIFY_DAEMON=/path/to/repo/target/debug/eggworkd \
 EGGWORK_QUALIFY_CONFIG="$ROOT/state/node.json" \
 EGGWORK_QUALIFY_TLS_DIR="$ROOT/state/tls" \
-EGGWORK_QUALIFY_HELPER="$HOME/.local/lib/eggwork/eggwork-sandbox-helper" \
+EGGWORK_QUALIFY_HELPER="$HOME/.local/lib/eggwork-quickstart/eggwork-sandbox-helper" \
   cargo test --locked -p eggwork-server --features qualification \
   --test installed_qualification -- --ignored \
   --exact installed_release_admits_execution_and_refuses_unsupported_isolation --nocapture
 ```
 
-The receipt includes:
+On a host that supports Landlock, the receipt includes:
 
 ```json
 {
@@ -256,14 +260,14 @@ its own would only mean the node could enforce isolation.
 | `[config_file_world_writable] …` on stderr | The config file is group- or world-writable | `chmod 600` the config; see step 5 |
 | `[tls_private_key_readable_by_others] the private key` | The private key is readable by other users | `chmod 600` the private key; see step 5 |
 | `[state_root_not_owner_only] …` | A state directory is not `0700` | `chmod 700` the state directories; see step 5 |
-| `doctor` says `configuration and TLS policy are valid` is false | A certificate is malformed, or expired | Re-check the chain; `openssl x509 -in ca.pem -noout -text` |
-| `sandbox-resource-backend` fails | Helper missing, group/world writable, or under a world-writable ancestor | Move it to `~/.local/lib/eggwork` (step 3) |
+| `doctor` says `configuration and TLS policy are valid` is false | A certificate is malformed, or expired | Check the certificates with `openssl verify -CAfile "$ROOT/tls/ca.pem" "$ROOT/tls/node.pem" "$ROOT/tls/client.pem"` |
+| `sandbox-resource-backend` fails | Helper missing, group/world writable, or under an untrusted ancestor | Install it under `~/.local/lib/eggwork-quickstart` (step 3) |
 | `listener` fails | Port already bound | Change `bind`, or stop the other process |
-| `configuration ... rejected` right after a `drain` | Not an error — drain persists across restarts until `undrain` | `eggworkd undrain --config …` |
-| The step 7 execution test fails immediately | A node is still running against the same state root and holds the lock | `pkill -x eggworkd`, then re-run |
+| `configuration ... rejected` right after a `drain` | Expected: drain persists across restarts until `undrain` | `eggworkd undrain --config <node.json>` |
+| The step 7 execution test fails immediately | A node is still running against the same state root and holds the lock | Stop that node with Ctrl-C, then re-run |
 
 ## Next
 
-- [operations.md](operations.md) — the full operator verb reference.
-- [deployment.md](deployment.md) — install and update a node as a service.
-- [releases.md](releases.md) — consume a published release.
+- [Node operations](operations.md): readiness, drain, inspection, and garbage collection.
+- [Deployment](deployment.md): install and update a node as a service.
+- [Releases](releases.md): supported targets and release installation.

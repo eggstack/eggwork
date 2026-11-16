@@ -1,13 +1,14 @@
 # Node operations
 
-`eggworkd` is the only supported way to operate a node. It is JSON-only: every
-verb writes JSON to stdout and nothing else, so it composes with `jq` and never
-requires parsing prose. Errors go to stderr and exit `2`.
+`eggworkd` is the operator CLI. Commands print JSON to stdout; errors go to
+stderr and exit with status `2`. Commands that operate on a node take
+`--config <file>`. The `version` command does not.
 
-Every verb takes `--config <file>` pointing at a versioned JSON config. See
-[quickstart.md](quickstart.md) for how to create one that loads.
+See the [quickstart](quickstart.md) for a working config. For installing a
+service or updating binaries, see [deployment](deployment.md). When running
+from a source checkout, use `./target/debug/eggworkd` in place of `eggworkd`.
 
-## Verbs
+## Commands
 
 ```text
 eggworkd version
@@ -22,66 +23,49 @@ eggworkd undrain         --config <node.json>
 eggworkd executions list --config <node.json> --limit 50 --offset 0
 eggworkd executions show --config <node.json> <execution-id>
 eggworkd storage summary --config <node.json>
-eggworkd inspect blob|workspace|artifact <id> --config <node.json>
-eggworkd gc              --config <node.json> --limit 128         # read-only preview
+eggworkd inspect blob <id>      --config <node.json>
+eggworkd inspect workspace <id> --config <node.json>
+eggworkd inspect artifact <id>  --config <node.json>
+eggworkd gc              --config <node.json> --limit 128
 eggworkd gc              --config <node.json> --apply --limit 128
 eggworkd deployment status --config <node.json>
-eggworkd deployment apply  --config <node.json> ...              # see deployment.md
+eggworkd deployment apply  --config <node.json> ...
 eggworkd service spec|status|install|start|stop|restart|uninstall --config <node.json> ...
 ```
 
-`eggworkd` with no arguments prints its usage and exits `2`.
-
-Every failure exits `2`, including a `service` mutation whose report carries
-`"completed": false`: the JSON is printed first, so the attempt stays recorded,
-but the exit code reports that the node did not reach the requested state.
+`gc` previews removals by default. Add `--apply` to delete eligible data.
+Service and deployment options vary by platform; see [deployment](deployment.md).
 
 ## Readiness
 
-`doctor` is the gate. It returns eight checks, and `ready` is true only when all
-of them pass:
+Run `doctor` before starting the node. `ready` is true only when all eight
+checks pass:
 
-| Check | Meaning |
+| Check | What it checks |
 |---|---|
-| `configuration` | Config parses and the TLS material loads into a usable server config |
-| `host-telemetry` | Whether the optional host-telemetry provider is configured (off by default) |
-| `sandbox-resource-backend` | The installed helper is trusted, and this host's actual isolation/resource capabilities were runtime-probed |
-| `listener` | The bind address is available |
-| `execution-root`, `blob-root`, `workspace-root` | Those directories exist and are trustworthy |
-| `storage-headroom` | Free space is sufficient for the configured quotas |
+| `configuration` | Config and TLS material are valid. |
+| `host-telemetry` | Optional telemetry provider config; disabled by default. |
+| `sandbox-resource-backend` | Trusted helper and runtime-supported isolation and resource controls. |
+| `listener` | The bind address is available. |
+| `execution-root`, `blob-root`, `workspace-root` | Required directories are available and trusted. |
+| `storage-headroom` | Free space covers configured storage quotas. |
 
-`config validate` runs the same checks and additionally requires
-`valid: true`; it is the non-mutating form to use in a deployment script.
+`config validate` performs the same checks and reports `valid: true` when the
+configuration is ready. It is useful in deployment scripts.
 
-When the `configuration` check fails, its `detail` names the rule that was
-broken, the item that broke it, and the corrective action — the same line
-`config print` and the daemon's startup failure print. See
-[configuration security](#configuration-security).
+The helper and its path must pass an ownership and permission check. If that
+check fails, the node refuses any required isolation guarantee. `doctor`
+reports what the current host can enforce; it does not infer support from the
+operating system alone. The [quickstart](quickstart.md#3-install-the-helper-where-it-is-trusted)
+shows a trusted install location.
 
-`sandbox-resource-backend` is a **runtime probe**, not a static claim. It
-reports what this host can enforce right now. The same trust decision —
-`eggwork_runner::verify_trusted_helper` — backs that check, capability
-advertisement, and admission, so the node never claims isolation its own
-enforcement path would refuse.
+Start the node in the foreground with `run`. Stop it with Ctrl-C.
 
-A helper is trusted when it is root- or effective-user-owned, not group/world
-writable, and inside non-writable ancestor directories. Anything else fails
-closed: required isolation stays unsupported instead of quietly degrading.
+## Host telemetry
 
-## Host telemetry (optional, off by default)
-
-A node can read **host-wide** measurements — CPU, memory, load, swap, disk
-capacity, disk and network throughput — from a telemetry provider running on
-the same machine, and expose them to authorized callers. This is observation
-for scheduling decisions, not enforcement: it never qualifies an execution, and
-it is never per-execution utilization.
-
-**The default `eggworkd` runs without a provider.** With no `host_telemetry`
-block in the config, the node creates no provider, starts no polling task, and
-claims no host measurements. The `host-telemetry` doctor check reports
-`disabled`.
-
-To enable it, add a block to the node config:
+Host telemetry is optional and disabled by default. Without a `host_telemetry`
+config block, the node reports no host measurements. To enable it, configure a
+local provider:
 
 ```json
 "host_telemetry": {
@@ -91,252 +75,100 @@ To enable it, add a block to the node config:
 }
 ```
 
-The provider must be **bound to the loopback interface**. The endpoint is
-validated when the config is validated, and it is refused unless it is:
+The endpoint must use plain HTTP, an explicit port, a loopback IP address, and
+the exact path `/v2/status`. Hostnames, redirects, proxies, credentials, query
+strings, and fragments are not accepted. `freshness_seconds` must be at least
+as long as `refresh_interval_seconds`.
 
-- plain `http` (not `https`),
-- an **IP literal** that is a loopback address (`127.0.0.0/8` or `::1`) — a
-  hostname such as `localhost` is refused, so no name is ever resolved and no
-  answer can be rebound,
-- naming an explicit TCP port,
-- exactly the path `/v2/status`, with no userinfo, query string, or fragment.
+An authorized controller reads cached measurements from `GET
+/v1/node/telemetry`. Its client grant must include the separate `telemetry`
+operation; `status` does not grant telemetry access.
 
-The client is built without redirect and proxy support, so a `3xx` is reported
-as an unexpected status rather than followed, and no ambient `HTTP_PROXY`
-setting is consulted. A redirect hop or an inherited proxy cannot move the
-request off the loopback interface.
-
-The node polls on its own schedule. One background task owns the provider and
-performs every request; readers consult the node's cache and never trigger a
-request themselves, so a burst of callers cannot become a burst of provider
-requests. A provider that is down is retried with a bounded backoff instead of
-being polled in a tight loop.
-
-`freshness_seconds` must not be shorter than `refresh_interval_seconds`; a
-sample older than the freshness bound is reported as **stale** rather than
-silently presented as current. A provider whose timestamp lies implausibly in
-the future is refused rather than treated as fresh.
-
-Provider failures are reported as a bounded category (connection, timeout,
-HTTP status, malformed, schema version, invalid, too large, clock skew). No
-response body, provider address, or host path is ever carried into a log line
-or a metric.
-
-## Reading host telemetry
-
-When a provider is configured, an **authorized controller** can read the node's
-host-wide observation over the existing mTLS channel:
-
-```text
-GET /v1/node/telemetry
-```
-
-The read is served from the node's own cache. It never contacts the provider,
-so a burst of readers cannot become a burst of provider requests, and a
-provider that is down does not turn a read into a timeout.
-
-**The `telemetry` grant is separate.** The operation name in a client's grant
-list is `telemetry`, and it is not implied by `status`:
-
-```json
-"clients": [
-  {
-    "principal_id": "controller-01",
-    "certificate_sha256": "0123…",
-    "operations": ["capabilities", "status", "telemetry"]
-  }
-]
-```
-
-A principal that is not granted `telemetry` receives the ordinary typed 403,
-and the refusal does not reveal whether the node holds an observation. A node
-that predates this route answers 404, which is a different answer: it means the
-node cannot serve telemetry at all.
-
-The response reports what the **provider** is doing, not what the host is
-doing:
-
-| `state` | Meaning |
+| State | Meaning |
 |---|---|
-| `disabled` | No provider is configured. The node reports no host measurements. |
-| `warming` | The provider is alive but has not produced a sample yet. |
-| `ready` | A sample is present and within its freshness bound. |
-| `stale` | A sample is present but older than the freshness bound. |
+| `disabled` | No provider is configured. |
+| `warming` | The provider has not returned a sample yet. |
+| `ready` | A current sample is available. |
+| `stale` | The last sample is older than its freshness limit. |
 | `unavailable` | The provider could not be reached. |
-| `invalid` | The provider answered with something unusable. |
+| `invalid` | The provider response could not be used. |
 
-A sample is current only when the state is `ready`. `unavailable` is not zero
-utilization, and the per-measurement groups keep that explicit: a measurement
-the host platform cannot produce is `unsupported`, one that was supported but
-not reported is `unknown`, and only a real measurement is a value.
-
-The response carries no provider address, mount path, device or interface
-identity, hostname, or per-execution measurement. The node's `status` and
-`capabilities` are unchanged by this feature: they answer "is this node
-accepting work", and telemetry answers "what did this host look like".
+Only `ready` means the sample is current. `unavailable` does not mean zero
+utilization.
 
 ## Drain
 
 ```bash
-eggworkd drain   --config <node.json>   # {"draining": true,  "persistent": true}
-eggworkd undrain --config <node.json>   # {"draining": false, "persistent": true}
+eggworkd drain   --config <node.json>
+eggworkd undrain --config <node.json>
 ```
 
-Drain is stored beside the execution database and is observed by a running node
-*before* it accepts each new execution. A draining node finishes in-flight work
-and refuses new work; it does not kill anything.
-
-Drain is **persistent** — it survives a restart. That is deliberate: it is what
-makes it safe to drain, replace binaries, and then investigate without having
-raced the node coming back up. Clear it explicitly when you are done.
+Drain stops the node from accepting new executions and lets current executions
+finish. The drain marker persists across restarts. Run `undrain` when the node
+is ready to accept work again.
 
 ## Garbage collection
 
-`gc` is a preview by default and reads only:
+`gc` is a read-only preview unless `--apply` is specified:
 
 ```bash
 eggworkd gc --config <node.json> --limit 128
-# ... "dry_run": true
 ```
 
-The preview never creates or reconciles a store: against a node whose data
-directories do not exist yet it fails with the generic bounded-GC error rather
-than reporting zero candidates, and it leaves the filesystem untouched.
+Review the preview before applying it. Apply is bounded by `--limit`, takes an
+exclusive lock on node state, and requires the daemon to be stopped. It first
+expires old blob references, so it may remove more than the preview listed.
+If the data roots have not been initialized, the preview reports an error
+instead of claiming there is nothing to collect.
 
-The preview reports what `--apply` would remove, and the apply pass may remove
-*more*: the apply pass also deletes expired blob references first, so a blob
-that becomes unreferenced as a result is collectable in the same pass. When the
-store holds no expired references, the preview's figures and the applied pass
-agree exactly.
-
-Applying it needs `--apply`, which is bounded by `--limit` and takes an
-**exclusive lock on node state**. It therefore fails while the node process is
-running — deliberately, because a live server is holding references the local
-GC cannot see:
+## Inspecting executions and data
 
 ```bash
-eggworkd gc --config <node.json> --apply --limit 128
-# eggworkd: bounded garbage collection failed
-```
-
-A live service should collect through `NodeServer::collect_garbage` instead,
-which operates on the running server's own stores and preserves active
-references.
-
-## Inspection and history
-
-```bash
+eggworkd status --config <node.json>
 eggworkd executions list --config <node.json> --limit 50 --offset 0
-eggworkd executions show  --config <node.json> <execution-id>
-eggworkd inspect blob|workspace|artifact <id> --config <node.json>
-eggworkd metrics          --config <node.json>
+eggworkd executions show --config <node.json> <execution-id>
+eggworkd inspect artifact <artifact-id> --config <node.json>
+eggworkd storage summary --config <node.json>
+eggworkd metrics --config <node.json>
 ```
 
-`executions list` is paginated; pass the returned `next_offset` back as
-`--offset` to continue. An unknown id returns a typed refusal
-(`resource was not found or could not be inspected`) rather than a generic
-error, and never reveals whether a different id exists — authorization runs
-before resource resolution, so a denied caller cannot distinguish an existing
-resource from an absent one.
+`executions list` is paginated. Use its `next_offset` as the next `--offset`.
+`metrics` includes each counter with a value of zero before it has been
+incremented.
 
-### Two execution counts, two names
+The `status` and execution list counts describe different things:
 
-`status` and `executions list` both report how many executions are still
-running, and they do **not** report the same measurement:
+| Field | Meaning |
+|---|---|
+| `execution_permits_held` | Execution permits held by a running node. It is `null` when the node is stopped. |
+| `non_terminal_executions` | Durable execution records that have not reached a terminal state. |
 
-| Key | Where it appears | What it counts |
-|---|---|---|
-| `execution_permits_held` | `status` | How many execution permits the **running node** holds right now. `null` when the node is not running — a stopped node has no live permit count. |
-| `non_terminal_executions` | `status`, `executions list` | How many durable execution rows are still in a non-terminal state (`Accepted`, `Preparing`, `Running`, `Cancelling`). |
+These counts can differ after a process failure or while the node is
+recovering. Check both when investigating stuck work.
 
-The two are independent samples and they legitimately disagree. An execution
-whose process died keeps its row until the node recovers it, so
-`non_terminal_executions` can be higher than `execution_permits_held`; and an
-idempotent re-request releases its permit while the original execution still
-holds one, so the reverse is possible too. An operator investigating a stuck
-execution wants both numbers, and neither of them is called `active_executions`
-here: that name is the API's, and on the API it means the permit count.
+For executions with declared outputs, `executions show` reports
+`artifact_capture`:
 
-The API's own status response keeps its published shape: `NodeStatus` carries
-`active_executions` for the permit count, and that field name and meaning are
-unchanged.
+| Value | Meaning |
+|---|---|
+| `not_requested` | No outputs were declared. |
+| `completed` | Outputs were captured and published. |
+| `failed` | Outputs were not captured, and the execution did not succeed. |
+| `unknown` | The node recovered the execution without a recorded capture result. |
 
-`metrics` prints the node's counters. Every counter the node can increment is
-present, with `0` before it is first incremented, so a missing key never means
-a missing measurement.
+## Configuration and redaction
 
-`executions show` prints the terminal snapshot, including the result's
-`artifact_capture` field. It is the field to read when an execution declared
-outputs:
+The config loader rejects unknown fields, symlinks, unsafe ownership, and
+unsafe permissions. Config and TLS files must be owned by root or the
+invoking user and must not be group-writable or world-writable. The private
+key must not be readable by other users. The execution, blob, and workspace
+roots and the database parent must be owner-only (`0700`).
 
-| `artifact_capture` | Meaning | What the operator sees |
-|---|---|---|
-| `not_requested` | The execution declared no outputs | Nothing was asked for, so nothing was lost |
-| `completed` | The declared outputs were captured and published | The execution's artifacts are listed and downloadable |
-| `failed` | The execution declared outputs and they were **not** captured | The terminal state is not `Succeeded`; the diagnostic in the event stream says whether the platform refused the capture or an attempted capture failed |
-| `unknown` | The node reported no disposition (an execution recovered after a crash) | The terminal state is `Interrupted`; the declared outputs, if any, are gone |
+Configuration errors include a stable rule identifier, the affected file or
+item, and a corrective action. For a private key or client certificate, the
+message names its role without revealing its path, fingerprint, or subject.
 
-A declared output that could not be captured fails the execution rather than
-leaving a successful execution with nothing in it, so a `Succeeded` execution
-never hides a dropped declared output. The legacy `finalization_failure`
-marker stays on the result as a secondary signal.
+`config print` redacts the private key path, client certificate fingerprints,
+and resource-scope identifiers. Review the output before sharing it.
 
-## Redaction
-
-`config print` prints the effective config with the private key path, every
-client certificate fingerprint, and every resource-scope identifier replaced by
-`[REDACTED]`, so the output is safe to paste into a ticket.
-
-## Configuration security
-
-The loader is strict, and a failure now says **which rule** was broken, **which
-item** broke it, and **what to do** — one line, on stderr:
-
-```text
-eggworkd: [config_file_world_writable] /etc/eggwork/node.json: remove group- and world-write permission from the configuration file
-```
-
-The bracketed identifier is stable and greppable, so a runbook can name it. The
-same fault is reported the same way by `config print`, `config validate`,
-`doctor`'s `configuration` check, and the daemon's own startup failure.
-
-The requirements it enforces:
-
-- The config file must be owned by the invoking user (or root) and **not**
-  group- or world-writable.
-- Every TLS file is checked the same way; the private key must additionally be
-  unreadable by others (`0600`).
-- `execution_root`, `blob_root`, `workspace_root` and the database's parent
-  must be owner-only directories (`0700`).
-- The config is capped in size and rejects symlinks and unknown fields.
-
-The message names the file or path that failed — the config file, a state
-directory, the sandbox helper, the bind address. It never names a
-**secret-bearing** item: a fault about the private key says *the private key*,
-never its path, and a fault about a client certificate says *the client
-certificate fingerprint*, never the value or the subject. Underlying `io` or
-JSON-parser text is never interpolated either: the rule, the item, and the
-action are all the message carries.
-
-The [quickstart](quickstart.md#5-set-permissions-required)
-has the exact `chmod` incantation.
-
-## Service management
-
-Service verbs require an explicit product policy for the platform — Linux
-`--unit-path`/`--scope`, macOS `--plist-path`/`--launchd-domain`/`--launchd-target`,
-and on Windows the optional `--windows-start-type` (`automatic`, `manual`, or
-`disabled`, defaulting to `manual`). See [deployment.md](deployment.md).
-
-On **Windows the daemon hosts the service**: `eggworkd service-host --config
-<absolute-path>` is what the service control manager launches, and the mutating
-`service` verbs go through Eggup's SCM adapter. A registration whose executable,
-config, or critical argv is not this node's is foreign, and Eggwork never touches
-it. Windows binary installation and daemon runtime are unaffected by the service
-policy.
-
-## Design reference
-
-[architecture/operations-cli.md](../architecture/operations-cli.md) ·
-[architecture/server-node.md](../architecture/server-node.md) ·
-[architecture/data-plane.md](../architecture/data-plane.md)
+For service commands and update behavior, see [deployment](deployment.md).
